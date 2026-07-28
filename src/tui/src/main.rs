@@ -49,10 +49,45 @@ enum Command {
     Auth,
     /// Show the effective configuration and where it comes from.
     Config,
-    /// Manage MCP servers (stored in ~/.bob/settings.json).
+    /// Manage MCP servers (stored in ~/.bob/config.toml).
     Mcp {
         #[command(subcommand)]
         action: McpAction,
+    },
+    /// Manage language servers (stored in ./.bob.config.toml for this project).
+    Lsp {
+        #[command(subcommand)]
+        action: LspAction,
+    },
+    /// Host this session for phone control: dial the relay and wait for your
+    /// phone to pair. Prints a pairing block (relay · session · token).
+    Remote {
+        /// Relay WebSocket URL (defaults to the configured/public relay).
+        #[arg(long)]
+        relay: Option<String>,
+        /// Pairing session id (default: auto-generated).
+        #[arg(long)]
+        session: Option<String>,
+        /// Shared secret the phone must present (default: auto-generated once,
+        /// then remembered in ~/.bob/config.toml).
+        #[arg(long)]
+        token: Option<String>,
+        /// Provider spec, e.g. anthropic:claude-sonnet-4-5 (defaults to config).
+        #[arg(short = 'p', long)]
+        provider: Option<String>,
+        /// Debug: run a terminal controller instead of the agent host.
+        #[arg(long, hide = true)]
+        test_client: bool,
+    },
+    /// Run the public relay that pairs a `bob remote` host with your phone.
+    Relay {
+        /// Address to bind, e.g. 0.0.0.0:8787.
+        #[arg(long, default_value = "127.0.0.1:8787")]
+        addr: String,
+        /// Shared secret hosts + phones must present (default: from config or
+        /// auto-generated and printed once).
+        #[arg(long)]
+        token: Option<String>,
     },
 }
 
@@ -74,6 +109,33 @@ enum McpAction {
     /// List configured MCP servers.
     List,
     /// Remove an MCP server by name.
+    Remove {
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum LspAction {
+    /// Add a language server for this project. Put the command after `--`.
+    ///
+    /// e.g.  bob lsp add rust --ext rs -- rust-analyzer
+    ///       bob lsp add ts --ext ts,tsx --root web -- typescript-language-server --stdio
+    Add {
+        /// A name for the server (labels it in the health indicator).
+        name: String,
+        /// Comma-separated file extensions the server handles, without dots.
+        #[arg(short = 'e', long = "ext", value_name = "rs,ts", required = true)]
+        ext: String,
+        /// Project root the server runs in, relative to the repo (default ".").
+        #[arg(short = 'r', long = "root", default_value = ".")]
+        root: String,
+        /// The command and its args (everything after `--`).
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
+    /// List configured language servers for this project.
+    List,
+    /// Remove a language server by name.
     Remove {
         name: String,
     },
@@ -140,6 +202,11 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Auth) => return show_auth(),
         Some(Command::Config) => return show_config(),
         Some(Command::Mcp { action }) => return run_mcp(action),
+        Some(Command::Lsp { action }) => return run_lsp(action),
+        Some(Command::Remote { relay, session, token, provider, test_client }) => {
+            return run_remote(relay, session, token, provider, test_client).await
+        }
+        Some(Command::Relay { addr, token }) => return run_relay(addr, token).await,
         None => {} // fall through to a chat
     }
 
@@ -284,12 +351,14 @@ fn show_config() -> anyhow::Result<()> {
         if config.system.is_some() { "(custom)" } else { "(default bob prompt)" }
     );
     println!("  max_turns:   {}", config.max_turns.unwrap_or(20));
+    println!("  theme:       {}", config.theme.as_deref().unwrap_or("dark"));
     println!("  permissions: default={}", config.permissions.default);
     println!("  mcp_servers: {}", config.mcp_servers.len());
+    println!("  lsp_servers: {}", config.lsp_servers.len());
     println!("\nsources (later overrides earlier):");
     println!("  1. built-in defaults");
-    println!("  2. ~/.bob/settings.json");
-    println!("  3. ./.bob/config.json  (or ./bob.config.json)");
+    println!("  2. ~/.bob/config.toml");
+    println!("  3. ./.bob.config.toml");
     Ok(())
 }
 
@@ -320,7 +389,7 @@ fn run_mcp(action: McpAction) -> anyhow::Result<()> {
                 env: env_map,
             })?;
             println!(
-                "\x1b[32m{}\x1b[0m MCP server '{}' in ~/.bob/settings.json",
+                "\x1b[32m{}\x1b[0m MCP server '{}' in ~/.bob/config.toml",
                 if replaced { "updated" } else { "added" },
                 name
             );
@@ -333,7 +402,7 @@ fn run_mcp(action: McpAction) -> anyhow::Result<()> {
                 println!("  \x1b[36mbob mcp add <name> -- <command> [args...]\x1b[0m");
                 return Ok(());
             }
-            println!("MCP servers (~/.bob/settings.json):");
+            println!("MCP servers (~/.bob/config.toml):");
             for s in servers {
                 let args = if s.args.is_empty() {
                     String::new()
@@ -349,6 +418,79 @@ fn run_mcp(action: McpAction) -> anyhow::Result<()> {
                 println!("\x1b[32mremoved\x1b[0m MCP server '{}'", name);
             } else {
                 println!("no MCP server named '{}'", name);
+            }
+            Ok(())
+        }
+    }
+}
+
+fn run_lsp(action: LspAction) -> anyhow::Result<()> {
+    use bob_core::core::config::{
+        add_lsp_server, list_lsp_servers, remove_lsp_server, LspServerConfig,
+    };
+    let cwd = std::env::current_dir()?;
+    match action {
+        LspAction::Add { name, ext, root, command } => {
+            let mut parts = command.into_iter();
+            let cmd = parts
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("no command given (put it after `--`)"))?;
+            let args: Vec<String> = parts.collect();
+            let extensions: Vec<String> = ext
+                .split(',')
+                .map(|s| s.trim().trim_start_matches('.').to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if extensions.is_empty() {
+                anyhow::bail!("--ext must list at least one extension, e.g. --ext rs");
+            }
+            let replaced = add_lsp_server(
+                &cwd,
+                LspServerConfig {
+                    name: name.clone(),
+                    command: cmd,
+                    args,
+                    extensions,
+                    root,
+                },
+            )?;
+            println!(
+                "\x1b[32m{}\x1b[0m LSP server '{}' in ./.bob.config.toml",
+                if replaced { "updated" } else { "added" },
+                name
+            );
+            Ok(())
+        }
+        LspAction::List => {
+            let servers = list_lsp_servers(&cwd)?;
+            if servers.is_empty() {
+                println!("no language servers configured for this project. Add one with:");
+                println!("  \x1b[36mbob lsp add rust --ext rs -- rust-analyzer\x1b[0m");
+                return Ok(());
+            }
+            println!("language servers (./.bob.config.toml):");
+            for s in servers {
+                let args = if s.args.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {}", s.args.join(" "))
+                };
+                println!(
+                    "  \x1b[1m{}\x1b[0m  \x1b[90m{}{}\x1b[0m  \x1b[36m[{}]\x1b[0m  root={}",
+                    s.name,
+                    s.command,
+                    args,
+                    s.extensions.join(","),
+                    s.root
+                );
+            }
+            Ok(())
+        }
+        LspAction::Remove { name } => {
+            if remove_lsp_server(&cwd, &name)? {
+                println!("\x1b[32mremoved\x1b[0m LSP server '{}'", name);
+            } else {
+                println!("no LSP server named '{}'", name);
             }
             Ok(())
         }

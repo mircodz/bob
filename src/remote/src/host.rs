@@ -18,7 +18,7 @@ use bob_core::core::permissions::{
     Asker, Decision, Mode, PermissionEngine, PermissionOption, PermissionRequest,
 };
 use bob_core::core::policies::{
-    allow_bash_commands, allow_read_only, allow_tools, deny_dangerous_bash, deny_tools,
+    allow_bash_commands, allow_code_action_list, allow_read_only, allow_tools, deny_dangerous_bash, deny_tools,
 };
 use bob_core::providers::create_provider;
 use bob_core::tools::registry::{ToolRegistry, UserAsker, UserQuery};
@@ -262,6 +262,7 @@ pub async fn run(
     };
     let mut engine = PermissionEngine::new(default_decision, Some(asker));
     engine.add(allow_read_only());
+    engine.add(allow_code_action_list());
     engine.add(deny_dangerous_bash());
     engine.add(allow_bash_commands(config.permissions.allow_bash.clone()));
     engine.add(allow_tools(config.permissions.allow.clone()));
@@ -271,12 +272,24 @@ pub async fn run(
     let jobs = bob_core::tools::jobs::JobRegistry::new();
     let (mcp_tools, _notices) = bob_core::mcp::connect_all(&config.mcp_servers).await;
 
+    // Start configured language servers in the background (non-blocking).
+    let lsp = if config.lsp_servers.is_empty() {
+        None
+    } else {
+        Some(bob_core::lsp::LspManager::start(&config.lsp_servers, &cwd))
+    };
+
     let mut subagent_tools = ToolRegistry::new(Some(permissions.clone()));
     for t in bob_core::tools::builtin_tools() {
         subagent_tools.add(t);
     }
     for t in &mcp_tools {
         subagent_tools.add(t.clone());
+    }
+    if let Some(lsp) = &lsp {
+        subagent_tools.add(Arc::new(bob_core::tools::lsp::LspTool::new(lsp.clone())));
+        subagent_tools.add(Arc::new(bob_core::tools::lsp_actions::RenameSymbolTool::new(lsp.clone())));
+        subagent_tools.add(Arc::new(bob_core::tools::lsp_actions::CodeActionTool::new(lsp.clone())));
     }
 
     let system_prompt =
@@ -289,6 +302,11 @@ pub async fn run(
     for t in &mcp_tools {
         tools.add(t.clone());
     }
+    if let Some(lsp) = &lsp {
+        tools.add(Arc::new(bob_core::tools::lsp::LspTool::new(lsp.clone())));
+        tools.add(Arc::new(bob_core::tools::lsp_actions::RenameSymbolTool::new(lsp.clone())));
+        tools.add(Arc::new(bob_core::tools::lsp_actions::CodeActionTool::new(lsp.clone())));
+    }
     tools.add(Arc::new(TaskTool {
         provider: provider.clone(),
         subagent_tools,
@@ -296,6 +314,7 @@ pub async fn run(
         cwd: cwd.to_string_lossy().to_string(),
         subagent_system: Some(system_prompt.clone()),
         jobs: jobs.clone(),
+        lsp: lsp.clone(),
     }));
 
     let mut agent = Agent::new(AgentConfig {
@@ -311,6 +330,7 @@ pub async fn run(
         keep_recent: 6,
         jobs: jobs.clone(),
         user_asker: Some(user_asker.clone()),
+        lsp: lsp.clone(),
     });
 
     // Resume the most recent conversation session (or start fresh), and load

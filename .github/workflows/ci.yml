@@ -34,3 +34,13 @@ jobs:
 
       - name: Clippy (non-blocking)
         run: cargo clippy --workspace --all-targets || true
+
+      - name: Build release binary
+        run: cargo build --release --bin bob
+
+      - name: Upload bob binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: bob-linux-x86_64
+          path: target/release/bob
+          if-no-files-found: error

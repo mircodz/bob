@@ -5,9 +5,6 @@
 # Local conversation state / sessions (private transcripts, churns constantly)
 /.bob/
 
-# User-local config (optional — remove this line if you want to commit defaults)
-# /bob.config.json
-
 # Xcode / iOS build artifacts
 ios/build/
 ios/DerivedData/

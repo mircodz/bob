@@ -9,13 +9,26 @@ use std::sync::Arc;
 // approving the spawn grants nothing on its own — auto-allow it to avoid a
 // pointless prompt before the real, individually-gated work.
 const READ_ONLY: &[&str] = &[
-    "read_file", "list_dir", "glob", "grep", "todo_write", "task",
+    "read_file", "list_dir", "glob", "grep", "todo_write", "task", "lsp",
 ];
 
 /// Read-only tools are always safe.
 pub fn allow_read_only() -> Rule {
     Arc::new(|req: &PermissionRequest| {
         if READ_ONLY.contains(&req.tool.as_str()) {
+            Some(Decision::Allow)
+        } else {
+            None
+        }
+    })
+}
+
+/// `code_action` mutates files in apply mode (`apply` set) but is read-only in
+/// list mode (no `apply` — it just asks the server what's available). Auto-allow
+/// the list case so discovering actions never prompts; apply still gets gated.
+pub fn allow_code_action_list() -> Rule {
+    Arc::new(|req: &PermissionRequest| {
+        if req.tool == "code_action" && req.input.get("apply").is_none() {
             Some(Decision::Allow)
         } else {
             None

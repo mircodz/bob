@@ -48,6 +48,14 @@ struct Renderer {
 
 impl Renderer {
     fn push_span(&mut self, text: impl Into<String>, style: Style) {
+        // Default any span without an explicit foreground to the theme's body
+        // text color, so plain text is never left to inherit the terminal's own
+        // foreground (which would be unreadable on a forced light/dark bg).
+        let style = if style.fg.is_none() {
+            style.fg(Palette::TEXT())
+        } else {
+            style
+        };
         self.cur.push(Span::styled(text.into(), style));
     }
 
@@ -55,7 +63,7 @@ impl Renderer {
     fn flush_line(&mut self) {
         let mut spans = Vec::new();
         for _ in 0..self.blockquote_depth {
-            spans.push(Span::styled("▏ ", Style::default().fg(Palette::BLOCKQUOTE_BAR)));
+            spans.push(Span::styled("▏ ", Style::default().fg(Palette::BLOCKQUOTE_BAR())));
         }
         spans.append(&mut self.cur);
         self.lines.push(Line::from(spans));
@@ -85,7 +93,7 @@ impl Renderer {
             Event::End(tag) => self.end(tag),
             Event::Text(t) => self.text(&t),
             Event::Code(t) => {
-                let s = Style::default().fg(Palette::INLINE_CODE);
+                let s = Style::default().fg(Palette::INLINE_CODE());
                 if self.in_table {
                     self.cell_buf.push_str(&t);
                 } else {
@@ -101,7 +109,7 @@ impl Renderer {
             }
             Event::Rule => {
                 self.blank();
-                self.push_span("─".repeat(48), Style::default().fg(Palette::RULE));
+                self.push_span("─".repeat(48), Style::default().fg(Palette::RULE()));
                 self.flush_line();
                 self.blank();
             }
@@ -117,10 +125,10 @@ impl Renderer {
                 let hashes = "#".repeat(heading_num(level));
                 self.push_span(
                     format!("{} ", hashes),
-                    Style::default().fg(Palette::FAINT),
+                    Style::default().fg(Palette::FAINT()),
                 );
                 self.style = Style::default()
-                    .fg(Palette::HEADING)
+                    .fg(Palette::HEADING())
                     .add_modifier(Modifier::BOLD);
             }
             Tag::BlockQuote(_) => {
@@ -152,7 +160,7 @@ impl Renderer {
                     _ => "• ".to_string(),
                 };
                 self.push_span(indent, Style::default());
-                self.push_span(marker, Style::default().fg(Palette::LIST_MARKER));
+                self.push_span(marker, Style::default().fg(Palette::LIST_MARKER()));
             }
             Tag::Emphasis => {
                 self.style_stack.push(self.style);
@@ -170,7 +178,7 @@ impl Renderer {
                 self.style_stack.push(self.style);
                 self.style = self
                     .style
-                    .fg(Palette::LINK)
+                    .fg(Palette::LINK())
                     .add_modifier(Modifier::UNDERLINED);
             }
             Tag::Table(aligns) => {
@@ -276,7 +284,7 @@ impl Renderer {
             }
         }
 
-        let border = Style::default().fg(Palette::TABLE_BORDER);
+        let border = Style::default().fg(Palette::TABLE_BORDER());
         let sep = |l: &str, m: &str, r: &str, widths: &[usize]| -> Line<'static> {
             let mut s = String::from(l);
             for (i, w) in widths.iter().enumerate() {
@@ -295,9 +303,9 @@ impl Renderer {
                 let cell = row.get(ci).cloned().unwrap_or_default();
                 let pad = pad_cell(&cell, *w, self.aligns.get(ci).copied().unwrap_or(Alignment::None));
                 let style = if ri == 0 {
-                    Style::default().fg(Palette::HEADING).add_modifier(Modifier::BOLD)
+                    Style::default().fg(Palette::HEADING()).add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(Palette::TEXT)
+                    Style::default().fg(Palette::TEXT())
                 };
                 spans.push(Span::styled(format!(" {} ", pad), style));
                 spans.push(Span::styled("│", border));

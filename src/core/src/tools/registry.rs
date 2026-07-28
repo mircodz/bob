@@ -42,6 +42,9 @@ pub struct ToolContext {
     /// UI hook for asking the user a question (ask_user / exit_plan). None in
     /// headless contexts — tools handle that by returning a note.
     pub user_asker: Option<Arc<dyn UserAsker>>,
+    /// Language servers for this project (None if no lsp_servers configured).
+    /// The `lsp` tool routes files to the right server via this manager.
+    pub lsp: Option<Arc<crate::lsp::LspManager>>,
 }
 
 #[async_trait]

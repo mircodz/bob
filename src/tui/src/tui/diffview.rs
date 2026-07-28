@@ -24,14 +24,14 @@ fn render_row(raw: &str, lang: &str) -> Line<'static> {
     if content == "..." && sign == ' ' {
         return Line::from(Span::styled(
             "     ...".to_string(),
-            Style::default().fg(Palette::FAINT),
+            Style::default().fg(Palette::FAINT()),
         ));
     }
 
     let (sign_color, bg) = match sign {
-        '+' => (Palette::DIFF_ADD, Some(Palette::DIFF_ADD_BG)),
-        '-' => (Palette::DIFF_REMOVE, Some(Palette::DIFF_REMOVE_BG)),
-        _ => (Palette::DIFF_GUTTER, None),
+        '+' => (Palette::DIFF_ADD(), Some(Palette::DIFF_ADD_BG())),
+        '-' => (Palette::DIFF_REMOVE(), Some(Palette::DIFF_REMOVE_BG())),
+        _ => (Palette::DIFF_GUTTER(), None),
     };
 
     let mut spans: Vec<Span<'static>> = Vec::new();
@@ -42,7 +42,7 @@ fn render_row(raw: &str, lang: &str) -> Line<'static> {
     ));
     spans.push(Span::styled(
         format!("{:>4} ", num),
-        Style::default().fg(Palette::DIFF_GUTTER),
+        Style::default().fg(Palette::DIFF_GUTTER()),
     ));
 
     // Content: syntax-highlighted, then tinted for add/remove via background.
@@ -79,6 +79,6 @@ fn parse_row(raw: &str) -> (char, String, &str) {
 pub fn diff_header(text: &str) -> Line<'static> {
     Line::from(Span::styled(
         text.to_string(),
-        Style::default().fg(Palette::DIM).add_modifier(Modifier::BOLD),
+        Style::default().fg(Palette::DIM()).add_modifier(Modifier::BOLD),
     ))
 }

@@ -22,6 +22,9 @@ pub struct TaskTool {
     pub subagent_system: Option<String>,
     /// Shared job registry (same instance the root agent + UI use).
     pub jobs: JobRegistry,
+    /// Shared language servers, so subagents get diagnostics/nav too. None if
+    /// no lsp_servers are configured.
+    pub lsp: Option<Arc<crate::lsp::LspManager>>,
 }
 
 impl TaskTool {
@@ -40,6 +43,7 @@ impl TaskTool {
             keep_recent: 6,
             jobs: self.jobs.clone(),
             user_asker: None,
+            lsp: self.lsp.clone(),
         })
     }
 }

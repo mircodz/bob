@@ -33,6 +33,9 @@ pub struct AgentConfig {
     pub jobs: crate::tools::jobs::JobRegistry,
     /// UI hook for ask_user / exit_plan. None → those tools return a note.
     pub user_asker: Option<Arc<dyn crate::tools::registry::UserAsker>>,
+    /// Language servers for this project. None if none configured. Shared with
+    /// every agent (root + subagents) so all see the same server processes.
+    pub lsp: Option<Arc<crate::lsp::LspManager>>,
 }
 
 impl Default for AgentConfig {
@@ -50,6 +53,7 @@ impl Default for AgentConfig {
             keep_recent: 6,
             jobs: crate::tools::jobs::JobRegistry::new(),
             user_asker: None,
+            lsp: None,
         }
     }
 }
@@ -136,6 +140,7 @@ impl Agent {
             todos: self.todos.clone(),
             jobs: self.cfg.jobs.clone(),
             user_asker: self.cfg.user_asker.clone(),
+            lsp: self.cfg.lsp.clone(),
         };
 
         self.history.push(Message::user_text(prompt));

@@ -1,0 +1,17 @@
+provider = "copilot:claude-opus-4.8"
+max_turns = 20
+theme = "dark"
+
+[permissions]
+default = "ask"
+allow_bash = ["ls", "cat", "pwd", "echo", "grep", "find", "git", "bun", "node", "tsc"]
+allow = ["read_file", "list_dir", "glob", "grep", "todo_write", "task"]
+deny = []
+
+# Language servers for this project. bob starts these in the background and the
+# `lsp` tool queries them for diagnostics, definitions, references, hover, etc.
+[[lsp_servers]]
+name = "rust"
+command = "rust-analyzer"
+extensions = ["rs"]
+root = "."

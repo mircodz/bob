@@ -52,15 +52,15 @@ pub fn render_cell(cell: &Cell, last_in_group: bool, width: usize, out: &mut Vec
             // A full-width band with the input background: blank padded row above
             // and below, and the message row padded out to `width` so the bg
             // fills edge-to-edge (no ragged right side).
-            let bg = Style::default().bg(Palette::INPUT_BG);
+            let bg = Style::default().bg(Palette::INPUT_BG());
             let pad_row = |w: usize| Line::from(Span::styled(" ".repeat(w), bg));
             out.push(pad_row(width));
             let prefix = "› ";
             let used = prefix.chars().count() + text.chars().count();
             let trailing = width.saturating_sub(used);
             out.push(Line::from(vec![
-                Span::styled(prefix, bg.fg(Palette::ACCENT).add_modifier(Modifier::BOLD)),
-                Span::styled(text.clone(), bg.fg(Palette::USER).add_modifier(Modifier::BOLD)),
+                Span::styled(prefix, bg.fg(Palette::ACCENT()).add_modifier(Modifier::BOLD)),
+                Span::styled(text.clone(), bg.fg(Palette::USER()).add_modifier(Modifier::BOLD)),
                 Span::styled(" ".repeat(trailing), bg),
             ]));
             out.push(pad_row(width));
@@ -78,7 +78,7 @@ pub fn render_cell(cell: &Cell, last_in_group: bool, width: usize, out: &mut Vec
         Cell::Subagent { agent_id, task, tools, done } => {
             let connector = if last_in_group { "╰─" } else { "├─" };
             // Always a bullet; color marks status (green = done, yellow = running).
-            let status_color = if *done { Palette::OK } else { Palette::RUNNING };
+            let status_color = if *done { Palette::OK() } else { Palette::RUNNING() };
             let count = if *tools == 1 {
                 "1 tool".to_string()
             } else {
@@ -86,34 +86,34 @@ pub fn render_cell(cell: &Cell, last_in_group: bool, width: usize, out: &mut Vec
             };
             let _ = agent_id;
             out.push(Line::from(vec![
-                Span::styled(format!("  {} ", connector), Style::default().fg(Palette::FAINT)),
+                Span::styled(format!("  {} ", connector), Style::default().fg(Palette::FAINT())),
                 Span::styled(format!("{} ", SPINNER_DOT), Style::default().fg(status_color)),
-                Span::styled(truncate(task, 56), Style::default().fg(Palette::TEXT)),
-                Span::styled(format!("  ({})", count), Style::default().fg(Palette::DIM)),
+                Span::styled(truncate(task, 56), Style::default().fg(Palette::TEXT())),
+                Span::styled(format!("  ({})", count), Style::default().fg(Palette::DIM())),
             ]));
         }
         Cell::Compaction { before, after } => {
             out.push(Line::from(Span::styled(
                 format!("  ⟲ compacted history: ~{} → ~{} tokens", before, after),
-                Style::default().fg(Palette::DIM),
+                Style::default().fg(Palette::DIM()),
             )));
         }
         Cell::Usage { input, output, cached } => {
             let cache_note = if *cached > 0 { format!(", {} cached", cached) } else { String::new() };
             out.push(Line::from(Span::styled(
                 format!("  [{} in{} / {} out]", input, cache_note, output),
-                Style::default().fg(Palette::FAINT),
+                Style::default().fg(Palette::FAINT()),
             )));
             out.push(Line::from(""));
         }
         Cell::Notice(text) => {
-            let color = if text.starts_with("error") { Palette::ERROR } else { Palette::DIM };
+            let color = if text.starts_with("error") { Palette::ERROR() } else { Palette::DIM() };
             out.push(Line::from(Span::styled(format!("  {}", text), Style::default().fg(color))));
         }
         Cell::Event(text) => {
             out.push(Line::from(vec![
-                Span::styled("• ", Style::default().fg(Palette::ACCENT)),
-                Span::styled(text.clone(), Style::default().fg(Palette::TEXT)),
+                Span::styled("• ", Style::default().fg(Palette::ACCENT())),
+                Span::styled(text.clone(), Style::default().fg(Palette::TEXT())),
             ]));
             out.push(Line::from(""));
         }
@@ -129,14 +129,14 @@ fn render_tool(
 ) {
     let (display, arg) = tool_display(name, input);
     let (bullet, bullet_color) = match status {
-        ToolStatus::Running => ("•", Palette::RUNNING),
-        ToolStatus::Ok => ("•", Palette::OK),
-        ToolStatus::Error => ("•", Palette::ERROR),
+        ToolStatus::Running => ("•", Palette::RUNNING()),
+        ToolStatus::Ok => ("•", Palette::OK()),
+        ToolStatus::Error => ("•", Palette::ERROR()),
     };
 
     let mut header = vec![
         Span::styled(format!("{} ", bullet), Style::default().fg(bullet_color)),
-        Span::styled(display, Style::default().fg(Palette::TEXT).add_modifier(Modifier::BOLD)),
+        Span::styled(display, Style::default().fg(Palette::TEXT()).add_modifier(Modifier::BOLD)),
     ];
     if !arg.is_empty() {
         if name == "bash" {
@@ -148,7 +148,7 @@ fn render_tool(
         } else {
             header.push(Span::styled(
                 format!(" {}", truncate(&arg, 72)),
-                Style::default().fg(Palette::DIM),
+                Style::default().fg(Palette::DIM()),
             ));
         }
     }
@@ -176,7 +176,7 @@ fn render_tool(
 
     // Generic: show a short dim preview (first few lines).
     let is_error = output.starts_with("error:");
-    let color = if is_error { Palette::ERROR } else { Palette::FAINT };
+    let color = if is_error { Palette::ERROR() } else { Palette::FAINT() };
     for line in output.split('\n').take(6) {
         out.push(Line::from(Span::styled(
             format!("    {}", truncate(line, 100)),
@@ -187,7 +187,7 @@ fn render_tool(
     if extra > 0 {
         out.push(Line::from(Span::styled(
             format!("    ... {} more lines", extra),
-            Style::default().fg(Palette::FAINT),
+            Style::default().fg(Palette::FAINT()),
         )));
     }
     // Trailing blank line separates consecutive tool cells.

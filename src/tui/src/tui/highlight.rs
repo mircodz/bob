@@ -92,7 +92,7 @@ pub fn highlight_line(code: &str, lang: &str) -> Vec<Span<'static>> {
         None => {
             return vec![Span::styled(
                 code.to_string(),
-                Style::default().fg(super::theme::Palette::CODE_DEFAULT),
+                Style::default().fg(super::theme::Palette::CODE_DEFAULT()),
             )]
         }
     };
@@ -114,14 +114,14 @@ pub fn highlight_line(code: &str, lang: &str) -> Vec<Span<'static>> {
             .collect(),
         Err(_) => vec![Span::styled(
             code.to_string(),
-            Style::default().fg(super::theme::Palette::CODE_DEFAULT),
+            Style::default().fg(super::theme::Palette::CODE_DEFAULT()),
         )],
     }
 }
 
 fn plain(code: &str) -> Vec<Line<'static>> {
     code.split('\n')
-        .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(super::theme::Palette::CODE_DEFAULT))))
+        .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(super::theme::Palette::CODE_DEFAULT()))))
         .collect()
 }
 

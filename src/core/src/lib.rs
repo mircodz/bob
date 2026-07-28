@@ -4,6 +4,7 @@
 pub mod agent;
 pub mod auth;
 pub mod core;
+pub mod lsp;
 pub mod mcp;
 pub mod providers;
 pub mod tools;

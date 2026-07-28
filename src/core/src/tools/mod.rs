@@ -4,6 +4,8 @@ pub mod edit;
 pub mod file_tracker;
 pub mod interact;
 pub mod jobs;
+pub mod lsp;
+pub mod lsp_actions;
 pub mod registry;
 pub mod search;
 pub mod task;
