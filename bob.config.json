@@ -1,0 +1,11 @@
+{
+  "provider": "copilot:claude-opus-4.8",
+  "max_turns": 20,
+  "permissions": {
+    "default": "ask",
+    "allow_bash": ["ls", "cat", "pwd", "echo", "grep", "find", "git", "bun", "node", "tsc"],
+    "allow": ["read_file", "list_dir", "glob", "grep", "todo_write"],
+    "deny": []
+  },
+  "mcp_servers": []
+}

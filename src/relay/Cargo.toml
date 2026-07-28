@@ -1,0 +1,27 @@
+[package]
+name = "bob-relay"
+version.workspace = true
+edition.workspace = true
+description = "Public WebSocket relay pairing a bob-remote host with a controller."
+
+[lib]
+name = "bob_relay"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bob-relay"
+path = "src/main.rs"
+
+[dependencies]
+bob-protocol = { path = "../protocol" }
+axum.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+dashmap.workspace = true
+anyhow.workspace = true
+futures.workspace = true
+
+[dev-dependencies]
+tokio-tungstenite.workspace = true
+serde.workspace = true

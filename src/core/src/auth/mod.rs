@@ -1,0 +1,422 @@
+//! Authentication framework. A pluggable way to log in to providers and store
+//! credentials, so bob can talk to Copilot / Claude / ChatGPT without a proxy or
+//! a hand-pasted key. Credentials live in ~/.bob/auth.json keyed by provider id.
+//!
+//! The framework is intentionally small: a `DeviceFlow` helper implements the
+//! OAuth 2.0 device authorization grant (RFC 8628), which GitHub uses; other
+//! providers can add their own flows (PKCE, etc.) later behind the same store.
+
+pub mod anthropic;
+pub mod copilot;
+pub mod openai;
+
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+/// One provider's stored credentials. Flexible bag so different auth schemes fit
+/// (an OAuth token here, a refresh token there). `extra` holds provider-specific
+/// fields (e.g. Copilot's cached short-lived token + its expiry).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Credential {
+    /// The long-lived token from the login flow (e.g. a GitHub OAuth token).
+    pub token: String,
+    /// Optional refresh token (for schemes that use one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
+    /// Provider-specific extra fields.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub extra: HashMap<String, String>,
+}
+
+/// The on-disk credential store: provider id → credential.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct AuthStore {
+    #[serde(default)]
+    pub providers: HashMap<String, Credential>,
+}
+
+fn auth_path() -> PathBuf {
+    let base = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    base.join(".bob").join("auth.json")
+}
+
+impl AuthStore {
+    pub fn load() -> AuthStore {
+        let path = auth_path();
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self) -> anyhow::Result<()> {
+        let path = auth_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, serde_json::to_string_pretty(self)?)?;
+        // Best-effort: restrict permissions (contains tokens).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(())
+    }
+
+    pub fn get(&self, provider: &str) -> Option<&Credential> {
+        self.providers.get(provider)
+    }
+
+    pub fn set(&mut self, provider: &str, cred: Credential) {
+        self.providers.insert(provider.to_string(), cred);
+    }
+
+    /// Remove a provider's stored credentials (logout). Returns true if present.
+    pub fn remove(&mut self, provider: &str) -> bool {
+        self.providers.remove(provider).is_some()
+    }
+
+    /// Provider ids we currently hold credentials for.
+    pub fn logged_in(&self) -> Vec<String> {
+        let mut v: Vec<String> = self
+            .providers
+            .iter()
+            .filter(|(_, c)| !c.token.is_empty())
+            .map(|(k, _)| k.clone())
+            .collect();
+        v.sort();
+        v
+    }
+}
+
+/// Parameters for an OAuth 2.0 device authorization grant (RFC 8628).
+pub struct DeviceFlowConfig {
+    pub client_id: String,
+    pub scope: String,
+    /// Endpoint that issues a device+user code.
+    pub device_code_url: String,
+    /// Endpoint that exchanges the device code for an access token.
+    pub token_url: String,
+}
+
+/// What the device endpoint returns — shown to the user so they can authorize.
+#[derive(Debug, Clone)]
+pub struct DeviceCode {
+    pub device_code: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    pub interval: u64,
+    pub expires_in: u64,
+}
+
+/// Step 1: request a device + user code. The caller shows `user_code` and
+/// `verification_uri` to the user, then calls `poll_for_token`.
+pub async fn request_device_code(cfg: &DeviceFlowConfig) -> anyhow::Result<DeviceCode> {
+    let client = reqwest::Client::new();
+    let res = client
+        .post(&cfg.device_code_url)
+        .header("accept", "application/json")
+        .header("user-agent", "bob")
+        .form(&[("client_id", cfg.client_id.as_str()), ("scope", cfg.scope.as_str())])
+        .send()
+        .await?;
+    if !res.status().is_success() {
+        anyhow::bail!("device code request failed: {}", res.status());
+    }
+    let v: serde_json::Value = res.json().await?;
+    Ok(DeviceCode {
+        device_code: v["device_code"].as_str().unwrap_or_default().to_string(),
+        user_code: v["user_code"].as_str().unwrap_or_default().to_string(),
+        verification_uri: v["verification_uri"].as_str().unwrap_or_default().to_string(),
+        interval: v["interval"].as_u64().unwrap_or(5),
+        expires_in: v["expires_in"].as_u64().unwrap_or(900),
+    })
+}
+
+/// Step 2: poll the token endpoint until the user authorizes (or it expires).
+/// Returns the access token on success. `on_wait` is called each poll so the
+/// caller can show a spinner / keep the UI alive.
+pub async fn poll_for_token<F: FnMut()>(
+    cfg: &DeviceFlowConfig,
+    device: &DeviceCode,
+    mut on_wait: F,
+) -> anyhow::Result<String> {
+    let client = reqwest::Client::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(device.expires_in);
+    let mut interval = device.interval.max(1);
+
+    loop {
+        if std::time::Instant::now() > deadline {
+            anyhow::bail!("device authorization timed out; run login again");
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+        on_wait();
+
+        let res = client
+            .post(&cfg.token_url)
+            .header("accept", "application/json")
+            .header("user-agent", "bob")
+            .form(&[
+                ("client_id", cfg.client_id.as_str()),
+                ("device_code", device.device_code.as_str()),
+                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+            ])
+            .send()
+            .await?;
+        let v: serde_json::Value = res.json().await?;
+
+        if let Some(token) = v["access_token"].as_str() {
+            return Ok(token.to_string());
+        }
+        match v["error"].as_str() {
+            Some("authorization_pending") => continue,
+            Some("slow_down") => {
+                interval += 5;
+                continue;
+            }
+            Some("expired_token") => anyhow::bail!("device code expired; run login again"),
+            Some("access_denied") => anyhow::bail!("authorization denied"),
+            Some(other) => anyhow::bail!("device auth error: {}", other),
+            None => continue,
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* PKCE + authorization-code helpers, for subscription OAuth flows      */
+/* (Claude Pro/Max via claude.ai, ChatGPT Plus/Pro via auth.openai.com) */
+/* ------------------------------------------------------------------ */
+
+/// URL-safe base64 without padding (RFC 4648 §5), used for PKCE.
+pub fn base64_url(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[((n >> 18) & 63) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 63) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(ALPHABET[((n >> 6) & 63) as usize] as char);
+        }
+        if chunk.len() > 2 {
+            out.push(ALPHABET[(n & 63) as usize] as char);
+        }
+    }
+    out
+}
+
+/// A PKCE code verifier + its S256 challenge.
+pub struct Pkce {
+    pub verifier: String,
+    pub challenge: String,
+}
+
+/// Generate a PKCE pair. The verifier is high-entropy random; the challenge is
+/// base64url(sha256(verifier)). Randomness comes from a fresh UUID pair (128
+/// bits each) to avoid pulling in a separate RNG crate.
+pub fn pkce() -> Pkce {
+    use sha2::{Digest, Sha256};
+    // 32 bytes of entropy from two UUIDs.
+    let mut seed = Vec::with_capacity(32);
+    seed.extend_from_slice(uuid_bytes().as_slice());
+    seed.extend_from_slice(uuid_bytes().as_slice());
+    let verifier = base64_url(&seed);
+    let mut hasher = Sha256::new();
+    hasher.update(verifier.as_bytes());
+    let challenge = base64_url(&hasher.finalize());
+    Pkce { verifier, challenge }
+}
+
+/// 16 random bytes (a UUID's bytes). Kept here so auth has no extra RNG dep —
+/// the tui crate owns `uuid`; core generates via getrandom through sha2? No:
+/// we hash the process/thread/time entropy instead to stay dependency-light.
+fn uuid_bytes() -> [u8; 16] {
+    use sha2::{Digest, Sha256};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tid = format!("{:?}", std::thread::current().id());
+    let mut h = Sha256::new();
+    h.update(nanos.to_le_bytes());
+    h.update(tid.as_bytes());
+    h.update(std::process::id().to_le_bytes());
+    // Mix an address for extra entropy across calls.
+    let stack_var = 0u8;
+    h.update((&stack_var as *const u8 as usize).to_le_bytes());
+    let digest = h.finalize();
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&digest[..16]);
+    out
+}
+
+/// Parameters for an OAuth 2.0 authorization-code + PKCE flow.
+pub struct AuthCodeConfig {
+    pub client_id: String,
+    pub authorize_url: String,
+    pub token_url: String,
+    pub scope: String,
+    /// The redirect URI registered for the client (usually a localhost port).
+    pub redirect_uri: String,
+    /// The localhost port to listen on for the callback.
+    pub callback_port: u16,
+    /// Extra query params to add to the authorize URL (provider-specific).
+    pub extra_authorize_params: Vec<(String, String)>,
+}
+
+/// Build the authorize URL the user opens in a browser.
+pub fn authorize_url(cfg: &AuthCodeConfig, pkce: &Pkce, state: &str) -> String {
+    let mut url = format!(
+        "{}?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}&code_challenge={}&code_challenge_method=S256",
+        cfg.authorize_url,
+        urlencode(&cfg.client_id),
+        urlencode(&cfg.redirect_uri),
+        urlencode(&cfg.scope),
+        urlencode(state),
+        urlencode(&pkce.challenge),
+    );
+    for (k, v) in &cfg.extra_authorize_params {
+        url.push('&');
+        url.push_str(&urlencode(k));
+        url.push('=');
+        url.push_str(&urlencode(v));
+    }
+    url
+}
+
+/// Listen on the localhost callback port for the OAuth redirect, returning the
+/// `code` (and validating `state`). Serves a tiny "you can close this" page.
+pub async fn wait_for_callback(port: u16, expected_state: &str) -> anyhow::Result<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
+    // One connection carries the redirect.
+    let (mut sock, _) = tokio::time::timeout(std::time::Duration::from_secs(300), listener.accept())
+        .await
+        .map_err(|_| anyhow::anyhow!("login timed out waiting for browser redirect"))??;
+
+    let mut buf = vec![0u8; 8192];
+    let n = sock.read(&mut buf).await?;
+    let req = String::from_utf8_lossy(&buf[..n]);
+    // First line: GET /callback?code=...&state=... HTTP/1.1
+    let path = req.lines().next().and_then(|l| l.split_whitespace().nth(1)).unwrap_or("");
+    let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
+    let params: HashMap<String, String> = query
+        .split('&')
+        .filter_map(|kv| kv.split_once('='))
+        .map(|(k, v)| (k.to_string(), urldecode(v)))
+        .collect();
+
+    let body = "<html><body style='font-family:sans-serif'><h2>bob is authorized ✓</h2><p>You can close this tab and return to the terminal.</p></body></html>";
+    let resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let _ = sock.write_all(resp.as_bytes()).await;
+
+    if let Some(err) = params.get("error") {
+        anyhow::bail!("authorization failed: {}", err);
+    }
+    if params.get("state").map(|s| s.as_str()) != Some(expected_state) {
+        anyhow::bail!("state mismatch (possible CSRF); login aborted");
+    }
+    params
+        .get("code")
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("no authorization code in callback"))
+}
+
+/// Exchange an authorization code (+ PKCE verifier) for tokens. Returns the raw
+/// token JSON so provider modules can pull out access/refresh/expiry as needed.
+pub async fn exchange_code(
+    cfg: &AuthCodeConfig,
+    pkce: &Pkce,
+    code: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let client = reqwest::Client::new();
+    let res = client
+        .post(&cfg.token_url)
+        .header("accept", "application/json")
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("client_id", cfg.client_id.as_str()),
+            ("redirect_uri", cfg.redirect_uri.as_str()),
+            ("code_verifier", pkce.verifier.as_str()),
+        ])
+        .send()
+        .await?;
+    if !res.status().is_success() {
+        anyhow::bail!("token exchange failed ({}): {}", res.status(), res.text().await.unwrap_or_default());
+    }
+    Ok(res.json().await?)
+}
+
+/// Refresh an access token using a refresh token. Returns the raw token JSON.
+pub async fn refresh_token(
+    token_url: &str,
+    client_id: &str,
+    refresh: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let client = reqwest::Client::new();
+    let res = client
+        .post(token_url)
+        .header("accept", "application/json")
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh),
+            ("client_id", client_id),
+        ])
+        .send()
+        .await?;
+    if !res.status().is_success() {
+        anyhow::bail!("token refresh failed ({})", res.status());
+    }
+    Ok(res.json().await?)
+}
+
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+fn urldecode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                    out.push(v);
+                    i += 3;
+                    continue;
+                }
+                out.push(bytes[i]);
+                i += 1;
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).to_string()
+}

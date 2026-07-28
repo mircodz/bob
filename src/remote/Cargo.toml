@@ -1,0 +1,21 @@
+[package]
+name = "bob-remote"
+version.workspace = true
+edition.workspace = true
+description = "Headless bob agent host reachable from a phone via the relay."
+
+[[bin]]
+name = "bob-remote"
+path = "src/main.rs"
+
+[dependencies]
+bob-core = { path = "../core" }
+bob-protocol = { path = "../protocol" }
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+uuid.workspace = true

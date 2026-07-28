@@ -1,0 +1,293 @@
+//! Wire protocol for bob remote control. JSON frames over a WebSocket, relayed
+//! between a `bob-remote` host (drives a bob-core Agent) and a controller (the
+//! iOS app, or the built-in `--test-client`).
+//!
+//! DTOs mirror bob-core types instead of deriving `Serialize` on core, keeping
+//! the core crate free of transport concerns. `From<&_>` conversions live here.
+
+use bob_core::core::events::AgentEvent;
+use bob_core::core::permissions::{PermissionOption, PermissionRequest};
+use bob_core::core::types::{Message, Usage};
+use bob_core::tools::registry::UserQuery;
+use serde::{Deserialize, Serialize};
+
+/// The first frame each peer sends on the control WebSocket: identify role +
+/// session + shared token. The relay validates the token and pairs a `Host`
+/// with a `Controller` sharing the same `session`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "role", rename_all = "snake_case")]
+pub enum Hello {
+    Host { session: String, token: String },
+    Controller { session: String, token: String },
+}
+
+impl Hello {
+    pub fn session(&self) -> &str {
+        match self {
+            Hello::Host { session, .. } | Hello::Controller { session, .. } => session,
+        }
+    }
+    pub fn token(&self) -> &str {
+        match self {
+            Hello::Host { token, .. } | Hello::Controller { token, .. } => token,
+        }
+    }
+    pub fn is_host(&self) -> bool {
+        matches!(self, Hello::Host { .. })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Host -> Controller
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum HostFrame {
+    /// A streamed agent event (text delta, tool call/result, turn end, ...).
+    Event(AgentEventDto),
+    /// The agent needs the human to answer a question (ask_user / exit_plan).
+    AskQuery { id: String, query: UserQueryDto },
+    /// A tool call needs permission; controller replies with a chosen index.
+    AskPermission {
+        id: String,
+        request: PermissionReqDto,
+        options: Vec<PermissionOptDto>,
+    },
+    /// Full conversation history, pushed when a controller connects, when a
+    /// session is loaded, or after a new session is started (empty).
+    History {
+        messages: Vec<Message>,
+        /// The active conversation session id these messages belong to.
+        #[serde(default)]
+        session_id: String,
+        /// Persisted subagent runs (the `task` tool's children with their tool
+        /// calls), so the app can rehydrate subagent detail after a restart.
+        #[serde(default)]
+        subagent_runs: Vec<bob_core::core::session::SubagentRun>,
+    },
+    /// The list of stored conversation sessions (for the drawer).
+    SessionList { sessions: Vec<SessionMeta> },
+    /// Whether the agent is mid-turn.
+    Status { busy: bool },
+}
+
+/// Lightweight metadata for one stored conversation session.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SessionMeta {
+    pub id: String,
+    /// A human title — typically the first user message, truncated.
+    pub title: String,
+    pub updated_at: String,
+    pub message_count: usize,
+}
+
+impl From<&bob_core::core::session::SessionSummary> for SessionMeta {
+    fn from(s: &bob_core::core::session::SessionSummary) -> Self {
+        SessionMeta {
+            id: s.id.clone(),
+            title: s.title.clone(),
+            updated_at: s.updated_at.clone(),
+            message_count: s.message_count,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Controller -> Host
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ControlFrame {
+    /// Start a new turn with this user prompt.
+    Prompt { text: String },
+    /// Interrupt the running turn.
+    Cancel,
+    /// Answer a prior `AskQuery` (None = dismissed).
+    AnswerQuery { id: String, answer: Option<String> },
+    /// Answer a prior `AskPermission` (index into options; None = deny).
+    AnswerPermission { id: String, choice: Option<usize> },
+    /// Change interaction mode: "normal" | "auto_accept" | "plan".
+    SetMode { mode: String },
+    /// Request the list of stored sessions (host replies with SessionList).
+    ListSessions,
+    /// Load a stored session by id (host replies with History).
+    LoadSession { id: String },
+    /// Start a fresh, empty session (host replies with empty History).
+    NewSession,
+}
+
+// ---------------------------------------------------------------------------
+// DTOs mirroring bob-core types
+// ---------------------------------------------------------------------------
+
+/// Serializable mirror of `AgentEvent`. `Message`/`Usage` are already Serialize
+/// so we embed them directly.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum AgentEventDto {
+    TurnStart { agent_id: String },
+    TextDelta { agent_id: String, text: String },
+    Message { agent_id: String, message: Message },
+    ToolCall {
+        agent_id: String,
+        tool_use_id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    ToolResult {
+        agent_id: String,
+        tool_use_id: String,
+        output: String,
+        is_error: bool,
+    },
+    SubagentSpawn {
+        parent_id: String,
+        agent_id: String,
+        task: String,
+    },
+    Compaction {
+        agent_id: String,
+        before_tokens: usize,
+        after_tokens: usize,
+    },
+    Completion {
+        agent_id: String,
+        model: String,
+        usage: Usage,
+    },
+    TurnEnd { agent_id: String, usage: Usage },
+    Error { agent_id: String, message: String },
+}
+
+impl From<&AgentEvent> for AgentEventDto {
+    fn from(e: &AgentEvent) -> Self {
+        match e {
+            AgentEvent::TurnStart { agent_id } => AgentEventDto::TurnStart {
+                agent_id: agent_id.clone(),
+            },
+            AgentEvent::TextDelta { agent_id, text } => AgentEventDto::TextDelta {
+                agent_id: agent_id.clone(),
+                text: text.clone(),
+            },
+            AgentEvent::Message { agent_id, message } => AgentEventDto::Message {
+                agent_id: agent_id.clone(),
+                message: message.clone(),
+            },
+            AgentEvent::ToolCall {
+                agent_id,
+                tool_use_id,
+                name,
+                input,
+            } => AgentEventDto::ToolCall {
+                agent_id: agent_id.clone(),
+                tool_use_id: tool_use_id.clone(),
+                name: name.clone(),
+                input: input.clone(),
+            },
+            AgentEvent::ToolResult {
+                agent_id,
+                tool_use_id,
+                output,
+                is_error,
+            } => AgentEventDto::ToolResult {
+                agent_id: agent_id.clone(),
+                tool_use_id: tool_use_id.clone(),
+                output: output.clone(),
+                is_error: *is_error,
+            },
+            AgentEvent::SubagentSpawn {
+                parent_id,
+                agent_id,
+                task,
+            } => AgentEventDto::SubagentSpawn {
+                parent_id: parent_id.clone(),
+                agent_id: agent_id.clone(),
+                task: task.clone(),
+            },
+            AgentEvent::Compaction {
+                agent_id,
+                before_tokens,
+                after_tokens,
+            } => AgentEventDto::Compaction {
+                agent_id: agent_id.clone(),
+                before_tokens: *before_tokens,
+                after_tokens: *after_tokens,
+            },
+            AgentEvent::Completion {
+                agent_id,
+                model,
+                usage,
+            } => AgentEventDto::Completion {
+                agent_id: agent_id.clone(),
+                model: model.clone(),
+                usage: *usage,
+            },
+            AgentEvent::TurnEnd { agent_id, usage } => AgentEventDto::TurnEnd {
+                agent_id: agent_id.clone(),
+                usage: *usage,
+            },
+            AgentEvent::Error { agent_id, message } => AgentEventDto::Error {
+                agent_id: agent_id.clone(),
+                message: message.clone(),
+            },
+        }
+    }
+}
+
+/// Mirror of `UserQuery` (ask_user / exit_plan).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UserQueryDto {
+    pub title: String,
+    pub detail: String,
+    pub options: Vec<String>,
+    pub allow_other: bool,
+}
+
+impl From<&UserQuery> for UserQueryDto {
+    fn from(q: &UserQuery) -> Self {
+        UserQueryDto {
+            title: q.title.clone(),
+            detail: q.detail.clone(),
+            options: q.options.clone(),
+            allow_other: q.allow_other,
+        }
+    }
+}
+
+/// Mirror of `PermissionRequest` (only the display-relevant fields).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PermissionReqDto {
+    pub tool: String,
+    pub input: serde_json::Value,
+    pub cwd: String,
+    pub preview: Option<String>,
+}
+
+impl From<&PermissionRequest> for PermissionReqDto {
+    fn from(r: &PermissionRequest) -> Self {
+        PermissionReqDto {
+            tool: r.tool.clone(),
+            input: r.input.clone(),
+            cwd: r.cwd.clone(),
+            preview: r.preview.clone(),
+        }
+    }
+}
+
+/// Mirror of `PermissionOption`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PermissionOptDto {
+    pub label: String,
+    pub allow: bool,
+}
+
+impl From<&PermissionOption> for PermissionOptDto {
+    fn from(o: &PermissionOption) -> Self {
+        PermissionOptDto {
+            label: o.label.clone(),
+            allow: o.allow,
+        }
+    }
+}
