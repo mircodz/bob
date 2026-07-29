@@ -1,4 +1,5 @@
 pub mod builtin;
+pub mod coordinate;
 pub mod diff;
 pub mod edit;
 pub mod file_tracker;

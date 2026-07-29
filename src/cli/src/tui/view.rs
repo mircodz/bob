@@ -29,18 +29,15 @@ pub enum Cell {
     /// A subagent spawn notice, with a running count of tools it has called.
     Subagent {
         agent_id: String,
+        /// Who spawned it ("root" or another agent's name), for nesting depth.
+        parent_id: String,
         task: String,
         tools: usize,
         done: bool,
+        failed: bool,
     },
     /// A compaction notice.
     Compaction { before: usize, after: usize },
-    /// End-of-turn usage line.
-    Usage {
-        input: u64,
-        output: u64,
-        cached: u64,
-    },
     /// A generic dim notice (startup notices, errors).
     Notice(String),
     /// A system event surfaced inline as a bulleted line (model/mode switches),
@@ -78,27 +75,22 @@ impl Cell {
             }
             Cell::Subagent {
                 agent_id,
+                parent_id,
                 task,
                 tools,
                 done,
+                failed,
             } => {
                 agent_id.hash(&mut h);
+                parent_id.hash(&mut h);
                 task.hash(&mut h);
                 tools.hash(&mut h);
                 done.hash(&mut h);
+                failed.hash(&mut h);
             }
             Cell::Compaction { before, after } => {
                 before.hash(&mut h);
                 after.hash(&mut h);
-            }
-            Cell::Usage {
-                input,
-                output,
-                cached,
-            } => {
-                input.hash(&mut h);
-                output.hash(&mut h);
-                cached.hash(&mut h);
             }
             Cell::Notice(t) | Cell::Event(t) => t.hash(&mut h),
         }
@@ -147,6 +139,12 @@ impl ViewModel {
                         });
                         continue;
                     }
+                    // Skip inter-agent coordination messages folded into history
+                    // — they're internal, not user turns. (Shared marker so this
+                    // can't drift from the injector; see agent::team.)
+                    if bob_core::agent::team::is_coord_message(&text) {
+                        continue;
+                    }
                     // A user turn may carry tool_results (role=tool is stored as
                     // its own message, but be defensive).
                     let mut had_text = false;
@@ -177,6 +175,11 @@ impl ViewModel {
                                     status: ToolStatus::Ok,
                                     output: None,
                                 });
+                                // Subagent tree cells come from live SubagentSpawn
+                                // *events*, which aren't in the message history. On
+                                // resume, reconstruct them from the tool's input so
+                                // spawned agents still show after a reload.
+                                self.hydrate_subagents(name, input);
                             }
                             _ => {}
                         }
@@ -205,6 +208,37 @@ impl ViewModel {
                 }
                 Role::System => {}
             }
+        }
+    }
+
+    /// Reconstruct Subagent tree cells from a persisted `task`/`spawn_agent` tool
+    /// call, so spawned agents still appear after a session is resumed. They're
+    /// marked done (the work is in the past) with an unknown tool count.
+    fn hydrate_subagents(&mut self, name: &str, input: &Value) {
+        let push = |cells: &mut Vec<Cell>, parent: &str, task: &str| {
+            cells.push(Cell::Subagent {
+                agent_id: String::new(),
+                parent_id: parent.to_string(),
+                task: task.to_string(),
+                tools: 0,
+                done: true,
+                failed: false,
+            });
+        };
+        match name {
+            "task" => {
+                if let Some(tasks) = input.get("tasks").and_then(|t| t.as_array()) {
+                    for t in tasks {
+                        let desc = t.get("description").and_then(|d| d.as_str()).unwrap_or("");
+                        push(&mut self.cells, "root", desc);
+                    }
+                }
+            }
+            "spawn_agent" => {
+                let desc = input.get("task").and_then(|t| t.as_str()).unwrap_or("");
+                push(&mut self.cells, "root", desc);
+            }
+            _ => {}
         }
     }
 
@@ -310,13 +344,28 @@ impl ViewModel {
                     *o = Some(output.clone());
                 }
             }
-            AgentEvent::SubagentSpawn { agent_id, task, .. } => {
+            AgentEvent::SubagentSpawn {
+                agent_id,
+                parent_id,
+                task,
+            } => {
                 self.cells.push(Cell::Subagent {
                     agent_id: agent_id.clone(),
+                    parent_id: parent_id.clone(),
                     task: task.clone(),
                     tools: 0,
                     done: false,
+                    failed: false,
                 });
+            }
+            AgentEvent::SubagentDone { agent_id, failed } => {
+                if let Some(Cell::Subagent {
+                    done, failed: f, ..
+                }) = self.find_subagent(agent_id)
+                {
+                    *done = true;
+                    *f = *failed;
+                }
             }
             AgentEvent::Compaction {
                 before_tokens,
@@ -328,15 +377,13 @@ impl ViewModel {
                     after: *after_tokens,
                 });
             }
-            AgentEvent::TurnEnd { usage, .. } => {
+            AgentEvent::TurnEnd { .. } => {
                 if let Some(Cell::Assistant { open, .. }) = self.open_assistant() {
                     *open = false;
                 }
-                self.cells.push(Cell::Usage {
-                    input: usage.input_tokens,
-                    output: usage.output_tokens,
-                    cached: usage.cache_read_input_tokens,
-                });
+                // Per-turn token counts are intentionally not rendered as a cell —
+                // they're noise in the transcript. Session + all-time totals live
+                // in the status bar and the /usage command.
                 self.busy = false;
             }
             AgentEvent::Error { message, .. } => {
@@ -345,12 +392,17 @@ impl ViewModel {
             }
             // Usage accounting is handled by the run-loop, not the view.
             AgentEvent::Completion { .. } => {}
+            // Inter-agent coordination chatter is internal — filtered out before
+            // it reaches the view (see is_ui_event); never rendered to the user.
+            AgentEvent::AgentMessage { .. } => {}
         }
     }
 }
 
-/// If an event comes from a spawned subagent (agent_id starts with "task_"),
-/// return that id; otherwise None (it's the root agent's own event).
+/// If an event comes from any spawned agent (agent_id other than "root"), return
+/// that id; otherwise None (it's the root agent's own event). This covers both
+/// `task_*` subagents and named coordinated agents — none of their inner activity
+/// belongs in the main transcript.
 fn subagent_id(event: &AgentEvent) -> Option<&str> {
     let id = match event {
         AgentEvent::TurnStart { agent_id }
@@ -363,8 +415,10 @@ fn subagent_id(event: &AgentEvent) -> Option<&str> {
         | AgentEvent::Completion { agent_id, .. }
         | AgentEvent::Error { agent_id, .. } => agent_id.as_str(),
         AgentEvent::SubagentSpawn { .. } => return None,
+        AgentEvent::SubagentDone { .. } => return None,
+        AgentEvent::AgentMessage { .. } => return None,
     };
-    if id.starts_with("task_") {
+    if id != "root" {
         Some(id)
     } else {
         None

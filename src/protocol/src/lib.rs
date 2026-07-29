@@ -174,6 +174,15 @@ pub enum AgentEventDto {
         agent_id: String,
         task: String,
     },
+    SubagentDone {
+        agent_id: String,
+        failed: bool,
+    },
+    AgentMessage {
+        to: String,
+        from: String,
+        text: String,
+    },
     Compaction {
         agent_id: String,
         before_tokens: usize,
@@ -238,6 +247,15 @@ impl From<&AgentEvent> for AgentEventDto {
                 parent_id: parent_id.clone(),
                 agent_id: agent_id.clone(),
                 task: task.clone(),
+            },
+            AgentEvent::SubagentDone { agent_id, failed } => AgentEventDto::SubagentDone {
+                agent_id: agent_id.clone(),
+                failed: *failed,
+            },
+            AgentEvent::AgentMessage { to, from, text } => AgentEventDto::AgentMessage {
+                to: to.clone(),
+                from: from.clone(),
+                text: text.clone(),
             },
             AgentEvent::Compaction {
                 agent_id,

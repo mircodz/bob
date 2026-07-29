@@ -11,7 +11,6 @@ use serde_json::Value;
 
 /// Glyph for a still-running subagent (a filled dot; the spinner in the input
 /// band already animates, so this stays static in the transcript).
-const SPINNER_DOT: &str = "•";
 
 /// Pretty display name for a tool + its most salient argument.
 /// write_file {path:"a.py"} → ("Write", "a.py")
@@ -35,6 +34,12 @@ fn tool_display(name: &str, input: &Value) -> (String, String) {
         "web_fetch" => ("Fetch".into(), arg("url")),
         "todo_write" => ("Plan".into(), String::new()),
         "task" => ("Task".into(), String::new()),
+        // spawn_agent renders like task: the "Agent" label, and its subagent cell
+        // (the ├─/╰─ line) shows the description + status below. The verbose tool
+        // output ("spawned agent…") is suppressed in render_tool.
+        "spawn_agent" => ("Agent".into(), arg("name")),
+        "send_message" => ("Message".into(), arg("to")),
+        "list_agents" => ("Agents".into(), String::new()),
         other => (other.to_string(), String::new()),
     }
 }
@@ -48,11 +53,9 @@ fn truncate(s: &str, n: usize) -> String {
     }
 }
 
-/// Render one cell into zero or more display lines. `last_in_group` tells a
-/// Subagent cell whether it's the last spawn in a consecutive run (so it uses
-/// the `└` tree corner instead of `├`). `width` is the render width, used to
-/// fill full-width background bands (the user message).
-pub fn render_cell(cell: &Cell, last_in_group: bool, width: usize, out: &mut Vec<Line<'static>>) {
+/// Render one cell into zero or more display lines. `width` is the render width,
+/// used to fill full-width background bands (the user message).
+pub fn render_cell(cell: &Cell, width: usize, out: &mut Vec<Line<'static>>) {
     match cell {
         Cell::User(text) => {
             // A full-width band with the input background: blank padded row above
@@ -95,60 +98,56 @@ pub fn render_cell(cell: &Cell, last_in_group: bool, width: usize, out: &mut Vec
         }
         Cell::Subagent {
             agent_id,
+            parent_id,
             task,
             tools,
             done,
+            failed,
         } => {
-            let connector = if last_in_group { "╰─" } else { "├─" };
-            // Always a bullet; color marks status (green = done, yellow = running).
-            let status_color = if *done {
+            let _ = parent_id;
+            // One line per subagent: a status dot — orange while running, green on
+            // success, red on failure — + "Spawned <name> agent", then the tool
+            // count while running, or "finished" / "failed" when done.
+            let dot_color = if *failed {
+                Palette::ERROR()
+            } else if *done {
                 Palette::OK()
             } else {
                 Palette::RUNNING()
             };
-            let count = if *tools == 1 {
-                "1 tool".to_string()
+            let label = if agent_id.is_empty() || agent_id.starts_with("task_") {
+                truncate(task, 48)
             } else {
-                format!("{} tools", tools)
+                agent_id.clone()
             };
-            let _ = agent_id;
+            let trailing = if *failed {
+                "  failed".to_string()
+            } else if *done {
+                "  finished".to_string()
+            } else if *tools == 1 {
+                "  (1 tool)".to_string()
+            } else {
+                format!("  ({} tools)", tools)
+            };
             out.push(Line::from(vec![
+                Span::styled("• ", Style::default().fg(dot_color)),
+                Span::styled("Spawned ", Style::default().fg(Palette::DIM())),
                 Span::styled(
-                    format!("  {} ", connector),
-                    Style::default().fg(Palette::FAINT()),
+                    label,
+                    Style::default()
+                        .fg(Palette::TEXT())
+                        .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(
-                    format!("{} ", SPINNER_DOT),
-                    Style::default().fg(status_color),
-                ),
-                Span::styled(truncate(task, 56), Style::default().fg(Palette::TEXT())),
-                Span::styled(
-                    format!("  ({})", count),
-                    Style::default().fg(Palette::DIM()),
-                ),
+                Span::styled(" agent", Style::default().fg(Palette::DIM())),
+                Span::styled(trailing, Style::default().fg(Palette::DIM())),
             ]));
+            out.push(Line::from(""));
         }
         Cell::Compaction { before, after } => {
             out.push(Line::from(Span::styled(
                 format!("  ⟲ compacted history: ~{} → ~{} tokens", before, after),
                 Style::default().fg(Palette::DIM()),
             )));
-        }
-        Cell::Usage {
-            input,
-            output,
-            cached,
-        } => {
-            let cache_note = if *cached > 0 {
-                format!(", {} cached", cached)
-            } else {
-                String::new()
-            };
-            out.push(Line::from(Span::styled(
-                format!("  [{} in{} / {} out]", input, cache_note, output),
-                Style::default().fg(Palette::FAINT()),
-            )));
-            out.push(Line::from(""));
         }
         Cell::Notice(text) => {
             let color = if text.starts_with("error") {
@@ -178,6 +177,14 @@ fn render_tool(
     output: Option<&str>,
     out: &mut Vec<Line<'static>>,
 ) {
+    // Neither `spawn_agent` nor `todo_write` renders a tool cell in the
+    // transcript. `spawn_agent`'s visible artifact is the separate `Subagent`
+    // cell (the "• Spawned <name> agent" line, from the SubagentSpawn event);
+    // `todo_write` is shown by the sticky todo panel above the input. A tool line
+    // for either would just be noise.
+    if name == "spawn_agent" || name == "todo_write" {
+        return;
+    }
     let (display, arg) = tool_display(name, input);
     let (bullet, bullet_color) = match status {
         ToolStatus::Running => ("•", Palette::RUNNING()),
@@ -210,13 +217,26 @@ fn render_tool(
     }
     out.push(Line::from(header));
 
+    // `task` and `spawn_agent` are immediately followed by their subagent cells
+    // (the ├─/╰─ tree), so they emit NO trailing blank and suppress their tool
+    // output — the tree butts directly under the header and shows the status. The
+    // last subagent in the group provides the spacing below.
+    if name == "task" || name == "spawn_agent" {
+        return;
+    }
+
     // Output preview / diff.
     let Some(output) = output else {
         out.push(Line::from(""));
         return;
     };
-    // Read shows only the path in the header — no content dump.
-    if name == "read_file" {
+    // Read and List show only the path in the header — no content dump.
+    if name == "read_file" || name == "list_dir" {
+        out.push(Line::from(""));
+        return;
+    }
+    // `todo_write` renders as the checklist panel — don't dump its raw result.
+    if name == "todo_write" {
         out.push(Line::from(""));
         return;
     }

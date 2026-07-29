@@ -45,6 +45,22 @@ pub struct ToolContext {
     /// Language servers for this project (None if no lsp_servers configured).
     /// The `lsp` tool routes files to the right server via this manager.
     pub lsp: Option<Arc<crate::lsp::LspManager>>,
+    /// Coordination context: this agent's name, spawn depth, and the shared team
+    /// roster, so the coordination tools (spawn_agent / send_message /
+    /// list_agents) know who is calling and can address other agents. None when
+    /// the agent is not part of a team (the simple `task` path).
+    pub coord: Option<CoordContext>,
+}
+
+/// The calling agent's coordination context, threaded to the coordination tools.
+#[derive(Clone)]
+pub struct CoordContext {
+    /// This agent's own name in the team.
+    pub name: String,
+    /// This agent's spawn depth (root = 0). Children are `depth + 1`.
+    pub depth: usize,
+    /// The shared team roster.
+    pub team: crate::agent::team::AgentRegistry,
 }
 
 #[async_trait]

@@ -28,7 +28,7 @@ impl Tool for TodoWriteTool {
                         "items": {
                             "type": "object",
                             "properties": {
-                                "content": { "type": "string", "description": "Imperative task description." },
+                                "content": { "type": "string", "description": "Short imperative task label, ideally 3-7 words (e.g. \"Add auth middleware\", \"Fix fmt failures\"). NOT a paragraph — keep it scannable; details go in your reply, not the todo." },
                                 "active_form": { "type": "string", "description": "Present-continuous form shown while in progress." },
                                 "status": { "type": "string", "enum": ["pending", "in_progress", "completed"] }
                             },

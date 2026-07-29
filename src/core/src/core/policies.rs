@@ -4,10 +4,11 @@ use crate::core::permissions::{Decision, PermissionRequest, Rule};
 use std::collections::HashSet;
 use std::sync::Arc;
 
-// Tools that never mutate anything themselves. `task` spawns subagents, but
-// every tool call *inside* a subagent is still gated by this same engine, so
-// approving the spawn grants nothing on its own — auto-allow it to avoid a
-// pointless prompt before the real, individually-gated work.
+// Tools that never mutate anything themselves. `task` and the coordination tools
+// (spawn_agent/send_message/list_agents) spawn or message subagents, but every
+// tool call *inside* a subagent is still gated by this same engine, so approving
+// the spawn/message grants nothing on its own — auto-allow to avoid a pointless
+// prompt before the real, individually-gated work.
 const READ_ONLY: &[&str] = &[
     "read_file",
     "list_dir",
@@ -15,7 +16,12 @@ const READ_ONLY: &[&str] = &[
     "grep",
     "todo_write",
     "task",
+    "spawn_agent",
+    "send_message",
+    "list_agents",
     "lsp",
+    "job_status",
+    "job_output",
 ];
 
 /// Read-only tools are always safe.
@@ -124,4 +130,42 @@ pub fn deny_tools(names: Vec<String>) -> Rule {
             None
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn req(tool: &str) -> PermissionRequest {
+        PermissionRequest {
+            tool: tool.to_string(),
+            input: serde_json::Value::Null,
+            cwd: ".".to_string(),
+            bash: None,
+            preview: None,
+        }
+    }
+
+    #[test]
+    fn coordination_tools_are_auto_allowed() {
+        let rule = allow_read_only();
+        // spawn_agent / send_message / list_agents must never prompt — spawning
+        // and messaging grant nothing; the real work inside is separately gated.
+        for tool in ["spawn_agent", "send_message", "list_agents", "task"] {
+            assert_eq!(
+                rule(&req(tool)),
+                Some(Decision::Allow),
+                "{tool} should be auto-allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn mutating_tools_are_not_auto_allowed() {
+        let rule = allow_read_only();
+        // These must fall through (None) so the engine can prompt/deny.
+        for tool in ["write_file", "edit_file", "bash"] {
+            assert_eq!(rule(&req(tool)), None, "{tool} must not be auto-allowed");
+        }
+    }
 }

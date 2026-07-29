@@ -29,6 +29,9 @@ pub struct Session {
     /// stored separately here to survive a restart.
     #[serde(default)]
     pub subagent_runs: Vec<SubagentRun>,
+    /// The agent's todo list, persisted so the sticky panel survives a resume.
+    #[serde(default)]
+    pub todos: Vec<crate::tools::todo::TodoItem>,
 }
 
 /// All subagents spawned by one `task` tool call.
@@ -97,6 +100,7 @@ pub fn new_session(provider: &str, id: String, now: String) -> Session {
         grants: vec![],
         usage: vec![],
         subagent_runs: vec![],
+        todos: vec![],
     }
 }
 

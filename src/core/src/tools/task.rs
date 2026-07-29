@@ -36,7 +36,7 @@ impl TaskTool {
             bus: self.bus.clone(),
             system: self.subagent_system.clone(),
             cwd,
-            max_turns: 20,
+            max_turns: 100,
             id: Some(id),
             context_window: 200_000,
             compact_threshold: 0.8,
@@ -44,6 +44,13 @@ impl TaskTool {
             jobs: self.jobs.clone(),
             user_asker: None,
             lsp: self.lsp.clone(),
+            // The simple `task` tool stays fire-and-forget: its children are not
+            // team members (no inbox/registry). Coordinated agents come from the
+            // separate `spawn_agent` path.
+            inbox: None,
+            team: None,
+            name: "subagent".to_string(),
+            depth: 1,
         })
     }
 }
@@ -69,7 +76,7 @@ impl Tool for TaskTool {
                         "items": {
                             "type": "object",
                             "properties": {
-                                "description": { "type": "string", "description": "Short label for the sub-task." },
+                                "description": { "type": "string", "description": "A 3-5 word label for the sub-task (e.g. \"review src/core\"), shown in the UI. NOT the full instructions." },
                                 "prompt": { "type": "string", "description": "Full instructions for the subagent." }
                             },
                             "required": ["description", "prompt"]

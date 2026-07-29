@@ -74,15 +74,18 @@ impl Tool for GrepTool {
                 as path:line:text. Optionally restrict to a subdirectory (`path`) or to files \
                 matching a `glob`. This is the right way to find where something is defined or \
                 used across the codebase — prefer it over `grep`/`rg` via bash. Node_modules, \
-                .git, and target/ are skipped automatically."
+                .git, and target/ are skipped automatically. Set `literal: true` to search for the \
+                pattern verbatim (no regex) — useful for strings with regex metacharacters like \
+                `#[derive` or `Vec<T>`."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "pattern": { "type": "string", "description": "Regular expression to search for." },
+                    "pattern": { "type": "string", "description": "Regular expression (or literal string if `literal` is true)." },
                     "path": { "type": "string", "description": "Directory to search (defaults to cwd)." },
                     "glob": { "type": "string", "description": "Only search files matching this glob." },
                     "ignore_case": { "type": "boolean" },
+                    "literal": { "type": "boolean", "description": "Treat `pattern` as a literal string, not a regex." },
                     "max_results": { "type": "number", "description": "Cap on matching lines (default 200)." }
                 },
                 "required": ["pattern"]
@@ -95,13 +98,15 @@ impl Tool for GrepTool {
         let path = input["path"].as_str().unwrap_or(".");
         let file_glob = input["glob"].as_str().unwrap_or("**/*");
         let ignore_case = input["ignore_case"].as_bool().unwrap_or(false);
+        let literal = input["literal"].as_bool().unwrap_or(false);
         let cap = input["max_results"].as_u64().unwrap_or(200) as usize;
 
         let root = resolve_path(&ctx.cwd, path);
-        let re = match RegexBuilder::new(pattern)
-            .case_insensitive(ignore_case)
-            .build()
-        {
+        // Build the matcher. If `literal` is set, escape the pattern up front. If a
+        // regex fails to compile (e.g. the model searched for `#[derive`, an
+        // unclosed character class), fall back to a literal search of the same
+        // text instead of hard-erroring — that's almost always what was intended.
+        let re = match build_matcher(pattern, ignore_case, literal) {
             Ok(r) => r,
             Err(e) => return format!("error: invalid regex: {}", e),
         };
@@ -144,5 +149,54 @@ impl Tool for GrepTool {
         } else {
             results.join("\n")
         }
+    }
+}
+
+/// Build the grep matcher. A `literal` pattern is escaped up front; otherwise we
+/// try it as a regex and, if it doesn't compile (e.g. `#[derive` — an unclosed
+/// character class), retry as a literal search of the same text. That way a
+/// pattern full of regex metacharacters never hard-fails.
+fn build_matcher(
+    pattern: &str,
+    ignore_case: bool,
+    literal: bool,
+) -> Result<regex::Regex, regex::Error> {
+    let build = |pat: &str| RegexBuilder::new(pat).case_insensitive(ignore_case).build();
+    if literal {
+        build(&regex::escape(pattern))
+    } else {
+        build(pattern).or_else(|_| build(&regex::escape(pattern)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_matcher;
+
+    #[test]
+    fn regex_metachars_fall_back_to_literal() {
+        // `#[derive` is an invalid regex (unclosed class) but a common literal
+        // search; it must not error — it should match the literal text.
+        let re = build_matcher("#[derive", false, false).unwrap();
+        assert!(re.is_match("#[derive(Clone)]"));
+        assert!(!re.is_match("derive"));
+    }
+
+    #[test]
+    fn valid_regex_stays_a_regex() {
+        let re = build_matcher(r"fn \w+\(", false, false).unwrap();
+        assert!(re.is_match("fn main("));
+    }
+
+    #[test]
+    fn literal_flag_escapes_metachars() {
+        let re = build_matcher("Vec<T>", false, true).unwrap();
+        assert!(re.is_match("let v: Vec<T> = ..."));
+    }
+
+    #[test]
+    fn ignore_case_applies() {
+        let re = build_matcher("todo", true, false).unwrap();
+        assert!(re.is_match("// TODO: fix"));
     }
 }

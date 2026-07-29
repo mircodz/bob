@@ -157,7 +157,7 @@ impl LspTool {
                 continue;
             }
             if shown >= 20 {
-                out.push_str(&format!("… and more (showing first 20)\n"));
+                out.push_str("… and more (showing first 20)\n");
                 break;
             }
             let sev_label = match sev {
@@ -180,7 +180,7 @@ impl LspTool {
             // Source line + caret.
             if let Some(src) = lines.get(line as usize) {
                 out.push_str(&format!("  {}\n", src));
-                let pad: String = std::iter::repeat(' ').take(col as usize + 2).collect();
+                let pad: String = std::iter::repeat_n(' ', col as usize + 2).collect();
                 out.push_str(&format!("{}^\n", pad));
             }
             shown += 1;
@@ -386,7 +386,7 @@ fn render_symbol(s: &Value, depth: usize, out: &mut String) {
         .or_else(|| s["location"]["range"]["start"]["line"].as_i64())
         .unwrap_or(0)
         + 1;
-    let indent: String = std::iter::repeat("  ").take(depth).collect();
+    let indent: String = std::iter::repeat_n("  ", depth).collect();
     out.push_str(&format!("{}{} {}  :{}\n", indent, kind, name, line));
     if let Some(children) = s["children"].as_array() {
         for c in children {

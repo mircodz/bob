@@ -312,6 +312,7 @@ pub async fn run(
     let permissions = Arc::new(engine);
 
     let jobs = bob_core::tools::jobs::JobRegistry::new();
+    let team = bob_core::agent::team::AgentRegistry::new();
     let (mcp_tools, _notices) = bob_core::mcp::connect_all(&config.mcp_servers).await;
 
     // Start configured language servers in the background (non-blocking).
@@ -337,6 +338,12 @@ pub async fn run(
             lsp.clone(),
         )));
     }
+    subagent_tools.add(Arc::new(bob_core::tools::coordinate::SendMessageTool {
+        team: team.clone(),
+    }));
+    subagent_tools.add(Arc::new(bob_core::tools::coordinate::ListAgentsTool {
+        team: team.clone(),
+    }));
 
     let system_prompt =
         bob_core::agent::prompt::build_system_prompt(config.system.as_deref(), &cwd);
@@ -359,13 +366,36 @@ pub async fn run(
     }
     tools.add(Arc::new(TaskTool {
         provider: provider.clone(),
-        subagent_tools,
+        subagent_tools: subagent_tools.clone(),
         bus: bus.clone(),
         cwd: cwd.to_string_lossy().to_string(),
         subagent_system: Some(system_prompt.clone()),
         jobs: jobs.clone(),
         lsp: lsp.clone(),
     }));
+    {
+        use bob_core::tools::coordinate::{
+            CoordDeps, ListAgentsTool, SendMessageTool, SpawnAgentTool,
+        };
+        let deps = CoordDeps {
+            provider: provider.clone(),
+            subagent_tools: subagent_tools.clone(),
+            bus: bus.clone(),
+            cwd: cwd.to_string_lossy().to_string(),
+            subagent_system: Some(system_prompt.clone()),
+            jobs: jobs.clone(),
+            lsp: lsp.clone(),
+            team: team.clone(),
+        };
+        tools.add(Arc::new(SpawnAgentTool { deps }));
+        tools.add(Arc::new(SendMessageTool { team: team.clone() }));
+        tools.add(Arc::new(ListAgentsTool { team: team.clone() }));
+    }
+
+    // Register the root as a team member with its own mailbox, so spawned agents
+    // can report their results back to "root" and wake it for a fresh turn.
+    let (root_inbox, root_tx) = bob_core::agent::team::mailbox();
+    team.register("root".to_string(), 0, root_tx);
 
     let mut agent = Agent::new(AgentConfig {
         provider: provider.clone(),
@@ -381,6 +411,10 @@ pub async fn run(
         jobs: jobs.clone(),
         user_asker: Some(user_asker.clone()),
         lsp: lsp.clone(),
+        inbox: Some(root_inbox),
+        team: Some(team.clone()),
+        name: "root".to_string(),
+        depth: 0,
     });
 
     // Resume the most recent conversation session (or start fresh), and load
@@ -645,6 +679,7 @@ pub async fn run(
 fn is_remote_event(e: &AgentEvent) -> bool {
     match e {
         AgentEvent::SubagentSpawn { .. }
+        | AgentEvent::SubagentDone { .. }
         | AgentEvent::ToolCall { .. }
         | AgentEvent::ToolResult { .. }
         | AgentEvent::TurnEnd { .. }
@@ -654,5 +689,7 @@ fn is_remote_event(e: &AgentEvent) -> bool {
         | AgentEvent::Message { agent_id, .. }
         | AgentEvent::Compaction { agent_id, .. }
         | AgentEvent::Error { agent_id, .. } => agent_id == "root",
+        // Inter-agent coordination chatter stays internal — never sent to the phone.
+        AgentEvent::AgentMessage { .. } => false,
     }
 }

@@ -35,6 +35,17 @@ pub enum AgentEvent {
         agent_id: String,
         task: String,
     },
+    /// A spawned agent finished. `failed` marks an error exit (shown red).
+    SubagentDone {
+        agent_id: String,
+        failed: bool,
+    },
+    /// A coordination message delivered from one team agent to another.
+    AgentMessage {
+        to: String,
+        from: String,
+        text: String,
+    },
     Compaction {
         agent_id: String,
         before_tokens: usize,

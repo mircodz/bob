@@ -53,13 +53,18 @@ fn default_root() -> String {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BobConfig {
+    /// Provider id: copilot | anthropic | openai. May also carry the model in
+    /// colon form ("anthropic:claude-sonnet-4-5"); a separate `model` field wins.
     pub provider: String,
+    /// Model id within the provider (e.g. "claude-sonnet-4-5", "gpt-5"). Empty =
+    /// use the provider's default (or the colon form in `provider`).
+    #[serde(default)]
+    pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system: Option<String>,
     #[serde(default)]
     pub max_turns: Option<u32>,
-    /// TUI color theme: "dark" (default), "light", or "terminal" (inherit the
-    /// terminal's own ANSI palette). Unknown values fall back to dark.
+    /// TUI color theme (e.g. "dark", "light", "catppuccin"). Unknown → dark.
     #[serde(default)]
     pub theme: Option<String>,
     pub permissions: PermissionsConfig,
@@ -73,6 +78,7 @@ impl Default for BobConfig {
     fn default() -> Self {
         BobConfig {
             provider: "anthropic".to_string(),
+            model: String::new(),
             system: None,
             max_turns: Some(20),
             theme: None,
@@ -100,6 +106,7 @@ impl Default for BobConfig {
 #[derive(Debug, Deserialize)]
 struct PartialConfig {
     provider: Option<String>,
+    model: Option<String>,
     system: Option<String>,
     max_turns: Option<u32>,
     theme: Option<String>,
@@ -121,6 +128,7 @@ fn read_partial(path: &Path) -> anyhow::Result<Option<PartialConfig>> {
 fn merge(base: BobConfig, over: PartialConfig) -> BobConfig {
     BobConfig {
         provider: over.provider.unwrap_or(base.provider),
+        model: over.model.unwrap_or(base.model),
         system: over.system.or(base.system),
         max_turns: over.max_turns.or(base.max_turns),
         theme: over.theme.or(base.theme),
@@ -152,9 +160,83 @@ pub fn load_config(cwd: &Path) -> anyhow::Result<BobConfig> {
 // formatting of unrelated keys are preserved across `bob mcp add/remove`.
 // ---------------------------------------------------------------------------
 
-fn global_config_path() -> anyhow::Result<std::path::PathBuf> {
+pub fn global_config_path() -> anyhow::Result<std::path::PathBuf> {
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("no home directory"))?;
     Ok(home.join(".bob").join("config.toml"))
+}
+
+/// The default global config as commented TOML — the scaffold `bob config init`
+/// writes. Documents every option so the file is self-explanatory. Values mirror
+/// `BobConfig::default()`.
+pub fn default_config_toml() -> String {
+    let d = BobConfig::default();
+    let quote = |v: &[String]| {
+        v.iter()
+            .map(|s| format!("\"{}\"", s))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!(
+        r#"# bob global configuration (~/.bob/config.toml).
+# A project may override any of these in ./.bob.config.toml.
+
+# Provider: copilot | anthropic | openai. Log in first with `bob login <provider>`.
+provider = "{provider}"
+# Model within the provider (e.g. "claude-sonnet-4-5", "gpt-5"). Empty = default.
+model = "{model}"
+
+# Color theme: dark | light | catppuccin | catppuccin-macchiato | catppuccin-frappe
+#            | catppuccin-latte | github-dark | github-light | solarized-dark
+#            | solarized-light | base16-dark
+theme = "dark"
+
+# Max agent turns per prompt before it stops on its own.
+max_turns = {max_turns}
+
+# Optional: replace the built-in system prompt entirely (advanced).
+# system = "You are ..."
+
+[permissions]
+# What to do for a tool call not covered by the lists below: allow | deny | ask.
+default = "{perm_default}"
+# Shell commands auto-approved without a prompt.
+allow_bash = [{allow_bash}]
+# Tools auto-approved without a prompt.
+allow = [{allow}]
+# Tools always denied.
+deny = [{deny}]
+
+# MCP servers (or add them with `bob mcp add <name> -- <command>`):
+# [[mcp_servers]]
+# name = "filesystem"
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+
+# Language servers live in the PROJECT config (./.bob.config.toml), added with
+# `bob lsp add rust --ext rs -- rust-analyzer`.
+"#,
+        provider = "",
+        model = "",
+        max_turns = d.max_turns.unwrap_or(20),
+        perm_default = d.permissions.default,
+        allow_bash = quote(&d.permissions.allow_bash),
+        allow = quote(&d.permissions.allow),
+        deny = quote(&d.permissions.deny),
+    )
+}
+
+/// Write the default config to `~/.bob/config.toml`. Returns the path written.
+/// If the file exists, it is overwritten only when `force` is true.
+pub fn init_global_config(force: bool) -> anyhow::Result<(std::path::PathBuf, bool)> {
+    let path = global_config_path()?;
+    if path.exists() && !force {
+        return Ok((path, false));
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, default_config_toml())?;
+    Ok((path, true))
 }
 
 fn read_config_doc() -> anyhow::Result<toml_edit::DocumentMut> {

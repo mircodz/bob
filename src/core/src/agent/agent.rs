@@ -39,6 +39,14 @@ pub struct AgentConfig {
     /// Language servers for this project. None if none configured. Shared with
     /// every agent (root + subagents) so all see the same server processes.
     pub lsp: Option<Arc<crate::lsp::LspManager>>,
+    /// This agent's mailbox for inter-agent coordination. None → the agent is not
+    /// part of a team and behaves exactly as before (no inbox drain).
+    pub inbox: Option<crate::agent::team::AgentInbox>,
+    /// The shared team roster, so coordination tools can address other agents.
+    pub team: Option<crate::agent::team::AgentRegistry>,
+    /// This agent's own name in the team + its spawn depth (root = 0).
+    pub name: String,
+    pub depth: usize,
 }
 
 impl Default for AgentConfig {
@@ -57,6 +65,10 @@ impl Default for AgentConfig {
             jobs: crate::tools::jobs::JobRegistry::new(),
             user_asker: None,
             lsp: None,
+            inbox: None,
+            team: None,
+            name: "root".to_string(),
+            depth: 0,
         }
     }
 }
@@ -102,6 +114,29 @@ impl Agent {
         self.todos.clone()
     }
 
+    /// Whether this agent should be woken to process coordination messages. It
+    /// wakes only when there is a pending message AND no team member is still
+    /// running — so when several agents were spawned, the parent wakes ONCE after
+    /// they've all reported, seeing every result together, and can write a single
+    /// synthesized reply rather than one dribbled paragraph per agent. (If a
+    /// message is waiting but a sibling is still running, we hold off; that
+    /// sibling's completion will re-trigger the check.) The frontend polls this on
+    /// an idle agent and, if true, drives a fresh empty-prompt "wake" turn.
+    pub fn has_pending_coordination(&mut self) -> bool {
+        let team_still_running = self.cfg.team.as_ref().is_some_and(|team| {
+            team.roster().iter().any(|(name, _, status)| {
+                name != &self.cfg.name && *status == crate::agent::team::AgentStatus::Running
+            })
+        });
+        if team_still_running {
+            return false;
+        }
+        self.cfg
+            .inbox
+            .as_mut()
+            .is_some_and(|inbox| inbox.has_pending())
+    }
+
     /// A handle to this agent's cancel flag. Set it to `true` (from the UI on
     /// another task) to cooperatively interrupt an in-flight `run`.
     pub fn cancel_handle(&self) -> Arc<std::sync::atomic::AtomicBool> {
@@ -144,9 +179,23 @@ impl Agent {
             jobs: self.cfg.jobs.clone(),
             user_asker: self.cfg.user_asker.clone(),
             lsp: self.cfg.lsp.clone(),
+            coord: self
+                .cfg
+                .team
+                .as_ref()
+                .map(|team| crate::tools::registry::CoordContext {
+                    name: self.cfg.name.clone(),
+                    depth: self.cfg.depth,
+                    team: team.clone(),
+                }),
         };
 
-        self.history.push(Message::user_text(prompt));
+        // A non-empty prompt is a real user turn. An EMPTY prompt is a
+        // coordination "wake" — no user message; the inbox drain below provides
+        // the content (a team member's result). Skip pushing an empty user turn.
+        if !prompt.is_empty() {
+            self.history.push(Message::user_text(prompt));
+        }
         self.cfg.bus.emit(AgentEvent::TurnStart {
             agent_id: self.id.clone(),
         });
@@ -156,6 +205,10 @@ impl Agent {
 
         let mut total = Usage::default();
         let mut final_text = String::new();
+        // Set true when the model finishes on its own (no more tool calls) or we
+        // stop deliberately. If the turn loop runs to exhaustion instead, we report
+        // that explicitly rather than returning an empty result.
+        let mut finished = false;
 
         for _turn in 0..self.cfg.max_turns {
             // Interrupt before starting a new turn — history ends on a valid
@@ -164,6 +217,22 @@ impl Agent {
             if self.is_cancelled() {
                 final_text = "[interrupted]".to_string();
                 break;
+            }
+            // Coordination seam: fold any messages from other agents into history
+            // as a synthetic user turn, so the model sees and can act on them at
+            // this turn boundary. No-op when the agent has no inbox (not a team).
+            if let Some(inbox) = self.cfg.inbox.as_mut() {
+                let messages = inbox.drain();
+                for m in messages {
+                    self.history.push(Message::user_text(
+                        crate::agent::team::format_coord_message(&m.from, &m.text),
+                    ));
+                    self.cfg.bus.emit(AgentEvent::AgentMessage {
+                        to: self.id.clone(),
+                        from: m.from.clone(),
+                        text: m.text.clone(),
+                    });
+                }
             }
             // Compact history if approaching the context window.
             let history = std::mem::take(&mut self.history);
@@ -260,6 +329,7 @@ impl Agent {
 
             if tool_uses.is_empty() {
                 final_text = completion.message.text();
+                finished = true;
                 break;
             }
 
@@ -318,6 +388,16 @@ impl Agent {
                 role: Role::Tool,
                 content: results,
             });
+        }
+
+        // If the turn loop ran to exhaustion without the model finishing, return
+        // a clear message rather than an empty string — otherwise a subagent that
+        // hits the cap looks like it silently returned nothing.
+        if !finished && final_text.is_empty() {
+            final_text = format!(
+                "[stopped after reaching the {}-turn limit without finishing]",
+                self.cfg.max_turns
+            );
         }
 
         self.cfg.bus.emit(AgentEvent::TurnEnd {

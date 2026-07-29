@@ -193,7 +193,7 @@ impl Provider for ResponsesProvider {
                         if !text.is_empty() {
                             content.push(ContentBlock::Text { text: text.clone() });
                         }
-                        for (_, (id, name, args)) in &tools {
+                        for (id, name, args) in tools.values() {
                             let input = if args.is_empty() {
                                 json!({})
                             } else {

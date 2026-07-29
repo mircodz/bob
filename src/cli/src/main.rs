@@ -47,8 +47,11 @@ enum Command {
     },
     /// Show which providers you're authenticated with.
     Auth,
-    /// Show the effective configuration and where it comes from.
-    Config,
+    /// Show the effective configuration, or scaffold a default one (`config init`).
+    Config {
+        #[command(subcommand)]
+        action: Option<ConfigAction>,
+    },
     /// Manage MCP servers (stored in ~/.bob/config.toml).
     Mcp {
         #[command(subcommand)]
@@ -84,6 +87,16 @@ enum Command {
         /// Address to bind, e.g. 0.0.0.0:8787.
         #[arg(long, default_value = "127.0.0.1:8787")]
         addr: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// Write a commented default config to ~/.bob/config.toml.
+    Init {
+        /// Overwrite an existing config file.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -192,7 +205,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Login { provider }) => return run_login(&provider).await,
         Some(Command::Logout { provider }) => return run_logout(&provider),
         Some(Command::Auth) => return show_auth(),
-        Some(Command::Config) => return show_config(),
+        Some(Command::Config { action }) => return run_config(action),
         Some(Command::Mcp { action }) => return run_mcp(action),
         Some(Command::Lsp { action }) => return run_lsp(action),
         Some(Command::Remote {
@@ -211,7 +224,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Resolve the provider spec: --provider/--model override config; a bare
     // colon-form (--provider openai:gpt-5) is also accepted for convenience.
-    let provider_spec = resolve_provider_spec(&cli, &config.provider);
+    let provider_spec = resolve_provider_spec(&cli, &config);
 
     let provider = match create_provider(&provider_spec).await {
         Ok(p) => p,
@@ -241,22 +254,24 @@ async fn main() -> anyhow::Result<()> {
 
 /// Combine --provider/--model (and the colon shorthand / config default) into a
 /// single "provider:model" spec.
-fn resolve_provider_spec(cli: &Cli, config_default: &str) -> String {
-    // Base provider: explicit flag, else the config default's provider part.
+fn resolve_provider_spec(cli: &Cli, config: &bob_core::core::config::BobConfig) -> String {
+    // Base provider: explicit flag, else the config `provider` (which may carry a
+    // colon model form).
     let base = cli
         .provider
         .clone()
-        .unwrap_or_else(|| config_default.to_string());
+        .unwrap_or_else(|| config.provider.clone());
     let (prov, colon_model) = match base.split_once(':') {
         Some((p, m)) => (p.to_string(), Some(m.to_string())),
         None => (base, None),
     };
-    // Model precedence: --model flag > colon form > config default's model.
-    let model = cli
-        .model
-        .clone()
-        .or(colon_model)
-        .or_else(|| config_default.split_once(':').map(|(_, m)| m.to_string()));
+    // Model precedence: --model flag > config `model` field > colon form.
+    let cfg_model = if config.model.is_empty() {
+        None
+    } else {
+        Some(config.model.clone())
+    };
+    let model = cli.model.clone().or(cfg_model).or(colon_model);
     match model {
         Some(m) if !m.is_empty() => format!("{}:{}", prov, m),
         _ => prov,
@@ -346,11 +361,38 @@ fn show_auth() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn run_config(action: Option<ConfigAction>) -> anyhow::Result<()> {
+    match action {
+        None => show_config(),
+        Some(ConfigAction::Init { force }) => {
+            let (path, written) = bob_core::core::config::init_global_config(force)?;
+            if written {
+                println!("\x1b[32mwrote\x1b[0m default config to {}", path.display());
+                println!("edit it, or override per-project in ./.bob.config.toml");
+            } else {
+                println!(
+                    "config already exists at {} (use --force to overwrite)",
+                    path.display()
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
 fn show_config() -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
     let config = load_config(&cwd)?;
     println!("effective config:");
     println!("  provider:    {}", config.provider);
+    println!(
+        "  model:       {}",
+        if config.model.is_empty() {
+            "(provider default)"
+        } else {
+            &config.model
+        }
+    );
     println!(
         "  system:      {}",
         if config.system.is_some() {

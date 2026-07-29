@@ -217,6 +217,11 @@ fn describe_input(tool: &str, input: &serde_json::Value) -> String {
 fn is_ui_event(e: &AgentEvent) -> bool {
     match e {
         AgentEvent::SubagentSpawn { .. } => true,
+        // A spawned agent finishing — updates its cell's status (green/red).
+        AgentEvent::SubagentDone { .. } => true,
+        // Inter-agent coordination chatter is internal — never surfaced in the
+        // user transcript (it's used by the receiving agent, not shown to you).
+        AgentEvent::AgentMessage { .. } => false,
         // ToolCall/TurnEnd pass from any agent: the view routes subagent ones to
         // update the spawn cell's count/done state.
         AgentEvent::ToolCall { .. } | AgentEvent::TurnEnd { .. } => true,
@@ -368,6 +373,10 @@ pub async fn run(
     // agent, the task tool, and the UI panel so all three see the same jobs.
     let jobs = bob_core::tools::jobs::JobRegistry::new();
 
+    // Shared team roster for agent coordination (spawn_agent/send_message/
+    // list_agents). Root + every spawned agent share this instance.
+    let team = bob_core::agent::team::AgentRegistry::new();
+
     // Connect to any configured MCP servers (bob is the MCP *client*). Their
     // tools are namespaced `<server>.<tool>` and handed to root + subagents.
     let (mcp_tools, mcp_notices) = bob_core::mcp::connect_all(&config.mcp_servers).await;
@@ -396,6 +405,15 @@ pub async fn run(
             lsp.clone(),
         )));
     }
+    // Spawned agents can message + inspect the team (cycle-free tools). Nested
+    // spawning (spawn_agent inside a child) is added to the root's tools only;
+    // the depth cap governs how deep it can go.
+    subagent_tools.add(Arc::new(bob_core::tools::coordinate::SendMessageTool {
+        team: team.clone(),
+    }));
+    subagent_tools.add(Arc::new(bob_core::tools::coordinate::ListAgentsTool {
+        team: team.clone(),
+    }));
     // Compose the system prompt: the base bob prompt (or a config override) plus
     // a live environment block and any AGENTS.md/CLAUDE.md project context.
     let system_prompt =
@@ -419,13 +437,42 @@ pub async fn run(
     }
     tools.add(Arc::new(TaskTool {
         provider: provider.clone(),
-        subagent_tools,
+        subagent_tools: subagent_tools.clone(),
         bus: bus.clone(),
         cwd: cwd.to_string_lossy().to_string(),
         subagent_system: Some(system_prompt.clone()),
         jobs: jobs.clone(),
         lsp: lsp.clone(),
     }));
+
+    // Agent-coordination tools: spawn_agent (build coordinated children from the
+    // same deps as the task tool), send_message, list_agents. Available to the
+    // root and to spawned agents (children get them via subagent_tools), so any
+    // team member can coordinate. Depth is enforced at runtime by spawn_agent.
+    {
+        use bob_core::tools::coordinate::{
+            CoordDeps, ListAgentsTool, SendMessageTool, SpawnAgentTool,
+        };
+        let deps = CoordDeps {
+            provider: provider.clone(),
+            subagent_tools: subagent_tools.clone(),
+            bus: bus.clone(),
+            cwd: cwd.to_string_lossy().to_string(),
+            subagent_system: Some(system_prompt.clone()),
+            jobs: jobs.clone(),
+            lsp: lsp.clone(),
+            team: team.clone(),
+        };
+        tools.add(Arc::new(SpawnAgentTool { deps: deps.clone() }));
+        tools.add(Arc::new(SendMessageTool { team: team.clone() }));
+        tools.add(Arc::new(ListAgentsTool { team: team.clone() }));
+    }
+
+    // The root is itself a team member so spawned agents can report back to it by
+    // name ("root"). It needs a mailbox registered in the team and wired as its
+    // inbox, or children's result messages would have nowhere to land.
+    let (root_inbox, root_tx) = bob_core::agent::team::mailbox();
+    team.register("root".to_string(), 0, root_tx);
 
     let mut agent = Agent::new(AgentConfig {
         provider: provider.clone(),
@@ -441,6 +488,10 @@ pub async fn run(
         jobs: jobs.clone(),
         user_asker: Some(user_asker.clone()),
         lsp: lsp.clone(),
+        inbox: Some(root_inbox),
+        team: Some(team.clone()),
+        name: "root".to_string(),
+        depth: 0,
     });
     if !session.messages.is_empty() {
         agent.load_history(session.messages.clone());
@@ -448,6 +499,11 @@ pub async fn run(
     // Grab the cancel handle before moving the agent behind the mutex, so the UI
     // can interrupt a running turn without needing to lock the (busy) agent.
     let cancel = agent.cancel_handle();
+    let todos = agent.todos();
+    // Restore the persisted todo list so the panel survives a resume.
+    if !session.todos.is_empty() {
+        todos.set(session.todos.clone());
+    }
     let agent = Arc::new(Mutex::new(agent));
 
     // --- terminal setup ---
@@ -468,6 +524,7 @@ pub async fn run(
     app.cwd_label = abbreviate_home(&cwd);
     app.branch = git_branch(&cwd);
     app.lsp = lsp.clone();
+    app.todos = Some(todos);
     app.theme_name = config.theme.clone().unwrap_or_else(|| "dark".to_string());
     // Seed usage totals: this session's prior usage + the global ledger.
     app.session_usage = bob_core::core::usage::total_of(&session.usage);
@@ -682,6 +739,9 @@ pub async fn run(
                 let a = agent.lock().await;
                 session.messages = a.messages().to_vec();
                 session.grants = permissions.export_grants();
+                if let Some(todos) = &app.todos {
+                    session.todos = todos.items();
+                }
                 session.updated_at = now_stamp();
                 let _ = save_session(&session);
                 drop(a);
@@ -705,6 +765,21 @@ pub async fn run(
             }
             _ = ticker.tick() => {
                 app.spinner = app.spinner.wrapping_add(1);
+                // Coordination wake: if idle but a spawned agent has reported back,
+                // drive a fresh empty-prompt turn so the root folds the result into
+                // history and acts on it — an idle agent is re-driven by a new turn
+                // rather than blocking.
+                if !app.running {
+                    let pending = {
+                        let mut a = agent.lock().await;
+                        a.has_pending_coordination()
+                    };
+                    if pending {
+                        app.running = true;
+                        app.turn_started = Some(std::time::Instant::now());
+                        spawn_turn(&agent, &app.turn_done_tx, String::new());
+                    }
+                }
             }
         }
     };
@@ -791,6 +866,8 @@ struct App {
     branch: Option<String>,
     /// Language servers for this project, for the status-line health indicator.
     lsp: Option<Arc<bob_core::lsp::LspManager>>,
+    /// The agent's todo list, rendered as a sticky panel above the input.
+    todos: Option<Arc<bob_core::tools::todo::TodoStore>>,
     /// Active theme name (for the /theme picker's current-selection + direct set).
     theme_name: String,
     /// Per-cell render cache: index → (cache key, rendered lines). The key folds
@@ -856,6 +933,7 @@ impl App {
             cwd_label: String::new(),
             branch: None,
             lsp: None,
+            todos: None,
             theme_name: "dark".to_string(),
             render_cache: Vec::new(),
         }
@@ -1639,11 +1717,22 @@ impl App {
             (job_rows.len() as u16 + 1).min(8)
         };
 
+        // A sticky todo panel sits just above the input while the list is
+        // non-empty (one row per item + a header), capped so it can't dominate.
+        let todo_items = self.todos.as_ref().map(|t| t.items()).unwrap_or_default();
+        let todos_height = if todo_items.is_empty() {
+            0
+        } else {
+            // header + one blank line of padding above and below.
+            (todo_items.len() as u16 + 3).min(14)
+        };
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(1),
                 Constraint::Length(prompt_height),
+                Constraint::Length(todos_height),
                 Constraint::Length(jobs_height),
                 Constraint::Length(input_height),
                 Constraint::Length(1), // status bar below the input
@@ -1656,21 +1745,102 @@ impl App {
         } else if self.pending_query.is_some() {
             self.draw_query(f, chunks[1]);
         }
-        if jobs_height > 0 {
-            self.draw_jobs(f, chunks[2], &job_rows);
+        if todos_height > 0 {
+            self.draw_todos(f, chunks[2], &todo_items);
         }
-        self.draw_input(f, chunks[3]);
-        self.draw_status_bar(f, chunks[4]);
+        if jobs_height > 0 {
+            self.draw_jobs(f, chunks[3], &job_rows);
+        }
+        self.draw_input(f, chunks[4]);
+        self.draw_status_bar(f, chunks[5]);
 
         if !self.menu.is_empty() {
-            self.draw_menu(f, chunks[3]);
+            self.draw_menu(f, chunks[4]);
         }
         if !self.file_menu.is_empty() {
-            self.draw_file_menu(f, chunks[3]);
+            self.draw_file_menu(f, chunks[4]);
         }
         if let Some(toast) = self.toast.clone() {
             self.draw_toast(f, area, &toast);
         }
+    }
+
+    /// Sticky todo checklist above the input: a header with the done/total count,
+    /// then one row per item — ☐ pending (dim), ◐ in-progress (accent, bold), ✓
+    /// done (green, struck-through-ish via dim).
+    fn draw_todos(
+        &self,
+        f: &mut ratatui::Frame,
+        area: Rect,
+        items: &[bob_core::tools::todo::TodoItem],
+    ) {
+        use bob_core::tools::todo::TodoStatus;
+        f.render_widget(Clear, area);
+        let done = items
+            .iter()
+            .filter(|i| i.status == TodoStatus::Completed)
+            .count();
+        let in_progress = items
+            .iter()
+            .filter(|i| i.status == TodoStatus::InProgress)
+            .count();
+        let open = items.len() - done - in_progress;
+        let header = format!(
+            "{} task{} ({} done, {} in progress, {} open)",
+            items.len(),
+            if items.len() == 1 { "" } else { "s" },
+            done,
+            in_progress,
+            open,
+        );
+        let mut lines: Vec<Line> = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("  {}", header),
+                Style::default().fg(Palette::DIM()),
+            )),
+        ];
+        for item in items
+            .iter()
+            .take(area.height.saturating_sub(3) as usize)
+        {
+            let (glyph, glyph_color, text_style) = match item.status {
+                TodoStatus::Pending => {
+                    ("[ ]", Palette::FAINT(), Style::default().fg(Palette::DIM()))
+                }
+                TodoStatus::InProgress => (
+                    "[~]",
+                    Palette::ACCENT(),
+                    Style::default()
+                        .fg(Palette::TEXT())
+                        .add_modifier(Modifier::BOLD),
+                ),
+                TodoStatus::Completed => {
+                    ("[x]", Palette::OK(), Style::default().fg(Palette::DIM()))
+                }
+            };
+            let width = area.width.saturating_sub(8) as usize;
+            let text: String = if item.label().chars().count() > width {
+                format!(
+                    "{}…",
+                    item.label()
+                        .chars()
+                        .take(width.saturating_sub(1))
+                        .collect::<String>()
+                )
+            } else {
+                item.label().to_string()
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {} ", glyph), Style::default().fg(glyph_color)),
+                Span::styled(text, text_style),
+            ]));
+        }
+        lines.push(Line::from(""));
+        f.render_widget(
+            Paragraph::new(lines).style(Style::default().bg(Palette::BG())),
+            area,
+        );
     }
 
     fn draw_jobs(
@@ -1736,17 +1906,15 @@ impl App {
             self.render_cache.resize(cells.len(), (0, Vec::new()));
         }
         for (i, cell) in cells.iter().enumerate() {
-            // A subagent cell is last-in-group if the next cell isn't a subagent.
-            let last_in_group = !matches!(cells.get(i + 1), Some(view::Cell::Subagent { .. }));
             let is_user = matches!(cell, view::Cell::User(_));
-            // Cache key: content + group flag + width + theme generation. A hit
-            // means this cell renders identically to last frame, so we reuse its
-            // Lines and skip markdown/syntax-highlighting entirely.
+
+            // Cache key: content + width + theme generation. A hit means this cell
+            // renders identically to last frame, so we reuse its Lines and skip
+            // markdown/syntax-highlighting entirely.
             let key = {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
                 cell.fingerprint().hash(&mut h);
-                last_in_group.hash(&mut h);
                 width_full.hash(&mut h);
                 theme_gen.hash(&mut h);
                 h.finish()
@@ -1754,7 +1922,7 @@ impl App {
             let slot = &mut self.render_cache[i];
             if slot.0 != key {
                 let mut rendered = Vec::new();
-                render::render_cell(cell, last_in_group, width_full, &mut rendered);
+                render::render_cell(cell, width_full, &mut rendered);
                 *slot = (key, rendered);
             }
             for line in &slot.1 {
@@ -2310,7 +2478,7 @@ impl App {
 /// spans at boundaries and preserving each span's style. Over-long single
 /// tokens are hard-broken.
 fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
-    if width == 0 || line.width() as usize <= width {
+    if width == 0 || line.width() <= width {
         return vec![line];
     }
     let mut out: Vec<Line<'static>> = Vec::new();
@@ -2373,7 +2541,7 @@ fn osc52_copy(text: &str) {
 /// Minimal standard base64 encoder (no external crate).
 fn base64_encode(input: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
         let b0 = chunk[0] as u32;
         let b1 = *chunk.get(1).unwrap_or(&0) as u32;
