@@ -9,38 +9,62 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  rust:
-    name: Rust (build · test · clippy · fmt)
+  # Fast lint + test gate on Linux. fmt is blocking now that the tree is clean;
+  # clippy stays advisory until the existing lints are cleared.
+  check:
+    name: Lint & test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
-
+      - name: Format check
+        run: cargo fmt --all --check
       - name: Build
         run: cargo build --workspace --all-targets
-
       - name: Test
         run: cargo test --workspace
-
-      - name: Format check (non-blocking)
-        run: cargo fmt --all --check || true
-
       - name: Clippy (non-blocking)
         run: cargo clippy --workspace --all-targets || true
 
+  # Build the release binary on every OS and upload a downloadable artifact per
+  # platform for every push/PR — not just tagged releases.
+  build:
+    name: Build ${{ matrix.target }}
+    needs: check
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            ext: ""
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            ext: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            ext: ".exe"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
       - name: Build release binary
-        run: cargo build --release --bin bob
-
+        run: cargo build --release --bin bob --target ${{ matrix.target }}
       - name: Upload bob binary
         uses: actions/upload-artifact@v4
         with:
-          name: bob-linux-x86_64
-          path: target/release/bob
+          name: bob-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/bob${{ matrix.ext }}
           if-no-files-found: error

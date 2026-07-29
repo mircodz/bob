@@ -16,7 +16,13 @@ const SPINNER_DOT: &str = "•";
 /// Pretty display name for a tool + its most salient argument.
 /// write_file {path:"a.py"} → ("Write", "a.py")
 fn tool_display(name: &str, input: &Value) -> (String, String) {
-    let arg = |k: &str| input.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let arg = |k: &str| {
+        input
+            .get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
     match name {
         "read_file" => ("Read".into(), arg("path")),
         "write_file" => ("Write".into(), arg("path")),
@@ -59,8 +65,14 @@ pub fn render_cell(cell: &Cell, last_in_group: bool, width: usize, out: &mut Vec
             let used = prefix.chars().count() + text.chars().count();
             let trailing = width.saturating_sub(used);
             out.push(Line::from(vec![
-                Span::styled(prefix, bg.fg(Palette::ACCENT()).add_modifier(Modifier::BOLD)),
-                Span::styled(text.clone(), bg.fg(Palette::USER()).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    prefix,
+                    bg.fg(Palette::ACCENT()).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    text.clone(),
+                    bg.fg(Palette::USER()).add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(" ".repeat(trailing), bg),
             ]));
             out.push(pad_row(width));
@@ -72,13 +84,28 @@ pub fn render_cell(cell: &Cell, last_in_group: bool, width: usize, out: &mut Vec
             }
             out.push(Line::from(""));
         }
-        Cell::Tool { name, input, status, output, .. } => {
+        Cell::Tool {
+            name,
+            input,
+            status,
+            output,
+            ..
+        } => {
             render_tool(name, input, *status, output.as_deref(), out);
         }
-        Cell::Subagent { agent_id, task, tools, done } => {
+        Cell::Subagent {
+            agent_id,
+            task,
+            tools,
+            done,
+        } => {
             let connector = if last_in_group { "╰─" } else { "├─" };
             // Always a bullet; color marks status (green = done, yellow = running).
-            let status_color = if *done { Palette::OK() } else { Palette::RUNNING() };
+            let status_color = if *done {
+                Palette::OK()
+            } else {
+                Palette::RUNNING()
+            };
             let count = if *tools == 1 {
                 "1 tool".to_string()
             } else {
@@ -86,10 +113,19 @@ pub fn render_cell(cell: &Cell, last_in_group: bool, width: usize, out: &mut Vec
             };
             let _ = agent_id;
             out.push(Line::from(vec![
-                Span::styled(format!("  {} ", connector), Style::default().fg(Palette::FAINT())),
-                Span::styled(format!("{} ", SPINNER_DOT), Style::default().fg(status_color)),
+                Span::styled(
+                    format!("  {} ", connector),
+                    Style::default().fg(Palette::FAINT()),
+                ),
+                Span::styled(
+                    format!("{} ", SPINNER_DOT),
+                    Style::default().fg(status_color),
+                ),
                 Span::styled(truncate(task, 56), Style::default().fg(Palette::TEXT())),
-                Span::styled(format!("  ({})", count), Style::default().fg(Palette::DIM())),
+                Span::styled(
+                    format!("  ({})", count),
+                    Style::default().fg(Palette::DIM()),
+                ),
             ]));
         }
         Cell::Compaction { before, after } => {
@@ -98,8 +134,16 @@ pub fn render_cell(cell: &Cell, last_in_group: bool, width: usize, out: &mut Vec
                 Style::default().fg(Palette::DIM()),
             )));
         }
-        Cell::Usage { input, output, cached } => {
-            let cache_note = if *cached > 0 { format!(", {} cached", cached) } else { String::new() };
+        Cell::Usage {
+            input,
+            output,
+            cached,
+        } => {
+            let cache_note = if *cached > 0 {
+                format!(", {} cached", cached)
+            } else {
+                String::new()
+            };
             out.push(Line::from(Span::styled(
                 format!("  [{} in{} / {} out]", input, cache_note, output),
                 Style::default().fg(Palette::FAINT()),
@@ -107,8 +151,15 @@ pub fn render_cell(cell: &Cell, last_in_group: bool, width: usize, out: &mut Vec
             out.push(Line::from(""));
         }
         Cell::Notice(text) => {
-            let color = if text.starts_with("error") { Palette::ERROR() } else { Palette::DIM() };
-            out.push(Line::from(Span::styled(format!("  {}", text), Style::default().fg(color))));
+            let color = if text.starts_with("error") {
+                Palette::ERROR()
+            } else {
+                Palette::DIM()
+            };
+            out.push(Line::from(Span::styled(
+                format!("  {}", text),
+                Style::default().fg(color),
+            )));
         }
         Cell::Event(text) => {
             out.push(Line::from(vec![
@@ -136,7 +187,12 @@ fn render_tool(
 
     let mut header = vec![
         Span::styled(format!("{} ", bullet), Style::default().fg(bullet_color)),
-        Span::styled(display, Style::default().fg(Palette::TEXT()).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            display,
+            Style::default()
+                .fg(Palette::TEXT())
+                .add_modifier(Modifier::BOLD),
+        ),
     ];
     if !arg.is_empty() {
         if name == "bash" {
@@ -176,7 +232,11 @@ fn render_tool(
 
     // Generic: show a short dim preview (first few lines).
     let is_error = output.starts_with("error:");
-    let color = if is_error { Palette::ERROR() } else { Palette::FAINT() };
+    let color = if is_error {
+        Palette::ERROR()
+    } else {
+        Palette::FAINT()
+    };
     for line in output.split('\n').take(6) {
         out.push(Line::from(Span::styled(
             format!("    {}", truncate(line, 100)),

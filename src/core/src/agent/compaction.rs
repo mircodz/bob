@@ -63,7 +63,10 @@ pub async fn maybe_compact(
     let split = messages.len().saturating_sub(opts.keep_recent);
     // Guard: never split a tool_use from its following tool_result.
     let adjusted_split = if split > 0
-        && messages.get(split).map(|m| m.role == Role::Tool).unwrap_or(false)
+        && messages
+            .get(split)
+            .map(|m| m.role == Role::Tool)
+            .unwrap_or(false)
     {
         split - 1
     } else {
@@ -131,7 +134,11 @@ fn render_for_summary(m: &Message) -> String {
                 content, is_error, ..
             } => format!(
                 "[tool_result{}]\n{}",
-                if is_error.unwrap_or(false) { " error" } else { "" },
+                if is_error.unwrap_or(false) {
+                    " error"
+                } else {
+                    ""
+                },
                 content
             ),
         })

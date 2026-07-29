@@ -54,4 +54,3 @@ pub fn persist(session: &mut Session, messages: Vec<Message>) {
 pub fn list_all() -> Vec<SessionMeta> {
     list_sessions().iter().map(SessionMeta::from).collect()
 }
-

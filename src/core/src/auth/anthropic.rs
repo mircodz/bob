@@ -7,8 +7,8 @@
 //! sanctioned path for custom tooling.
 
 use super::{
-    authorize_url, exchange_code, pkce, refresh_token, wait_for_callback, AuthCodeConfig, AuthStore,
-    Credential, Pkce,
+    authorize_url, exchange_code, pkce, refresh_token, wait_for_callback, AuthCodeConfig,
+    AuthStore, Credential, Pkce,
 };
 
 // Public client id used by Claude Code's OAuth flow.
@@ -109,7 +109,10 @@ pub async fn access_token() -> anyhow::Result<String> {
         .ok_or_else(|| anyhow::anyhow!("session expired and no refresh token; log in again"))?;
     let tokens = refresh_token(TOKEN_URL, CLIENT_ID, &refresh).await?;
     store_tokens(&tokens)?;
-    Ok(tokens["access_token"].as_str().unwrap_or_default().to_string())
+    Ok(tokens["access_token"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string())
 }
 
 fn now() -> u64 {

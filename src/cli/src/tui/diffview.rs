@@ -12,9 +12,7 @@ use ratatui::text::{Line, Span};
 /// number, `|`, then the content). Bare lines are tolerated. `lang` selects the
 /// syntax for highlighting the content (from the fence tag / file extension).
 pub fn render_diff(body: &str, lang: &str) -> Vec<Line<'static>> {
-    body.split('\n')
-        .map(|raw| render_row(raw, lang))
-        .collect()
+    body.split('\n').map(|raw| render_row(raw, lang)).collect()
 }
 
 fn render_row(raw: &str, lang: &str) -> Line<'static> {
@@ -68,7 +66,9 @@ fn parse_row(raw: &str) -> (char, String, &str) {
     // Split "NNNN| content" on the first '|'.
     if let Some(bar) = rest.find('|') {
         let num = rest[..bar].trim().to_string();
-        let content = rest[bar + 1..].strip_prefix(' ').unwrap_or(&rest[bar + 1..]);
+        let content = rest[bar + 1..]
+            .strip_prefix(' ')
+            .unwrap_or(&rest[bar + 1..]);
         (sign, num, content)
     } else {
         (sign, String::new(), rest)
@@ -79,6 +79,8 @@ fn parse_row(raw: &str) -> (char, String, &str) {
 pub fn diff_header(text: &str) -> Line<'static> {
     Line::from(Span::styled(
         text.to_string(),
-        Style::default().fg(Palette::DIM()).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Palette::DIM())
+            .add_modifier(Modifier::BOLD),
     ))
 }

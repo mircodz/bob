@@ -52,8 +52,14 @@ impl TokenSource for CopilotAuth {
     fn extra_headers(&self) -> Vec<(String, String)> {
         vec![
             ("editor-version".to_string(), CLIENT_VERSION.to_string()),
-            ("editor-plugin-version".to_string(), CLIENT_VERSION.to_string()),
-            ("copilot-integration-id".to_string(), "vscode-chat".to_string()),
+            (
+                "editor-plugin-version".to_string(),
+                CLIENT_VERSION.to_string(),
+            ),
+            (
+                "copilot-integration-id".to_string(),
+                "vscode-chat".to_string(),
+            ),
             ("user-agent".to_string(), CLIENT_VERSION.to_string()),
             ("x-client".to_string(), CLIENT_ID.to_string()),
         ]
@@ -81,9 +87,8 @@ fn is_responses_model(model: &str) -> bool {
 /// the correct API base by minting a token up front, and routes newer models to
 /// the Responses API (`/responses`) while classic models use /chat/completions.
 pub async fn native_copilot(model: Option<String>) -> anyhow::Result<Arc<dyn Provider>> {
-    let github_token = auth::github_token().ok_or_else(|| {
-        anyhow::anyhow!("not logged in to Copilot — run `bob login copilot`")
-    })?;
+    let github_token = auth::github_token()
+        .ok_or_else(|| anyhow::anyhow!("not logged in to Copilot — run `bob login copilot`"))?;
     let source = CopilotAuth {
         github_token,
         cached: Mutex::new(None),
@@ -94,9 +99,10 @@ pub async fn native_copilot(model: Option<String>) -> anyhow::Result<Arc<dyn Pro
     let model = model.unwrap_or_else(|| "gpt-4o".to_string());
 
     if is_responses_model(&model) {
-        Ok(Arc::new(ResponsesProvider::with_auth(model, api_base, source)))
+        Ok(Arc::new(ResponsesProvider::with_auth(
+            model, api_base, source,
+        )))
     } else {
         Ok(Arc::new(OpenAiProvider::with_auth(model, api_base, source)))
     }
 }
-

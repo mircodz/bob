@@ -172,10 +172,7 @@ fn parse_text_edit(e: &Value) -> Option<TextEdit> {
 }
 
 /// Apply the edits to disk and return a multi-file diff report.
-fn apply_and_report(
-    edits: BTreeMap<PathBuf, Vec<TextEdit>>,
-    ctx: &ToolContext,
-) -> String {
+fn apply_and_report(edits: BTreeMap<PathBuf, Vec<TextEdit>>, ctx: &ToolContext) -> String {
     let mut report = String::new();
     let mut files_changed = 0;
     let mut total_added = 0;
@@ -191,9 +188,7 @@ fn apply_and_report(
         };
         // Apply edits from the END of the file backwards so earlier offsets stay
         // valid as we splice. Sort by (start_line, start_char) descending.
-        file_edits.sort_by(|a, b| {
-            (b.start_line, b.start_char).cmp(&(a.start_line, a.start_char))
-        });
+        file_edits.sort_by(|a, b| (b.start_line, b.start_char).cmp(&(a.start_line, a.start_char)));
         let after = match apply_edits(&before, &file_edits) {
             Ok(s) => s,
             Err(e) => {
@@ -271,10 +266,7 @@ fn line_start_offsets(s: &str) -> Vec<usize> {
 /// UTF-16 accounting.
 fn offset_at(line_starts: &[usize], s: &str, line: usize, character: usize) -> Option<usize> {
     let line_start = *line_starts.get(line)?;
-    let line_str = s[line_start..]
-        .split('\n')
-        .next()
-        .unwrap_or("");
+    let line_str = s[line_start..].split('\n').next().unwrap_or("");
     let mut byte = line_start;
     let mut chars = 0;
     for ch in line_str.chars() {
@@ -349,7 +341,10 @@ impl Tool for CodeActionTool {
             _ => return "error: character is required (1-based)".to_string(),
         };
         let end_line = input["endLine"].as_i64().map(|l| l - 1).unwrap_or(line);
-        let end_char = input["endCharacter"].as_i64().map(|c| c - 1).unwrap_or(character);
+        let end_char = input["endCharacter"]
+            .as_i64()
+            .map(|c| c - 1)
+            .unwrap_or(character);
 
         let client = match self.manager.client_for(&file) {
             Some(c) => c,
@@ -393,7 +388,11 @@ impl Tool for CodeActionTool {
                     return format!(
                         "error: no action titled '{}'. Available: {}",
                         want,
-                        if titles.is_empty() { "(none)".to_string() } else { titles.join(" | ") }
+                        if titles.is_empty() {
+                            "(none)".to_string()
+                        } else {
+                            titles.join(" | ")
+                        }
                     );
                 }
             };
@@ -448,4 +447,3 @@ impl Tool for CodeActionTool {
         out
     }
 }
-

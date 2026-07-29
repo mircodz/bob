@@ -14,7 +14,10 @@ use std::sync::Arc;
 static AGENT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn next_agent_id() -> String {
-    format!("agent_{}", AGENT_COUNTER.fetch_add(1, Ordering::Relaxed) + 1)
+    format!(
+        "agent_{}",
+        AGENT_COUNTER.fetch_add(1, Ordering::Relaxed) + 1
+    )
 }
 
 pub struct AgentConfig {
@@ -148,7 +151,8 @@ impl Agent {
             agent_id: self.id.clone(),
         });
         // Fresh run: clear any stale cancel signal.
-        self.cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.cancel
+            .store(false, std::sync::atomic::Ordering::Relaxed);
 
         let mut total = Usage::default();
         let mut final_text = String::new();

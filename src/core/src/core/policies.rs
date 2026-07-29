@@ -9,7 +9,13 @@ use std::sync::Arc;
 // approving the spawn grants nothing on its own — auto-allow it to avoid a
 // pointless prompt before the real, individually-gated work.
 const READ_ONLY: &[&str] = &[
-    "read_file", "list_dir", "glob", "grep", "todo_write", "task", "lsp",
+    "read_file",
+    "list_dir",
+    "glob",
+    "grep",
+    "todo_write",
+    "task",
+    "lsp",
 ];
 
 /// Read-only tools are always safe.

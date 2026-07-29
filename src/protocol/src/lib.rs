@@ -11,14 +11,18 @@ use bob_core::core::types::{Message, Usage};
 use bob_core::tools::registry::UserQuery;
 use serde::{Deserialize, Serialize};
 
-/// The first frame each peer sends on the control WebSocket: identify role +
-/// session + shared token. The relay validates the token and pairs a `Host`
-/// with a `Controller` sharing the same `session`.
+/// The first frame each peer sends on the control WebSocket. It identifies the
+/// role + session slot and carries the **admission proof** (an opaque base64
+/// value derived from the pairing secret via `bob-secure`). The relay pairs a
+/// `Host` with a `Controller` on the same `session` and admits the second peer
+/// only if its proof byte-matches the first's — without ever learning the secret.
+/// Everything after the Hello is an end-to-end-encrypted [`Sealed`] frame the
+/// relay cannot read.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "snake_case")]
 pub enum Hello {
-    Host { session: String, token: String },
-    Controller { session: String, token: String },
+    Host { session: String, admission: String },
+    Controller { session: String, admission: String },
 }
 
 impl Hello {
@@ -27,14 +31,29 @@ impl Hello {
             Hello::Host { session, .. } | Hello::Controller { session, .. } => session,
         }
     }
-    pub fn token(&self) -> &str {
+    /// The base64 admission proof this peer presents.
+    pub fn admission(&self) -> &str {
         match self {
-            Hello::Host { token, .. } | Hello::Controller { token, .. } => token,
+            Hello::Host { admission, .. } | Hello::Controller { admission, .. } => admission,
         }
     }
     pub fn is_host(&self) -> bool {
         matches!(self, Hello::Host { .. })
     }
+}
+
+/// Everything sent *after* the [`Hello`], while and once the end-to-end channel
+/// is established. During the handshake the peers exchange [`Envelope::Handshake`]
+/// messages; afterwards every application frame travels as [`Envelope::Sealed`].
+/// The relay forwards these opaque blobs verbatim and can read none of them.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Envelope {
+    /// One Noise-handshake message, base64-encoded.
+    Handshake { data: String },
+    /// A sealed application frame: base64 of `bob_secure::Session::seal(plaintext)`,
+    /// where the plaintext is a JSON `HostFrame` or `ControlFrame`.
+    Sealed { data: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -127,9 +146,17 @@ pub enum ControlFrame {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum AgentEventDto {
-    TurnStart { agent_id: String },
-    TextDelta { agent_id: String, text: String },
-    Message { agent_id: String, message: Message },
+    TurnStart {
+        agent_id: String,
+    },
+    TextDelta {
+        agent_id: String,
+        text: String,
+    },
+    Message {
+        agent_id: String,
+        message: Message,
+    },
     ToolCall {
         agent_id: String,
         tool_use_id: String,
@@ -157,8 +184,14 @@ pub enum AgentEventDto {
         model: String,
         usage: Usage,
     },
-    TurnEnd { agent_id: String, usage: Usage },
-    Error { agent_id: String, message: String },
+    TurnEnd {
+        agent_id: String,
+        usage: Usage,
+    },
+    Error {
+        agent_id: String,
+        message: String,
+    },
 }
 
 impl From<&AgentEvent> for AgentEventDto {

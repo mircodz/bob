@@ -1,0 +1,24 @@
+[package]
+name = "bob-secure"
+version.workspace = true
+edition.workspace = true
+description = "End-to-end encryption + device pairing for bob remote control. Pure crypto + framing, no transport."
+
+[lib]
+name = "bob_secure"
+path = "src/lib.rs"
+
+[dependencies]
+# Audited RustCrypto primitives — we wire these, never invent our own.
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+hmac = "0.12"
+sha2.workspace = true
+rand_core = { version = "0.6", features = ["getrandom"] }
+# Persistence (identity.key raw bytes; devices.toml).
+serde = { workspace = true }
+toml = "0.8"
+anyhow.workspace = true
+subtle = "2"
+base64 = "0.22"

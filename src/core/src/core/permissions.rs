@@ -109,10 +109,7 @@ impl Mode {
 
 /// Tools that MUTATE state (files, shell). Used for mode gating.
 pub fn is_mutating_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "write_file" | "edit_file" | "multi_edit" | "bash"
-    )
+    matches!(name, "write_file" | "edit_file" | "multi_edit" | "bash")
 }
 
 /// Tools that edit FILES (auto-accepted in AutoAccept mode).
@@ -142,7 +139,8 @@ impl PermissionEngine {
     }
 
     pub fn set_mode(&self, mode: Mode) {
-        self.mode.store(mode.as_u8(), std::sync::atomic::Ordering::Relaxed);
+        self.mode
+            .store(mode.as_u8(), std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn mode(&self) -> Mode {
@@ -233,8 +231,12 @@ fn grant_matches(grant: &Grant, req: &PermissionRequest) -> bool {
             if !is_simple(bash) {
                 return false;
             }
-            let Some(argv) = bash.commands.first() else { return false };
-            let Some(cmd) = argv.first() else { return false };
+            let Some(argv) = bash.commands.first() else {
+                return false;
+            };
+            let Some(cmd) = argv.first() else {
+                return false;
+            };
             if base_name(cmd) != name {
                 return false;
             }
@@ -284,14 +286,20 @@ fn build_options(req: &PermissionRequest) -> Vec<PermissionOption> {
                         opts.push(PermissionOption {
                             label: format!("Always allow `{}` in {}", name, glob),
                             allow: true,
-                            grant: Some(Grant::BashCommand { name: name.clone(), glob }),
+                            grant: Some(Grant::BashCommand {
+                                name: name.clone(),
+                                glob,
+                            }),
                         });
                     }
                     // Broad grant: any invocation of this command.
                     opts.push(PermissionOption {
                         label: format!("Always allow `{}` (any args)", name),
                         allow: true,
-                        grant: Some(Grant::BashCommand { name, glob: "**".to_string() }),
+                        grant: Some(Grant::BashCommand {
+                            name,
+                            glob: "**".to_string(),
+                        }),
                     });
                 }
             }
@@ -348,7 +356,11 @@ pub fn glob_match(pattern: &str, path: &str) -> bool {
         // Handle `**` (matches across '/').
         if p.starts_with(b"**") {
             // Consume optional following '/'.
-            let rest = if p.len() > 2 && p[2] == b'/' { &p[3..] } else { &p[2..] };
+            let rest = if p.len() > 2 && p[2] == b'/' {
+                &p[3..]
+            } else {
+                &p[2..]
+            };
             if rest.is_empty() {
                 return true;
             }

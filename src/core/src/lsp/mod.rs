@@ -94,8 +94,14 @@ impl LspClient {
         let mut child = command
             .spawn()
             .map_err(|e| anyhow::anyhow!("failed to start LSP '{}': {}", cfg.name, e))?;
-        let stdin = child.stdin.take().ok_or_else(|| anyhow::anyhow!("no stdin"))?;
-        let stdout = child.stdout.take().ok_or_else(|| anyhow::anyhow!("no stdout"))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("no stdin"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("no stdout"))?;
 
         let inner = Arc::new(LspInner {
             name: cfg.name.clone(),
@@ -142,9 +148,8 @@ impl LspClient {
         let init_result = client.request("initialize", init).await?;
         // Record the code-action kinds the server advertises, so `code_action`
         // can tell the model what this server can do without a round-trip.
-        if let Some(kinds) = init_result["capabilities"]["codeActionProvider"]
-            ["codeActionKinds"]
-            .as_array()
+        if let Some(kinds) =
+            init_result["capabilities"]["codeActionProvider"]["codeActionKinds"].as_array()
         {
             let kinds: Vec<String> = kinds
                 .iter()
@@ -279,11 +284,16 @@ fn spawn_reader(inner: Arc<LspInner>, stdout: ChildStdout) {
                     let params = &msg["params"];
                     if let Some(uri) = params["uri"].as_str() {
                         let version = params["version"].as_i64().unwrap_or(0);
-                        let diags =
-                            params["diagnostics"].as_array().cloned().unwrap_or_default();
+                        let diags = params["diagnostics"]
+                            .as_array()
+                            .cloned()
+                            .unwrap_or_default();
                         inner.diagnostics.lock().unwrap().insert(
                             uri.to_string(),
-                            FileDiagnostics { version, diagnostics: diags },
+                            FileDiagnostics {
+                                version,
+                                diagnostics: diags,
+                            },
                         );
                     }
                     // First diagnostics push implies the server is answering.

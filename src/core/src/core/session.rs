@@ -42,15 +42,15 @@ pub struct SubagentRun {
 /// A single persisted subagent and the tools it invoked.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PersistedSubagent {
-    pub id: String,      // "task_N"
-    pub task: String,    // description
+    pub id: String,   // "task_N"
+    pub task: String, // description
     pub tools: Vec<PersistedTool>,
 }
 
 /// A persisted subagent tool call with its input and output.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PersistedTool {
-    pub id: String,      // tool_use_id
+    pub id: String, // tool_use_id
     pub name: String,
     pub input: Value,
     #[serde(default)]
@@ -128,7 +128,9 @@ pub fn save_session(s: &Session) -> anyhow::Result<()> {
 pub fn load_session(id: &str) -> anyhow::Result<Option<Session>> {
     let conn = open_db()?;
     let data: Option<String> = conn
-        .query_row("SELECT data FROM sessions WHERE id = ?1", [id], |r| r.get(0))
+        .query_row("SELECT data FROM sessions WHERE id = ?1", [id], |r| {
+            r.get(0)
+        })
         .ok();
     match data {
         Some(json) => Ok(Some(serde_json::from_str(&json)?)),

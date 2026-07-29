@@ -98,7 +98,10 @@ impl Tool for GrepTool {
         let cap = input["max_results"].as_u64().unwrap_or(200) as usize;
 
         let root = resolve_path(&ctx.cwd, path);
-        let re = match RegexBuilder::new(pattern).case_insensitive(ignore_case).build() {
+        let re = match RegexBuilder::new(pattern)
+            .case_insensitive(ignore_case)
+            .build()
+        {
             Ok(r) => r,
             Err(e) => return format!("error: invalid regex: {}", e),
         };

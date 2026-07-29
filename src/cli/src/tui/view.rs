@@ -48,6 +48,64 @@ pub enum Cell {
     Event(String),
 }
 
+impl Cell {
+    /// A content fingerprint used to cache a cell's rendered lines. Two cells
+    /// with the same fingerprint render identically, so the draw loop can reuse
+    /// cached Lines instead of re-running markdown/syntax highlighting every
+    /// frame. Only fields that affect rendering are hashed.
+    pub fn fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        std::mem::discriminant(self).hash(&mut h);
+        match self {
+            Cell::User(t) => t.hash(&mut h),
+            Cell::Assistant { text, open } => {
+                text.hash(&mut h);
+                open.hash(&mut h);
+            }
+            Cell::Tool {
+                name,
+                input,
+                status,
+                output,
+                ..
+            } => {
+                name.hash(&mut h);
+                // Value isn't Hash; its stable string form is good enough.
+                input.to_string().hash(&mut h);
+                (*status as u8).hash(&mut h);
+                output.hash(&mut h);
+            }
+            Cell::Subagent {
+                agent_id,
+                task,
+                tools,
+                done,
+            } => {
+                agent_id.hash(&mut h);
+                task.hash(&mut h);
+                tools.hash(&mut h);
+                done.hash(&mut h);
+            }
+            Cell::Compaction { before, after } => {
+                before.hash(&mut h);
+                after.hash(&mut h);
+            }
+            Cell::Usage {
+                input,
+                output,
+                cached,
+            } => {
+                input.hash(&mut h);
+                output.hash(&mut h);
+                cached.hash(&mut h);
+            }
+            Cell::Notice(t) | Cell::Event(t) => t.hash(&mut h),
+        }
+        h.finish()
+    }
+}
+
 #[derive(Default)]
 pub struct ViewModel {
     pub cells: Vec<Cell>,
@@ -83,7 +141,10 @@ impl ViewModel {
                     // Skip synthetic compaction-summary messages.
                     let text = m.text();
                     if text.starts_with("[conversation summary]") {
-                        self.cells.push(Cell::Compaction { before: 0, after: 0 });
+                        self.cells.push(Cell::Compaction {
+                            before: 0,
+                            after: 0,
+                        });
                         continue;
                     }
                     // A user turn may carry tool_results (role=tool is stored as
@@ -159,7 +220,10 @@ impl ViewModel {
     }
 
     fn find_tool(&mut self, id: &str) -> Option<&mut Cell> {
-        self.cells.iter_mut().rev().find(|c| matches!(c, Cell::Tool { id: tid, .. } if tid == id))
+        self.cells
+            .iter_mut()
+            .rev()
+            .find(|c| matches!(c, Cell::Tool { id: tid, .. } if tid == id))
     }
 
     fn find_subagent(&mut self, id: &str) -> Option<&mut Cell> {
@@ -234,8 +298,15 @@ impl ViewModel {
                 is_error,
                 ..
             } => {
-                if let Some(Cell::Tool { status, output: o, .. }) = self.find_tool(tool_use_id) {
-                    *status = if *is_error { ToolStatus::Error } else { ToolStatus::Ok };
+                if let Some(Cell::Tool {
+                    status, output: o, ..
+                }) = self.find_tool(tool_use_id)
+                {
+                    *status = if *is_error {
+                        ToolStatus::Error
+                    } else {
+                        ToolStatus::Ok
+                    };
                     *o = Some(output.clone());
                 }
             }

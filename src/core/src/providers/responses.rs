@@ -113,12 +113,19 @@ impl Provider for ResponsesProvider {
         completion.ok_or_else(|| anyhow::anyhow!("responses stream ended without completion"))
     }
 
-    async fn stream(&self, opts: GenerateOptions) -> anyhow::Result<mpsc::UnboundedReceiver<StreamEvent>> {
+    async fn stream(
+        &self,
+        opts: GenerateOptions,
+    ) -> anyhow::Result<mpsc::UnboundedReceiver<StreamEvent>> {
         let body = self.build_body(&opts);
         let res = self.request(body).await?.send().await?;
         if !res.status().is_success() {
             let status = res.status();
-            anyhow::bail!("responses {}: {}", status, res.text().await.unwrap_or_default());
+            anyhow::bail!(
+                "responses {}: {}",
+                status,
+                res.text().await.unwrap_or_default()
+            );
         }
 
         let (tx, rx) = mpsc::unbounded_channel();
@@ -135,7 +142,9 @@ impl Provider for ResponsesProvider {
                     "response.output_text.delta" => {
                         if let Some(d) = evt["delta"].as_str() {
                             text.push_str(d);
-                            let _ = tx.send(StreamEvent::TextDelta { text: d.to_string() });
+                            let _ = tx.send(StreamEvent::TextDelta {
+                                text: d.to_string(),
+                            });
                         }
                     }
                     // A new output item — capture function-call metadata.
@@ -176,8 +185,9 @@ impl Provider for ResponsesProvider {
                         let u = &evt["response"]["usage"];
                         usage.input_tokens = u["input_tokens"].as_u64().unwrap_or(0);
                         usage.output_tokens = u["output_tokens"].as_u64().unwrap_or(0);
-                        usage.cache_read_input_tokens =
-                            u["input_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0);
+                        usage.cache_read_input_tokens = u["input_tokens_details"]["cached_tokens"]
+                            .as_u64()
+                            .unwrap_or(0);
 
                         let mut content: Vec<ContentBlock> = Vec::new();
                         if !text.is_empty() {
@@ -201,7 +211,10 @@ impl Provider for ResponsesProvider {
                             StopReason::ToolUse
                         };
                         let completion = Completion {
-                            message: Message { role: Role::Assistant, content },
+                            message: Message {
+                                role: Role::Assistant,
+                                content,
+                            },
                             stop_reason: stop,
                             usage,
                         };
@@ -216,7 +229,9 @@ impl Provider for ResponsesProvider {
                         let completion = Completion {
                             message: Message {
                                 role: Role::Assistant,
-                                content: vec![ContentBlock::Text { text: format!("error: {}", msg) }],
+                                content: vec![ContentBlock::Text {
+                                    text: format!("error: {}", msg),
+                                }],
                             },
                             stop_reason: StopReason::EndTurn,
                             usage,
@@ -250,7 +265,11 @@ fn to_input_items(m: &Message) -> Vec<Value> {
                     ContentBlock::Text { text } => {
                         parts.push(json!({ "type": "input_text", "text": text }));
                     }
-                    ContentBlock::ToolResult { tool_use_id, content, .. } => {
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        ..
+                    } => {
                         // Tool results are their own top-level items.
                         items.push(json!({
                             "type": "function_call_output",
@@ -270,7 +289,11 @@ fn to_input_items(m: &Message) -> Vec<Value> {
             .content
             .iter()
             .filter_map(|b| match b {
-                ContentBlock::ToolResult { tool_use_id, content, .. } => Some(json!({
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } => Some(json!({
                     "type": "function_call_output",
                     "call_id": tool_use_id,
                     "output": content,

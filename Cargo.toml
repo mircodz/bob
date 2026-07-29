@@ -1,6 +1,6 @@
 [workspace]
-members = ["src/core", "src/tui", "src/protocol", "src/relay", "src/remote"]
-default-members = ["src/tui"]
+members = ["src/core", "src/cli", "src/protocol", "src/relay", "src/remote", "src/secure"]
+default-members = ["src/cli"]
 resolver = "2"
 
 [workspace.package]

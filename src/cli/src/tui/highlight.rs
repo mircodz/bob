@@ -121,7 +121,12 @@ pub fn highlight_line(code: &str, lang: &str) -> Vec<Span<'static>> {
 
 fn plain(code: &str) -> Vec<Line<'static>> {
     code.split('\n')
-        .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(super::theme::Palette::CODE_DEFAULT()))))
+        .map(|l| {
+            Line::from(Span::styled(
+                l.to_string(),
+                Style::default().fg(super::theme::Palette::CODE_DEFAULT()),
+            ))
+        })
         .collect()
 }
 

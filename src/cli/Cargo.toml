@@ -1,8 +1,8 @@
 [package]
-name = "bob-tui"
+name = "bob-cli"
 version.workspace = true
 edition.workspace = true
-description = "Terminal UI + CLI frontend for bob."
+description = "The bob command-line app: TUI chat plus remote/relay and all subcommands. Produces the `bob` binary."
 
 [[bin]]
 name = "bob"
@@ -12,7 +12,9 @@ path = "src/main.rs"
 bob-core = { path = "../core" }
 bob-remote = { path = "../remote" }
 bob-relay = { path = "../relay" }
+bob-secure = { path = "../secure" }
 tokio.workspace = true
+axum.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 futures.workspace = true

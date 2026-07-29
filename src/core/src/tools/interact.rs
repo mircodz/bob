@@ -43,7 +43,11 @@ impl Tool for AskUserTool {
         let detail = input["detail"].as_str().unwrap_or("").to_string();
         let options: Vec<String> = input["options"]
             .as_array()
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
             .unwrap_or_default();
 
         let query = UserQuery {

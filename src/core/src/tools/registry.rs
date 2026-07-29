@@ -104,10 +104,7 @@ impl ToolRegistry {
         // Gate every call through the permission engine, if configured.
         if let Some(perms) = &self.permissions {
             let bash = if name == "bash" {
-                let cmd = input
-                    .get("command")
-                    .and_then(|c| c.as_str())
-                    .unwrap_or("");
+                let cmd = input.get("command").and_then(|c| c.as_str()).unwrap_or("");
                 Some(parse_bash(cmd))
             } else {
                 None

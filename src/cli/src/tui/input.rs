@@ -33,7 +33,6 @@ impl Input {
         self.buf.split('\n').collect()
     }
 
-
     /// (row, col) of the cursor in display coordinates.
     pub fn cursor_row_col(&self) -> (usize, usize) {
         let mut row = 0;
@@ -250,7 +249,11 @@ impl Input {
             return;
         }
         // Emacs: at end of line, transpose the last two chars.
-        let i = if self.cursor >= len { len - 1 } else { self.cursor };
+        let i = if self.cursor >= len {
+            len - 1
+        } else {
+            self.cursor
+        };
         if i == 0 {
             return;
         }

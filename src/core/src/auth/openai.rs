@@ -121,7 +121,11 @@ pub async fn finish_login<F: FnMut()>(device: &DeviceCode, mut on_wait: F) -> an
         .send()
         .await?;
     if !res.status().is_success() {
-        anyhow::bail!("token exchange failed ({}): {}", res.status(), res.text().await.unwrap_or_default());
+        anyhow::bail!(
+            "token exchange failed ({}): {}",
+            res.status(),
+            res.text().await.unwrap_or_default()
+        );
     }
     let tokens: serde_json::Value = res.json().await?;
     store_tokens(&tokens)?;
@@ -195,18 +199,26 @@ pub async fn access_token() -> anyhow::Result<String> {
         .send()
         .await?;
     if !res.status().is_success() {
-        anyhow::bail!("token refresh failed ({}); run `bob login openai` again", res.status());
+        anyhow::bail!(
+            "token refresh failed ({}); run `bob login openai` again",
+            res.status()
+        );
     }
     let tokens: serde_json::Value = res.json().await?;
     store_tokens(&tokens)?;
-    Ok(tokens["access_token"].as_str().unwrap_or_default().to_string())
+    Ok(tokens["access_token"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string())
 }
 
 fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
             _ => out.push_str(&format!("%{:02X}", b)),
         }
     }

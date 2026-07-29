@@ -53,13 +53,14 @@ impl Tool for TaskTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "task".to_string(),
-            description: "Delegate one or more independent sub-tasks to fresh subagents, each with \
+            description:
+                "Delegate one or more independent sub-tasks to fresh subagents, each with \
                 its own isolated context and tools. By default they run inline and this returns \
                 every subagent's final result. Set `background: true` to detach them as background \
                 jobs instead — this returns immediately with job ids you can later inspect with \
                 job_status and collect with job_output (use for long-running work you don't want \
                 to block on). Subagents cannot spawn further subagents."
-                .to_string(),
+                    .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -87,7 +88,11 @@ impl Tool for TaskTool {
             _ => return "error: no tasks provided".to_string(),
         };
         let background = input["background"].as_bool().unwrap_or(false);
-        let base_cwd = if self.cwd.is_empty() { ctx.cwd.clone() } else { self.cwd.clone() };
+        let base_cwd = if self.cwd.is_empty() {
+            ctx.cwd.clone()
+        } else {
+            self.cwd.clone()
+        };
 
         if background {
             // Detach each task as a background job; return the ids immediately.
@@ -106,7 +111,8 @@ impl Tool for TaskTool {
                         Err(e) => jobs.finish(&jid, JobStatus::Failed, format!("error: {}", e)),
                     }
                 });
-                ctx.jobs.register(job_id.clone(), "task", description.clone(), handle);
+                ctx.jobs
+                    .register(job_id.clone(), "task", description.clone(), handle);
                 ids.push(format!("{} ({})", job_id, description));
             }
             return format!(
@@ -122,11 +128,12 @@ impl Tool for TaskTool {
             let description = t["description"].as_str().unwrap_or("").to_string();
             let prompt = t["prompt"].as_str().unwrap_or("").to_string();
             let id = format!("task_{}", i + 1);
-            self.bus.emit(crate::core::events::AgentEvent::SubagentSpawn {
-                parent_id: "root".to_string(),
-                agent_id: id.clone(),
-                task: description.clone(),
-            });
+            self.bus
+                .emit(crate::core::events::AgentEvent::SubagentSpawn {
+                    parent_id: "root".to_string(),
+                    agent_id: id.clone(),
+                    task: description.clone(),
+                });
             let child = self.make_child(id, base_cwd.clone());
             handles.push(tokio::spawn(async move {
                 let mut child = child;

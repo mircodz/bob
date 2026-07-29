@@ -13,8 +13,10 @@ pub trait Provider: Send + Sync {
     /// Returns a channel of stream events. The provider spawns a task that
     /// drives the HTTP stream and sends events; the receiver is consumed by
     /// the agent loop.
-    async fn stream(&self, opts: GenerateOptions)
-        -> anyhow::Result<mpsc::UnboundedReceiver<StreamEvent>>;
+    async fn stream(
+        &self,
+        opts: GenerateOptions,
+    ) -> anyhow::Result<mpsc::UnboundedReceiver<StreamEvent>>;
 
     /// List the model ids this provider offers (via its /models endpoint).
     /// Default: none — providers that can enumerate override this.

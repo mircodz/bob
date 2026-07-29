@@ -78,10 +78,12 @@ impl Default for BobConfig {
             theme: None,
             permissions: PermissionsConfig {
                 default: "ask".to_string(),
-                allow_bash: ["ls", "cat", "pwd", "echo", "grep", "find", "git", "bun", "node", "tsc"]
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect(),
+                allow_bash: [
+                    "ls", "cat", "pwd", "echo", "grep", "find", "git", "bun", "node", "tsc",
+                ]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
                 allow: ["read_file", "list_dir", "glob", "grep", "todo_write"]
                     .iter()
                     .map(|s| s.to_string())

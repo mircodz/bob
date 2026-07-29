@@ -40,9 +40,7 @@ impl AnthropicProvider {
         }
         let api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
         if api_key.is_empty() {
-            anyhow::bail!(
-                "no Anthropic auth — run `bob login anthropic` or set ANTHROPIC_API_KEY"
-            );
+            anyhow::bail!("no Anthropic auth — run `bob login anthropic` or set ANTHROPIC_API_KEY");
         }
         Ok(AnthropicProvider {
             auth: AuthMode::ApiKey(api_key),
@@ -89,7 +87,10 @@ impl AnthropicProvider {
         let mut messages: Vec<Value> = opts.messages.iter().map(to_api_message).collect();
         if cache && messages.len() >= 2 {
             let idx = messages.len() - 2;
-            if let Some(blocks) = messages[idx].get_mut("content").and_then(|c| c.as_array_mut()) {
+            if let Some(blocks) = messages[idx]
+                .get_mut("content")
+                .and_then(|c| c.as_array_mut())
+            {
                 if let Some(last) = blocks.last_mut() {
                     merge_into(last, &cc);
                 }
@@ -152,7 +153,11 @@ impl Provider for AnthropicProvider {
         let res = self.request(body).await?.send().await?;
         if !res.status().is_success() {
             let status = res.status();
-            anyhow::bail!("anthropic {}: {}", status, res.text().await.unwrap_or_default());
+            anyhow::bail!(
+                "anthropic {}: {}",
+                status,
+                res.text().await.unwrap_or_default()
+            );
         }
         let data: Value = res.json().await?;
         Ok(Completion {
@@ -171,12 +176,19 @@ impl Provider for AnthropicProvider {
         })
     }
 
-    async fn stream(&self, opts: GenerateOptions) -> anyhow::Result<mpsc::UnboundedReceiver<StreamEvent>> {
+    async fn stream(
+        &self,
+        opts: GenerateOptions,
+    ) -> anyhow::Result<mpsc::UnboundedReceiver<StreamEvent>> {
         let body = self.build_body(&opts, true);
         let res = self.request(body).await?.send().await?;
         if !res.status().is_success() {
             let status = res.status();
-            anyhow::bail!("anthropic {}: {}", status, res.text().await.unwrap_or_default());
+            anyhow::bail!(
+                "anthropic {}: {}",
+                status,
+                res.text().await.unwrap_or_default()
+            );
         }
 
         let (tx, rx) = mpsc::unbounded_channel();
@@ -203,7 +215,9 @@ impl Provider for AnthropicProvider {
                         let b = &data["content_block"];
                         match b["type"].as_str() {
                             Some("text") => {
-                                blocks[idx] = Some(ContentBlock::Text { text: String::new() });
+                                blocks[idx] = Some(ContentBlock::Text {
+                                    text: String::new(),
+                                });
                             }
                             Some("tool_use") => {
                                 let id = b["id"].as_str().unwrap_or("").to_string();
@@ -225,7 +239,8 @@ impl Provider for AnthropicProvider {
                         match d["type"].as_str() {
                             Some("text_delta") => {
                                 let t = d["text"].as_str().unwrap_or("").to_string();
-                                if let Some(Some(ContentBlock::Text { text })) = blocks.get_mut(idx) {
+                                if let Some(Some(ContentBlock::Text { text })) = blocks.get_mut(idx)
+                                {
                                     text.push_str(&t);
                                 }
                                 let _ = tx.send(StreamEvent::TextDelta { text: t });
@@ -288,7 +303,10 @@ impl Provider for AnthropicProvider {
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {
         // base_url points at .../v1/messages; the models endpoint is .../v1/models.
         let url = self.base_url.replace("/messages", "/models");
-        let mut req = self.client.get(&url).header("anthropic-version", API_VERSION);
+        let mut req = self
+            .client
+            .get(&url)
+            .header("anthropic-version", API_VERSION);
         req = match &self.auth {
             AuthMode::ApiKey(key) => req.header("x-api-key", key),
             AuthMode::Oauth => {
@@ -299,7 +317,11 @@ impl Provider for AnthropicProvider {
         };
         let res = req.send().await?;
         if !res.status().is_success() {
-            anyhow::bail!("models {}: {}", res.status(), res.text().await.unwrap_or_default());
+            anyhow::bail!(
+                "models {}: {}",
+                res.status(),
+                res.text().await.unwrap_or_default()
+            );
         }
         let data: Value = res.json().await?;
         let mut ids: Vec<String> = data["data"]
@@ -341,7 +363,9 @@ fn map_stop_reason(reason: &str) -> StopReason {
 }
 
 fn to_api_message(m: &Message) -> Value {
-    let role = if m.role == Role::Tool { "user" } else {
+    let role = if m.role == Role::Tool {
+        "user"
+    } else {
         match m.role {
             Role::System => "system",
             Role::User => "user",
@@ -386,7 +410,9 @@ fn from_api_message(data: &Value) -> Message {
                         name: b["name"].as_str().unwrap_or("").to_string(),
                         input: b["input"].clone(),
                     },
-                    _ => ContentBlock::Text { text: String::new() },
+                    _ => ContentBlock::Text {
+                        text: String::new(),
+                    },
                 })
                 .collect()
         })

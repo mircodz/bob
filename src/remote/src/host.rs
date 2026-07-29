@@ -1,4 +1,4 @@
-//! The agent host. Assembles a bob-core Agent exactly like bob-tui's `run()`,
+//! The agent host. Assembles a bob-core Agent exactly like bob-cli's `run()`,
 //! but bridges the two seams over a WebSocket to the relay instead of a
 //! terminal:
 //!   - EventBus listener  -> HostFrame::Event   (outbound)
@@ -11,6 +11,7 @@ use std::sync::Arc;
 use crate::session;
 
 use async_trait::async_trait;
+use base64::Engine as _;
 use bob_core::agent::agent::{Agent, AgentConfig};
 use bob_core::core::config::load_config;
 use bob_core::core::events::{AgentEvent, EventBus};
@@ -18,7 +19,8 @@ use bob_core::core::permissions::{
     Asker, Decision, Mode, PermissionEngine, PermissionOption, PermissionRequest,
 };
 use bob_core::core::policies::{
-    allow_bash_commands, allow_code_action_list, allow_read_only, allow_tools, deny_dangerous_bash, deny_tools,
+    allow_bash_commands, allow_code_action_list, allow_read_only, allow_tools, deny_dangerous_bash,
+    deny_tools,
 };
 use bob_core::providers::create_provider;
 use bob_core::tools::registry::{ToolRegistry, UserAsker, UserQuery};
@@ -49,9 +51,12 @@ impl SubAccum {
         use bob_core::core::session::{PersistedSubagent, PersistedTool, SubagentRun};
         match e {
             // A new `task` call starts a fresh run bound to its tool_use_id.
-            AgentEvent::ToolCall { agent_id, tool_use_id, name, .. }
-                if agent_id == "root" && name == "task" =>
-            {
+            AgentEvent::ToolCall {
+                agent_id,
+                tool_use_id,
+                name,
+                ..
+            } if agent_id == "root" && name == "task" => {
                 if let Some(done) = self.current.take() {
                     self.runs.push(done);
                 }
@@ -71,7 +76,12 @@ impl SubAccum {
                 }
             }
             // A tool call inside a subagent → record it.
-            AgentEvent::ToolCall { agent_id, tool_use_id, name, input } if agent_id != "root" => {
+            AgentEvent::ToolCall {
+                agent_id,
+                tool_use_id,
+                name,
+                input,
+            } if agent_id != "root" => {
                 if let Some(sub) = self.find_sub(agent_id) {
                     sub.tools.push(PersistedTool {
                         id: tool_use_id.clone(),
@@ -83,7 +93,12 @@ impl SubAccum {
                 }
             }
             // A subagent tool result → attach output.
-            AgentEvent::ToolResult { agent_id, tool_use_id, output, is_error } if agent_id != "root" => {
+            AgentEvent::ToolResult {
+                agent_id,
+                tool_use_id,
+                output,
+                is_error,
+            } if agent_id != "root" => {
                 if let Some(sub) = self.find_sub(agent_id) {
                     if let Some(t) = sub.tools.iter_mut().find(|t| &t.id == tool_use_id) {
                         t.output = output.clone();
@@ -115,18 +130,13 @@ impl SubAccum {
     }
 }
 
-/// Sends a HostFrame to the relay (serialized to a WS text frame).
+/// Queues a HostFrame for the writer task, which seals it into the E2E channel.
 #[derive(Clone)]
-struct Outbound(mpsc::UnboundedSender<WsMessage>);
+struct Outbound(mpsc::UnboundedSender<HostFrame>);
 impl Outbound {
     fn send(&self, frame: HostFrame) {
-        match serde_json::to_string(&frame) {
-            Ok(json) => {
-                if self.0.send(WsMessage::Text(json)).is_err() {
-                    eprintln!("[host] OUT DROPPED (writer gone)");
-                }
-            }
-            Err(e) => eprintln!("[host] OUT SERIALIZE FAILED: {e}"),
+        if self.0.send(frame).is_err() {
+            eprintln!("[host] OUT DROPPED (writer gone)");
         }
     }
 }
@@ -175,7 +185,7 @@ impl Asker for RemoteAsker {
 pub async fn run(
     relay: String,
     session: String,
-    token: String,
+    secure: crate::SecureParams,
     provider_override: Option<String>,
 ) -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
@@ -185,28 +195,60 @@ pub async fn run(
     let provider = create_provider(&provider_spec).await?;
     eprintln!("[host] provider ready");
 
-    // Connect to the relay and send Hello::Host.
+    // Connect to the relay, present the admission proof, then run the responder
+    // side of the Noise-XK handshake. After this, every frame is sealed.
     let (ws, _) = tokio_tungstenite::connect_async(&relay).await?;
     let (mut ws_sink, mut ws_stream) = ws.split();
+    let admission = bob_secure::admission::prove(&secure.pairing_secret, &session);
     let hello = serde_json::to_string(&Hello::Host {
         session: session.clone(),
-        token,
+        admission: base64::engine::general_purpose::STANDARD_NO_PAD.encode(&admission),
     })?;
     ws_sink.send(WsMessage::Text(hello)).await?;
     eprintln!("[host] connected to relay, session '{}'", session);
 
-    // Outbound queue: everything the host sends to the relay funnels here.
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<WsMessage>();
+    let pro = crate::channel::prologue(&relay, &session);
+    let est = crate::channel::handshake_responder(
+        &mut ws_sink,
+        &mut ws_stream,
+        &pro,
+        secure.identity,
+        secure.ephemeral,
+    )
+    .await?;
+    eprintln!(
+        "[host] secure channel established · safety number {:04}",
+        est.safety_number
+    );
+    (secure.on_established)(&est);
+    let mut opener = est.opener;
+
+    // Outbound queue: everything the host sends funnels here, gets sealed, and is
+    // written to the relay by the writer task (which owns the Sealer).
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<HostFrame>();
+    let mut sealer = est.sealer;
     let writer = tokio::spawn(async move {
-        while let Some(msg) = out_rx.recv().await {
-            if ws_sink.send(msg).await.is_err() {
-                break;
+        while let Some(frame) = out_rx.recv().await {
+            let plaintext = match serde_json::to_vec(&frame) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("[host] OUT SERIALIZE FAILED: {e}");
+                    continue;
+                }
+            };
+            match crate::channel::seal_envelope(&mut sealer, &plaintext) {
+                Ok(text) => {
+                    if ws_sink.send(WsMessage::Text(text)).await.is_err() {
+                        break;
+                    }
+                }
+                Err(e) => eprintln!("[host] SEAL FAILED: {e}"),
             }
         }
     });
     let out = Outbound(out_tx);
 
-    // --- Assemble the agent (mirrors bob-tui run()) ---
+    // --- Assemble the agent (mirrors bob-cli run()) ---
     let bus = EventBus::new();
     // Live turn buffer: every event forwarded to the controller is ALSO kept
     // here for the duration of the in-flight turn, so a controller that
@@ -288,8 +330,12 @@ pub async fn run(
     }
     if let Some(lsp) = &lsp {
         subagent_tools.add(Arc::new(bob_core::tools::lsp::LspTool::new(lsp.clone())));
-        subagent_tools.add(Arc::new(bob_core::tools::lsp_actions::RenameSymbolTool::new(lsp.clone())));
-        subagent_tools.add(Arc::new(bob_core::tools::lsp_actions::CodeActionTool::new(lsp.clone())));
+        subagent_tools.add(Arc::new(
+            bob_core::tools::lsp_actions::RenameSymbolTool::new(lsp.clone()),
+        ));
+        subagent_tools.add(Arc::new(bob_core::tools::lsp_actions::CodeActionTool::new(
+            lsp.clone(),
+        )));
     }
 
     let system_prompt =
@@ -304,8 +350,12 @@ pub async fn run(
     }
     if let Some(lsp) = &lsp {
         tools.add(Arc::new(bob_core::tools::lsp::LspTool::new(lsp.clone())));
-        tools.add(Arc::new(bob_core::tools::lsp_actions::RenameSymbolTool::new(lsp.clone())));
-        tools.add(Arc::new(bob_core::tools::lsp_actions::CodeActionTool::new(lsp.clone())));
+        tools.add(Arc::new(
+            bob_core::tools::lsp_actions::RenameSymbolTool::new(lsp.clone()),
+        ));
+        tools.add(Arc::new(bob_core::tools::lsp_actions::CodeActionTool::new(
+            lsp.clone(),
+        )));
     }
     tools.add(Arc::new(TaskTool {
         provider: provider.clone(),
@@ -395,7 +445,16 @@ pub async fn run(
             }
             _ => continue,
         };
-        let frame: ControlFrame = match serde_json::from_str(&text) {
+        // Every post-handshake frame is a sealed envelope; open it, then parse the
+        // plaintext as a ControlFrame.
+        let plaintext = match crate::channel::open_envelope(&mut opener, &text) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[host] {e}");
+                break;
+            }
+        };
+        let frame: ControlFrame = match serde_json::from_slice(&plaintext) {
             Ok(f) => f,
             Err(e) => {
                 eprintln!("[host] bad control frame: {e}");
@@ -404,7 +463,10 @@ pub async fn run(
         };
         match frame {
             ControlFrame::Prompt { text } => {
-                eprintln!("[host] prompt received ({} chars); starting turn", text.len());
+                eprintln!(
+                    "[host] prompt received ({} chars); starting turn",
+                    text.len()
+                );
                 // New turn: reset the live buffer + subagent accumulator so
                 // they only hold this turn's events, and mark busy.
                 if let Ok(mut buf) = live_buffer.lock() {
@@ -493,10 +555,8 @@ pub async fn run(
                         subagent_runs: s.subagent_runs.clone(),
                     });
                 }
-                let replay: Vec<AgentEventDto> = live_buffer
-                    .lock()
-                    .map(|b| b.clone())
-                    .unwrap_or_default();
+                let replay: Vec<AgentEventDto> =
+                    live_buffer.lock().map(|b| b.clone()).unwrap_or_default();
                 if !replay.is_empty() {
                     eprintln!("[host] resync: replaying {} buffered events", replay.len());
                     for dto in replay {
@@ -529,12 +589,17 @@ pub async fn run(
                         let (messages, sid, runs) = {
                             let mut active = active_session.lock().await;
                             *active = s;
-                            (active.messages.clone(), active.id.clone(),
-                             active.subagent_runs.clone())
+                            (
+                                active.messages.clone(),
+                                active.id.clone(),
+                                active.subagent_runs.clone(),
+                            )
                         };
                         eprintln!("[host] loaded session {sid} ({} messages)", messages.len());
                         out.send(HostFrame::History {
-                            messages, session_id: sid, subagent_runs: runs,
+                            messages,
+                            session_id: sid,
+                            subagent_runs: runs,
                         });
                     }
                     None => eprintln!("[host] load: unknown session {id}"),
@@ -558,9 +623,13 @@ pub async fn run(
                 *active_session.lock().await = fresh;
                 eprintln!("[host] started new session {sid}");
                 out.send(HostFrame::History {
-                    messages: Vec::new(), session_id: sid, subagent_runs: Vec::new(),
+                    messages: Vec::new(),
+                    session_id: sid,
+                    subagent_runs: Vec::new(),
                 });
-                out.send(HostFrame::SessionList { sessions: session::list_all() });
+                out.send(HostFrame::SessionList {
+                    sessions: session::list_all(),
+                });
             }
         }
     }

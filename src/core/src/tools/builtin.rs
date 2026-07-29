@@ -183,7 +183,8 @@ impl Tool for BashTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "bash".to_string(),
-            description: "Run a shell command via `bash -c` and return its combined stdout/stderr. \
+            description:
+                "Run a shell command via `bash -c` and return its combined stdout/stderr. \
                 Use this to actually DO things: run builds, tests, linters, git, package managers, \
                 and scripts. Do NOT use it to read, search, or list files — use read_file, grep, \
                 glob, and list_dir instead (they're faster and cleaner). Guidance: commands run \
@@ -191,7 +192,7 @@ impl Tool for BashTool {
                 spaces; chain related steps with `&&`; avoid destructive commands (`rm -rf`, \
                 `git push`, `git reset --hard`) unless explicitly requested; never commit or push \
                 unless the user asks."
-                .to_string(),
+                    .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": { "command": { "type": "string" } },

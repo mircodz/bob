@@ -520,32 +520,88 @@ pub struct Palette;
 
 #[allow(dead_code, non_snake_case)]
 impl Palette {
-    pub fn BG() -> Color { active().bg }
-    pub fn TEXT() -> Color { active().text }
-    pub fn DIM() -> Color { active().dim }
-    pub fn FAINT() -> Color { active().faint }
-    pub fn ACCENT() -> Color { active().accent }
-    pub fn USER() -> Color { active().user }
-    pub fn OK() -> Color { active().ok }
-    pub fn ERROR() -> Color { active().error }
-    pub fn WARN() -> Color { active().warn }
-    pub fn RUNNING() -> Color { active().running }
-    pub fn HEADING() -> Color { active().heading }
-    pub fn LIST_MARKER() -> Color { active().list_marker }
-    pub fn INLINE_CODE() -> Color { active().inline_code }
-    pub fn LINK() -> Color { active().link }
-    pub fn BLOCKQUOTE() -> Color { active().blockquote }
-    pub fn BLOCKQUOTE_BAR() -> Color { active().blockquote_bar }
-    pub fn RULE() -> Color { active().rule }
-    pub fn TABLE_BORDER() -> Color { active().table_border }
-    pub fn CODE_DEFAULT() -> Color { active().code_default }
-    pub fn DIFF_ADD() -> Color { active().diff_add }
-    pub fn DIFF_REMOVE() -> Color { active().diff_remove }
-    pub fn DIFF_ADD_BG() -> Color { active().diff_add_bg }
-    pub fn DIFF_REMOVE_BG() -> Color { active().diff_remove_bg }
-    pub fn DIFF_GUTTER() -> Color { active().diff_gutter }
-    pub fn BORDER() -> Color { active().border }
-    pub fn INPUT_BG() -> Color { active().input_bg }
-    pub fn POPUP_BG() -> Color { active().popup_bg }
-    pub fn SELECTED_BG() -> Color { active().selected_bg }
+    pub fn BG() -> Color {
+        active().bg
+    }
+    pub fn TEXT() -> Color {
+        active().text
+    }
+    pub fn DIM() -> Color {
+        active().dim
+    }
+    pub fn FAINT() -> Color {
+        active().faint
+    }
+    pub fn ACCENT() -> Color {
+        active().accent
+    }
+    pub fn USER() -> Color {
+        active().user
+    }
+    pub fn OK() -> Color {
+        active().ok
+    }
+    pub fn ERROR() -> Color {
+        active().error
+    }
+    pub fn WARN() -> Color {
+        active().warn
+    }
+    pub fn RUNNING() -> Color {
+        active().running
+    }
+    pub fn HEADING() -> Color {
+        active().heading
+    }
+    pub fn LIST_MARKER() -> Color {
+        active().list_marker
+    }
+    pub fn INLINE_CODE() -> Color {
+        active().inline_code
+    }
+    pub fn LINK() -> Color {
+        active().link
+    }
+    pub fn BLOCKQUOTE() -> Color {
+        active().blockquote
+    }
+    pub fn BLOCKQUOTE_BAR() -> Color {
+        active().blockquote_bar
+    }
+    pub fn RULE() -> Color {
+        active().rule
+    }
+    pub fn TABLE_BORDER() -> Color {
+        active().table_border
+    }
+    pub fn CODE_DEFAULT() -> Color {
+        active().code_default
+    }
+    pub fn DIFF_ADD() -> Color {
+        active().diff_add
+    }
+    pub fn DIFF_REMOVE() -> Color {
+        active().diff_remove
+    }
+    pub fn DIFF_ADD_BG() -> Color {
+        active().diff_add_bg
+    }
+    pub fn DIFF_REMOVE_BG() -> Color {
+        active().diff_remove_bg
+    }
+    pub fn DIFF_GUTTER() -> Color {
+        active().diff_gutter
+    }
+    pub fn BORDER() -> Color {
+        active().border
+    }
+    pub fn INPUT_BG() -> Color {
+        active().input_bg
+    }
+    pub fn POPUP_BG() -> Color {
+        active().popup_bg
+    }
+    pub fn SELECTED_BG() -> Color {
+        active().selected_bg
+    }
 }

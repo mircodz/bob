@@ -119,7 +119,10 @@ pub async fn request_device_code(cfg: &DeviceFlowConfig) -> anyhow::Result<Devic
         .post(&cfg.device_code_url)
         .header("accept", "application/json")
         .header("user-agent", "bob")
-        .form(&[("client_id", cfg.client_id.as_str()), ("scope", cfg.scope.as_str())])
+        .form(&[
+            ("client_id", cfg.client_id.as_str()),
+            ("scope", cfg.scope.as_str()),
+        ])
         .send()
         .await?;
     if !res.status().is_success() {
@@ -129,7 +132,10 @@ pub async fn request_device_code(cfg: &DeviceFlowConfig) -> anyhow::Result<Devic
     Ok(DeviceCode {
         device_code: v["device_code"].as_str().unwrap_or_default().to_string(),
         user_code: v["user_code"].as_str().unwrap_or_default().to_string(),
-        verification_uri: v["verification_uri"].as_str().unwrap_or_default().to_string(),
+        verification_uri: v["verification_uri"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
         interval: v["interval"].as_u64().unwrap_or(5),
         expires_in: v["expires_in"].as_u64().unwrap_or(900),
     })
@@ -191,8 +197,7 @@ pub async fn poll_for_token<F: FnMut()>(
 
 /// URL-safe base64 without padding (RFC 4648 §5), used for PKCE.
 pub fn base64_url(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let b0 = chunk[0] as u32;
@@ -230,7 +235,10 @@ pub fn pkce() -> Pkce {
     let mut hasher = Sha256::new();
     hasher.update(verifier.as_bytes());
     let challenge = base64_url(&hasher.finalize());
-    Pkce { verifier, challenge }
+    Pkce {
+        verifier,
+        challenge,
+    }
 }
 
 /// 16 random bytes (a UUID's bytes). Kept here so auth has no extra RNG dep —
@@ -297,15 +305,20 @@ pub async fn wait_for_callback(port: u16, expected_state: &str) -> anyhow::Resul
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     // One connection carries the redirect.
-    let (mut sock, _) = tokio::time::timeout(std::time::Duration::from_secs(300), listener.accept())
-        .await
-        .map_err(|_| anyhow::anyhow!("login timed out waiting for browser redirect"))??;
+    let (mut sock, _) =
+        tokio::time::timeout(std::time::Duration::from_secs(300), listener.accept())
+            .await
+            .map_err(|_| anyhow::anyhow!("login timed out waiting for browser redirect"))??;
 
     let mut buf = vec![0u8; 8192];
     let n = sock.read(&mut buf).await?;
     let req = String::from_utf8_lossy(&buf[..n]);
     // First line: GET /callback?code=...&state=... HTTP/1.1
-    let path = req.lines().next().and_then(|l| l.split_whitespace().nth(1)).unwrap_or("");
+    let path = req
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .unwrap_or("");
     let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
     let params: HashMap<String, String> = query
         .split('&')
@@ -354,7 +367,11 @@ pub async fn exchange_code(
         .send()
         .await?;
     if !res.status().is_success() {
-        anyhow::bail!("token exchange failed ({}): {}", res.status(), res.text().await.unwrap_or_default());
+        anyhow::bail!(
+            "token exchange failed ({}): {}",
+            res.status(),
+            res.text().await.unwrap_or_default()
+        );
     }
     Ok(res.json().await?)
 }
@@ -386,7 +403,9 @@ fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
             _ => out.push_str(&format!("%{:02X}", b)),
         }
     }

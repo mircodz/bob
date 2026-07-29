@@ -63,7 +63,10 @@ impl Renderer {
     fn flush_line(&mut self) {
         let mut spans = Vec::new();
         for _ in 0..self.blockquote_depth {
-            spans.push(Span::styled("▏ ", Style::default().fg(Palette::BLOCKQUOTE_BAR())));
+            spans.push(Span::styled(
+                "▏ ",
+                Style::default().fg(Palette::BLOCKQUOTE_BAR()),
+            ));
         }
         spans.append(&mut self.cur);
         self.lines.push(Line::from(spans));
@@ -243,10 +246,7 @@ impl Renderer {
             TagEnd::Item => {
                 self.flush_line();
             }
-            TagEnd::Emphasis
-            | TagEnd::Strong
-            | TagEnd::Strikethrough
-            | TagEnd::Link => {
+            TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::Link => {
                 if let Some(s) = self.style_stack.pop() {
                     self.style = s;
                 }
@@ -301,9 +301,15 @@ impl Renderer {
             spans.push(Span::styled("│", border));
             for (ci, w) in widths.iter().enumerate() {
                 let cell = row.get(ci).cloned().unwrap_or_default();
-                let pad = pad_cell(&cell, *w, self.aligns.get(ci).copied().unwrap_or(Alignment::None));
+                let pad = pad_cell(
+                    &cell,
+                    *w,
+                    self.aligns.get(ci).copied().unwrap_or(Alignment::None),
+                );
                 let style = if ri == 0 {
-                    Style::default().fg(Palette::HEADING()).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(Palette::HEADING())
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Palette::TEXT())
                 };

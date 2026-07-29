@@ -68,11 +68,7 @@ impl OpenAiProvider {
 
     /// Build an OpenAI-compatible provider with a custom auth source + base_url
     /// (used by the native Copilot provider).
-    pub fn with_auth(
-        model: String,
-        base_url: String,
-        auth: Arc<dyn TokenSource>,
-    ) -> Self {
+    pub fn with_auth(model: String, base_url: String, auth: Arc<dyn TokenSource>) -> Self {
         OpenAiProvider {
             auth,
             model,
@@ -120,7 +116,10 @@ impl OpenAiProvider {
     }
 
     /// Apply auth + extra headers to a request builder.
-    async fn authed(&self, mut req: reqwest::RequestBuilder) -> anyhow::Result<reqwest::RequestBuilder> {
+    async fn authed(
+        &self,
+        mut req: reqwest::RequestBuilder,
+    ) -> anyhow::Result<reqwest::RequestBuilder> {
         let token = self.auth.token().await?;
         req = req.header("authorization", format!("Bearer {}", token));
         for (k, v) in self.auth.extra_headers() {
@@ -153,7 +152,11 @@ impl Provider for OpenAiProvider {
         let res = self.request(body).await?.send().await?;
         if !res.status().is_success() {
             let status = res.status();
-            anyhow::bail!("openai {}: {}", status, res.text().await.unwrap_or_default());
+            anyhow::bail!(
+                "openai {}: {}",
+                status,
+                res.text().await.unwrap_or_default()
+            );
         }
         let data: Value = res.json().await?;
         let choice = &data["choices"][0];
@@ -171,7 +174,10 @@ impl Provider for OpenAiProvider {
         })
     }
 
-    async fn stream(&self, opts: GenerateOptions) -> anyhow::Result<mpsc::UnboundedReceiver<StreamEvent>> {
+    async fn stream(
+        &self,
+        opts: GenerateOptions,
+    ) -> anyhow::Result<mpsc::UnboundedReceiver<StreamEvent>> {
         let body = self.build_body(&opts, true);
         let res = self.request(body).await?.send().await?;
         if !res.status().is_success() {
@@ -201,9 +207,11 @@ impl Provider for OpenAiProvider {
                 // The final chunk carries usage with an empty choices array.
                 if let Some(u) = evt.get("usage") {
                     if !u.is_null() {
-                        usage.input_tokens = u["prompt_tokens"].as_u64().unwrap_or(usage.input_tokens);
-                        usage.output_tokens =
-                            u["completion_tokens"].as_u64().unwrap_or(usage.output_tokens);
+                        usage.input_tokens =
+                            u["prompt_tokens"].as_u64().unwrap_or(usage.input_tokens);
+                        usage.output_tokens = u["completion_tokens"]
+                            .as_u64()
+                            .unwrap_or(usage.output_tokens);
                         usage.cache_read_input_tokens = u["prompt_tokens_details"]["cached_tokens"]
                             .as_u64()
                             .unwrap_or(usage.cache_read_input_tokens);
@@ -218,7 +226,9 @@ impl Provider for OpenAiProvider {
                 if let Some(c) = delta["content"].as_str() {
                     if !c.is_empty() {
                         text.push_str(c);
-                        let _ = tx.send(StreamEvent::TextDelta { text: c.to_string() });
+                        let _ = tx.send(StreamEvent::TextDelta {
+                            text: c.to_string(),
+                        });
                     }
                 }
                 if let Some(calls) = delta["tool_calls"].as_array() {
@@ -288,7 +298,11 @@ impl Provider for OpenAiProvider {
         let req = self.client.get(format!("{}/models", self.base_url));
         let res = self.authed(req).await?.send().await?;
         if !res.status().is_success() {
-            anyhow::bail!("models {}: {}", res.status(), res.text().await.unwrap_or_default());
+            anyhow::bail!(
+                "models {}: {}",
+                res.status(),
+                res.text().await.unwrap_or_default()
+            );
         }
         let data: Value = res.json().await?;
         let mut ids: Vec<String> = data["data"]
@@ -377,7 +391,9 @@ fn from_api_message(msg: &Value) -> Message {
     let mut content: Vec<ContentBlock> = Vec::new();
     if let Some(c) = msg["content"].as_str() {
         if !c.is_empty() {
-            content.push(ContentBlock::Text { text: c.to_string() });
+            content.push(ContentBlock::Text {
+                text: c.to_string(),
+            });
         }
     }
     if let Some(calls) = msg["tool_calls"].as_array() {

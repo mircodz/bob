@@ -54,7 +54,11 @@ impl Tool for TodoWriteTool {
                             _ => TodoStatus::Pending,
                         };
                         let active_form = t["active_form"].as_str().map(|s| s.to_string());
-                        Some(TodoItem { content, status, active_form })
+                        Some(TodoItem {
+                            content,
+                            status,
+                            active_form,
+                        })
                     })
                     .collect()
             })

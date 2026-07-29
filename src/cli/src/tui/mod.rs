@@ -18,11 +18,12 @@ use bob_core::core::permissions::{
     Asker, Decision, Mode, PermissionEngine, PermissionOption, PermissionRequest,
 };
 use bob_core::core::policies::{
-    allow_bash_commands, allow_code_action_list, allow_read_only, allow_tools, deny_dangerous_bash, deny_tools,
+    allow_bash_commands, allow_code_action_list, allow_read_only, allow_tools, deny_dangerous_bash,
+    deny_tools,
 };
 use bob_core::core::session::{save_session, Session};
-use bob_core::providers::provider::Provider;
 use bob_core::providers::create_provider;
+use bob_core::providers::provider::Provider;
 use bob_core::tools::registry::ToolRegistry;
 use bob_core::tools::task::TaskTool;
 
@@ -32,8 +33,10 @@ use crossterm::event::{
     Event as CtEvent, EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseButton,
     MouseEventKind,
 };
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::execute;
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -125,7 +128,10 @@ impl bob_core::tools::registry::UserAsker for TuiUserAsker {
         let (resp_tx, resp_rx) = oneshot::channel();
         if self
             .tx
-            .send(QueryPrompt { query: query.clone(), resp: resp_tx })
+            .send(QueryPrompt {
+                query: query.clone(),
+                resp: resp_tx,
+            })
             .is_err()
         {
             return None;
@@ -189,7 +195,13 @@ impl Asker for TuiAsker {
 
 /// A short human description of a non-bash tool's key argument.
 fn describe_input(tool: &str, input: &serde_json::Value) -> String {
-    let arg = |k: &str| input.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let arg = |k: &str| {
+        input
+            .get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
     match tool {
         "write_file" | "edit_file" | "multi_edit" | "read_file" | "list_dir" => arg("path"),
         "web_fetch" => arg("url"),
@@ -305,7 +317,9 @@ pub async fn run(
     mut session: Session,
 ) -> anyhow::Result<()> {
     // Select the color theme from config before anything renders.
-    theme::set_theme(theme::Theme::by_name(config.theme.as_deref().unwrap_or("dark")));
+    theme::set_theme(theme::Theme::by_name(
+        config.theme.as_deref().unwrap_or("dark"),
+    ));
 
     let bus = EventBus::new();
 
@@ -375,8 +389,12 @@ pub async fn run(
     }
     if let Some(lsp) = &lsp {
         subagent_tools.add(Arc::new(bob_core::tools::lsp::LspTool::new(lsp.clone())));
-        subagent_tools.add(Arc::new(bob_core::tools::lsp_actions::RenameSymbolTool::new(lsp.clone())));
-        subagent_tools.add(Arc::new(bob_core::tools::lsp_actions::CodeActionTool::new(lsp.clone())));
+        subagent_tools.add(Arc::new(
+            bob_core::tools::lsp_actions::RenameSymbolTool::new(lsp.clone()),
+        ));
+        subagent_tools.add(Arc::new(bob_core::tools::lsp_actions::CodeActionTool::new(
+            lsp.clone(),
+        )));
     }
     // Compose the system prompt: the base bob prompt (or a config override) plus
     // a live environment block and any AGENTS.md/CLAUDE.md project context.
@@ -392,8 +410,12 @@ pub async fn run(
     }
     if let Some(lsp) = &lsp {
         tools.add(Arc::new(bob_core::tools::lsp::LspTool::new(lsp.clone())));
-        tools.add(Arc::new(bob_core::tools::lsp_actions::RenameSymbolTool::new(lsp.clone())));
-        tools.add(Arc::new(bob_core::tools::lsp_actions::CodeActionTool::new(lsp.clone())));
+        tools.add(Arc::new(
+            bob_core::tools::lsp_actions::RenameSymbolTool::new(lsp.clone()),
+        ));
+        tools.add(Arc::new(bob_core::tools::lsp_actions::CodeActionTool::new(
+            lsp.clone(),
+        )));
     }
     tools.add(Arc::new(TaskTool {
         provider: provider.clone(),
@@ -431,7 +453,12 @@ pub async fn run(
     // --- terminal setup ---
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste, EnableMouseCapture)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -683,7 +710,12 @@ pub async fn run(
     };
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableBracketedPaste, DisableMouseCapture)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableBracketedPaste,
+        DisableMouseCapture
+    )?;
     terminal.show_cursor()?;
     result
 }
@@ -774,7 +806,10 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/context", "show context-window usage"),
     ("/model", "show the current model"),
     ("/models", "list & switch models"),
-    ("/reasoning", "set reasoning effort (off/low/medium/high/max)"),
+    (
+        "/reasoning",
+        "set reasoning effort (off/low/medium/high/max)",
+    ),
     ("/theme", "switch color theme (dark/light/terminal)"),
     ("/jobs", "list background jobs"),
     ("/mcp", "list configured MCP servers"),
@@ -872,7 +907,8 @@ impl App {
 
     /// Accept the selected `@file` completion, replacing the token in the input.
     fn accept_file(&mut self) {
-        if let (Some(start), Some(path)) = (self.file_at, self.file_menu.get(self.file_sel).cloned())
+        if let (Some(start), Some(path)) =
+            (self.file_at, self.file_menu.get(self.file_sel).cloned())
         {
             self.input.replace_at_token(start, &path);
             self.file_menu.clear();
@@ -926,7 +962,9 @@ impl App {
 
     /// Handle keys while a user question (ask_user / exit_plan) is open.
     fn handle_query_key(&mut self, code: KeyCode) -> KeyOutcome {
-        let Some(q) = &mut self.pending_query else { return KeyOutcome::None };
+        let Some(q) = &mut self.pending_query else {
+            return KeyOutcome::None;
+        };
         let n = q.query.options.len() + if q.query.allow_other { 1 } else { 0 };
 
         // Free-text "Other" entry mode routes typing into the buffer.
@@ -990,7 +1028,9 @@ impl App {
 
     /// Select option `idx`; the "Other" row enters free-text mode.
     fn pick_query_option(&mut self, idx: usize) -> KeyOutcome {
-        let Some(q) = &mut self.pending_query else { return KeyOutcome::None };
+        let Some(q) = &mut self.pending_query else {
+            return KeyOutcome::None;
+        };
         if idx < q.query.options.len() {
             let answer = q.query.options[idx].clone();
             self.answer_query(answer)
@@ -1003,7 +1043,9 @@ impl App {
     /// Finalize the pending query. Tool questions send the answer back over the
     /// oneshot; the model picker turns the answer into a SwitchModel outcome.
     fn answer_query(&mut self, answer: String) -> KeyOutcome {
-        let Some(q) = self.pending_query.take() else { return KeyOutcome::None };
+        let Some(q) = self.pending_query.take() else {
+            return KeyOutcome::None;
+        };
         match q.purpose {
             QueryPurpose::Tool(resp) => {
                 let is_plan = q.query.title == "Ready to code?";
@@ -1046,8 +1088,7 @@ impl App {
     /// persists on Enter, and reverts on Esc. Selection starts on the current
     /// theme so opening the picker doesn't change anything until you move.
     fn open_theme_picker(&mut self, current: &str) {
-        let options: Vec<String> =
-            theme::Theme::NAMES.iter().map(|s| s.to_string()).collect();
+        let options: Vec<String> = theme::Theme::NAMES.iter().map(|s| s.to_string()).collect();
         let selected = options.iter().position(|n| n == current).unwrap_or(0);
         self.pending_query = Some(PendingQuery {
             query: bob_core::tools::registry::UserQuery {
@@ -1376,7 +1417,8 @@ impl App {
         match bob_core::core::config::list_mcp_servers() {
             Ok(servers) if servers.is_empty() => {
                 self.view.push_notice(
-                    "no MCP servers configured. Add one with: bob mcp add <name> -- <command>".to_string(),
+                    "no MCP servers configured. Add one with: bob mcp add <name> -- <command>"
+                        .to_string(),
                 );
             }
             Ok(servers) => {
@@ -1387,10 +1429,13 @@ impl App {
                     } else {
                         format!(" {}", s.args.join(" "))
                     };
-                    self.view.push_notice(format!("  {}: {}{}", s.name, s.command, args));
+                    self.view
+                        .push_notice(format!("  {}: {}{}", s.name, s.command, args));
                 }
             }
-            Err(e) => self.view.push_notice(format!("error reading MCP config: {}", e)),
+            Err(e) => self
+                .view
+                .push_notice(format!("error reading MCP config: {}", e)),
         }
         self.stick_to_bottom();
     }
@@ -1481,7 +1526,8 @@ impl App {
             .clone()
             .unwrap_or_else(|| "turn".to_string());
         let id = self.jobs.next_id();
-        self.jobs.register_tracking(id.clone(), "turn", truncate_mid(&desc, 60));
+        self.jobs
+            .register_tracking(id.clone(), "turn", truncate_mid(&desc, 60));
         self.detached_job = Some(id.clone());
         self.toast = Some(format!("detached as {}", id));
     }
@@ -1490,7 +1536,8 @@ impl App {
     /// agent unwinds at its next safe point, keeping history valid) and clears
     /// any queued prompts so they don't fire after the interrupt.
     fn interrupt(&mut self) {
-        self.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         self.queue.clear();
         self.view.push_notice("interrupting…".to_string());
         self.toast = Some("interrupting…".into());
@@ -1518,7 +1565,14 @@ impl App {
     /// given the usable text width. Used for BOTH the height calc and rendering
     /// so they never disagree (which is what clipped long lines).
     fn input_lines(&self, width: usize, busy: bool) -> Vec<Line<'static>> {
-        let prompt = || Span::styled("› ", Style::default().fg(Palette::ACCENT()).add_modifier(Modifier::BOLD));
+        let prompt = || {
+            Span::styled(
+                "› ",
+                Style::default()
+                    .fg(Palette::ACCENT())
+                    .add_modifier(Modifier::BOLD),
+            )
+        };
         if self.input.text().is_empty() && !busy {
             return vec![Line::from(vec![
                 prompt(),
@@ -1560,7 +1614,9 @@ impl App {
         // (1 pad row above + N text rows + 1 pad row below), capped so it can't
         // eat the whole screen.
         let text_width = area.width.saturating_sub(2) as usize;
-        let wrapped = self.input_lines(text_width, self.running || self.view.busy).len();
+        let wrapped = self
+            .input_lines(text_width, self.running || self.view.busy)
+            .len();
         let text_rows = (wrapped as u16).clamp(1, 10);
         let input_height = text_rows + 2;
 
@@ -1625,10 +1681,15 @@ impl App {
     ) {
         use bob_core::tools::jobs::JobStatus;
         f.render_widget(Clear, area);
-        let running = jobs.iter().filter(|(_, _, _, s)| *s == JobStatus::Running).count();
+        let running = jobs
+            .iter()
+            .filter(|(_, _, _, s)| *s == JobStatus::Running)
+            .count();
         let mut lines: Vec<Line> = vec![Line::from(Span::styled(
             format!(" background jobs · {} running ", running),
-            Style::default().fg(Palette::ACCENT()).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Palette::ACCENT())
+                .add_modifier(Modifier::BOLD),
         ))];
         for (id, kind, desc, status) in jobs.iter().take(area.height.saturating_sub(1) as usize) {
             let (glyph, color) = match status {
@@ -1640,8 +1701,14 @@ impl App {
             lines.push(Line::from(vec![
                 Span::styled(format!("  {} ", glyph), Style::default().fg(color)),
                 Span::styled(format!("{} ", id), Style::default().fg(Palette::DIM())),
-                Span::styled(format!("[{}] ", kind), Style::default().fg(Palette::FAINT())),
-                Span::styled(truncate_mid(desc, area.width as usize / 2), Style::default().fg(Palette::TEXT())),
+                Span::styled(
+                    format!("[{}] ", kind),
+                    Style::default().fg(Palette::FAINT()),
+                ),
+                Span::styled(
+                    truncate_mid(desc, area.width as usize / 2),
+                    Style::default().fg(Palette::TEXT()),
+                ),
             ]));
         }
         f.render_widget(
@@ -1704,7 +1771,10 @@ impl App {
                 .turn_started
                 .map(|t| t.elapsed().as_secs())
                 .unwrap_or(0);
-            let mut spans: Vec<Span> = vec![Span::styled("  • ", Style::default().fg(Palette::RUNNING()))];
+            let mut spans: Vec<Span> = vec![Span::styled(
+                "  • ",
+                Style::default().fg(Palette::RUNNING()),
+            )];
             spans.extend(shimmer_spans("Working", self.spinner));
             spans.push(Span::styled(
                 format!(" ({}s · esc to interrupt)", secs),
@@ -1723,7 +1793,11 @@ impl App {
         let mut lines: Vec<Line> = Vec::new();
         for (idx, l) in raw.into_iter().enumerate() {
             let inset = inset_flags.get(idx).copied().unwrap_or(false);
-            let wrap_width = if inset { width.saturating_sub(2).max(1) } else { width };
+            let wrap_width = if inset {
+                width.saturating_sub(2).max(1)
+            } else {
+                width
+            };
             for mut wl in wrap_line(l, wrap_width) {
                 if inset {
                     wl.spans.insert(0, Span::raw("  "));
@@ -1743,9 +1817,17 @@ impl App {
 
         // Scroll hint when not at the bottom.
         if self.scroll_up > 0 {
-            let hint = Rect { x: area.x + area.width.saturating_sub(10), y: area.y, width: 10, height: 1 };
+            let hint = Rect {
+                x: area.x + area.width.saturating_sub(10),
+                y: area.y,
+                width: 10,
+                height: 1,
+            };
             f.render_widget(
-                Paragraph::new(Span::styled(" ↑ scrolled ", Style::default().fg(Palette::WARN()).bg(Palette::POPUP_BG()))),
+                Paragraph::new(Span::styled(
+                    " ↑ scrolled ",
+                    Style::default().fg(Palette::WARN()).bg(Palette::POPUP_BG()),
+                )),
                 hint,
             );
         }
@@ -1790,9 +1872,11 @@ impl App {
                 use bob_core::lsp::Health;
                 let (glyph, label, color) = match health {
                     Health::Starting => ("\u{25CB}".to_string(), name.clone(), Palette::DIM()),
-                    Health::Indexing(Some(p)) => {
-                        ("\u{25D0}".to_string(), format!("{name} {p}%"), Palette::WARN())
-                    }
+                    Health::Indexing(Some(p)) => (
+                        "\u{25D0}".to_string(),
+                        format!("{name} {p}%"),
+                        Palette::WARN(),
+                    ),
                     Health::Indexing(None) => {
                         ("\u{25D0}".to_string(), name.clone(), Palette::WARN())
                     }
@@ -1800,7 +1884,10 @@ impl App {
                     Health::Failed(_) => ("\u{25CF}".to_string(), name.clone(), Palette::ERROR()),
                 };
                 spans.push(sep());
-                spans.push(Span::styled(format!("{glyph} {label}"), Style::default().fg(color)));
+                spans.push(Span::styled(
+                    format!("{glyph} {label}"),
+                    Style::default().fg(color),
+                ));
             }
         }
 
@@ -1907,21 +1994,37 @@ impl App {
             .enumerate()
             .map(|(i, (cmd, desc))| {
                 let selected = i == self.menu_sel;
-                let row_bg = if selected { Palette::SELECTED_BG() } else { Palette::POPUP_BG() };
+                let row_bg = if selected {
+                    Palette::SELECTED_BG()
+                } else {
+                    Palette::POPUP_BG()
+                };
                 let marker = if selected { "❯" } else { " " };
                 let cmd_style = if selected {
-                    Style::default().fg(Palette::ACCENT()).bg(row_bg).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(Palette::ACCENT())
+                        .bg(row_bg)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Palette::TEXT()).bg(row_bg)
                 };
                 Line::from(vec![
-                    Span::styled(format!(" {} ", marker), Style::default().fg(Palette::ACCENT()).bg(row_bg)),
+                    Span::styled(
+                        format!(" {} ", marker),
+                        Style::default().fg(Palette::ACCENT()).bg(row_bg),
+                    ),
                     Span::styled(format!("{:<8}", cmd), cmd_style),
-                    Span::styled(format!("  {}", desc), Style::default().fg(Palette::FAINT()).bg(row_bg)),
+                    Span::styled(
+                        format!("  {}", desc),
+                        Style::default().fg(Palette::FAINT()).bg(row_bg),
+                    ),
                 ])
             })
             .collect();
-        f.render_widget(Paragraph::new(lines).style(Style::default().bg(Palette::POPUP_BG())), area);
+        f.render_widget(
+            Paragraph::new(lines).style(Style::default().bg(Palette::POPUP_BG())),
+            area,
+        );
     }
 
     /// The `@file` completion popup — same borderless style as the slash menu.
@@ -1948,36 +2051,56 @@ impl App {
             .enumerate()
             .map(|(i, path)| {
                 let selected = i == self.file_sel;
-                let row_bg = if selected { Palette::SELECTED_BG() } else { Palette::POPUP_BG() };
+                let row_bg = if selected {
+                    Palette::SELECTED_BG()
+                } else {
+                    Palette::POPUP_BG()
+                };
                 let marker = if selected { "❯" } else { " " };
                 let path_style = if selected {
-                    Style::default().fg(Palette::ACCENT()).bg(row_bg).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(Palette::ACCENT())
+                        .bg(row_bg)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Palette::TEXT()).bg(row_bg)
                 };
                 Line::from(vec![
-                    Span::styled(format!(" {} ", marker), Style::default().fg(Palette::ACCENT()).bg(row_bg)),
+                    Span::styled(
+                        format!(" {} ", marker),
+                        Style::default().fg(Palette::ACCENT()).bg(row_bg),
+                    ),
                     Span::styled(path.clone(), path_style),
                 ])
             })
             .collect();
-        f.render_widget(Paragraph::new(lines).style(Style::default().bg(Palette::POPUP_BG())), area);
+        f.render_widget(
+            Paragraph::new(lines).style(Style::default().bg(Palette::POPUP_BG())),
+            area,
+        );
     }
 
     /// Build all lines for the permission prompt: title, optional preview diff,
     /// numbered options, and the hint. Shared by height calc + render.
     fn permission_lines(&self, width: usize) -> Vec<Line<'static>> {
-        let Some(p) = &self.pending_perm else { return vec![] };
+        let Some(p) = &self.pending_perm else {
+            return vec![];
+        };
         let mut lines: Vec<Line> = Vec::new();
 
         // Title line, e.g. "Allow write_file?" with the target dimmed after it.
         let mut title_spans = vec![Span::styled(
             p.title.clone(),
-            Style::default().fg(Palette::WARN()).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Palette::WARN())
+                .add_modifier(Modifier::BOLD),
         )];
         if !p.detail.is_empty() {
             title_spans.push(Span::styled(
-                format!("  {}", truncate_mid(&p.detail, width.saturating_sub(p.title.len() + 2))),
+                format!(
+                    "  {}",
+                    truncate_mid(&p.detail, width.saturating_sub(p.title.len() + 2))
+                ),
                 Style::default().fg(Palette::DIM()),
             ));
         }
@@ -2004,7 +2127,11 @@ impl App {
             let selected = i == p.selected;
             let marker = if selected { "❯" } else { " " };
             let base = if opt.allow {
-                if opt.grant.is_some() { Palette::OK() } else { Palette::TEXT() }
+                if opt.grant.is_some() {
+                    Palette::OK()
+                } else {
+                    Palette::TEXT()
+                }
             } else {
                 Palette::ERROR()
             };
@@ -2014,7 +2141,10 @@ impl App {
                 Style::default().fg(base)
             };
             lines.push(Line::from(vec![
-                Span::styled(format!(" {} ", marker), Style::default().fg(Palette::WARN())),
+                Span::styled(
+                    format!(" {} ", marker),
+                    Style::default().fg(Palette::WARN()),
+                ),
                 Span::styled(format!("{}. ", i + 1), Style::default().fg(Palette::DIM())),
                 Span::styled(opt.label.clone(), label_style),
             ]));
@@ -2042,14 +2172,21 @@ impl App {
     /// optional Markdown detail (e.g. the plan), then a numbered select with an
     /// "Other…" row, or a free-text field when the user chose Other.
     fn query_lines(&self, width: usize) -> Vec<Line<'static>> {
-        let Some(q) = &self.pending_query else { return vec![] };
+        let Some(q) = &self.pending_query else {
+            return vec![];
+        };
         let mut lines: Vec<Line> = Vec::new();
         lines.push(Line::from(Span::styled(
             q.query.title.clone(),
-            Style::default().fg(Palette::ACCENT()).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Palette::ACCENT())
+                .add_modifier(Modifier::BOLD),
         )));
         if !q.query.detail.is_empty() {
-            for l in render::render_markdown_like(&q.query.detail).into_iter().take(12) {
+            for l in render::render_markdown_like(&q.query.detail)
+                .into_iter()
+                .take(12)
+            {
                 lines.push(indent_line(l));
             }
         }
@@ -2103,14 +2240,21 @@ impl App {
         for (i, label, is_other) in &rows[start..end] {
             let selected = *i == q.selected;
             let marker = if selected { "❯" } else { " " };
-            let base = if *is_other { Palette::DIM() } else { Palette::TEXT() };
+            let base = if *is_other {
+                Palette::DIM()
+            } else {
+                Palette::TEXT()
+            };
             let style = if selected {
                 Style::default().fg(base).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(base)
             };
             lines.push(Line::from(vec![
-                Span::styled(format!(" {} ", marker), Style::default().fg(Palette::ACCENT())),
+                Span::styled(
+                    format!(" {} ", marker),
+                    Style::default().fg(Palette::ACCENT()),
+                ),
                 Span::styled(format!("{}. ", i + 1), Style::default().fg(Palette::DIM())),
                 Span::styled(label.clone(), style),
             ]));
@@ -2153,7 +2297,9 @@ impl App {
         f.render_widget(
             Paragraph::new(Span::styled(
                 format!(" {} ", text),
-                Style::default().fg(Palette::TEXT()).bg(Palette::SELECTED_BG()),
+                Style::default()
+                    .fg(Palette::TEXT())
+                    .bg(Palette::SELECTED_BG()),
             )),
             toast,
         );
@@ -2195,7 +2341,6 @@ fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
     out
 }
 
-
 fn truncate_mid(s: &str, max: usize) -> String {
     if s.chars().count() <= max || max < 4 {
         return s.to_string();
@@ -2204,7 +2349,6 @@ fn truncate_mid(s: &str, max: usize) -> String {
     let head: String = s.chars().take(keep).collect();
     format!("{}...", head)
 }
-
 
 /// Indent a rendered line by 3 columns (for the permission preview block).
 fn indent_line(line: Line<'static>) -> Line<'static> {
@@ -2228,8 +2372,7 @@ fn osc52_copy(text: &str) {
 
 /// Minimal standard base64 encoder (no external crate).
 fn base64_encode(input: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
     for chunk in input.chunks(3) {
         let b0 = chunk[0] as u32;

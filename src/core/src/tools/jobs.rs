@@ -160,7 +160,14 @@ impl JobRegistry {
             .unwrap()
             .iter()
             .filter_map(|id| jobs.get(id))
-            .map(|j| (j.id.clone(), j.kind.clone(), j.description.clone(), j.status))
+            .map(|j| {
+                (
+                    j.id.clone(),
+                    j.kind.clone(),
+                    j.description.clone(),
+                    j.status,
+                )
+            })
             .collect()
     }
 
@@ -259,7 +266,11 @@ impl Tool for JobOutputTool {
                     JobStatus::Failed => "failed",
                     JobStatus::Cancelled => "cancelled",
                 };
-                let body = if output.is_empty() { "(no output yet)" } else { &output };
+                let body = if output.is_empty() {
+                    "(no output yet)"
+                } else {
+                    &output
+                };
                 format!("{} [{}]:\n{}", id, state, body)
             }
             None => format!("error: no such job {}", id),

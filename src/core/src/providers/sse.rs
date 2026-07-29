@@ -5,10 +5,7 @@ use futures::StreamExt;
 use serde_json::Value;
 
 /// Drive a reqwest byte stream, invoking `on_event` for each parsed SSE payload.
-pub async fn parse_sse<F>(
-    resp: reqwest::Response,
-    mut on_event: F,
-) -> anyhow::Result<()>
+pub async fn parse_sse<F>(resp: reqwest::Response, mut on_event: F) -> anyhow::Result<()>
 where
     F: FnMut(Value),
 {
@@ -21,7 +18,9 @@ where
 
         // Split on blank lines between events.
         loop {
-            let Some(idx) = buffer.find("\n\n") else { break };
+            let Some(idx) = buffer.find("\n\n") else {
+                break;
+            };
             let raw = buffer[..idx].to_string();
             buffer.drain(..idx + 2);
 

@@ -98,10 +98,14 @@ impl Tool for LspTool {
 
         match op {
             "diagnostics" => self.diagnostics(&client, &file, &text, &input).await,
-            "definition" => self.locations(&client, &file, &input, "textDocument/definition").await,
+            "definition" => {
+                self.locations(&client, &file, &input, "textDocument/definition")
+                    .await
+            }
             "references" => self.references(&client, &file, &input).await,
             "implementation" => {
-                self.locations(&client, &file, &input, "textDocument/implementation").await
+                self.locations(&client, &file, &input, "textDocument/implementation")
+                    .await
             }
             "hover" => self.hover(&client, &file, &input).await,
             "document_symbols" => self.document_symbols(&client, &file).await,
@@ -182,7 +186,15 @@ impl LspTool {
             shown += 1;
         }
         if shown == 0 {
-            return format!("No diagnostics for {} (at or above {} severity).", rel(file), match min_sev { 1 => "error", 2 => "warning", _ => "hint" });
+            return format!(
+                "No diagnostics for {} (at or above {} severity).",
+                rel(file),
+                match min_sev {
+                    1 => "error",
+                    2 => "warning",
+                    _ => "hint",
+                }
+            );
         }
         out
     }
@@ -238,12 +250,7 @@ impl LspTool {
         out
     }
 
-    async fn hover(
-        &self,
-        client: &crate::lsp::LspClient,
-        file: &Path,
-        input: &Value,
-    ) -> String {
+    async fn hover(&self, client: &crate::lsp::LspClient, file: &Path, input: &Value) -> String {
         let params = match position_params(file, input) {
             Ok(p) => p,
             Err(e) => return e,
@@ -266,11 +273,7 @@ impl LspTool {
         contents.to_string()
     }
 
-    async fn document_symbols(
-        &self,
-        client: &crate::lsp::LspClient,
-        file: &Path,
-    ) -> String {
+    async fn document_symbols(&self, client: &crate::lsp::LspClient, file: &Path) -> String {
         let params = json!({ "textDocument": { "uri": path_uri(file) } });
         let result = match client.request("textDocument/documentSymbol", params).await {
             Ok(r) => r,
@@ -303,8 +306,7 @@ impl LspTool {
                             let kind = symbol_kind(s["kind"].as_i64().unwrap_or(0));
                             let loc = &s["location"];
                             let uri = loc["uri"].as_str().unwrap_or("");
-                            let line =
-                                loc["range"]["start"]["line"].as_i64().unwrap_or(0) + 1;
+                            let line = loc["range"]["start"]["line"].as_i64().unwrap_or(0) + 1;
                             out.push_str(&format!(
                                 "{}:{}  {} {}\n",
                                 uri_to_rel(uri),
@@ -422,7 +424,11 @@ fn symbol_kind(k: i64) -> &'static str {
 fn rel(file: &Path) -> String {
     std::env::current_dir()
         .ok()
-        .and_then(|cwd| file.strip_prefix(&cwd).ok().map(|p| p.to_string_lossy().to_string()))
+        .and_then(|cwd| {
+            file.strip_prefix(&cwd)
+                .ok()
+                .map(|p| p.to_string_lossy().to_string())
+        })
         .unwrap_or_else(|| file.to_string_lossy().to_string())
 }
 

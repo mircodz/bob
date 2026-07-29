@@ -14,7 +14,10 @@ use std::sync::Arc;
 pub async fn create_provider(spec: &str) -> anyhow::Result<Arc<dyn Provider>> {
     let mut parts = spec.splitn(2, ':');
     let id = parts.next().unwrap_or("");
-    let model = parts.next().filter(|s| !s.is_empty()).map(|s| s.to_string());
+    let model = parts
+        .next()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
 
     match id {
         "anthropic" => Ok(Arc::new(AnthropicProvider::new(model)?)),

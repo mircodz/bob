@@ -44,11 +44,17 @@ impl McpClient {
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
 
-        let mut child = command.spawn().map_err(|e| {
-            anyhow::anyhow!("failed to start MCP server '{}': {}", cfg.name, e)
-        })?;
-        let stdin = child.stdin.take().ok_or_else(|| anyhow::anyhow!("no stdin"))?;
-        let stdout = child.stdout.take().ok_or_else(|| anyhow::anyhow!("no stdout"))?;
+        let mut child = command
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("failed to start MCP server '{}': {}", cfg.name, e))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("no stdin"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("no stdout"))?;
 
         let inner = Arc::new(McpInner {
             name: cfg.name.clone(),
@@ -149,7 +155,11 @@ impl McpClient {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        if result.get("isError").and_then(|v| v.as_bool()).unwrap_or(false) {
+        if result
+            .get("isError")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
             Ok(format!("error: {}", text))
         } else {
             Ok(text)
@@ -222,9 +232,7 @@ impl Tool for McpTool {
 /// Connect to every configured MCP server and return all their tools flattened,
 /// plus a notice string per server (connected N tools / failed). Servers that
 /// fail to connect are skipped (not fatal).
-pub async fn connect_all(
-    configs: &[McpServerConfig],
-) -> (Vec<Arc<dyn Tool>>, Vec<String>) {
+pub async fn connect_all(configs: &[McpServerConfig]) -> (Vec<Arc<dyn Tool>>, Vec<String>) {
     let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
     let mut notices: Vec<String> = Vec::new();
     for cfg in configs {
