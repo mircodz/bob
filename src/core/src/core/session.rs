@@ -171,19 +171,6 @@ pub struct SessionSummary {
     pub message_count: usize,
 }
 
-impl SessionSummary {
-    pub fn of(s: &Session) -> Self {
-        SessionSummary {
-            id: s.id.clone(),
-            title: title_of(s),
-            provider: s.provider.clone(),
-            created_at: s.created_at.clone(),
-            updated_at: s.updated_at.clone(),
-            message_count: s.messages.len(),
-        }
-    }
-}
-
 /// A short display title for a session: its first user-message text, collapsed
 /// to one line and truncated. Falls back to "New conversation" when empty.
 pub fn title_of(session: &Session) -> String {

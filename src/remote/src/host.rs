@@ -1,6 +1,6 @@
-//! The agent host. Assembles a bob-core Agent exactly like bob-cli's `run()`,
-//! but bridges the two seams over a WebSocket to the relay instead of a
-//! terminal:
+//! The agent host. Builds a bob-core Agent via the shared
+//! `agent::assembly::build_root_agent` (the same wiring the TUI uses), but
+//! bridges the two seams over a WebSocket to the relay instead of a terminal:
 //!   - EventBus listener  -> HostFrame::Event   (outbound)
 //!   - RemoteUserAsker / RemoteAsker  <-> AskQuery / AskPermission round-trips
 //!   - incoming ControlFrame::Prompt/Cancel/SetMode drive the agent
@@ -12,7 +12,6 @@ use crate::session;
 
 use async_trait::async_trait;
 use base64::Engine as _;
-use bob_core::agent::agent::{Agent, AgentConfig};
 use bob_core::core::config::load_config;
 use bob_core::core::events::{AgentEvent, EventBus};
 use bob_core::core::permissions::{
@@ -23,8 +22,7 @@ use bob_core::core::policies::{
     deny_tools,
 };
 use bob_core::providers::create_provider;
-use bob_core::tools::registry::{ToolRegistry, UserAsker, UserQuery};
-use bob_core::tools::task::TaskTool;
+use bob_core::tools::registry::{UserAsker, UserQuery};
 use bob_protocol::{
     AgentEventDto, ControlFrame, Hello, HostFrame, PermissionOptDto, PermissionReqDto, UserQueryDto,
 };
@@ -322,100 +320,25 @@ pub async fn run(
         Some(bob_core::lsp::LspManager::start(&config.lsp_servers, &cwd))
     };
 
-    let mut subagent_tools = ToolRegistry::new(Some(permissions.clone()));
-    for t in bob_core::tools::builtin_tools() {
-        subagent_tools.add(t);
-    }
-    for t in &mcp_tools {
-        subagent_tools.add(t.clone());
-    }
-    if let Some(lsp) = &lsp {
-        subagent_tools.add(Arc::new(bob_core::tools::lsp::LspTool::new(lsp.clone())));
-        subagent_tools.add(Arc::new(
-            bob_core::tools::lsp_actions::RenameSymbolTool::new(lsp.clone()),
-        ));
-        subagent_tools.add(Arc::new(bob_core::tools::lsp_actions::CodeActionTool::new(
-            lsp.clone(),
-        )));
-    }
-    subagent_tools.add(Arc::new(bob_core::tools::coordinate::SendMessageTool {
-        team: team.clone(),
-    }));
-    subagent_tools.add(Arc::new(bob_core::tools::coordinate::ListAgentsTool {
-        team: team.clone(),
-    }));
-
     let system_prompt =
         bob_core::agent::prompt::build_system_prompt(config.system.as_deref(), &cwd);
 
-    let mut tools = ToolRegistry::new(Some(permissions.clone()));
-    for t in bob_core::tools::builtin_tools() {
-        tools.add(t);
-    }
-    for t in &mcp_tools {
-        tools.add(t.clone());
-    }
-    if let Some(lsp) = &lsp {
-        tools.add(Arc::new(bob_core::tools::lsp::LspTool::new(lsp.clone())));
-        tools.add(Arc::new(
-            bob_core::tools::lsp_actions::RenameSymbolTool::new(lsp.clone()),
-        ));
-        tools.add(Arc::new(bob_core::tools::lsp_actions::CodeActionTool::new(
-            lsp.clone(),
-        )));
-    }
-    tools.add(Arc::new(TaskTool {
-        provider: provider.clone(),
-        subagent_tools: subagent_tools.clone(),
-        bus: bus.clone(),
-        cwd: cwd.to_string_lossy().to_string(),
-        subagent_system: Some(system_prompt.clone()),
-        jobs: jobs.clone(),
-        lsp: lsp.clone(),
-    }));
-    {
-        use bob_core::tools::coordinate::{
-            CoordDeps, ListAgentsTool, SendMessageTool, SpawnAgentTool,
-        };
-        let deps = CoordDeps {
+    // Build the fully-wired root agent (tools + coordination + team mailbox). The
+    // same builder backs the TUI, so the two can't drift.
+    let mut agent =
+        bob_core::agent::assembly::build_root_agent(bob_core::agent::assembly::RootAgentParams {
             provider: provider.clone(),
-            subagent_tools: subagent_tools.clone(),
+            permissions: permissions.clone(),
             bus: bus.clone(),
-            cwd: cwd.to_string_lossy().to_string(),
-            subagent_system: Some(system_prompt.clone()),
             jobs: jobs.clone(),
-            lsp: lsp.clone(),
             team: team.clone(),
-        };
-        tools.add(Arc::new(SpawnAgentTool { deps }));
-        tools.add(Arc::new(SendMessageTool { team: team.clone() }));
-        tools.add(Arc::new(ListAgentsTool { team: team.clone() }));
-    }
-
-    // Register the root as a team member with its own mailbox, so spawned agents
-    // can report their results back to "root" and wake it for a fresh turn.
-    let (root_inbox, root_tx) = bob_core::agent::team::mailbox();
-    team.register("root".to_string(), 0, root_tx);
-
-    let mut agent = Agent::new(AgentConfig {
-        provider: provider.clone(),
-        tools,
-        bus: bus.clone(),
-        system: Some(system_prompt.clone()),
-        cwd: cwd.to_string_lossy().to_string(),
-        max_turns: config.max_turns.unwrap_or(20),
-        id: Some("root".to_string()),
-        context_window: 200_000,
-        compact_threshold: 0.8,
-        keep_recent: 6,
-        jobs: jobs.clone(),
-        user_asker: Some(user_asker.clone()),
-        lsp: lsp.clone(),
-        inbox: Some(root_inbox),
-        team: Some(team.clone()),
-        name: "root".to_string(),
-        depth: 0,
-    });
+            cwd: cwd.to_string_lossy().to_string(),
+            system_prompt: system_prompt.clone(),
+            mcp_tools: mcp_tools.clone(),
+            lsp: lsp.clone(),
+            user_asker: user_asker.clone(),
+            max_turns: config.max_turns,
+        });
 
     // Resume the most recent conversation session (or start fresh), and load
     // its messages into the agent so a reconnecting controller sees history.

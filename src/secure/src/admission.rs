@@ -15,23 +15,17 @@
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-use subtle::ConstantTimeEq;
 
 type HmacSha256 = Hmac<Sha256>;
 
 /// Derive the admission proof for a session from the pairing secret. Both peers
-/// compute the same value; the relay compares them with [`matches`].
+/// compute the same value; the relay records the first party's and requires the
+/// second to present a byte-identical one (compared in constant time).
 pub fn prove(secret: &[u8], session: &str) -> Vec<u8> {
     let mut m = <HmacSha256 as Mac>::new_from_slice(secret).expect("HMAC accepts any key length");
     m.update(b"bob-remote/admission/v1");
     m.update(session.as_bytes());
     m.finalize().into_bytes().to_vec()
-}
-
-/// Constant-time equality of two proofs, for the relay's second-party check.
-/// Avoids a timing oracle on the comparison.
-pub fn matches(a: &[u8], b: &[u8]) -> bool {
-    a.ct_eq(b).into()
 }
 
 #[cfg(test)]
@@ -42,27 +36,16 @@ mod tests {
 
     #[test]
     fn same_secret_and_session_match() {
-        let host = prove(SECRET, "sess");
-        let phone = prove(SECRET, "sess");
-        assert!(matches(&host, &phone));
+        assert_eq!(prove(SECRET, "sess"), prove(SECRET, "sess"));
     }
 
     #[test]
     fn wrong_secret_does_not_match() {
-        let a = prove(SECRET, "sess");
-        let b = prove(b"other", "sess");
-        assert!(!matches(&a, &b));
+        assert_ne!(prove(SECRET, "sess"), prove(b"other", "sess"));
     }
 
     #[test]
     fn different_session_does_not_match() {
-        let a = prove(SECRET, "sess");
-        let b = prove(SECRET, "other");
-        assert!(!matches(&a, &b));
-    }
-
-    #[test]
-    fn matches_is_length_safe() {
-        assert!(!matches(b"short", b"a-much-longer-value"));
+        assert_ne!(prove(SECRET, "sess"), prove(SECRET, "other"));
     }
 }

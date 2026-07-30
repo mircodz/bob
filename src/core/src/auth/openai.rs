@@ -11,7 +11,7 @@
 //!        → { id_token, access_token, refresh_token }
 //! Refresh uses grant_type=refresh_token at the same /oauth/token endpoint.
 
-use super::{AuthStore, Credential};
+use super::{now, store_tokens, urlencode, AuthStore};
 
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const ISSUER: &str = "https://auth.openai.com";
@@ -128,35 +128,7 @@ pub async fn finish_login<F: FnMut()>(device: &DeviceCode, mut on_wait: F) -> an
         );
     }
     let tokens: serde_json::Value = res.json().await?;
-    store_tokens(&tokens)?;
-    Ok(())
-}
-
-fn store_tokens(tokens: &serde_json::Value) -> anyhow::Result<()> {
-    let access = tokens["access_token"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("no access_token"))?
-        .to_string();
-    let refresh = tokens["refresh_token"].as_str().map(|s| s.to_string());
-    // These tokens are typically ~1h; store an expiry so we refresh proactively.
-    let expires_in = tokens["expires_in"].as_u64().unwrap_or(3600);
-    let expires_at = now() + expires_in;
-
-    let mut store = AuthStore::load();
-    let mut extra = std::collections::HashMap::new();
-    extra.insert("expires_at".to_string(), expires_at.to_string());
-    if let Some(id) = tokens["id_token"].as_str() {
-        extra.insert("id_token".to_string(), id.to_string());
-    }
-    store.set(
-        "openai",
-        Credential {
-            token: access,
-            refresh_token: refresh,
-            extra,
-        },
-    );
-    store.save()?;
+    store_tokens("openai", &tokens, &["id_token"])?;
     Ok(())
 }
 
@@ -205,29 +177,9 @@ pub async fn access_token() -> anyhow::Result<String> {
         );
     }
     let tokens: serde_json::Value = res.json().await?;
-    store_tokens(&tokens)?;
+    store_tokens("openai", &tokens, &["id_token"])?;
     Ok(tokens["access_token"]
         .as_str()
         .unwrap_or_default()
         .to_string())
-}
-
-fn urlencode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{:02X}", b)),
-        }
-    }
-    out
-}
-
-fn now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }

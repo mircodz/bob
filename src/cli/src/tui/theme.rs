@@ -26,7 +26,6 @@ pub struct Theme {
     pub list_marker: Color,
     pub inline_code: Color,
     pub link: Color,
-    pub blockquote: Color,
     pub blockquote_bar: Color,
     pub rule: Color,
     pub table_border: Color,
@@ -36,7 +35,6 @@ pub struct Theme {
     pub diff_add_bg: Color,
     pub diff_remove_bg: Color,
     pub diff_gutter: Color,
-    pub border: Color,
     pub input_bg: Color,
     pub popup_bg: Color,
     pub selected_bg: Color,
@@ -65,7 +63,6 @@ impl Theme {
             list_marker: rgb(0x8a, 0x8f, 0x98),
             inline_code: rgb(0xe8, 0x9d, 0x6a),
             link: rgb(0x56, 0xc8, 0xd8),
-            blockquote: rgb(0xaa, 0xaa, 0xaa),
             blockquote_bar: rgb(0x3a, 0x3e, 0x46),
             rule: rgb(0x2a, 0x2e, 0x36),
             table_border: rgb(0x2a, 0x2e, 0x36),
@@ -75,7 +72,6 @@ impl Theme {
             diff_add_bg: rgb(0x0d, 0x1a, 0x0d),
             diff_remove_bg: rgb(0x1f, 0x0e, 0x0e),
             diff_gutter: rgb(0x55, 0x5a, 0x63),
-            border: rgb(0x2a, 0x2e, 0x36),
             input_bg: rgb(0x1a, 0x1a, 0x20),
             popup_bg: rgb(0x12, 0x13, 0x16),
             selected_bg: rgb(0x1e, 0x33, 0x4a),
@@ -100,7 +96,6 @@ impl Theme {
             list_marker: rgb(0x6a, 0x73, 0x7d),
             inline_code: rgb(0xa6, 0x3d, 0x11),
             link: rgb(0x0a, 0x7d, 0x6b),
-            blockquote: rgb(0x50, 0x58, 0x60),
             blockquote_bar: rgb(0xc4, 0xcb, 0xd3),
             rule: rgb(0xd8, 0xdd, 0xe3),
             table_border: rgb(0xc4, 0xcb, 0xd3),
@@ -110,7 +105,6 @@ impl Theme {
             diff_add_bg: rgb(0xe4, 0xf2, 0xe4),
             diff_remove_bg: rgb(0xfb, 0xe6, 0xe6),
             diff_gutter: rgb(0x9d, 0xa5, 0xb4),
-            border: rgb(0xcf, 0xd5, 0xdc),
             input_bg: rgb(0xf2, 0xf3, 0xf5),
             popup_bg: rgb(0xec, 0xee, 0xf1),
             selected_bg: rgb(0xd4, 0xe4, 0xf4),
@@ -134,7 +128,6 @@ impl Theme {
             list_marker: rgb(0x6c, 0x70, 0x86),
             inline_code: rgb(0xfa, 0xb3, 0x87),
             link: rgb(0x94, 0xe2, 0xd5),
-            blockquote: rgb(0xa6, 0xad, 0xc8),
             blockquote_bar: rgb(0x45, 0x47, 0x5a),
             rule: rgb(0x31, 0x32, 0x44),
             table_border: rgb(0x31, 0x32, 0x44),
@@ -144,7 +137,6 @@ impl Theme {
             diff_add_bg: rgb(0x31, 0x32, 0x44),
             diff_remove_bg: rgb(0x31, 0x32, 0x44),
             diff_gutter: rgb(0x6c, 0x70, 0x86),
-            border: rgb(0x31, 0x32, 0x44),
             input_bg: rgb(0x18, 0x18, 0x25),
             popup_bg: rgb(0x18, 0x18, 0x25),
             selected_bg: rgb(0x45, 0x47, 0x5a),
@@ -168,7 +160,6 @@ impl Theme {
             list_marker: rgb(0x6e, 0x73, 0x8d),
             inline_code: rgb(0xf5, 0xa9, 0x7f),
             link: rgb(0x8b, 0xd5, 0xca),
-            blockquote: rgb(0xa5, 0xad, 0xcb),
             blockquote_bar: rgb(0x49, 0x4d, 0x64),
             rule: rgb(0x36, 0x3a, 0x4f),
             table_border: rgb(0x36, 0x3a, 0x4f),
@@ -178,7 +169,6 @@ impl Theme {
             diff_add_bg: rgb(0x36, 0x3a, 0x4f),
             diff_remove_bg: rgb(0x36, 0x3a, 0x4f),
             diff_gutter: rgb(0x6e, 0x73, 0x8d),
-            border: rgb(0x36, 0x3a, 0x4f),
             input_bg: rgb(0x1e, 0x20, 0x30),
             popup_bg: rgb(0x1e, 0x20, 0x30),
             selected_bg: rgb(0x49, 0x4d, 0x64),
@@ -202,7 +192,6 @@ impl Theme {
             list_marker: rgb(0x73, 0x79, 0x94),
             inline_code: rgb(0xef, 0x9f, 0x76),
             link: rgb(0x81, 0xc8, 0xbe),
-            blockquote: rgb(0xa5, 0xad, 0xce),
             blockquote_bar: rgb(0x51, 0x57, 0x6d),
             rule: rgb(0x41, 0x45, 0x59),
             table_border: rgb(0x41, 0x45, 0x59),
@@ -212,7 +201,6 @@ impl Theme {
             diff_add_bg: rgb(0x41, 0x45, 0x59),
             diff_remove_bg: rgb(0x41, 0x45, 0x59),
             diff_gutter: rgb(0x73, 0x79, 0x94),
-            border: rgb(0x41, 0x45, 0x59),
             input_bg: rgb(0x29, 0x2c, 0x3c),
             popup_bg: rgb(0x29, 0x2c, 0x3c),
             selected_bg: rgb(0x51, 0x57, 0x6d),
@@ -236,7 +224,6 @@ impl Theme {
             list_marker: rgb(0x9c, 0xa0, 0xb0),
             inline_code: rgb(0xfe, 0x64, 0x0b),
             link: rgb(0x17, 0x92, 0x99),
-            blockquote: rgb(0x6c, 0x6f, 0x85),
             blockquote_bar: rgb(0xbc, 0xc0, 0xcc),
             rule: rgb(0xcc, 0xd0, 0xda),
             table_border: rgb(0xcc, 0xd0, 0xda),
@@ -246,7 +233,6 @@ impl Theme {
             diff_add_bg: rgb(0xcc, 0xd0, 0xda),
             diff_remove_bg: rgb(0xcc, 0xd0, 0xda),
             diff_gutter: rgb(0x9c, 0xa0, 0xb0),
-            border: rgb(0xcc, 0xd0, 0xda),
             input_bg: rgb(0xe6, 0xe9, 0xef),
             popup_bg: rgb(0xe6, 0xe9, 0xef),
             selected_bg: rgb(0xbc, 0xc0, 0xcc),
@@ -283,7 +269,6 @@ impl Theme {
             list_marker: base04,
             inline_code: base0e,
             link: base0c,
-            blockquote: base04,
             blockquote_bar: base02,
             rule: base02,
             table_border: base02,
@@ -293,7 +278,6 @@ impl Theme {
             diff_add_bg: base01,
             diff_remove_bg: base01,
             diff_gutter: base03,
-            border: base02,
             input_bg: base01,
             popup_bg: base01,
             selected_bg: base02,
@@ -328,7 +312,6 @@ impl Theme {
             list_marker: base1,
             inline_code: magenta,
             link: cyan,
-            blockquote: base01,
             blockquote_bar: base2,
             rule: base2,
             table_border: base2,
@@ -338,7 +321,6 @@ impl Theme {
             diff_add_bg: rgb(0xed, 0xf0, 0xd6),
             diff_remove_bg: rgb(0xf6, 0xe3, 0xdd),
             diff_gutter: base1,
-            border: base2,
             input_bg: base2,
             popup_bg: base2,
             selected_bg: rgb(0xd9, 0xe6, 0xe8),
@@ -352,7 +334,6 @@ impl Theme {
         let base01 = rgb(0x58, 0x6e, 0x75);
         let base00 = rgb(0x65, 0x7b, 0x83);
         let base0 = rgb(0x83, 0x94, 0x96); // body text
-        let base1 = rgb(0x93, 0xa1, 0xa1);
         let yellow = rgb(0xb5, 0x89, 0x00);
         let red = rgb(0xdc, 0x32, 0x2f);
         let green = rgb(0x85, 0x99, 0x00);
@@ -374,7 +355,6 @@ impl Theme {
             list_marker: base01,
             inline_code: magenta,
             link: cyan,
-            blockquote: base1,
             blockquote_bar: base02,
             rule: base02,
             table_border: base02,
@@ -384,7 +364,6 @@ impl Theme {
             diff_add_bg: base02,
             diff_remove_bg: base02,
             diff_gutter: base00,
-            border: base02,
             input_bg: base02,
             popup_bg: base02,
             selected_bg: base01,
@@ -408,7 +387,6 @@ impl Theme {
             list_marker: rgb(0x8b, 0x94, 0x9e),
             inline_code: rgb(0xff, 0xa6, 0x57),
             link: rgb(0x58, 0xa6, 0xff),
-            blockquote: rgb(0x8b, 0x94, 0x9e),
             blockquote_bar: rgb(0x30, 0x36, 0x3d),
             rule: rgb(0x21, 0x26, 0x2d),
             table_border: rgb(0x30, 0x36, 0x3d),
@@ -418,7 +396,6 @@ impl Theme {
             diff_add_bg: rgb(0x0f, 0x2a, 0x18),
             diff_remove_bg: rgb(0x2a, 0x12, 0x12),
             diff_gutter: rgb(0x6e, 0x76, 0x81),
-            border: rgb(0x30, 0x36, 0x3d),
             input_bg: rgb(0x01, 0x04, 0x09),
             popup_bg: rgb(0x16, 0x1b, 0x22),
             selected_bg: rgb(0x1f, 0x2d, 0x3d),
@@ -442,7 +419,6 @@ impl Theme {
             list_marker: rgb(0x57, 0x60, 0x6a),
             inline_code: rgb(0x95, 0x38, 0x00),
             link: rgb(0x09, 0x69, 0xda),
-            blockquote: rgb(0x57, 0x60, 0x6a),
             blockquote_bar: rgb(0xd0, 0xd7, 0xde),
             rule: rgb(0xd8, 0xde, 0xe4),
             table_border: rgb(0xd0, 0xd7, 0xde),
@@ -452,7 +428,6 @@ impl Theme {
             diff_add_bg: rgb(0xda, 0xfb, 0xe1),
             diff_remove_bg: rgb(0xff, 0xeb, 0xe9),
             diff_gutter: rgb(0x8c, 0x95, 0x9f),
-            border: rgb(0xd0, 0xd7, 0xde),
             input_bg: rgb(0xf6, 0xf8, 0xfa),
             popup_bg: rgb(0xf6, 0xf8, 0xfa),
             selected_bg: rgb(0xdd, 0xf4, 0xff),
@@ -562,9 +537,6 @@ impl Palette {
     pub fn LINK() -> Color {
         active().link
     }
-    pub fn BLOCKQUOTE() -> Color {
-        active().blockquote
-    }
     pub fn BLOCKQUOTE_BAR() -> Color {
         active().blockquote_bar
     }
@@ -591,9 +563,6 @@ impl Palette {
     }
     pub fn DIFF_GUTTER() -> Color {
         active().diff_gutter
-    }
-    pub fn BORDER() -> Color {
-        active().border
     }
     pub fn INPUT_BG() -> Color {
         active().input_bg

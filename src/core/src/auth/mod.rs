@@ -241,27 +241,11 @@ pub fn pkce() -> Pkce {
     }
 }
 
-/// 16 random bytes (a UUID's bytes). Kept here so auth has no extra RNG dep —
-/// the tui crate owns `uuid`; core generates via getrandom through sha2? No:
-/// we hash the process/thread/time entropy instead to stay dependency-light.
+/// 16 cryptographically-random bytes (a UUID's worth), for PKCE verifiers and
+/// OAuth state. Uses the OS CSPRNG via `getrandom`.
 fn uuid_bytes() -> [u8; 16] {
-    use sha2::{Digest, Sha256};
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let tid = format!("{:?}", std::thread::current().id());
-    let mut h = Sha256::new();
-    h.update(nanos.to_le_bytes());
-    h.update(tid.as_bytes());
-    h.update(std::process::id().to_le_bytes());
-    // Mix an address for extra entropy across calls.
-    let stack_var = 0u8;
-    h.update((&stack_var as *const u8 as usize).to_le_bytes());
-    let digest = h.finalize();
     let mut out = [0u8; 16];
-    out.copy_from_slice(&digest[..16]);
+    getrandom::getrandom(&mut out).expect("OS RNG unavailable");
     out
 }
 
@@ -399,7 +383,7 @@ pub async fn refresh_token(
     Ok(res.json().await?)
 }
 
-fn urlencode(s: &str) -> String {
+pub(crate) fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
@@ -410,6 +394,51 @@ fn urlencode(s: &str) -> String {
         }
     }
     out
+}
+
+/// Current Unix time in seconds (0 on the impossible pre-epoch case).
+pub(crate) fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Persist an OAuth token response under `provider`, recording an `expires_at`
+/// so callers can refresh proactively. `extra_keys` names additional top-level
+/// token fields to copy into the credential's `extra` map (e.g. "id_token").
+pub(crate) fn store_tokens(
+    provider: &str,
+    tokens: &serde_json::Value,
+    extra_keys: &[&str],
+) -> anyhow::Result<()> {
+    let access = tokens["access_token"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("no access_token"))?
+        .to_string();
+    let refresh = tokens["refresh_token"].as_str().map(|s| s.to_string());
+    // These tokens are typically ~1h; store an expiry so we refresh proactively.
+    let expires_in = tokens["expires_in"].as_u64().unwrap_or(3600);
+    let expires_at = now() + expires_in;
+
+    let mut extra = std::collections::HashMap::new();
+    extra.insert("expires_at".to_string(), expires_at.to_string());
+    for key in extra_keys {
+        if let Some(v) = tokens[*key].as_str() {
+            extra.insert((*key).to_string(), v.to_string());
+        }
+    }
+
+    let mut store = AuthStore::load();
+    store.set(
+        provider,
+        Credential {
+            token: access,
+            refresh_token: refresh,
+            extra,
+        },
+    );
+    store.save()
 }
 
 fn urldecode(s: &str) -> String {

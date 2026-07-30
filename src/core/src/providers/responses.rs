@@ -30,10 +30,7 @@ impl ResponsesProvider {
             auth,
             model,
             base_url: base_url.trim_end_matches('/').to_string(),
-            client: reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(20))
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+            client: super::openai::http_client(),
         }
     }
 
@@ -245,12 +242,6 @@ impl Provider for ResponsesProvider {
         });
 
         Ok(rx)
-    }
-
-    async fn list_models(&self) -> anyhow::Result<Vec<String>> {
-        // The responses backend doesn't expose /models the same way; return the
-        // known set (see providers::mod::RESPONSES_MODELS).
-        Ok(vec![])
     }
 }
 

@@ -24,6 +24,18 @@ pub enum JobStatus {
     Cancelled,
 }
 
+impl JobStatus {
+    /// Lowercase display label ("running", "done", "failed", "cancelled").
+    pub fn label(self) -> &'static str {
+        match self {
+            JobStatus::Running => "running",
+            JobStatus::Done => "done",
+            JobStatus::Failed => "failed",
+            JobStatus::Cancelled => "cancelled",
+        }
+    }
+}
+
 /// A single background job's live state. Output accumulates as the job streams;
 /// `result` is set once when it finishes.
 pub struct BgJob {
@@ -37,19 +49,6 @@ pub struct BgJob {
     pub result: Option<String>,
     /// Abort handle; dropping/aborting cancels the underlying future.
     pub handle: Option<JoinHandle<()>>,
-}
-
-impl BgJob {
-    /// A short one-line status summary (for panels / listings).
-    pub fn summary(&self) -> String {
-        let state = match self.status {
-            JobStatus::Running => "running",
-            JobStatus::Done => "done",
-            JobStatus::Failed => "failed",
-            JobStatus::Cancelled => "cancelled",
-        };
-        format!("{} [{}] {}", self.id, state, self.description)
-    }
 }
 
 /// Shared registry of background jobs. Cloneable handle over shared state, held
@@ -100,13 +99,6 @@ impl JobRegistry {
         };
         self.jobs.lock().unwrap().insert(id.clone(), job);
         self.order.lock().unwrap().push(id);
-    }
-
-    /// Append streamed output to a job.
-    pub fn append_output(&self, id: &str, text: &str) {
-        if let Some(j) = self.jobs.lock().unwrap().get_mut(id) {
-            j.output.push_str(text);
-        }
     }
 
     /// Mark a job finished with its final result (or failure message).
@@ -170,16 +162,6 @@ impl JobRegistry {
             })
             .collect()
     }
-
-    /// Number of jobs still running.
-    pub fn running_count(&self) -> usize {
-        self.jobs
-            .lock()
-            .unwrap()
-            .values()
-            .filter(|j| j.status == JobStatus::Running)
-            .count()
-    }
 }
 
 /// `job_status`: list background jobs (or one by id) with their state. This is
@@ -217,13 +199,7 @@ impl Tool for JobStatusTool {
         }
         jobs.iter()
             .map(|(id, kind, desc, status)| {
-                let state = match status {
-                    JobStatus::Running => "running",
-                    JobStatus::Done => "done",
-                    JobStatus::Failed => "failed",
-                    JobStatus::Cancelled => "cancelled",
-                };
-                format!("{} [{}] {}: {}", id, state, kind, desc)
+                format!("{} [{}] {}: {}", id, status.label(), kind, desc)
             })
             .collect::<Vec<_>>()
             .join("\n")

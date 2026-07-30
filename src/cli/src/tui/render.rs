@@ -9,9 +9,6 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
 
-/// Glyph for a still-running subagent (a filled dot; the spinner in the input
-/// band already animates, so this stays static in the transcript).
-
 /// Pretty display name for a tool + its most salient argument.
 /// write_file {path:"a.py"} → ("Write", "a.py")
 fn tool_display(name: &str, input: &Value) -> (String, String) {
@@ -34,9 +31,8 @@ fn tool_display(name: &str, input: &Value) -> (String, String) {
         "web_fetch" => ("Fetch".into(), arg("url")),
         "todo_write" => ("Plan".into(), String::new()),
         "task" => ("Task".into(), String::new()),
-        // spawn_agent renders like task: the "Agent" label, and its subagent cell
-        // (the ├─/╰─ line) shows the description + status below. The verbose tool
-        // output ("spawned agent…") is suppressed in render_tool.
+        // spawn_agent's tool cell is suppressed in render_tool; its visible
+        // artifact is the separate "• Spawned <name> agent" Subagent line.
         "spawn_agent" => ("Agent".into(), arg("name")),
         "send_message" => ("Message".into(), arg("to")),
         "list_agents" => ("Agents".into(), String::new()),
@@ -203,7 +199,7 @@ fn render_tool(
     ];
     if !arg.is_empty() {
         if name == "bash" {
-            // Syntax-highlight the shell command (like Codex does).
+            // Syntax-highlight the shell command.
             header.push(Span::raw(" "));
             for s in highlight_line(&truncate(&arg, 100), "sh") {
                 header.push(s);
@@ -217,10 +213,9 @@ fn render_tool(
     }
     out.push(Line::from(header));
 
-    // `task` and `spawn_agent` are immediately followed by their subagent cells
-    // (the ├─/╰─ tree), so they emit NO trailing blank and suppress their tool
-    // output — the tree butts directly under the header and shows the status. The
-    // last subagent in the group provides the spacing below.
+    // `task` and `spawn_agent` are followed by their own Subagent cells (the
+    // "• Spawned <name> agent" lines), so they emit no trailing blank and
+    // suppress their tool output — the Subagent cell provides the spacing.
     if name == "task" || name == "spawn_agent" {
         return;
     }

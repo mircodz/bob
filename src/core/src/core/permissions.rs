@@ -152,10 +152,6 @@ impl PermissionEngine {
         self
     }
 
-    pub fn set_asker(&mut self, asker: Arc<dyn Asker>) {
-        self.asker = Some(asker);
-    }
-
     /// Resolve to true if the tool call is permitted.
     pub async fn check(&self, req: &PermissionRequest) -> bool {
         let mode = self.mode();

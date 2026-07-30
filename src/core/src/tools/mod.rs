@@ -1,3 +1,4 @@
+pub mod bash;
 pub mod builtin;
 pub mod coordinate;
 pub mod diff;
@@ -14,7 +15,8 @@ pub mod todo;
 pub mod todo_write;
 pub mod web;
 
-use crate::tools::builtin::{BashTool, ListDirTool, ReadFileTool, WriteFileTool};
+use crate::tools::bash::BashTool;
+use crate::tools::builtin::{ListDirTool, ReadFileTool, WriteFileTool};
 use crate::tools::edit::{EditFileTool, MultiEditTool};
 use crate::tools::interact::{AskUserTool, ExitPlanTool};
 use crate::tools::jobs::{JobOutputTool, JobStatusTool};

@@ -41,7 +41,7 @@ pub enum Cell {
     /// A generic dim notice (startup notices, errors).
     Notice(String),
     /// A system event surfaced inline as a bulleted line (model/mode switches),
-    /// Cortex-style: "• Model changed to gpt-5.5 medium".
+    /// e.g. "• Model changed to gpt-5.5 medium".
     Event(String),
 }
 
@@ -147,16 +147,13 @@ impl ViewModel {
                     }
                     // A user turn may carry tool_results (role=tool is stored as
                     // its own message, but be defensive).
-                    let mut had_text = false;
                     for b in &m.content {
                         if let ContentBlock::Text { text } = b {
                             if !text.is_empty() {
                                 self.cells.push(Cell::User(text.clone()));
-                                had_text = true;
                             }
                         }
                     }
-                    let _ = had_text;
                 }
                 Role::Assistant => {
                     for b in &m.content {

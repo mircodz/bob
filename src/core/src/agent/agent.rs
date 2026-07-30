@@ -40,43 +40,13 @@ pub struct AgentConfig {
     /// every agent (root + subagents) so all see the same server processes.
     pub lsp: Option<Arc<crate::lsp::LspManager>>,
     /// This agent's mailbox for inter-agent coordination. None → the agent is not
-    /// part of a team and behaves exactly as before (no inbox drain).
+    /// part of a team (no inbox drain).
     pub inbox: Option<crate::agent::team::AgentInbox>,
     /// The shared team roster, so coordination tools can address other agents.
     pub team: Option<crate::agent::team::AgentRegistry>,
     /// This agent's own name in the team + its spawn depth (root = 0).
     pub name: String,
     pub depth: usize,
-}
-
-impl Default for AgentConfig {
-    fn default() -> Self {
-        AgentConfig {
-            provider: panic_provider(),
-            tools: ToolRegistry::new(None),
-            bus: EventBus::new(),
-            system: None,
-            cwd: ".".to_string(),
-            max_turns: 20,
-            id: None,
-            context_window: 200_000,
-            compact_threshold: 0.8,
-            keep_recent: 6,
-            jobs: crate::tools::jobs::JobRegistry::new(),
-            user_asker: None,
-            lsp: None,
-            inbox: None,
-            team: None,
-            name: "root".to_string(),
-            depth: 0,
-        }
-    }
-}
-
-fn panic_provider() -> Arc<dyn Provider> {
-    // AgentConfig::default is only used field-by-field in practice; never call
-    // this. Present so `..Default::default()` compiles if ever needed.
-    unreachable!("AgentConfig requires a provider")
 }
 
 pub struct Agent {

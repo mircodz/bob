@@ -20,5 +20,4 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 serde = { workspace = true }
 toml = "0.8"
 anyhow.workspace = true
-subtle = "2"
 base64 = "0.22"

@@ -48,8 +48,8 @@ pub struct AgentMessage {
 /// history so the model sees and can act on them.
 pub struct AgentInbox {
     rx: mpsc::UnboundedReceiver<AgentMessage>,
-    /// Messages pulled off the channel but not yet consumed (e.g. one awaited by
-    /// the run loop to detect a wake, then requeued for the uniform drain path).
+    /// Messages pulled off the channel but not yet consumed (e.g. one peeked by
+    /// `has_pending` to detect a wake, then returned by the next `drain`).
     pushback: std::collections::VecDeque<AgentMessage>,
 }
 
@@ -78,13 +78,7 @@ impl AgentInbox {
         false
     }
 
-    /// Put a message back at the front so the next `drain` returns it first.
-    pub fn requeue(&mut self, msg: AgentMessage) {
-        self.pushback.push_front(msg);
-    }
-
-    /// Await the next message. Returns `None` if every sender has been dropped
-    /// (the agent can no longer receive).
+    /// Await the next message. Returns `None` if every sender has been dropped    /// (the agent can no longer receive).
     pub async fn recv(&mut self) -> Option<AgentMessage> {
         if let Some(msg) = self.pushback.pop_front() {
             return Some(msg);
@@ -211,9 +205,9 @@ impl AgentRegistry {
         self.agents.lock().unwrap().len()
     }
 
-    /// Whether the team is empty.
+    /// Whether the team has no members (satisfies the len/is_empty pair).
     pub fn is_empty(&self) -> bool {
-        self.agents.lock().unwrap().is_empty()
+        self.len() == 0
     }
 }
 

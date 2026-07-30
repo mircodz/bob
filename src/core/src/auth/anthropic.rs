@@ -7,8 +7,8 @@
 //! sanctioned path for custom tooling.
 
 use super::{
-    authorize_url, exchange_code, pkce, refresh_token, wait_for_callback, AuthCodeConfig,
-    AuthStore, Credential, Pkce,
+    authorize_url, exchange_code, now, pkce, refresh_token, store_tokens, wait_for_callback,
+    AuthCodeConfig, AuthStore, Pkce,
 };
 
 // Public client id used by Claude Code's OAuth flow.
@@ -52,31 +52,7 @@ pub async fn finish_login(handle: LoginHandle) -> anyhow::Result<()> {
     let cfg = config();
     let code = wait_for_callback(cfg.callback_port, &handle.state).await?;
     let tokens = exchange_code(&cfg, &handle.pkce, &code).await?;
-    store_tokens(&tokens)?;
-    Ok(())
-}
-
-fn store_tokens(tokens: &serde_json::Value) -> anyhow::Result<()> {
-    let access = tokens["access_token"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("no access_token"))?
-        .to_string();
-    let refresh = tokens["refresh_token"].as_str().map(|s| s.to_string());
-    let expires_in = tokens["expires_in"].as_u64().unwrap_or(3600);
-    let expires_at = now() + expires_in;
-
-    let mut store = AuthStore::load();
-    let mut extra = std::collections::HashMap::new();
-    extra.insert("expires_at".to_string(), expires_at.to_string());
-    store.set(
-        "anthropic",
-        Credential {
-            token: access,
-            refresh_token: refresh,
-            extra,
-        },
-    );
-    store.save()?;
+    store_tokens("anthropic", &tokens, &[])?;
     Ok(())
 }
 
@@ -108,16 +84,9 @@ pub async fn access_token() -> anyhow::Result<String> {
         .refresh_token
         .ok_or_else(|| anyhow::anyhow!("session expired and no refresh token; log in again"))?;
     let tokens = refresh_token(TOKEN_URL, CLIENT_ID, &refresh).await?;
-    store_tokens(&tokens)?;
+    store_tokens("anthropic", &tokens, &[])?;
     Ok(tokens["access_token"]
         .as_str()
         .unwrap_or_default()
         .to_string())
-}
-
-fn now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }

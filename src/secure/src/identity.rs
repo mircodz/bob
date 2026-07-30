@@ -150,11 +150,6 @@ impl DeviceBook {
         Ok(book)
     }
 
-    /// All trusted devices.
-    pub fn devices(&self) -> &[Device] {
-        &self.devices
-    }
-
     /// Find a trusted device by the peer static public key presented in a
     /// handshake. `None` means "unknown device" → reject the connection.
     pub fn find_by_public(&self, public: &PublicKey) -> Option<&Device> {
@@ -172,15 +167,6 @@ impl DeviceBook {
         self.devices.retain(|d| d.name != device.name);
         self.devices.push(device);
         self.save()
-    }
-
-    /// Remove a device by name; returns whether one was removed. Persists.
-    pub fn remove(&mut self, name: &str) -> Result<bool> {
-        let before = self.devices.len();
-        self.devices.retain(|d| d.name != name);
-        let removed = self.devices.len() != before;
-        self.save()?;
-        Ok(removed)
     }
 
     fn save(&self) -> Result<()> {
@@ -253,10 +239,6 @@ mod tests {
         // Reload from disk: the trust persists.
         let book2 = DeviceBook::load(&path).unwrap();
         assert_eq!(book2.find_by_public(&peer_pub).unwrap().name, "Phone");
-
-        let mut book3 = DeviceBook::load(&path).unwrap();
-        assert!(book3.remove("Phone").unwrap());
-        assert!(!book3.is_trusted(&peer_pub));
         std::fs::remove_file(&path).unwrap();
     }
 

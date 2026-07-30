@@ -254,6 +254,7 @@ dependencies = [
  "async-trait",
  "dirs",
  "futures",
+ "getrandom 0.2.17",
  "glob",
  "regex",
  "reqwest",
@@ -323,7 +324,6 @@ dependencies = [
  "rand_core 0.6.4",
  "serde",
  "sha2",
- "subtle",
  "toml",
  "x25519-dalek",
 ]

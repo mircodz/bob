@@ -572,7 +572,7 @@ async fn run_remote(
     test_client: bool,
     pair_url: Option<String>,
 ) -> anyhow::Result<()> {
-    use bob_secure::{admission, Device, DeviceBook, Identity, Pairing};
+    use bob_secure::{Device, DeviceBook, Identity, Pairing};
 
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("no home directory"))?;
     let bob_dir = home.join(".bob");
@@ -607,7 +607,6 @@ async fn run_remote(
         secret: pairing_secret.clone(),
     };
     print_pairing(&pairing);
-    let _ = admission::prove(&pairing_secret, &session); // (proof computed in host::run)
 
     let devices_path = bob_dir.join("devices.toml");
     let session_for_cb = session.clone();

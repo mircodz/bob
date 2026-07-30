@@ -45,6 +45,36 @@ fn replace_first(haystack: &str, needle: &str, replacement: &str) -> String {
     }
 }
 
+/// Apply one string replacement to `content`, enforcing the uniqueness rules.
+/// Returns the updated content, or a human-readable error (used verbatim in the
+/// tool result, so `label` prefixes it, e.g. "edit 2: "). `old_string` must match
+/// exactly once unless `replace_all` is set.
+fn apply_edit(
+    content: &str,
+    old_string: &str,
+    new_string: &str,
+    replace_all: bool,
+    label: &str,
+) -> Result<String, String> {
+    if old_string == new_string {
+        return Err(format!("{label}old_string and new_string are identical"));
+    }
+    let occ = count_occurrences(content, old_string);
+    if occ == 0 {
+        return Err(format!("{label}old_string not found"));
+    }
+    if occ > 1 && !replace_all {
+        return Err(format!(
+            "{label}old_string matches {occ} times; add context to make it unique or set replace_all"
+        ));
+    }
+    Ok(if replace_all {
+        content.replace(old_string, new_string)
+    } else {
+        replace_first(content, old_string, new_string)
+    })
+}
+
 /// Compute the would-be new content of a single edit, without touching disk.
 /// Returns None if the file can't be read or the edit wouldn't apply cleanly.
 fn compute_edit(
@@ -107,29 +137,14 @@ impl Tool for EditFileTool {
         if let Some(stale) = ctx.files.check_editable(&full_str) {
             return format!("error: {}", stale);
         }
-        if old_string == new_string {
-            return "error: old_string and new_string are identical".to_string();
-        }
 
         let content = match std::fs::read_to_string(&full) {
             Ok(c) => c,
             Err(e) => return format!("error: {}", e),
         };
-        let occ = count_occurrences(&content, old_string);
-        if occ == 0 {
-            return format!("error: old_string not found in {}", path);
-        }
-        if occ > 1 && !replace_all {
-            return format!(
-                "error: old_string matches {} times in {}; add context to make it unique or set replace_all",
-                occ, path
-            );
-        }
-
-        let updated = if replace_all {
-            content.replace(old_string, new_string)
-        } else {
-            replace_first(&content, old_string, new_string)
+        let updated = match apply_edit(&content, old_string, new_string, replace_all, "") {
+            Ok(u) => u,
+            Err(e) => return format!("error: {}", e),
         };
 
         if let Err(e) = std::fs::write(&full, &updated) {
@@ -209,23 +224,15 @@ impl Tool for MultiEditTool {
             let old_string = e["old_string"].as_str().unwrap_or("");
             let new_string = e["new_string"].as_str().unwrap_or("");
             let replace_all = e["replace_all"].as_bool().unwrap_or(false);
-            if old_string == new_string {
-                return format!("error: edit {}: identical old/new string", i);
-            }
-            let occ = count_occurrences(&content, old_string);
-            if occ == 0 {
-                return format!("error: edit {}: old_string not found", i);
-            }
-            if occ > 1 && !replace_all {
-                return format!(
-                    "error: edit {}: matches {} times; set replace_all or add context",
-                    i, occ
-                );
-            }
-            content = if replace_all {
-                content.replace(old_string, new_string)
-            } else {
-                replace_first(&content, old_string, new_string)
+            content = match apply_edit(
+                &content,
+                old_string,
+                new_string,
+                replace_all,
+                &format!("edit {i}: "),
+            ) {
+                Ok(u) => u,
+                Err(err) => return format!("error: {}", err),
             };
         }
 

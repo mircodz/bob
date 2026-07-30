@@ -30,7 +30,9 @@ struct StaticKey(String);
 /// Shared HTTP client with sane timeouts. A connect timeout prevents hanging on
 /// an unreachable endpoint; we deliberately do NOT set an overall read timeout,
 /// since legitimate streamed generations can run for minutes.
-fn http_client() -> reqwest::Client {
+/// Shared reqwest client builder for the OpenAI-family providers (Chat
+/// Completions + Responses), with a bounded connect timeout.
+pub(crate) fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(20))
         .build()
