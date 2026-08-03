@@ -21,6 +21,9 @@ pub struct ReadFileTool;
 
 #[async_trait]
 impl Tool for ReadFileTool {
+    fn is_read_only(&self) -> bool {
+        true
+    }
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "read_file".to_string(),
@@ -159,6 +162,9 @@ pub struct ListDirTool;
 
 #[async_trait]
 impl Tool for ListDirTool {
+    fn is_read_only(&self) -> bool {
+        true
+    }
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "list_dir".to_string(),
@@ -193,7 +199,16 @@ impl Tool for ListDirTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::registry::ToolErrorKind;
+    use crate::tools::registry::{Tool, ToolErrorKind};
+
+    #[test]
+    fn read_only_classification() {
+        // Reads/searches are read-only; writes/edits/bash are not. This is the
+        // single source of truth the concurrency split + explore-subset consume.
+        assert!(ReadFileTool.is_read_only());
+        assert!(ListDirTool.is_read_only());
+        assert!(!WriteFileTool.is_read_only());
+    }
 
     fn ctx(cwd: &str) -> ToolContext {
         ToolContext {

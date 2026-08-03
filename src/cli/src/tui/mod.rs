@@ -10,6 +10,7 @@ mod highlight;
 mod input;
 mod markdown;
 mod render;
+mod scrollback;
 mod team;
 mod theme;
 mod view;
@@ -210,17 +211,6 @@ fn describe_input(tool: &str, input: &serde_json::Value) -> String {
     }
 }
 
-/// Return true if an event should reach the App. Root-agent events feed the main
-/// transcript; subagent events + inter-agent messages feed the team drawer's
-/// per-agent threads (`App.teams`). Effectively everything is forwarded now; the
-/// apply site routes each event to the right place by agent id.
-fn is_ui_event(e: &AgentEvent) -> bool {
-    // Completion events carry only usage accounting; still forwarded so the usage
-    // interceptor at the apply site sees them.
-    let _ = e;
-    true
-}
-
 fn now_stamp() -> String {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -350,9 +340,9 @@ pub async fn run(
     {
         let evt_tx = evt_tx.clone();
         bus.on(Arc::new(move |e: &AgentEvent| {
-            if is_ui_event(e) {
-                let _ = evt_tx.send(e.clone());
-            }
+            // Every event is forwarded to the UI channel; the apply site routes each
+            // to the main transcript or a team-drawer thread by agent id.
+            let _ = evt_tx.send(e.clone());
         }));
     }
 
@@ -652,14 +642,14 @@ pub async fn run(
                             if let Some(d) = app.team_drawer.as_mut() {
                                 d.scroll = d.scroll.saturating_sub(1);
                             } else {
-                                app.scroll_up = app.scroll_up.saturating_add(1);
+                                app.scrollback.scroll_up(1);
                             }
                         }
                         MouseEventKind::ScrollDown => {
                             if let Some(d) = app.team_drawer.as_mut() {
                                 d.scroll = d.scroll.saturating_add(1);
                             } else {
-                                app.scroll_up = app.scroll_up.saturating_sub(1);
+                                app.scrollback.scroll_down(1);
                             }
                         }
                         MouseEventKind::Down(MouseButton::Left) => {
@@ -718,7 +708,7 @@ pub async fn run(
                 // Follow new output only when already pinned to the bottom. If the
                 // user has scrolled up to read, don't yank them back down on every
                 // streamed token.
-                if app.scroll_up == 0 {
+                if app.scrollback.at_bottom() {
                     app.stick_to_bottom();
                 }
             }
@@ -903,8 +893,6 @@ enum KeyOutcome {
 struct App {
     view: ViewModel,
     input: input::Input,
-    /// Lines scrolled up from the bottom (0 = stuck to bottom).
-    scroll_up: u16,
     spinner: usize,
     pending_perm: Option<PendingPerm>,
     /// Filtered slash-command menu, when the input starts with '/'.
@@ -965,31 +953,8 @@ struct App {
     todos: Option<Arc<bob_core::tools::todo::TodoStore>>,
     /// Active theme name (for the /theme picker's current-selection + direct set).
     theme_name: String,
-    /// Per-cell render cache: index → (cache key, rendered lines). The key folds
-    /// the cell fingerprint, group flag, width, and theme generation, so a hit
-    /// means the cell renders identically and we can skip markdown/highlighting.
-    render_cache: Vec<(u64, Vec<Line<'static>>)>,
-    /// Flattened, display-ready lines for the WHOLE scrollback (all cells wrapped +
-    /// inset, concatenated). Rebuilt only when `display_sig` changes; a plain scroll
-    /// reuses it and just re-windows, so scrolling an idle transcript is O(viewport)
-    /// rather than O(total lines).
-    display_cache: Vec<Line<'static>>,
-    /// Signature of the inputs that produced `display_cache` (folded cell keys +
-    /// width + theme + the transient working line). A mismatch triggers a rebuild.
-    display_sig: u64,
-    /// Parallel to `display_cache`: the source cell index for each display line (or
-    /// `None` for the transient working line / spacers). Lets a click in the
-    /// scrollback map back to which tool cell to expand/collapse.
-    line_owner: Vec<Option<usize>>,
-    /// The scrollback viewport rect + the index of the first visible display line,
-    /// captured each draw so a click row maps to a `line_owner` entry.
-    scrollback_rect: Option<Rect>,
-    scrollback_start: usize,
-    /// The `max_scroll` from the previous scrollback draw. When new lines are
-    /// generated while the user is scrolled up, we bump `scroll_up` by the growth so
-    /// their ABSOLUTE view stays put (scroll_up is distance-from-bottom, so without
-    /// this the viewport drifts down one line per generated line).
-    prev_max_scroll: usize,
+    /// The main transcript viewport: render caches, scroll position, click map.
+    scrollback: scrollback::ScrollbackRenderer,
     /// Per-agent transcripts for the team drawer (fed by subagent events).
     teams: team::AgentTranscripts,
     /// Team drawer overlay state; `None` when closed.
@@ -1033,7 +998,6 @@ impl App {
         App {
             view: ViewModel::new(),
             input: input::Input::new(),
-            scroll_up: 0,
             spinner: 0,
             pending_perm: None,
             menu: Vec::new(),
@@ -1067,13 +1031,7 @@ impl App {
             lsp: None,
             todos: None,
             theme_name: "dark".to_string(),
-            render_cache: Vec::new(),
-            display_cache: Vec::new(),
-            display_sig: 0,
-            line_owner: Vec::new(),
-            scrollback_rect: None,
-            scrollback_start: 0,
-            prev_max_scroll: 0,
+            scrollback: scrollback::ScrollbackRenderer::new(),
             teams: team::AgentTranscripts::new(),
             team_drawer: None,
             roster_rect: None,
@@ -1083,7 +1041,7 @@ impl App {
     }
 
     fn stick_to_bottom(&mut self) {
-        self.scroll_up = 0;
+        self.scrollback.stick_to_bottom();
     }
 
     fn refresh_menu(&mut self) {
@@ -1482,26 +1440,13 @@ impl App {
     }
 
     /// Toggle a tool cell's expanded state when the scrollback is clicked at
-    /// `col`/`row`. Maps the screen row → display line → owning cell via
-    /// `line_owner`; only `Cell::Tool` cells toggle. Returns true if something
-    /// toggled (so the caller can mark dirty + bump the view revision).
+    /// `row`. Maps the row → cell via the scrollback's hit-test; only `Cell::Tool`
+    /// cells toggle. Returns true if something toggled (so the caller marks dirty).
     fn click_scrollback(&mut self, _col: u16, row: u16) -> bool {
-        let Some(rect) = self.scrollback_rect else {
-            return false;
-        };
-        if row < rect.y || row >= rect.y + rect.height {
-            return false;
+        match self.scrollback.hit_test(row) {
+            Some(cell_idx) => self.view.toggle_tool_expanded(cell_idx),
+            None => false,
         }
-        let line_idx = self.scrollback_start + (row - rect.y) as usize;
-        let Some(Some(cell_idx)) = self.line_owner.get(line_idx).copied() else {
-            return false;
-        };
-        if let Some(view::Cell::Tool { expanded, .. }) = self.view.cells.get_mut(cell_idx) {
-            *expanded = !*expanded;
-            self.view.revision += 1;
-            return true;
-        }
-        false
     }
 
     /// `hovered` to the roster index under the cursor, or `None` when off-roster.
@@ -1713,11 +1658,11 @@ impl App {
                 return KeyOutcome::None;
             }
             (KeyCode::PageUp, _) => {
-                self.scroll_up = self.scroll_up.saturating_add(10);
+                self.scrollback.scroll_up(10);
                 return KeyOutcome::None;
             }
             (KeyCode::PageDown, _) => {
-                self.scroll_up = self.scroll_up.saturating_sub(10);
+                self.scrollback.scroll_down(10);
                 return KeyOutcome::None;
             }
             _ => {}
@@ -1844,8 +1789,7 @@ impl App {
         match cmd {
             "/exit" => Some(KeyOutcome::Quit),
             "/clear" => {
-                self.view.cells.clear();
-                self.view.revision += 1;
+                self.view.clear();
                 Some(KeyOutcome::None)
             }
             "/copy" => {

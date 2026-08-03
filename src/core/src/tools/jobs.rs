@@ -170,6 +170,9 @@ pub struct JobStatusTool;
 
 #[async_trait]
 impl Tool for JobStatusTool {
+    fn is_read_only(&self) -> bool {
+        true
+    }
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "job_status".to_string(),
@@ -214,6 +217,9 @@ pub struct JobOutputTool;
 
 #[async_trait]
 impl Tool for JobOutputTool {
+    fn is_read_only(&self) -> bool {
+        true
+    }
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "job_output".to_string(),

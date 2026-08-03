@@ -15,7 +15,7 @@
 //! spawner keeps control and can do other work while children run, with no
 //! blocking primitive that could deadlock.
 
-use crate::agent::agent::{Agent, AgentConfig};
+use crate::agent::agent::{build_subagent, SubagentSpec, SUBAGENT_MAX_TURNS};
 use crate::agent::team::{mailbox, AgentRegistry, AgentStatus};
 use crate::core::events::EventBus;
 use crate::core::types::ToolSpec;
@@ -159,7 +159,7 @@ impl Tool for SpawnAgentTool {
         }));
 
         // Assemble the child agent, itself a team member (so it can coordinate).
-        let child = Agent::new(AgentConfig {
+        let child = build_subagent(SubagentSpec {
             provider: self.deps.provider.clone(),
             tools: child_tools,
             bus: self.deps.bus.clone(),
@@ -169,18 +169,13 @@ impl Tool for SpawnAgentTool {
             } else {
                 self.deps.cwd.clone()
             },
-            max_turns: 100,
-            id: Some(name.clone()),
-            context_window: 200_000,
-            compact_threshold: 0.8,
-            keep_recent: 6,
             jobs: self.deps.jobs.clone(),
-            user_asker: None,
             lsp: self.deps.lsp.clone(),
+            name: name.clone(),
+            max_turns: SUBAGENT_MAX_TURNS,
+            depth: child_depth,
             inbox: Some(inbox),
             team: Some(self.deps.team.clone()),
-            name: name.clone(),
-            depth: child_depth,
         });
 
         // Run in the background. On completion, deliver the result back to the
@@ -275,6 +270,9 @@ pub struct ListAgentsTool {
 
 #[async_trait]
 impl Tool for ListAgentsTool {
+    fn is_read_only(&self) -> bool {
+        true
+    }
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "list_agents".to_string(),

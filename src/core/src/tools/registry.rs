@@ -67,6 +67,16 @@ pub struct CoordContext {
 pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
     async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult;
+    /// Whether this tool only *observes* state (never mutates the workspace or
+    /// shared state). Read-only tools can run concurrently with siblings in one
+    /// turn, and are the set an `explore` agent is limited to. Defaults to false
+    /// (the conservative choice); read-only tools override to true. This is the
+    /// SINGLE source of truth for "is this tool read-only" — the agent loop's
+    /// concurrency split and the explore-subset both consume it, so they can't
+    /// drift. (Permission auto-allow is a separate, broader notion — see policies.)
+    fn is_read_only(&self) -> bool {
+        false
+    }
     /// Optionally produce a human-readable preview of what this call *would* do,
     /// computed WITHOUT side effects. Shown in the permission prompt before the
     /// user approves. Edit/write tools return a ```diff block; most return None.
@@ -200,24 +210,24 @@ impl ToolRegistry {
         self.tools.get(name).cloned()
     }
 
+    /// Whether the named tool is read-only (only observes state). Unknown tools are
+    /// treated as NOT read-only — the conservative default. Single source of truth
+    /// via `Tool::is_read_only`, consumed by the agent loop's concurrency split and
+    /// the explore-subset below.
+    pub fn is_read_only(&self, name: &str) -> bool {
+        self.tools.get(name).is_some_and(|t| t.is_read_only())
+    }
+
     /// A new registry containing only the read-only tools from this one — reads,
     /// searches, navigation, web. Used to build the `explore` subagent, which must
-    /// not mutate the workspace. Unknown/mutating tools (edit, write, bash, etc.)
-    /// are dropped, so an explore agent physically cannot change anything.
+    /// not mutate the workspace. Mutating tools (edit, write, bash, etc.) are
+    /// dropped, so an explore agent physically cannot change anything. Membership
+    /// comes from `Tool::is_read_only` — one source of truth.
     pub fn read_only_subset(&self) -> ToolRegistry {
-        const READ_ONLY: &[&str] = &[
-            "read_file",
-            "list_dir",
-            "glob",
-            "grep",
-            "lsp",
-            "web_fetch",
-            "web_search",
-        ];
         let mut out = ToolRegistry::new(self.permissions.clone());
         for name in &self.order {
-            if READ_ONLY.contains(&name.as_str()) {
-                if let Some(t) = self.tools.get(name) {
+            if let Some(t) = self.tools.get(name) {
+                if t.is_read_only() {
                     out.add(t.clone());
                 }
             }

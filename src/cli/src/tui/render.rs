@@ -2,6 +2,7 @@
 
 use super::diffview::{diff_header, render_diff};
 use super::highlight::highlight_line;
+use super::indent_line;
 use super::markdown::render_markdown;
 use super::theme::Palette;
 use super::view::{Cell, ToolStatus};
@@ -253,9 +254,9 @@ fn render_tool(
     }
     if let Some((head, lang, body)) = parse_diff_output(output) {
         // Edit tools: "edited x (+a -b)" then a ```diff <path> body.
-        out.push(indent(diff_header(&head)));
+        out.push(indent_line(diff_header(&head)));
         for l in render_diff(&body, &lang) {
-            out.push(indent(l));
+            out.push(indent_line(l));
         }
         out.push(Line::from(""));
         return;
@@ -305,12 +306,6 @@ fn parse_diff_output(output: &str) -> Option<(String, String, String)> {
     let end = rest.find("```").unwrap_or(rest.len());
     let body = rest[..end].trim_end_matches('\n').to_string();
     Some((header, lang, body))
-}
-
-fn indent(line: Line<'static>) -> Line<'static> {
-    let mut spans = vec![Span::raw("   ")];
-    spans.extend(line.spans);
-    Line::from(spans)
 }
 
 /// Render a small markdown snippet (used for the permission preview diff). The

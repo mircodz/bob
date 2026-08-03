@@ -5,7 +5,10 @@
 //! with its own mailbox so children can report back to it. This module owns that
 //! wiring once so the two frontends can't drift.
 
-use crate::agent::agent::{Agent, AgentConfig};
+use crate::agent::agent::{
+    Agent, AgentConfig, COMPACT_THRESHOLD, CONTEXT_WINDOW, DEFAULT_MAX_TURNS, KEEP_RECENT,
+    ROOT_AGENT_ID,
+};
 use crate::agent::team::{mailbox, AgentRegistry};
 use crate::core::events::EventBus;
 use crate::lsp::LspManager;
@@ -17,13 +20,6 @@ use crate::tools::lsp_actions::{CodeActionTool, RenameSymbolTool};
 use crate::tools::registry::{Tool, ToolRegistry, UserAsker};
 use crate::tools::task::TaskTool;
 use std::sync::Arc;
-
-/// The tuning knobs shared by every root agent. Centralized so the two frontends
-/// stop repeating the same literals (and silently disagreeing).
-const CONTEXT_WINDOW: usize = 200_000;
-const COMPACT_THRESHOLD: f64 = 0.8;
-const KEEP_RECENT: usize = 6;
-const DEFAULT_MAX_TURNS: u32 = 200;
 
 /// Everything a frontend must supply to build the root agent. The frontend still
 /// owns process-level concerns (event bus, permission engine, how it asks the
@@ -134,7 +130,7 @@ pub fn build_root_agent(p: RootAgentParams) -> Agent {
     // can report their results back to "root" and wake it for a fresh turn.
     let (root_inbox, root_tx) = mailbox();
     p.team
-        .register("root".to_string(), 0, String::new(), root_tx);
+        .register(ROOT_AGENT_ID.to_string(), 0, String::new(), root_tx);
 
     Agent::new(AgentConfig {
         provider: p.provider.clone(),
@@ -143,7 +139,7 @@ pub fn build_root_agent(p: RootAgentParams) -> Agent {
         system: Some(p.system_prompt.clone()),
         cwd: p.cwd.clone(),
         max_turns: p.max_turns.unwrap_or(DEFAULT_MAX_TURNS),
-        id: Some("root".to_string()),
+        id: Some(ROOT_AGENT_ID.to_string()),
         context_window: CONTEXT_WINDOW,
         compact_threshold: COMPACT_THRESHOLD,
         keep_recent: KEEP_RECENT,
@@ -152,7 +148,7 @@ pub fn build_root_agent(p: RootAgentParams) -> Agent {
         lsp: p.lsp.clone(),
         inbox: Some(root_inbox),
         team: Some(p.team.clone()),
-        name: "root".to_string(),
+        name: ROOT_AGENT_ID.to_string(),
         depth: 0,
     })
 }

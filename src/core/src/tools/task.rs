@@ -4,7 +4,9 @@
 //! detached as a background *job*; the tool returns immediately with job ids the
 //! model later polls via job_status / job_output.
 
-use crate::agent::agent::{Agent, AgentConfig};
+use crate::agent::agent::{
+    build_subagent, Agent, SubagentSpec, EXPLORE_MAX_TURNS, ROOT_AGENT_ID, SUBAGENT_MAX_TURNS,
+};
 use crate::core::events::EventBus;
 use crate::core::types::ToolSpec;
 use crate::providers::provider::Provider;
@@ -30,27 +32,21 @@ pub struct TaskTool {
 impl TaskTool {
     /// Build a subagent for one task and return the future that runs it.
     fn make_child(&self, id: String, cwd: String) -> Agent {
-        Agent::new(AgentConfig {
+        // The simple `task` tool stays fire-and-forget: its children are not team
+        // members (no inbox/registry). Coordinated agents come from `spawn_agent`.
+        build_subagent(SubagentSpec {
             provider: self.provider.clone(),
             tools: self.subagent_tools.clone(),
             bus: self.bus.clone(),
             system: self.subagent_system.clone(),
             cwd,
-            max_turns: 100,
-            id: Some(id),
-            context_window: 200_000,
-            compact_threshold: 0.8,
-            keep_recent: 6,
             jobs: self.jobs.clone(),
-            user_asker: None,
             lsp: self.lsp.clone(),
-            // The simple `task` tool stays fire-and-forget: its children are not
-            // team members (no inbox/registry). Coordinated agents come from the
-            // separate `spawn_agent` path.
+            name: id,
+            max_turns: SUBAGENT_MAX_TURNS,
+            depth: 1,
             inbox: None,
             team: None,
-            name: "subagent".to_string(),
-            depth: 1,
         })
     }
 }
@@ -137,7 +133,7 @@ impl Tool for TaskTool {
             let id = format!("task_{}", i + 1);
             self.bus
                 .emit(crate::core::events::AgentEvent::SubagentSpawn {
-                    parent_id: "root".to_string(),
+                    parent_id: ROOT_AGENT_ID.to_string(),
                     agent_id: id.clone(),
                     task: description.clone(),
                     prompt: prompt.clone(),
@@ -241,31 +237,26 @@ impl Tool for ExploreTool {
         let id = "explore".to_string();
         self.bus
             .emit(crate::core::events::AgentEvent::SubagentSpawn {
-                parent_id: "root".to_string(),
+                parent_id: ROOT_AGENT_ID.to_string(),
                 agent_id: id.clone(),
                 task: label,
                 prompt: query.clone(),
             });
 
         // A read-only child: only reads/searches, its own focused prompt.
-        let mut child = Agent::new(AgentConfig {
+        let mut child = build_subagent(SubagentSpec {
             provider: self.provider.clone(),
             tools: self.subagent_tools.read_only_subset(),
             bus: self.bus.clone(),
             system: Some(EXPLORE_SYSTEM.to_string()),
             cwd,
-            max_turns: 60,
-            id: Some(id.clone()),
-            context_window: 200_000,
-            compact_threshold: 0.8,
-            keep_recent: 6,
             jobs: self.jobs.clone(),
-            user_asker: None,
             lsp: self.lsp.clone(),
+            name: id.clone(),
+            max_turns: EXPLORE_MAX_TURNS,
+            depth: 1,
             inbox: None,
             team: None,
-            name: "explore".to_string(),
-            depth: 1,
         });
         let (out, failed) = match child.run(&query).await {
             Ok(out) => (out, false),

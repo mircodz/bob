@@ -4,7 +4,7 @@
 //! child module, they can access App's private fields directly.
 
 use super::theme::Palette;
-use super::{indent_line, render, shimmer_spans, team, theme, truncate_mid, view, wrap_line, App};
+use super::{indent_line, render, team, truncate_mid, App};
 use bob_core::core::permissions::Mode;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -478,169 +478,13 @@ impl App {
     }
 
     fn draw_scrollback(&mut self, f: &mut ratatui::Frame, full: Rect) {
-        use std::hash::{Hash, Hasher};
-        // Inset the whole scrollback horizontally so content (and the full-width
-        // user band) has breathing room on BOTH sides, not just a left indent.
-        const SIDE_PAD: u16 = 2;
-        let full = Rect {
-            x: full.x + SIDE_PAD,
-            y: full.y,
-            width: full.width.saturating_sub(SIDE_PAD * 2),
-            height: full.height,
-        };
-        let width_full = full.width as usize;
-        // The inset wrap width for non-user cells (2-col hanging indent).
-        let width = full.width.max(1) as usize;
-        let theme_gen = theme::generation();
-        let cells = &self.view.cells;
-        // Keep the cache index-aligned with the cell list.
-        if self.render_cache.len() != cells.len() {
-            self.render_cache.resize(cells.len(), (0, Vec::new()));
-        }
-
-        // Cheap rebuild trigger: the view's revision counter (bumped only when cells
-        // actually change) plus width/theme and the transient working-line tick. A
-        // pure scroll never mutates the view, so `sig` is stable and we skip the
-        // rebuild entirely — no per-cell hashing, so cost is O(1) per scroll frame
-        // regardless of transcript length. (Hashing every cell each frame was what
-        // made scrolling get slower as the conversation grew.)
         let working = self.running || self.view.busy;
-        let mut sig_hasher = std::collections::hash_map::DefaultHasher::new();
-        self.view.revision.hash(&mut sig_hasher);
-        width_full.hash(&mut sig_hasher);
-        theme_gen.hash(&mut sig_hasher);
-        working.hash(&mut sig_hasher);
-        if working {
-            self.spinner.hash(&mut sig_hasher);
-            self.turn_started
-                .map(|t| t.elapsed().as_secs())
-                .unwrap_or(0)
-                .hash(&mut sig_hasher);
-        }
-        let sig = sig_hasher.finish();
-
-        // Rebuild the flattened display lines only when the signature changed. The
-        // per-cell render_cache still avoids re-rendering unchanged cells during a
-        // rebuild (only the one cell that changed is re-wrapped).
-        let stale = self.display_cache.is_empty() && !cells.is_empty();
-        if sig != self.display_sig || stale {
-            let mut flat: Vec<Line> = Vec::new();
-            let mut owners: Vec<Option<usize>> = Vec::new();
-            for (i, cell) in cells.iter().enumerate() {
-                let is_user = matches!(cell, view::Cell::User(_));
-                let key = {
-                    let mut h = std::collections::hash_map::DefaultHasher::new();
-                    cell.fingerprint().hash(&mut h);
-                    width_full.hash(&mut h);
-                    theme_gen.hash(&mut h);
-                    h.finish()
-                };
-                let slot = &mut self.render_cache[i];
-                if slot.0 != key {
-                    // Render, then wrap + inset once, storing display-ready lines.
-                    let mut rendered = Vec::new();
-                    render::render_cell(cell, width_full, &mut rendered);
-                    let wrap_width = if is_user {
-                        width
-                    } else {
-                        // Reserve columns for BOTH the 2-col left hanging indent and
-                        // a matching 2-col right margin, so wrapped text has even
-                        // breathing room on each side instead of hugging the edge.
-                        width.saturating_sub(4).max(1)
-                    };
-                    let mut display = Vec::new();
-                    for l in rendered {
-                        for mut wl in wrap_line(l, wrap_width) {
-                            if !is_user {
-                                wl.spans.insert(0, Span::raw("  "));
-                            }
-                            display.push(wl);
-                        }
-                    }
-                    *slot = (key, display);
-                }
-                for line in &slot.1 {
-                    flat.push(line.clone());
-                    owners.push(Some(i));
-                }
-            }
-
-            // The transient "Working" line: a shimmering label with elapsed seconds
-            // and the interrupt hint. Regenerated as part of a rebuild (its state is
-            // folded into `sig`, so it refreshes each tick while running).
-            if working {
-                let secs = self
-                    .turn_started
-                    .map(|t| t.elapsed().as_secs())
-                    .unwrap_or(0);
-                let mut spans: Vec<Span> = vec![Span::styled(
-                    "  • ",
-                    Style::default().fg(Palette::RUNNING()),
-                )];
-                spans.extend(shimmer_spans("Working", self.spinner));
-                spans.push(Span::styled(
-                    format!(" ({}s · esc to interrupt)", secs),
-                    Style::default().fg(Palette::FAINT()),
-                ));
-                for wl in wrap_line(Line::from(spans), width) {
-                    flat.push(wl);
-                    owners.push(None);
-                }
-            }
-
-            self.display_cache = flat;
-            self.line_owner = owners;
-            self.display_sig = sig;
-        }
-
-        let area = full;
-        let viewport = area.height as usize;
-        let total = self.display_cache.len();
-        let max_scroll = total.saturating_sub(viewport);
-        // Keep the user's ABSOLUTE scroll position fixed across content changes that
-        // aren't new output at the bottom — expanding/collapsing a tool cell, etc.
-        // `scroll_up` is distance-from-bottom, so when `max_scroll` changes we shift
-        // it by the SAME delta (grow OR shrink) so `start = max_scroll - scroll_up`
-        // is unchanged and the viewport doesn't move. Only when pinned to the bottom
-        // (scroll_up == 0) do we intentionally keep following new output.
-        if self.scroll_up > 0 {
-            let delta = max_scroll as i64 - self.prev_max_scroll as i64;
-            let adjusted = (self.scroll_up as i64 + delta).clamp(0, max_scroll as i64);
-            self.scroll_up = adjusted as u16;
-        }
-        self.prev_max_scroll = max_scroll;
-        self.scroll_up = self.scroll_up.min(max_scroll as u16);
-        let start = max_scroll.saturating_sub(self.scroll_up as usize);
-        // Remember the viewport + first-visible line so a click can map a screen row
-        // back to a cell (via line_owner).
-        self.scrollback_rect = Some(area);
-        self.scrollback_start = start;
-        let window: Vec<Line> = self
-            .display_cache
-            .iter()
-            .skip(start)
-            .take(viewport)
-            .cloned()
-            .collect();
-
-        f.render_widget(Paragraph::new(window), area);
-
-        // Scroll hint when not at the bottom.
-        if self.scroll_up > 0 {
-            let hint = Rect {
-                x: area.x + area.width.saturating_sub(10),
-                y: area.y,
-                width: 10,
-                height: 1,
-            };
-            f.render_widget(
-                Paragraph::new(Span::styled(
-                    " ↑ scrolled ",
-                    Style::default().fg(Palette::WARN()).bg(Palette::POPUP_BG()),
-                )),
-                hint,
-            );
-        }
+        let secs = self
+            .turn_started
+            .map(|t| t.elapsed().as_secs())
+            .unwrap_or(0);
+        self.scrollback
+            .render(f, full, &self.view, working, self.spinner, secs);
     }
 
     /// A one-line status bar below the input: cwd · branch · mode.

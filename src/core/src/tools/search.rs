@@ -12,6 +12,9 @@ pub struct GlobTool;
 
 #[async_trait]
 impl Tool for GlobTool {
+    fn is_read_only(&self) -> bool {
+        true
+    }
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "glob".to_string(),
@@ -86,6 +89,9 @@ pub struct GrepTool;
 
 #[async_trait]
 impl Tool for GrepTool {
+    fn is_read_only(&self) -> bool {
+        true
+    }
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "grep".to_string(),

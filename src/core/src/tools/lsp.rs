@@ -26,6 +26,9 @@ impl LspTool {
 
 #[async_trait]
 impl Tool for LspTool {
+    fn is_read_only(&self) -> bool {
+        true
+    }
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "lsp".to_string(),

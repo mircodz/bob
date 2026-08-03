@@ -248,6 +248,26 @@ impl ViewModel {
         self.revision += 1;
     }
 
+    /// Clear the whole transcript (the `/clear` command).
+    pub fn clear(&mut self) {
+        self.cells.clear();
+        self.revision += 1;
+    }
+
+    /// Toggle a tool cell's expanded/collapsed output at `idx`. Returns true if a
+    /// tool cell was actually toggled. Going through this method (rather than poking
+    /// `cells` directly) guarantees the render-cache revision is bumped, so the
+    /// "forgot to bump → stale render" bug can't happen.
+    pub fn toggle_tool_expanded(&mut self, idx: usize) -> bool {
+        if let Some(Cell::Tool { expanded, .. }) = self.cells.get_mut(idx) {
+            *expanded = !*expanded;
+            self.revision += 1;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Rebuild the scrollback from a stored message history (on `--resume`).
     /// Tool results are matched back to their tool_use cell by id.
     pub fn hydrate(&mut self, messages: &[Message]) {
@@ -365,17 +385,6 @@ impl ViewModel {
         }
     }
 
-    /// Index of the currently-open assistant cell, if any.
-    fn open_assistant(&mut self) -> Option<&mut Cell> {
-        match self.cells.last_mut() {
-            Some(c @ Cell::Assistant { .. }) => match c {
-                Cell::Assistant { open, .. } if *open => Some(c),
-                _ => None,
-            },
-            _ => None,
-        }
-    }
-
     fn find_tool(&mut self, id: &str) -> Option<&mut Cell> {
         self.cells
             .iter_mut()
@@ -445,7 +454,7 @@ impl ViewModel {
                 }
             }
             AgentEvent::TurnEnd { .. } => {
-                if let Some(Cell::Assistant { open, .. }) = self.open_assistant() {
+                if let Some(Cell::Assistant { open, .. }) = open_assistant_in(&mut self.cells) {
                     *open = false;
                 }
                 // Per-turn token counts are intentionally not rendered as a cell —

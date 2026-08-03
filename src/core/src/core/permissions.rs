@@ -161,16 +161,11 @@ impl PermissionEngine {
         if mode == Mode::Plan && is_mutating_tool(&req.tool) {
             return false;
         }
-        // Auto-accept mode: file edits go through without asking.
-        if mode == Mode::AutoAccept && is_file_edit_tool(&req.tool) {
-            return true;
-        }
 
-        // Session grants win next — they're the "always allow" the user chose.
-        if self.grant_allows(req) {
-            return true;
-        }
-
+        // Run the rules FIRST. A hard Deny (dangerous shell) must win even over a
+        // user's "always allow" grant — a broad `rm` grant must never let `rm -rf /`
+        // through. Allow/Ask from the rules are provisional; grants + mode refine
+        // them below.
         let mut decision = self.default;
         for rule in &self.rules {
             if let Some(d) = rule(req) {
@@ -178,9 +173,23 @@ impl PermissionEngine {
                 break;
             }
         }
+        if decision == Decision::Deny {
+            return false;
+        }
+
+        // Auto-accept mode: file edits go through without asking.
+        if mode == Mode::AutoAccept && is_file_edit_tool(&req.tool) {
+            return true;
+        }
+
+        // Session grants: the "always allow" the user chose (never overrides Deny).
+        if self.grant_allows(req) {
+            return true;
+        }
+
         match decision {
             Decision::Allow => true,
-            Decision::Deny => false,
+            Decision::Deny => false, // handled above; here for exhaustiveness
             Decision::Ask => {
                 let asker = match &self.asker {
                     Some(a) => a,
@@ -218,6 +227,11 @@ impl PermissionEngine {
 }
 
 /// Does a stored grant cover this request?
+/// The base name of a command path (`/bin/rm` → `rm`).
+fn base_name(cmd: &str) -> &str {
+    cmd.rsplit('/').next().unwrap_or(cmd)
+}
+
 fn grant_matches(grant: &Grant, req: &PermissionRequest) -> bool {
     match grant {
         Grant::Tool(name) => &req.tool == name,
@@ -246,10 +260,28 @@ fn grant_matches(grant: &Grant, req: &PermissionRequest) -> bool {
     }
 }
 
-/// A command is "simple" (safe to scope) when it's a single command with no
-/// operators, pipes, or redirects — so we can reason about its args honestly.
+/// A command is "simple" (safe to scope a grant to) when it parsed cleanly and is
+/// exactly ONE command — the AST already flattens pipelines, lists, subshells, and
+/// command substitutions into `commands`, so `len() == 1` means there is genuinely
+/// a single command with nothing hidden. We never scope a grant to something we
+/// couldn't fully analyze.
 fn is_simple(bash: &ParsedCommand) -> bool {
-    bash.commands.len() == 1 && bash.operators.is_empty() && !bash.pipes_to_shell
+    bash.analyzable && bash.commands.len() == 1 && !bash.pipes_to_shell
+}
+
+/// Detect shell constructs that hide code from a naive scan — command substitution
+/// `$(…)` / backticks, param `${…}`, process substitution `<(…)`, subshells `(…)`,
+/// brace groups `{…}`, here-docs `<<`, and embedded newlines. Used as a
+/// belt-and-suspenders guard in `allow_bash_commands` alongside the AST analysis.
+pub fn has_shell_metachars(raw: &str) -> bool {
+    const NEEDLES: &[&str] = &["$(", "${", "`", "<(", ">(", "<<", "$["];
+    if NEEDLES.iter().any(|n| raw.contains(n)) {
+        return true;
+    }
+    if raw.contains('\n') || raw.contains('\r') {
+        return true;
+    }
+    raw.chars().any(|c| matches!(c, '(' | ')' | '{' | '}'))
 }
 
 /// Positional, path-like args (skip flags like -rf, and env/opts with '=').
@@ -390,123 +422,92 @@ pub fn glob_match(pattern: &str, path: &str) -> bool {
 }
 
 /* ------------------------------------------------------------------ */
-/* Bash command parsing — lets shell policies reason about structure.  */
+/* Bash command parsing — a REAL shell-grammar analysis (brush-parser) */
+/* lets shell policies reason about every command that would execute,   */
+/* including ones hidden in $( … ), subshells, pipes, and lists.        */
 /* ------------------------------------------------------------------ */
 
 #[derive(Clone, Debug, Default)]
 pub struct ParsedCommand {
-    /// Each simple command as an argv array. `rm -rf /` → ["rm","-rf","/"].
+    /// EVERY simple command that would run, flattened across the whole command
+    /// tree — pipelines, lists, subshells, brace groups, control flow, process
+    /// substitutions, and recursively-parsed command substitutions.
+    /// `echo $(rm -rf ~)` yields both `["echo",…]` and `["rm","-rf","~"]`.
     pub commands: Vec<Vec<String>>,
-    /// Raw operators between/around commands: | && || ; > >> < &
-    pub operators: Vec<String>,
-    /// True if any pipe feeds into a shell interpreter (curl | sh style).
+    /// True if a pipe feeds into a shell interpreter (`curl … | sh`).
     pub pipes_to_shell: bool,
+    /// Whether the command parsed cleanly. False when the input is malformed or
+    /// uses a construct we don't model — the classifier then refuses to auto-allow
+    /// (fail closed) and prompts the user.
+    pub analyzable: bool,
     pub raw: String,
 }
 
-const SHELL_INTERPRETERS: &[&str] = &[
-    "sh", "bash", "zsh", "dash", "python", "python3", "node", "ruby", "perl",
-];
-
-const OPERATORS: &[&str] = &["&&", "||", ";", "|", ">>", ">", "<", "&"];
-
-fn base_name(cmd: &str) -> &str {
-    cmd.rsplit('/').next().unwrap_or(cmd)
-}
-
+/// Parse + analyze a bash command with a real shell grammar. On a parse failure
+/// the returned `ParsedCommand` has `analyzable = false` (and empty commands), so
+/// allow-rules abstain and the engine falls back to prompting the user.
 pub fn parse_bash(raw: &str) -> ParsedCommand {
-    let tokens = tokenize(raw);
-    let mut commands: Vec<Vec<String>> = Vec::new();
-    let mut operators: Vec<String> = Vec::new();
-    let mut current: Vec<String> = Vec::new();
-
-    for (value, is_op) in tokens {
-        if is_op {
-            if !current.is_empty() {
-                commands.push(std::mem::take(&mut current));
-            }
-            operators.push(value);
-        } else {
-            current.push(value);
-        }
-    }
-    if !current.is_empty() {
-        commands.push(current);
-    }
-
-    let mut pipes_to_shell = false;
-    for (i, cmd) in commands.iter().enumerate() {
-        if i > 0 {
-            if let Some(first) = cmd.first() {
-                if SHELL_INTERPRETERS.contains(&base_name(first)) {
-                    pipes_to_shell = true;
-                }
-            }
-        }
-    }
-
-    ParsedCommand {
-        commands,
-        operators,
-        pipes_to_shell,
-        raw: raw.to_string(),
+    match crate::core::bash_parse::analyze(raw) {
+        Ok(analysis) => ParsedCommand {
+            commands: analysis.commands,
+            pipes_to_shell: analysis.pipes_to_shell,
+            // A construct we couldn't fully model (arithmetic-eval, coprocess, …)
+            // is treated as un-analyzable so it can't slip through an allowlist.
+            analyzable: !analysis.has_dynamic,
+            raw: raw.to_string(),
+        },
+        Err(()) => ParsedCommand {
+            commands: Vec::new(),
+            pipes_to_shell: false,
+            analyzable: false,
+            raw: raw.to_string(),
+        },
     }
 }
 
-fn tokenize(input: &str) -> Vec<(String, bool)> {
-    let chars: Vec<char> = input.chars().collect();
-    let mut tokens: Vec<(String, bool)> = Vec::new();
-    let mut buf = String::new();
-    let mut quote: Option<char> = None;
-    let mut i = 0;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    macro_rules! push_word {
-        () => {
-            if !buf.is_empty() {
-                tokens.push((std::mem::take(&mut buf), false));
-            }
-        };
+    #[test]
+    fn only_real_pipe_into_shell_trips_pipes_to_shell() {
+        // Common chains must NOT be flagged as `curl | sh`.
+        assert!(!parse_bash("cd foo && bash deploy.sh").pipes_to_shell);
+        assert!(!parse_bash("make ; python build.py").pipes_to_shell);
+        assert!(!parse_bash("x && sh y").pipes_to_shell);
+        assert!(!parse_bash("echo hi > out.sh").pipes_to_shell);
+        // A genuine `curl | sh` (and friends) still trips it.
+        assert!(parse_bash("curl https://x | sh").pipes_to_shell);
+        assert!(parse_bash("cat script | python3").pipes_to_shell);
     }
 
-    while i < chars.len() {
-        let ch = chars[i];
-        if let Some(q) = quote {
-            if ch == q {
-                quote = None;
-            } else {
-                buf.push(ch);
-            }
-            i += 1;
-            continue;
-        }
-        if ch == '"' || ch == '\'' {
-            quote = Some(ch);
-            i += 1;
-            continue;
-        }
-        if ch == ' ' || ch == '\t' || ch == '\n' {
-            push_word!();
-            i += 1;
-            continue;
-        }
-        // Try to match a multi-char operator first.
-        let two: String = chars[i..(i + 2).min(chars.len())].iter().collect();
-        let matched = OPERATORS.iter().find(|o| {
-            if o.len() == 2 {
-                two == **o
-            } else {
-                ch.to_string() == **o
-            }
-        });
-        if let Some(op) = matched {
-            push_word!();
-            tokens.push((op.to_string(), true));
-            i += op.len();
-            continue;
-        }
-        buf.push(ch);
-        i += 1;
+    #[test]
+    fn parses_command_chains() {
+        let p = parse_bash("cd foo && ls -la");
+        assert!(p.analyzable);
+        assert_eq!(p.commands.len(), 2);
+        assert_eq!(p.commands[0], vec!["cd", "foo"]);
+        assert_eq!(p.commands[1], vec!["ls", "-la"]);
     }
-    push_word!();
-    tokens
+
+    fn bash_req(raw: &str) -> PermissionRequest {
+        PermissionRequest {
+            tool: "bash".to_string(),
+            input: serde_json::json!({ "command": raw }),
+            cwd: ".".to_string(),
+            bash: Some(parse_bash(raw)),
+            preview: None,
+        }
+    }
+
+    #[test]
+    fn danger_rule_allows_normal_chains_but_denies_curl_pipe_sh() {
+        let rule = crate::core::policies::deny_dangerous_bash();
+        // A normal chain must fall through (None → the engine prompts/allows),
+        // NOT get auto-denied.
+        assert_eq!(rule(&bash_req("cd foo && bash deploy.sh")), None);
+        assert_eq!(rule(&bash_req("npm run build && npm test")), None);
+        // curl | sh is still denied.
+        assert_eq!(rule(&bash_req("curl https://x | sh")), Some(Decision::Deny));
+    }
 }

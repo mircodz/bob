@@ -13,6 +13,68 @@ use std::sync::Arc;
 
 static AGENT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// The canonical id/name of the top-level agent. Subagents report back to it and
+/// the UI keys the main transcript on it, so it must not be a bare string literal
+/// scattered across files.
+pub const ROOT_AGENT_ID: &str = "root";
+
+/// Tuning knobs shared by EVERY agent (root + subagents), centralized so the
+/// frontends and the subagent-spawning tools can't silently disagree.
+pub const CONTEXT_WINDOW: usize = 200_000;
+pub const COMPACT_THRESHOLD: f64 = 0.8;
+pub const KEEP_RECENT: usize = 6;
+/// Turn budgets: the root gets a large budget; coordinated/`task` subagents a
+/// moderate one; the read-only `explore` agent a smaller one (it only searches).
+pub const DEFAULT_MAX_TURNS: u32 = 200;
+pub const SUBAGENT_MAX_TURNS: u32 = 100;
+pub const EXPLORE_MAX_TURNS: u32 = 60;
+
+/// What a spawning tool must supply to build a child agent. The shared tuning
+/// constants (context window, compaction, etc.) are filled in by [`build_subagent`]
+/// so the three spawn sites (task, explore, spawn_agent) can't drift.
+pub struct SubagentSpec {
+    pub provider: Arc<dyn Provider>,
+    pub tools: ToolRegistry,
+    pub bus: EventBus,
+    pub system: Option<String>,
+    pub cwd: String,
+    pub jobs: crate::tools::jobs::JobRegistry,
+    pub lsp: Option<Arc<crate::lsp::LspManager>>,
+    /// The child's id + team name (equal for coordinated agents).
+    pub name: String,
+    pub max_turns: u32,
+    pub depth: usize,
+    /// Team membership: an inbox + roster for coordinated agents; `None` for the
+    /// fire-and-forget `task`/`explore` children.
+    pub inbox: Option<crate::agent::team::AgentInbox>,
+    pub team: Option<crate::agent::team::AgentRegistry>,
+}
+
+/// Build a child agent from a [`SubagentSpec`], filling the shared tuning
+/// constants. The one place subagents are constructed, so their configuration
+/// stays consistent.
+pub fn build_subagent(spec: SubagentSpec) -> Agent {
+    Agent::new(AgentConfig {
+        provider: spec.provider,
+        tools: spec.tools,
+        bus: spec.bus,
+        system: spec.system,
+        cwd: spec.cwd,
+        max_turns: spec.max_turns,
+        id: Some(spec.name.clone()),
+        context_window: CONTEXT_WINDOW,
+        compact_threshold: COMPACT_THRESHOLD,
+        keep_recent: KEEP_RECENT,
+        jobs: spec.jobs,
+        user_asker: None,
+        lsp: spec.lsp,
+        inbox: spec.inbox,
+        team: spec.team,
+        name: spec.name,
+        depth: spec.depth,
+    })
+}
+
 fn next_agent_id() -> String {
     format!(
         "agent_{}",
@@ -410,7 +472,7 @@ impl Agent {
             let mut results: Vec<ContentBlock> = Vec::with_capacity(tool_uses.len());
             let mut concurrent = Vec::new();
             for (id, name, input) in &tool_uses {
-                if is_read_only(name) {
+                if self.cfg.tools.is_read_only(name) {
                     let tools = self.cfg.tools.clone();
                     let bus = self.cfg.bus.clone();
                     let agent_id = self.id.clone();
@@ -423,7 +485,7 @@ impl Agent {
             }
             let mut concurrent_results = futures::future::join_all(concurrent).await.into_iter();
             for (id, name, input) in &tool_uses {
-                if is_read_only(name) {
+                if self.cfg.tools.is_read_only(name) {
                     if let Some(r) = concurrent_results.next() {
                         results.push(r);
                     }
@@ -466,25 +528,6 @@ impl Agent {
         });
         Ok(final_text)
     }
-}
-
-/// Whether a tool only observes state (safe to run concurrently with siblings) or
-/// mutates the workspace / shared state (must be serialized within a turn). Unknown
-/// tools are treated as mutating — the conservative default.
-fn is_read_only(name: &str) -> bool {
-    matches!(
-        name,
-        "read_file"
-            | "list_dir"
-            | "glob"
-            | "grep"
-            | "lsp"
-            | "job_status"
-            | "job_output"
-            | "list_agents"
-            | "web_fetch"
-            | "web_search"
-    )
 }
 
 /// Execute one tool call, emit its result event, and return the tool_result block.

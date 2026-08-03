@@ -121,21 +121,29 @@ impl AnthropicProvider {
         body
     }
 
-    async fn request(&self, body: Value) -> anyhow::Result<reqwest::RequestBuilder> {
-        let mut req = self
-            .client
-            .post(&self.base_url)
-            .header("content-type", "application/json")
-            .header("anthropic-version", API_VERSION);
-        req = match &self.auth {
+    /// Apply the auth headers (api-key or OAuth bearer + beta) to a request. Shared
+    /// by the messages request and the models listing so they can't diverge.
+    async fn apply_auth(
+        &self,
+        req: reqwest::RequestBuilder,
+    ) -> anyhow::Result<reqwest::RequestBuilder> {
+        Ok(match &self.auth {
             AuthMode::ApiKey(key) => req.header("x-api-key", key),
             AuthMode::Oauth => {
                 let token = crate::auth::anthropic::access_token().await?;
                 req.header("authorization", format!("Bearer {}", token))
                     .header("anthropic-beta", OAUTH_BETA)
             }
-        };
-        Ok(req.json(&body))
+        })
+    }
+
+    async fn request(&self, body: Value) -> anyhow::Result<reqwest::RequestBuilder> {
+        let req = self
+            .client
+            .post(&self.base_url)
+            .header("content-type", "application/json")
+            .header("anthropic-version", API_VERSION);
+        Ok(self.apply_auth(req).await?.json(&body))
     }
 }
 
@@ -309,19 +317,11 @@ impl Provider for AnthropicProvider {
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {
         // base_url points at .../v1/messages; the models endpoint is .../v1/models.
         let url = self.base_url.replace("/messages", "/models");
-        let mut req = self
+        let req = self
             .client
             .get(&url)
             .header("anthropic-version", API_VERSION);
-        req = match &self.auth {
-            AuthMode::ApiKey(key) => req.header("x-api-key", key),
-            AuthMode::Oauth => {
-                let token = crate::auth::anthropic::access_token().await?;
-                req.header("authorization", format!("Bearer {}", token))
-                    .header("anthropic-beta", OAUTH_BETA)
-            }
-        };
-        let res = req.send().await?;
+        let res = self.apply_auth(req).await?.send().await?;
         if !res.status().is_success() {
             anyhow::bail!(
                 "models {}: {}",

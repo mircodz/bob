@@ -24,3 +24,4 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 toml = "0.8"
 toml_edit = "0.22"
 getrandom = "0.2"
+brush-parser = "0.4.0"
