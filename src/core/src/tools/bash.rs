@@ -3,7 +3,7 @@
 
 use crate::core::types::ToolSpec;
 use crate::tools::jobs::JobStatus;
-use crate::tools::registry::{Tool, ToolContext};
+use crate::tools::registry::{Tool, ToolContext, ToolError, ToolResult};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
@@ -39,7 +39,7 @@ impl Tool for BashTool {
         }
     }
 
-    async fn execute(&self, input: Value, ctx: &ToolContext) -> String {
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
         let command = input["command"].as_str().unwrap_or("").to_string();
         let cwd = ctx.cwd.clone();
 
@@ -51,16 +51,14 @@ impl Tool for BashTool {
             let job_id = id.clone();
             let bg_cmd = command.clone();
             let handle = tokio::spawn(async move {
-                let out = tokio::task::spawn_blocking(move || {
-                    std::process::Command::new("bash")
-                        .arg("-c")
-                        .arg(&bg_cmd)
-                        .current_dir(&cwd)
-                        .output()
-                })
-                .await;
+                let out = tokio::process::Command::new("bash")
+                    .arg("-c")
+                    .arg(&bg_cmd)
+                    .current_dir(&cwd)
+                    .output()
+                    .await;
                 let (status, text) = match out {
-                    Ok(Ok(o)) => (
+                    Ok(o) => (
                         if o.status.success() {
                             JobStatus::Done
                         } else {
@@ -68,49 +66,59 @@ impl Tool for BashTool {
                         },
                         combine_output(&o.stdout, &o.stderr, o.status.code()),
                     ),
-                    Ok(Err(e)) => (JobStatus::Failed, format!("error: {}", e)),
-                    Err(e) => (JobStatus::Failed, format!("error: {}", e)),
+                    Err(e) => (JobStatus::Failed, format!("failed to run: {}", e)),
                 };
                 jobs.finish(&job_id, status, text);
             });
             ctx.jobs
                 .register(id.clone(), "bash", truncate_desc(&command), handle);
-            return format!(
+            return Ok(format!(
                 "started background job {id}: {}\nPoll with job_status / job_output.",
                 truncate_desc(&command)
-            );
+            ));
         }
 
-        // Foreground: run to completion, optionally bounded by a timeout.
-        let run = tokio::task::spawn_blocking(move || {
-            std::process::Command::new("bash")
-                .arg("-c")
-                .arg(&command)
-                .current_dir(&cwd)
-                .output()
-        });
+        // Foreground: spawn the child so we hold a handle and can actually KILL it
+        // on timeout. `kill_on_drop` means that when the timeout fires and the
+        // `wait_with_output` future is dropped, tokio sends SIGKILL to the child
+        // instead of leaving a detached process running.
+        let child = tokio::process::Command::new("bash")
+            .arg("-c")
+            .arg(&command)
+            .current_dir(&cwd)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| ToolError::failed(e.to_string()))?;
 
-        let result = match input["timeout"].as_f64() {
+        let collect = child.wait_with_output();
+        let out = match input["timeout"].as_f64() {
             Some(secs) if secs > 0.0 => {
                 let dur = std::time::Duration::from_secs_f64(secs);
-                match tokio::time::timeout(dur, run).await {
+                match tokio::time::timeout(dur, collect).await {
                     Ok(r) => r,
                     Err(_) => {
-                        return format!(
-                            "error: command timed out after {}s (still running detached; \
-                             it was not killed cleanly — prefer run_in_background for long work)",
+                        // Timed out: dropping `collect` (via early return) fires
+                        // kill_on_drop and SIGKILLs the child.
+                        return Err(ToolError::timeout(format!(
+                            "command timed out after {}s and was killed; prefer \
+                             run_in_background for long-running work",
                             secs
-                        );
+                        )));
                     }
                 }
             }
-            _ => run.await,
+            _ => collect.await,
         };
 
-        match result {
-            Ok(Ok(out)) => combine_output(&out.stdout, &out.stderr, out.status.code()),
-            Ok(Err(e)) => format!("error: {}", e),
-            Err(e) => format!("error: {}", e),
+        match out {
+            Ok(o) => Ok(cap_output(combine_output(
+                &o.stdout,
+                &o.stderr,
+                o.status.code(),
+            ))),
+            Err(e) => Err(ToolError::failed(e.to_string())),
         }
     }
 }
@@ -132,6 +140,29 @@ fn combine_output(stdout: &[u8], stderr: &[u8], code: Option<i32>) -> String {
     } else {
         combined
     }
+}
+
+/// Cap combined command output so a chatty build can't blow the context window.
+/// Keeps the head and tail (where errors and summaries usually live) and notes how
+/// much was elided in the middle.
+fn cap_output(text: String) -> String {
+    const LIMIT: usize = 30_000;
+    if text.len() <= LIMIT {
+        return text;
+    }
+    let head = 20_000;
+    let tail = 8_000;
+    let start: String = text.chars().take(head).collect();
+    let end: String = text
+        .chars()
+        .rev()
+        .take(tail)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let elided = text.len().saturating_sub(head + tail);
+    format!("{start}\n\n... [{elided} bytes truncated] ...\n\n{end}")
 }
 
 /// A short one-line description of a command, for the jobs panel.

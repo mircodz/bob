@@ -28,27 +28,54 @@ impl Input {
         &self.buf
     }
 
-    /// Buffer split into display lines (on '\n').
-    pub fn display_lines(&self) -> Vec<&str> {
-        self.buf.split('\n').collect()
-    }
+    /// Wrap the buffer to `width` columns, returning the visual rows (content
+    /// only, without any prompt prefix) and the cursor's (row, col) within them.
+    /// Wrapping happens on hard newlines AND at the width boundary, char-based —
+    /// crucially, the cursor is computed in the SAME pass, so the rendered text
+    /// and the cursor can never disagree (the old split-brain wrap/cursor bug).
+    pub fn wrapped(&self, width: usize) -> (Vec<String>, usize, usize) {
+        let width = width.max(1);
+        let chars: Vec<char> = self.buf.chars().collect();
+        let mut rows: Vec<String> = vec![String::new()];
+        let mut col = 0usize;
+        let mut cur_row = 0usize;
+        let mut cur_col = 0usize;
+        let mut cursor_set = false;
 
-    /// (row, col) of the cursor in display coordinates.
-    pub fn cursor_row_col(&self) -> (usize, usize) {
-        let mut row = 0;
-        let mut col = 0;
-        for (i, ch) in self.buf.chars().enumerate() {
+        for (i, &ch) in chars.iter().enumerate() {
+            // Soft-wrap BEFORE placing (or locating the cursor at) this char, so a
+            // char at the boundary — and a cursor sitting before it — both land on
+            // the fresh row rather than at an off-screen column == width.
+            if ch != '\n' && col == width {
+                rows.push(String::new());
+                col = 0;
+            }
             if i == self.cursor {
-                return (row, col);
+                cur_row = rows.len() - 1;
+                cur_col = col;
+                cursor_set = true;
             }
             if ch == '\n' {
-                row += 1;
+                rows.push(String::new());
                 col = 0;
             } else {
+                rows.last_mut().unwrap().push(ch);
                 col += 1;
             }
         }
-        (row, col)
+
+        // Cursor at the very end of the buffer.
+        if !cursor_set {
+            if col == width {
+                rows.push(String::new());
+                cur_row = rows.len() - 1;
+                cur_col = 0;
+            } else {
+                cur_row = rows.len() - 1;
+                cur_col = col;
+            }
+        }
+        (rows, cur_row, cur_col)
     }
 
     /// The text to actually send: buffer with paste placeholders expanded.
@@ -263,20 +290,30 @@ impl Input {
         self.cursor = (i + 1).min(len);
     }
 
+    /// Delete the character before the cursor (Backspace).
+    fn backspace(&mut self) {
+        if self.cursor > 0 {
+            let start = self.byte_at(self.cursor - 1);
+            let end = self.byte_at(self.cursor);
+            self.buf.replace_range(start..end, "");
+            self.cursor -= 1;
+        }
+    }
+
     pub fn on_key(&mut self, code: KeyCode) {
         match code {
+            // Windows conhost (and terminals without the enhanced key protocol)
+            // deliver Backspace/Delete as control chars (BS \u{8}, DEL \u{7f})
+            // rather than KeyCode::Backspace/Delete. Route them to deletion and
+            // drop any other control char so it can't be inserted as a blank/box
+            // glyph (the "backspace prints spaces" bug).
+            KeyCode::Char('\u{8}') | KeyCode::Char('\u{7f}') => self.backspace(),
+            KeyCode::Char(ch) if ch.is_control() => {}
             KeyCode::Char(ch) => {
                 self.hist_idx = None;
                 self.insert(ch);
             }
-            KeyCode::Backspace => {
-                if self.cursor > 0 {
-                    let start = self.byte_at(self.cursor - 1);
-                    let end = self.byte_at(self.cursor);
-                    self.buf.replace_range(start..end, "");
-                    self.cursor -= 1;
-                }
-            }
+            KeyCode::Backspace => self.backspace(),
             KeyCode::Delete => {
                 let len = self.buf.chars().count();
                 if self.cursor < len {
@@ -351,4 +388,74 @@ impl Input {
 fn placeholder(id: usize, content: &str) -> String {
     let lines = content.split('\n').count();
     format!("[Pasted text #{} +{} lines]", id, lines)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn typed(s: &str) -> Input {
+        let mut i = Input::new();
+        i.set(s);
+        i
+    }
+
+    #[test]
+    fn short_line_no_wrap() {
+        let i = typed("hello");
+        let (rows, r, c) = i.wrapped(20);
+        assert_eq!(rows, vec!["hello"]);
+        assert_eq!((r, c), (0, 5)); // cursor at end
+    }
+
+    #[test]
+    fn hard_newline_splits_rows() {
+        let i = typed("ab\ncd");
+        let (rows, r, c) = i.wrapped(20);
+        assert_eq!(rows, vec!["ab", "cd"]);
+        assert_eq!((r, c), (1, 2));
+    }
+
+    #[test]
+    fn soft_wrap_at_width() {
+        let i = typed("abcdef"); // width 3 → "abc" / "def"
+        let (rows, r, c) = i.wrapped(3);
+        // The cursor sits at the end of an exactly-full row, so a fresh empty row
+        // is added for it to rest on (standard editor behavior).
+        assert_eq!(rows, vec!["abc", "def", ""]);
+        assert_eq!((r, c), (2, 0));
+    }
+
+    #[test]
+    fn soft_wrap_cursor_not_at_end() {
+        let mut i = typed("abcdefg"); // width 3 → abc/def/g
+        i.move_home();
+        for _ in 0..4 {
+            i.move_right(); // cursor after 'd'
+        }
+        let (rows, r, c) = i.wrapped(3);
+        assert_eq!(rows, vec!["abc", "def", "g"]);
+        assert_eq!((r, c), (1, 1)); // after 'd' on row 1
+    }
+
+    #[test]
+    fn cursor_mid_buffer_tracks_wrap() {
+        let mut i = typed("abcdef");
+        // Move cursor to just after 'c' (index 3): should be row 1 col 0 with a
+        // width-3 wrap, since the boundary pushes to the next row.
+        i.move_home();
+        for _ in 0..3 {
+            i.move_right();
+        }
+        let (_, r, c) = i.wrapped(3);
+        assert_eq!((r, c), (1, 0));
+    }
+
+    #[test]
+    fn trailing_newline_gives_empty_row() {
+        let i = typed("a\n");
+        let (rows, r, c) = i.wrapped(20);
+        assert_eq!(rows, vec!["a", ""]);
+        assert_eq!((r, c), (1, 0));
+    }
 }

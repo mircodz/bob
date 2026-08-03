@@ -150,15 +150,9 @@ impl Provider for AnthropicProvider {
 
     async fn generate(&self, opts: GenerateOptions) -> anyhow::Result<Completion> {
         let body = self.build_body(&opts, false);
-        let res = self.request(body).await?.send().await?;
-        if !res.status().is_success() {
-            let status = res.status();
-            anyhow::bail!(
-                "anthropic {}: {}",
-                status,
-                res.text().await.unwrap_or_default()
-            );
-        }
+        let res =
+            crate::providers::provider::send_with_retry(self.request(body).await?, "anthropic")
+                .await?;
         let data: Value = res.json().await?;
         Ok(Completion {
             message: from_api_message(&data),
@@ -181,15 +175,9 @@ impl Provider for AnthropicProvider {
         opts: GenerateOptions,
     ) -> anyhow::Result<mpsc::UnboundedReceiver<StreamEvent>> {
         let body = self.build_body(&opts, true);
-        let res = self.request(body).await?.send().await?;
-        if !res.status().is_success() {
-            let status = res.status();
-            anyhow::bail!(
-                "anthropic {}: {}",
-                status,
-                res.text().await.unwrap_or_default()
-            );
-        }
+        let res =
+            crate::providers::provider::send_with_retry(self.request(body).await?, "anthropic")
+                .await?;
 
         let (tx, rx) = mpsc::unbounded_channel();
         tokio::spawn(async move {
@@ -197,6 +185,7 @@ impl Provider for AnthropicProvider {
             let mut tool_json: Vec<String> = Vec::new();
             let mut stop_reason = "end_turn".to_string();
             let mut usage = Usage::default();
+            let mut stopped = false;
 
             let _ = parse_sse(res, |data| {
                 let typ = data["type"].as_str().unwrap_or("");
@@ -229,6 +218,17 @@ impl Provider for AnthropicProvider {
                                 });
                                 let _ = tx.send(StreamEvent::ToolUseStart { id, name });
                             }
+                            Some("thinking") => {
+                                blocks[idx] = Some(ContentBlock::Thinking {
+                                    thinking: b["thinking"].as_str().unwrap_or("").to_string(),
+                                    signature: b["signature"].as_str().unwrap_or("").to_string(),
+                                });
+                            }
+                            Some("redacted_thinking") => {
+                                blocks[idx] = Some(ContentBlock::RedactedThinking {
+                                    data: b["data"].as_str().unwrap_or("").to_string(),
+                                });
+                            }
                             _ => {}
                         }
                     }
@@ -257,6 +257,22 @@ impl Provider for AnthropicProvider {
                                     partial_json: pj,
                                 });
                             }
+                            Some("thinking_delta") => {
+                                let t = d["thinking"].as_str().unwrap_or("");
+                                if let Some(Some(ContentBlock::Thinking { thinking, .. })) =
+                                    blocks.get_mut(idx)
+                                {
+                                    thinking.push_str(t);
+                                }
+                            }
+                            Some("signature_delta") => {
+                                let s = d["signature"].as_str().unwrap_or("");
+                                if let Some(Some(ContentBlock::Thinking { signature, .. })) =
+                                    blocks.get_mut(idx)
+                                {
+                                    signature.push_str(s);
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -269,32 +285,22 @@ impl Provider for AnthropicProvider {
                         }
                     }
                     "message_stop" => {
-                        // Finalize: parse accumulated tool_use JSON.
-                        for (i, b) in blocks.iter_mut().enumerate() {
-                            if let Some(ContentBlock::ToolUse { input, .. }) = b {
-                                let raw = &tool_json[i];
-                                *input = if raw.is_empty() {
-                                    json!({})
-                                } else {
-                                    serde_json::from_str(raw).unwrap_or(json!({}))
-                                };
-                            }
-                        }
-                        let content: Vec<ContentBlock> = blocks.iter().flatten().cloned().collect();
-                        let completion = Completion {
-                            message: Message {
-                                role: Role::Assistant,
-                                content,
-                            },
-                            stop_reason: map_stop_reason(&stop_reason),
-                            usage,
-                        };
+                        stopped = true;
+                        let completion = finalize(&mut blocks, &tool_json, &stop_reason, usage);
                         let _ = tx.send(StreamEvent::MessageStop { completion });
                     }
                     _ => {}
                 }
             })
             .await;
+
+            // The stream ended without a `message_stop` event (dropped connection,
+            // truncated response). Emit whatever we accumulated so the agent loop
+            // gets a completion instead of hanging forever on an empty receiver.
+            if !stopped {
+                let completion = finalize(&mut blocks, &tool_json, &stop_reason, usage);
+                let _ = tx.send(StreamEvent::MessageStop { completion });
+            }
         });
 
         Ok(rx)
@@ -345,6 +351,36 @@ fn ensure_len(blocks: &mut Vec<Option<ContentBlock>>, tool_json: &mut Vec<String
     }
 }
 
+/// Assemble the streamed blocks into a final assistant Completion, parsing each
+/// tool_use's accumulated argument JSON. Shared by the normal `message_stop` path
+/// and the stream-drop fallback.
+fn finalize(
+    blocks: &mut [Option<ContentBlock>],
+    tool_json: &[String],
+    stop_reason: &str,
+    usage: Usage,
+) -> Completion {
+    for (i, b) in blocks.iter_mut().enumerate() {
+        if let Some(ContentBlock::ToolUse { input, .. }) = b {
+            let raw = &tool_json[i];
+            *input = if raw.is_empty() {
+                json!({})
+            } else {
+                serde_json::from_str(raw).unwrap_or(json!({}))
+            };
+        }
+    }
+    let content: Vec<ContentBlock> = blocks.iter().flatten().cloned().collect();
+    Completion {
+        message: Message {
+            role: Role::Assistant,
+            content,
+        },
+        stop_reason: map_stop_reason(stop_reason),
+        usage,
+    }
+}
+
 fn merge_into(target: &mut Value, extra: &Value) {
     if let (Some(t), Some(e)) = (target.as_object_mut(), extra.as_object()) {
         for (k, v) in e {
@@ -376,21 +412,34 @@ fn to_api_message(m: &Message) -> Value {
     let content: Vec<Value> = m
         .content
         .iter()
-        .map(|b| match b {
-            ContentBlock::Text { text } => json!({ "type": "text", "text": text }),
+        .filter_map(|b| match b {
+            ContentBlock::Text { text } => Some(json!({ "type": "text", "text": text })),
             ContentBlock::ToolUse { id, name, input } => {
-                json!({ "type": "tool_use", "id": id, "name": name, "input": input })
+                Some(json!({ "type": "tool_use", "id": id, "name": name, "input": input }))
             }
             ContentBlock::ToolResult {
                 tool_use_id,
                 content,
                 is_error,
-            } => json!({
+            } => Some(json!({
                 "type": "tool_result",
                 "tool_use_id": tool_use_id,
                 "content": content,
                 "is_error": is_error,
-            }),
+            })),
+            ContentBlock::Thinking {
+                thinking,
+                signature,
+            } => Some(json!({
+                "type": "thinking",
+                "thinking": thinking,
+                "signature": signature,
+            })),
+            ContentBlock::RedactedThinking { data } => {
+                Some(json!({ "type": "redacted_thinking", "data": data }))
+            }
+            // OpenAI Responses-specific; never sent to Anthropic — drop it.
+            ContentBlock::ReasoningItem { .. } => None,
         })
         .collect();
     json!({ "role": role, "content": content })
@@ -410,6 +459,13 @@ fn from_api_message(data: &Value) -> Message {
                         name: b["name"].as_str().unwrap_or("").to_string(),
                         input: b["input"].clone(),
                     },
+                    Some("thinking") => ContentBlock::Thinking {
+                        thinking: b["thinking"].as_str().unwrap_or("").to_string(),
+                        signature: b["signature"].as_str().unwrap_or("").to_string(),
+                    },
+                    Some("redacted_thinking") => ContentBlock::RedactedThinking {
+                        data: b["data"].as_str().unwrap_or("").to_string(),
+                    },
                     _ => ContentBlock::Text {
                         text: String::new(),
                     },
@@ -420,5 +476,77 @@ fn from_api_message(data: &Value) -> Message {
     Message {
         role: Role::Assistant,
         content,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn thinking_block_round_trips_through_api_message() {
+        // A parsed assistant turn carrying a thinking block + a tool_use, as we'd
+        // build it from the stream, must re-serialize with the thinking block
+        // preserved (signature intact) ahead of the tool_use.
+        let msg = Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: "let me reason".to_string(),
+                    signature: "sig-abc".to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: "tu_1".to_string(),
+                    name: "read_file".to_string(),
+                    input: json!({"path": "x"}),
+                },
+            ],
+        };
+        let v = to_api_message(&msg);
+        let blocks = v["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["type"], "thinking");
+        assert_eq!(blocks[0]["thinking"], "let me reason");
+        assert_eq!(blocks[0]["signature"], "sig-abc");
+        assert_eq!(blocks[1]["type"], "tool_use");
+    }
+
+    #[test]
+    fn from_api_message_parses_thinking() {
+        let data = json!({
+            "content": [
+                {"type": "thinking", "thinking": "hmm", "signature": "s1"},
+                {"type": "text", "text": "answer"},
+            ]
+        });
+        let msg = from_api_message(&data);
+        match &msg.content[0] {
+            ContentBlock::Thinking {
+                thinking,
+                signature,
+            } => {
+                assert_eq!(thinking, "hmm");
+                assert_eq!(signature, "s1");
+            }
+            other => panic!("expected thinking, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn reasoning_item_is_dropped_for_anthropic() {
+        let msg = Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::ReasoningItem {
+                    item: json!({"type": "reasoning"}),
+                },
+                ContentBlock::Text {
+                    text: "hi".to_string(),
+                },
+            ],
+        };
+        let v = to_api_message(&msg);
+        let blocks = v["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "text");
     }
 }

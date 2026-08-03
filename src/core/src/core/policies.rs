@@ -16,10 +16,13 @@ const READ_ONLY: &[&str] = &[
     "grep",
     "todo_write",
     "task",
+    "explore",
     "spawn_agent",
     "send_message",
     "list_agents",
     "lsp",
+    "web_fetch",
+    "web_search",
     "job_status",
     "job_output",
 ];

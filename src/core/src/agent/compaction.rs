@@ -19,6 +19,9 @@ pub fn estimate_message_tokens(m: &Message) -> usize {
                 n += estimate_tokens(&input.to_string()) + estimate_tokens(name)
             }
             ContentBlock::ToolResult { content, .. } => n += estimate_tokens(content),
+            ContentBlock::Thinking { thinking, .. } => n += estimate_tokens(thinking),
+            ContentBlock::RedactedThinking { data } => n += estimate_tokens(data),
+            ContentBlock::ReasoningItem { .. } => {}
         }
     }
     n
@@ -32,6 +35,10 @@ pub struct CompactionOptions {
     pub context_window: usize,
     pub threshold: f64,
     pub keep_recent: usize,
+    /// Estimated tokens for the fixed request overhead that is NOT in `messages`:
+    /// the system prompt plus every tool schema. Counted toward the budget so we
+    /// compact before the real request (system + tools + history) overflows.
+    pub system_overhead_tokens: usize,
 }
 
 pub struct CompactionResult {
@@ -48,7 +55,7 @@ pub async fn maybe_compact(
     provider: &Arc<dyn Provider>,
     opts: &CompactionOptions,
 ) -> CompactionResult {
-    let before_tokens = estimate_history_tokens(&messages);
+    let before_tokens = estimate_history_tokens(&messages) + opts.system_overhead_tokens;
     let limit = (opts.context_window as f64 * opts.threshold) as usize;
 
     if before_tokens <= limit || messages.len() <= opts.keep_recent + 1 {
@@ -76,7 +83,20 @@ pub async fn maybe_compact(
     let older: Vec<Message> = messages[..adjusted_split].to_vec();
     let recent: Vec<Message> = messages[adjusted_split..].to_vec();
 
-    let summary_text = summarize(&older, provider).await;
+    // If summarizing fails (transient API error), keep the full history verbatim
+    // rather than discarding the older half — a dropped request must never destroy
+    // conversation context.
+    let summary_text = match summarize(&older, provider).await {
+        Ok(text) => text,
+        Err(_) => {
+            return CompactionResult {
+                messages,
+                compacted: false,
+                before_tokens,
+                after_tokens: before_tokens,
+            };
+        }
+    };
     let summary_message = Message {
         role: Role::User,
         content: vec![ContentBlock::Text {
@@ -86,7 +106,7 @@ pub async fn maybe_compact(
 
     let mut compacted = vec![summary_message];
     compacted.extend(recent);
-    let after_tokens = estimate_history_tokens(&compacted);
+    let after_tokens = estimate_history_tokens(&compacted) + opts.system_overhead_tokens;
     CompactionResult {
         messages: compacted,
         compacted: true,
@@ -95,7 +115,7 @@ pub async fn maybe_compact(
     }
 }
 
-async fn summarize(messages: &[Message], provider: &Arc<dyn Provider>) -> String {
+async fn summarize(messages: &[Message], provider: &Arc<dyn Provider>) -> anyhow::Result<String> {
     let transcript = messages
         .iter()
         .map(render_for_summary)
@@ -115,10 +135,8 @@ async fn summarize(messages: &[Message], provider: &Arc<dyn Provider>) -> String
         ..Default::default()
     };
 
-    match provider.generate(opts).await {
-        Ok(c) => c.message.text().trim().to_string(),
-        Err(e) => format!("(summary failed: {})", e),
-    }
+    let completion = provider.generate(opts).await?;
+    Ok(completion.message.text().trim().to_string())
 }
 
 fn render_for_summary(m: &Message) -> String {
@@ -141,6 +159,9 @@ fn render_for_summary(m: &Message) -> String {
                 },
                 content
             ),
+            ContentBlock::Thinking { thinking, .. } => format!("[thinking]\n{}", thinking),
+            ContentBlock::RedactedThinking { .. } => "[redacted_thinking]".to_string(),
+            ContentBlock::ReasoningItem { .. } => String::new(),
         })
         .collect();
     let role = match m.role {

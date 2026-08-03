@@ -100,6 +100,17 @@ impl OpenAiProvider {
         if let Some(t) = opts.temperature {
             body["temperature"] = json!(t);
         }
+        // Reasoning-capable chat models (o-series, gpt-5 family) accept
+        // `reasoning_effort`. Sending it to a non-reasoning model (gpt-4o) is
+        // rejected, so gate on a capability check. Off → omit.
+        if chat_supports_reasoning(&self.model) {
+            if let Some(effort) = opts.reasoning.as_str() {
+                body["reasoning_effort"] = json!(effort);
+                // These models don't accept an explicit temperature alongside
+                // reasoning; drop it to avoid a 400.
+                body.as_object_mut().map(|o| o.remove("temperature"));
+            }
+        }
         if !opts.tools.is_empty() {
             body["tools"] = json!(opts
                 .tools
@@ -151,26 +162,24 @@ impl Provider for OpenAiProvider {
 
     async fn generate(&self, opts: GenerateOptions) -> anyhow::Result<Completion> {
         let body = self.build_body(&opts, false);
-        let res = self.request(body).await?.send().await?;
-        if !res.status().is_success() {
-            let status = res.status();
-            anyhow::bail!(
-                "openai {}: {}",
-                status,
-                res.text().await.unwrap_or_default()
-            );
-        }
+        let res = crate::providers::provider::send_with_retry(self.request(body).await?, "openai")
+            .await?;
         let data: Value = res.json().await?;
         let choice = &data["choices"][0];
+        let cached = data["usage"]["prompt_tokens_details"]["cached_tokens"]
+            .as_u64()
+            .unwrap_or(0);
+        let prompt = data["usage"]["prompt_tokens"].as_u64().unwrap_or(0);
         Ok(Completion {
             message: from_api_message(&choice["message"]),
             stop_reason: map_finish(choice["finish_reason"].as_str().unwrap_or("stop")),
             usage: Usage {
-                input_tokens: data["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
+                // OpenAI's prompt_tokens INCLUDES cached tokens; subtract them so
+                // `input_tokens` means "fresh input" (the Anthropic convention) and
+                // total_input() doesn't double-count the cache read.
+                input_tokens: prompt.saturating_sub(cached),
                 output_tokens: data["usage"]["completion_tokens"].as_u64().unwrap_or(0),
-                cache_read_input_tokens: data["usage"]["prompt_tokens_details"]["cached_tokens"]
-                    .as_u64()
-                    .unwrap_or(0),
+                cache_read_input_tokens: cached,
                 cache_creation_input_tokens: 0,
             },
         })
@@ -181,21 +190,21 @@ impl Provider for OpenAiProvider {
         opts: GenerateOptions,
     ) -> anyhow::Result<mpsc::UnboundedReceiver<StreamEvent>> {
         let body = self.build_body(&opts, true);
-        let res = self.request(body).await?.send().await?;
-        if !res.status().is_success() {
-            let status = res.status();
-            let body = res.text().await.unwrap_or_default();
-            // Newer models only work over the Responses API, which bob uses on
-            // the ChatGPT-subscription path. Give an actionable hint.
-            if body.contains("unsupported_api_for_model") {
-                anyhow::bail!(
-                    "model '{}' needs the Responses API — log in with `bob login openai` \
-                     to use it on a ChatGPT subscription, or pick a chat model (gpt-4o).",
-                    self.model
-                );
-            }
-            anyhow::bail!("openai {}: {}", status, body);
-        }
+        let res = crate::providers::provider::send_with_retry(self.request(body).await?, "openai")
+            .await
+            .map_err(|e| {
+                // Newer models only work over the Responses API. Give an actionable
+                // hint instead of the raw 4xx body.
+                if e.to_string().contains("unsupported_api_for_model") {
+                    anyhow::anyhow!(
+                        "model '{}' needs the Responses API — log in with `bob login openai` \
+                         to use it on a ChatGPT subscription, or pick a chat model (gpt-4o).",
+                        self.model
+                    )
+                } else {
+                    e
+                }
+            })?;
 
         let (tx, rx) = mpsc::unbounded_channel();
         tokio::spawn(async move {
@@ -209,14 +218,17 @@ impl Provider for OpenAiProvider {
                 // The final chunk carries usage with an empty choices array.
                 if let Some(u) = evt.get("usage") {
                     if !u.is_null() {
-                        usage.input_tokens =
-                            u["prompt_tokens"].as_u64().unwrap_or(usage.input_tokens);
+                        let prompt = u["prompt_tokens"].as_u64().unwrap_or(usage.input_tokens);
+                        let cached = u["prompt_tokens_details"]["cached_tokens"]
+                            .as_u64()
+                            .unwrap_or(usage.cache_read_input_tokens);
+                        // prompt_tokens includes cached; store fresh input only so
+                        // total_input() doesn't double-count (Anthropic convention).
+                        usage.input_tokens = prompt.saturating_sub(cached);
                         usage.output_tokens = u["completion_tokens"]
                             .as_u64()
                             .unwrap_or(usage.output_tokens);
-                        usage.cache_read_input_tokens = u["prompt_tokens_details"]["cached_tokens"]
-                            .as_u64()
-                            .unwrap_or(usage.cache_read_input_tokens);
+                        usage.cache_read_input_tokens = cached;
                     }
                 }
                 let choice = &evt["choices"][0];
@@ -321,6 +333,23 @@ impl Provider for OpenAiProvider {
     }
 }
 
+/// Whether an OpenAI-compatible chat-completions model accepts the
+/// `reasoning_effort` field. True for the o-series and gpt-5 chat families;
+/// false for classic chat models (gpt-4o, gpt-4, gpt-3.5) which reject it.
+pub(crate) fn chat_supports_reasoning(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    // o1 / o3 / o4 reasoning models, and the gpt-5 family.
+    m.starts_with("o1")
+        || m.starts_with("o3")
+        || m.starts_with("o4")
+        || m.starts_with("gpt-5")
+        // Copilot proxies some of these under a vendor prefix.
+        || m.contains("/o1")
+        || m.contains("/o3")
+        || m.contains("/o4")
+        || m.contains("/gpt-5")
+}
+
 fn map_finish(reason: &str) -> StopReason {
     match reason {
         "tool_calls" | "function_call" => StopReason::ToolUse,
@@ -415,5 +444,21 @@ fn from_api_message(msg: &Value) -> Message {
     Message {
         role: Role::Assistant,
         content,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::chat_supports_reasoning;
+
+    #[test]
+    fn reasoning_capability_gate() {
+        assert!(chat_supports_reasoning("o1"));
+        assert!(chat_supports_reasoning("o3-mini"));
+        assert!(chat_supports_reasoning("gpt-5.1"));
+        assert!(chat_supports_reasoning("copilot/gpt-5"));
+        assert!(!chat_supports_reasoning("gpt-4o"));
+        assert!(!chat_supports_reasoning("claude-sonnet-4-5"));
+        assert!(!chat_supports_reasoning("gpt-3.5-turbo"));
     }
 }

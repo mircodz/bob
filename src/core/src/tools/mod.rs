@@ -23,7 +23,7 @@ use crate::tools::jobs::{JobOutputTool, JobStatusTool};
 use crate::tools::registry::Tool;
 use crate::tools::search::{GlobTool, GrepTool};
 use crate::tools::todo_write::TodoWriteTool;
-use crate::tools::web::WebFetchTool;
+use crate::tools::web::{WebFetchTool, WebSearchTool};
 use std::sync::Arc;
 
 /// The full built-in tool set (not including `task`, which is wired separately).
@@ -38,6 +38,7 @@ pub fn builtin_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(GrepTool),
         Arc::new(BashTool),
         Arc::new(WebFetchTool),
+        Arc::new(WebSearchTool),
         Arc::new(TodoWriteTool),
         Arc::new(JobStatusTool),
         Arc::new(JobOutputTool),

@@ -448,6 +448,27 @@ pub async fn run(
                         Ok(reply) => eprintln!("[host] turn finished ok ({} chars)", reply.len()),
                         Err(e) => eprintln!("[host] turn FAILED: {e:#}"),
                     }
+                    // Coordination: if this turn spawned agents, keep the root
+                    // alive until they all report back, driving an empty-prompt
+                    // "wake" turn each time results are ready so the root folds them
+                    // into history and acts on them. Without this, coordination is
+                    // dead on remote (results reach root's inbox but nothing
+                    // re-drives root). We hold the agent lock throughout, so a new
+                    // Prompt queues behind this — intended: the turn isn't "done"
+                    // until its team is. Bounded so a stuck child can't spin forever.
+                    let mut wakes = 0;
+                    while wakes < 128 && a.has_outstanding_coordination() {
+                        if a.has_pending_coordination() {
+                            wakes += 1;
+                            if let Err(e) = a.run("").await {
+                                eprintln!("[host] wake turn FAILED: {e:#}");
+                                break;
+                            }
+                        } else {
+                            // Children still running; wait for one to report.
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        }
+                    }
                     // Collect this turn's subagent runs and merge into the
                     // session so subagent tool calls survive a restart.
                     let new_runs = sub_accum

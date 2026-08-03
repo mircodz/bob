@@ -32,6 +32,48 @@ pub struct Session {
     /// The agent's todo list, persisted so the sticky panel survives a resume.
     #[serde(default)]
     pub todos: Vec<crate::tools::todo::TodoItem>,
+    /// Per-agent drawer transcripts (the team drawer), so they survive a resume.
+    #[serde(default)]
+    pub agent_threads: Vec<PersistedThread>,
+}
+
+/// One spawned agent's persisted transcript for the team drawer.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PersistedThread {
+    pub id: String,
+    pub name: String,
+    pub parent_id: String,
+    pub task: String,
+    /// "running" | "done" | "failed".
+    pub status: String,
+    pub cells: Vec<PersistedCell>,
+}
+
+/// A render-agnostic transcript cell (the persisted form of the drawer's `Cell`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PersistedCell {
+    /// A user-style input line (the delegated prompt seeded into a subagent's
+    /// thread), rendered like the main view's user input.
+    User {
+        text: String,
+    },
+    Assistant {
+        text: String,
+    },
+    Tool {
+        name: String,
+        input: Value,
+        output: String,
+        is_error: bool,
+    },
+    Message {
+        from: String,
+        text: String,
+    },
+    Notice {
+        text: String,
+    },
 }
 
 /// All subagents spawned by one `task` tool call.
@@ -101,6 +143,7 @@ pub fn new_session(provider: &str, id: String, now: String) -> Session {
         usage: vec![],
         subagent_runs: vec![],
         todos: vec![],
+        agent_threads: vec![],
     }
 }
 
@@ -221,5 +264,58 @@ pub fn list_sessions() -> Vec<SessionSummary> {
     match rows {
         Ok(iter) => iter.flatten().collect(),
         Err(_) => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_threads_round_trip() {
+        let session = Session {
+            agent_threads: vec![PersistedThread {
+                id: "reviewer".into(),
+                name: "reviewer".into(),
+                parent_id: "root".into(),
+                task: "review the diff".into(),
+                status: "done".into(),
+                cells: vec![
+                    PersistedCell::Assistant {
+                        text: "looks good".into(),
+                    },
+                    PersistedCell::Tool {
+                        name: "grep".into(),
+                        input: serde_json::json!({"pattern": "x"}),
+                        output: "3 matches".into(),
+                        is_error: false,
+                    },
+                    PersistedCell::Message {
+                        from: "user".into(),
+                        text: "also check y".into(),
+                    },
+                ],
+            }],
+            ..new_session("anthropic", "s1".into(), "now".into())
+        };
+        let json = serde_json::to_string(&session).unwrap();
+        let back: Session = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.agent_threads.len(), 1);
+        let t = &back.agent_threads[0];
+        assert_eq!(t.name, "reviewer");
+        assert_eq!(t.cells.len(), 3);
+    }
+
+    #[test]
+    fn old_session_without_agent_threads_loads() {
+        // A session JSON from before the field existed must still deserialize
+        // (serde default → empty vec).
+        let json = r#"{
+            "id": "s1", "created_at": "t", "updated_at": "t",
+            "provider": "anthropic", "messages": []
+        }"#;
+        let s: Session = serde_json::from_str(json).unwrap();
+        assert!(s.agent_threads.is_empty());
+        assert!(s.todos.is_empty());
     }
 }

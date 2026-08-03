@@ -14,7 +14,7 @@
 use crate::core::types::ToolSpec;
 use crate::tools::builtin::resolve_path;
 use crate::tools::diff::{compact_diff, diff_lines, diff_stat, format_unified};
-use crate::tools::registry::{Tool, ToolContext};
+use crate::tools::registry::{Tool, ToolContext, ToolError, ToolResult};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -59,31 +59,31 @@ impl Tool for RenameSymbolTool {
         }
     }
 
-    async fn execute(&self, input: Value, ctx: &ToolContext) -> String {
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
         let file = match input["filePath"].as_str() {
             Some(f) => resolve_path(&ctx.cwd, f),
-            None => return "error: filePath is required".to_string(),
+            None => return Err(ToolError::invalid_input("filePath is required")),
         };
         let new_name = match input["newName"].as_str() {
             Some(n) if !n.is_empty() => n,
-            _ => return "error: newName is required".to_string(),
+            _ => return Err(ToolError::invalid_input("newName is required")),
         };
         let line = match input["line"].as_i64() {
             Some(l) if l >= 1 => l - 1,
-            _ => return "error: line is required (1-based)".to_string(),
+            _ => return Err(ToolError::invalid_input("line is required (1-based)")),
         };
         let character = match input["character"].as_i64() {
             Some(c) if c >= 1 => c - 1,
-            _ => return "error: character is required (1-based)".to_string(),
+            _ => return Err(ToolError::invalid_input("character is required (1-based)")),
         };
 
         let client = match self.manager.client_for(&file) {
             Some(c) => c,
             None => {
-                return format!(
-                    "error: no language server configured for {} (check `bob lsp list`)",
+                return Err(ToolError::unavailable(format!(
+                    "no language server configured for {} (check `bob lsp list`)",
                     file.display()
-                )
+                )))
             }
         };
 
@@ -99,20 +99,21 @@ impl Tool for RenameSymbolTool {
         });
         let result = match client.request("textDocument/rename", params).await {
             Ok(r) => r,
-            Err(e) => return format!("error: rename failed: {}", e),
+            Err(e) => return Err(ToolError::failed(format!("rename failed: {}", e))),
         };
         if result.is_null() {
-            return "error: the language server returned no edit (symbol not renamable here?)"
-                .to_string();
+            return Err(ToolError::failed(
+                "the language server returned no edit (symbol not renamable here?)",
+            ));
         }
 
         let edits = match collect_workspace_edit(&result) {
             Ok(e) if !e.is_empty() => e,
-            Ok(_) => return "error: rename produced no changes".to_string(),
-            Err(e) => return format!("error: {}", e),
+            Ok(_) => return Err(ToolError::failed("rename produced no changes")),
+            Err(e) => return Err(ToolError::failed(e)),
         };
 
-        apply_and_report(edits, ctx)
+        Ok(apply_and_report(edits, ctx))
     }
 }
 
@@ -327,18 +328,18 @@ impl Tool for CodeActionTool {
         }
     }
 
-    async fn execute(&self, input: Value, ctx: &ToolContext) -> String {
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
         let file = match input["filePath"].as_str() {
             Some(f) => resolve_path(&ctx.cwd, f),
-            None => return "error: filePath is required".to_string(),
+            None => return Err(ToolError::invalid_input("filePath is required")),
         };
         let line = match input["line"].as_i64() {
             Some(l) if l >= 1 => l - 1,
-            _ => return "error: line is required (1-based)".to_string(),
+            _ => return Err(ToolError::invalid_input("line is required (1-based)")),
         };
         let character = match input["character"].as_i64() {
             Some(c) if c >= 1 => c - 1,
-            _ => return "error: character is required (1-based)".to_string(),
+            _ => return Err(ToolError::invalid_input("character is required (1-based)")),
         };
         let end_line = input["endLine"].as_i64().map(|l| l - 1).unwrap_or(line);
         let end_char = input["endCharacter"]
@@ -349,10 +350,10 @@ impl Tool for CodeActionTool {
         let client = match self.manager.client_for(&file) {
             Some(c) => c,
             None => {
-                return format!(
-                    "error: no language server configured for {} (check `bob lsp list`)",
+                return Err(ToolError::unavailable(format!(
+                    "no language server configured for {} (check `bob lsp list`)",
                     file.display()
-                )
+                )))
             }
         };
         if let Ok(text) = std::fs::read_to_string(&file) {
@@ -373,7 +374,7 @@ impl Tool for CodeActionTool {
         });
         let result = match client.request("textDocument/codeAction", params).await {
             Ok(r) => r,
-            Err(e) => return format!("error: codeAction failed: {}", e),
+            Err(e) => return Err(ToolError::failed(format!("codeAction failed: {}", e))),
         };
         let actions = result.as_array().cloned().unwrap_or_default();
 
@@ -385,15 +386,15 @@ impl Tool for CodeActionTool {
                 None => {
                     let titles: Vec<&str> =
                         actions.iter().filter_map(|a| a["title"].as_str()).collect();
-                    return format!(
-                        "error: no action titled '{}'. Available: {}",
+                    return Err(ToolError::failed(format!(
+                        "no action titled '{}'. Available: {}",
                         want,
                         if titles.is_empty() {
                             "(none)".to_string()
                         } else {
                             titles.join(" | ")
                         }
-                    );
+                    )));
                 }
             };
             // A CodeAction may carry its edit inline (`edit`) or need resolving
@@ -403,36 +404,41 @@ impl Tool for CodeActionTool {
             } else {
                 match client.request("codeAction/resolve", action.clone()).await {
                     Ok(resolved) => resolved["edit"].clone(),
-                    Err(e) => return format!("error: could not resolve action: {}", e),
+                    Err(e) => {
+                        return Err(ToolError::failed(format!(
+                            "could not resolve action: {}",
+                            e
+                        )))
+                    }
                 }
             };
             if edit.is_null() {
                 // Some actions run a command instead of returning an edit; we
                 // don't execute arbitrary server commands (side effects, no diff).
-                return format!(
+                return Ok(format!(
                     "action '{}' has no direct edit (it runs a server command, which bob does not \
                      execute automatically).",
                     want
-                );
+                ));
             }
             let edits = match collect_workspace_edit(&edit) {
                 Ok(e) if !e.is_empty() => e,
-                Ok(_) => return format!("action '{}' produced no changes", want),
-                Err(e) => return format!("error: {}", e),
+                Ok(_) => return Ok(format!("action '{}' produced no changes", want)),
+                Err(e) => return Err(ToolError::failed(e)),
             };
-            return apply_and_report(edits, ctx);
+            return Ok(apply_and_report(edits, ctx));
         }
 
         // List mode: show available actions (title + kind) and advertised kinds.
         if actions.is_empty() {
             let kinds = client.code_action_kinds();
             if kinds.is_empty() {
-                return "No code actions available here.".to_string();
+                return Ok("No code actions available here.".to_string());
             }
-            return format!(
+            return Ok(format!(
                 "No actions at this position. This server supports: {}",
                 kinds.join(", ")
-            );
+            ));
         }
         let mut out = String::from("Available code actions (apply one by title):\n");
         for a in &actions {
@@ -444,6 +450,6 @@ impl Tool for CodeActionTool {
                 out.push_str(&format!("  - {}  [{}]\n", title, kind));
             }
         }
-        out
+        Ok(out)
     }
 }

@@ -31,6 +31,24 @@ pub enum ContentBlock {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
     },
+    /// Anthropic extended-thinking block. The `signature` is opaque and MUST be
+    /// echoed back verbatim in the assistant turn that carries the `tool_use`, or
+    /// the next request is rejected. Not shown to the user.
+    Thinking {
+        thinking: String,
+        signature: String,
+    },
+    /// Encrypted/redacted thinking — opaque bytes to be passed back unchanged.
+    RedactedThinking {
+        data: String,
+    },
+    /// An OpenAI Responses API reasoning item, stored verbatim so it can be
+    /// echoed back in the next request's `input` (required to preserve reasoning
+    /// continuity across tool calls when `store: false`). Opaque to everything
+    /// except the Responses provider; other providers skip it.
+    ReasoningItem {
+        item: Value,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -112,10 +130,25 @@ pub struct Completion {
 /// Streaming events, normalized across providers.
 #[derive(Clone, Debug)]
 pub enum StreamEvent {
-    TextDelta { text: String },
-    ToolUseStart { id: String, name: String },
-    ToolUseInputDelta { id: String, partial_json: String },
-    MessageStop { completion: Completion },
+    TextDelta {
+        text: String,
+    },
+    ToolUseStart {
+        id: String,
+        name: String,
+    },
+    ToolUseInputDelta {
+        id: String,
+        partial_json: String,
+    },
+    MessageStop {
+        completion: Completion,
+    },
+    /// A mid-stream API failure (e.g. Responses `response.failed`). The agent loop
+    /// surfaces this as a real error rather than a fabricated assistant message.
+    Error {
+        message: String,
+    },
 }
 
 /// Reasoning intensity for models that support it (OpenAI Responses

@@ -1,7 +1,7 @@
 //! The todo_write tool: replaces the current todo list.
 
 use crate::core::types::ToolSpec;
-use crate::tools::registry::{Tool, ToolContext};
+use crate::tools::registry::{Tool, ToolContext, ToolResult};
 use crate::tools::todo::{render_todos, TodoItem, TodoStatus};
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -41,7 +41,7 @@ impl Tool for TodoWriteTool {
         }
     }
 
-    async fn execute(&self, input: Value, ctx: &ToolContext) -> String {
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
         let items: Vec<TodoItem> = input["todos"]
             .as_array()
             .map(|arr| {
@@ -74,9 +74,9 @@ impl Tool for TodoWriteTool {
         }
         let rendered = render_todos(&items);
         ctx.todos.set(items);
-        format!(
+        Ok(format!(
             "todo list updated ({} done, {} in progress, {} pending)\n{}",
             done, prog, pend, rendered
-        )
+        ))
     }
 }

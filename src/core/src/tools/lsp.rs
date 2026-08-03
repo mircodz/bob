@@ -8,7 +8,7 @@
 use crate::core::types::ToolSpec;
 use crate::lsp::LspManager;
 use crate::tools::builtin::resolve_path;
-use crate::tools::registry::{Tool, ToolContext};
+use crate::tools::registry::{Tool, ToolContext, ToolError, ToolResult};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::path::Path;
@@ -66,7 +66,7 @@ impl Tool for LspTool {
         }
     }
 
-    async fn execute(&self, input: Value, ctx: &ToolContext) -> String {
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
         let op = input["operation"].as_str().unwrap_or("");
 
         // workspace_symbols is the only op not tied to a specific file.
@@ -77,22 +77,28 @@ impl Tool for LspTool {
 
         let file = match input["filePath"].as_str() {
             Some(f) => resolve_path(&ctx.cwd, f),
-            None => return "error: filePath is required".to_string(),
+            None => return Err(ToolError::invalid_input("filePath is required")),
         };
         let client = match self.manager.client_for(&file) {
             Some(c) => c,
             None => {
-                return format!(
-                    "error: no language server configured for {} (check `bob lsp list`)",
+                return Err(ToolError::unavailable(format!(
+                    "no language server configured for {} (check `bob lsp list`)",
                     file.display()
-                )
+                )))
             }
         };
 
         // Read current on-disk text and sync it so the server sees the latest.
         let text = match std::fs::read_to_string(&file) {
             Ok(t) => t,
-            Err(e) => return format!("error: cannot read {}: {}", file.display(), e),
+            Err(e) => {
+                return Err(ToolError::failed(format!(
+                    "cannot read {}: {}",
+                    file.display(),
+                    e
+                )))
+            }
         };
         client.sync_file(&file, &text).await;
 
@@ -109,7 +115,10 @@ impl Tool for LspTool {
             }
             "hover" => self.hover(&client, &file, &input).await,
             "document_symbols" => self.document_symbols(&client, &file).await,
-            other => format!("error: unknown operation '{}'", other),
+            other => Err(ToolError::invalid_input(format!(
+                "unknown operation '{}'",
+                other
+            ))),
         }
     }
 }
@@ -125,7 +134,7 @@ impl LspTool {
         file: &Path,
         text: &str,
         input: &Value,
-    ) -> String {
+    ) -> ToolResult {
         let min_sev = match input["severity"].as_str() {
             Some("all") => 4,
             Some("warning") => 2,
@@ -186,7 +195,7 @@ impl LspTool {
             shown += 1;
         }
         if shown == 0 {
-            return format!(
+            return Ok(format!(
                 "No diagnostics for {} (at or above {} severity).",
                 rel(file),
                 match min_sev {
@@ -194,9 +203,9 @@ impl LspTool {
                     2 => "warning",
                     _ => "hint",
                 }
-            );
+            ));
         }
-        out
+        Ok(out)
     }
 
     async fn locations(
@@ -205,23 +214,24 @@ impl LspTool {
         file: &Path,
         input: &Value,
         method: &str,
-    ) -> String {
+    ) -> ToolResult {
         let params = match position_params(file, input) {
             Ok(p) => p,
-            Err(e) => return e,
+            Err(e) => return Err(e),
         };
         let result = match client.request(method, params).await {
             Ok(r) => r,
-            Err(e) => return format!("error: {}", e),
+            Err(e) => return Err(ToolError::failed(format!("{}", e))),
         };
         let locs = collect_locations(&result);
         if locs.is_empty() {
-            return "No results.".to_string();
+            return Ok("No results.".to_string());
         }
-        locs.into_iter()
+        Ok(locs
+            .into_iter()
             .map(|(uri, line, col)| format!("{}:{}:{}", uri_to_rel(&uri), line + 1, col + 1))
             .collect::<Vec<_>>()
-            .join("\n")
+            .join("\n"))
     }
 
     async fn references(
@@ -229,68 +239,73 @@ impl LspTool {
         client: &crate::lsp::LspClient,
         file: &Path,
         input: &Value,
-    ) -> String {
+    ) -> ToolResult {
         let mut params = match position_params(file, input) {
             Ok(p) => p,
-            Err(e) => return e,
+            Err(e) => return Err(e),
         };
         params["context"] = json!({ "includeDeclaration": true });
         let result = match client.request("textDocument/references", params).await {
             Ok(r) => r,
-            Err(e) => return format!("error: {}", e),
+            Err(e) => return Err(ToolError::failed(format!("{}", e))),
         };
         let locs = collect_locations(&result);
         if locs.is_empty() {
-            return "No references found.".to_string();
+            return Ok("No references found.".to_string());
         }
         let mut out = format!("{} reference(s):\n", locs.len());
         for (uri, line, col) in locs {
             out.push_str(&format!("{}:{}:{}\n", uri_to_rel(&uri), line + 1, col + 1));
         }
-        out
+        Ok(out)
     }
 
-    async fn hover(&self, client: &crate::lsp::LspClient, file: &Path, input: &Value) -> String {
+    async fn hover(
+        &self,
+        client: &crate::lsp::LspClient,
+        file: &Path,
+        input: &Value,
+    ) -> ToolResult {
         let params = match position_params(file, input) {
             Ok(p) => p,
-            Err(e) => return e,
+            Err(e) => return Err(e),
         };
         let result = match client.request("textDocument/hover", params).await {
             Ok(r) => r,
-            Err(e) => return format!("error: {}", e),
+            Err(e) => return Err(ToolError::failed(format!("{}", e))),
         };
         // hover.contents is MarkupContent { kind, value } or a string / array.
         let contents = &result["contents"];
         if let Some(s) = contents.as_str() {
-            return s.to_string();
+            return Ok(s.to_string());
         }
         if let Some(v) = contents["value"].as_str() {
-            return v.to_string();
+            return Ok(v.to_string());
         }
         if contents.is_null() {
-            return "No hover information.".to_string();
+            return Ok("No hover information.".to_string());
         }
-        contents.to_string()
+        Ok(contents.to_string())
     }
 
-    async fn document_symbols(&self, client: &crate::lsp::LspClient, file: &Path) -> String {
+    async fn document_symbols(&self, client: &crate::lsp::LspClient, file: &Path) -> ToolResult {
         let params = json!({ "textDocument": { "uri": path_uri(file) } });
         let result = match client.request("textDocument/documentSymbol", params).await {
             Ok(r) => r,
-            Err(e) => return format!("error: {}", e),
+            Err(e) => return Err(ToolError::failed(format!("{}", e))),
         };
         let arr = match result.as_array() {
             Some(a) if !a.is_empty() => a,
-            _ => return "No symbols.".to_string(),
+            _ => return Ok("No symbols.".to_string()),
         };
         let mut out = String::new();
         for s in arr {
             render_symbol(s, 0, &mut out);
         }
-        out
+        Ok(out)
     }
 
-    async fn workspace_symbols(&self, query: &str) -> String {
+    async fn workspace_symbols(&self, query: &str) -> ToolResult {
         // Query every ready server; merge results. workspace/symbol isn't file-
         // scoped, so we can't route — ask all servers that have a client.
         let mut out = String::new();
@@ -320,22 +335,22 @@ impl LspTool {
             }
         }
         if !any {
-            return "No matching symbols.".to_string();
+            return Ok("No matching symbols.".to_string());
         }
-        out
+        Ok(out)
     }
 }
 
 // --- helpers ---------------------------------------------------------------
 
-fn position_params(file: &Path, input: &Value) -> Result<Value, String> {
+fn position_params(file: &Path, input: &Value) -> Result<Value, ToolError> {
     let line = match input["line"].as_i64() {
         Some(l) if l >= 1 => l - 1,
-        _ => return Err("error: line is required (1-based)".to_string()),
+        _ => return Err(ToolError::invalid_input("line is required (1-based)")),
     };
     let character = match input["character"].as_i64() {
         Some(c) if c >= 1 => c - 1,
-        _ => return Err("error: character is required (1-based)".to_string()),
+        _ => return Err(ToolError::invalid_input("character is required (1-based)")),
     };
     Ok(json!({
         "textDocument": { "uri": path_uri(file) },

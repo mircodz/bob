@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use tokio::task::JoinHandle;
 
 use crate::core::types::ToolSpec;
-use crate::tools::registry::{Tool, ToolContext};
+use crate::tools::registry::{Tool, ToolContext, ToolError, ToolResult};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
@@ -186,23 +186,24 @@ impl Tool for JobStatusTool {
         }
     }
 
-    async fn execute(&self, input: Value, ctx: &ToolContext) -> String {
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
         if let Some(id) = input["id"].as_str() {
             return match ctx.jobs.status_of(id) {
-                Some(s) => format!("{}: {:?}", id, s),
-                None => format!("error: no such job {}", id),
+                Some(s) => Ok(format!("{}: {:?}", id, s)),
+                None => Err(ToolError::not_found(format!("no such job {}", id))),
             };
         }
         let jobs = ctx.jobs.list();
         if jobs.is_empty() {
-            return "(no background jobs)".to_string();
+            return Ok("(no background jobs)".to_string());
         }
-        jobs.iter()
+        Ok(jobs
+            .iter()
             .map(|(id, kind, desc, status)| {
                 format!("{} [{}] {}: {}", id, status.label(), kind, desc)
             })
             .collect::<Vec<_>>()
-            .join("\n")
+            .join("\n"))
     }
 }
 
@@ -229,10 +230,10 @@ impl Tool for JobOutputTool {
         }
     }
 
-    async fn execute(&self, input: Value, ctx: &ToolContext) -> String {
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
         let id = match input["id"].as_str() {
             Some(i) => i,
-            None => return "error: id is required".to_string(),
+            None => return Err(ToolError::invalid_input("id is required")),
         };
         match ctx.jobs.output_of(id) {
             Some((status, output)) => {
@@ -247,9 +248,9 @@ impl Tool for JobOutputTool {
                 } else {
                     &output
                 };
-                format!("{} [{}]:\n{}", id, state, body)
+                Ok(format!("{} [{}]:\n{}", id, state, body))
             }
-            None => format!("error: no such job {}", id),
+            None => Err(ToolError::not_found(format!("no such job {}", id))),
         }
     }
 }

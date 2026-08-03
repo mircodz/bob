@@ -22,6 +22,8 @@ pub const BASE_PROMPT: &str = r#"You are bob, an interactive CLI coding assistan
 - When you have enough information to act, act. Don't re-derive facts already established, re-litigate a decision the user already made, or narrate options you won't pursue. If weighing a choice, give a recommendation, not an exhaustive survey.
 - Report outcomes faithfully: if tests fail, say so with the output; if you skipped a step, say that; when something is done and verified, state it plainly without hedging. Never invent facts — read the file or run the command, or say you don't know.
 - Use Markdown sparingly; it renders in the terminal. Code, paths, and commands in backticks.
+- Do not use emoji unless the user uses them first or explicitly asks. Plain text reads better in a terminal.
+- Add a web_search when you need current information or don't have a URL, then web_fetch the most relevant result to read it. Don't guess at facts that may have changed — look them up.
 
 # Working with files
 - ALWAYS read a file before editing it. Edits are rejected otherwise, and you need the exact current content to make a correct edit.
@@ -36,6 +38,7 @@ pub const BASE_PROMPT: &str = r#"You are bob, an interactive CLI coding assistan
 - Use `read_file`, `glob`, `grep`, `list_dir` rather than shelling out to `cat`, `find`, `ls`, or `grep` via `bash` — the dedicated tools are faster and cleaner.
 - Use the `lsp` tool for code intelligence when a language server is configured: `diagnostics` to see compiler/type errors, `definition`/`references` to find where a symbol is defined or used, `hover` for types/signatures. Prefer it over `grep` for "where is X defined/used" — it understands scope, not just text. `grep` takes a `literal: true` flag for searching strings with regex metacharacters (e.g. `#[derive`).
 - Reserve `bash` for actually running things: builds, tests, git, package managers, scripts. Quote paths with spaces. Don't `cd` unless asked — commands run from the working directory already.
+- Keep bash non-interactive: pass flags that avoid prompts (e.g. `--yes`, `--no-pager`), never launch editors or pagers, and set a `timeout` for anything that could hang. A command that blocks on input will stall the turn.
 - When several independent reads/searches are needed, do them in parallel (multiple tool calls in one step) rather than one at a time.
 - Verify your work when practical: run the tests, build, or the script you just changed.
 
@@ -49,7 +52,7 @@ pub const BASE_PROMPT: &str = r#"You are bob, an interactive CLI coding assistan
 
 # Plan mode
 - The user can switch you into PLAN mode (shown in the status line). In plan mode you are READ-ONLY: all file edits and shell commands are blocked. Research the code, then propose an implementation plan.
-- When your plan is ready, call `exit_plan` with the plan as Markdown to ask the user to approve it. If they approve, mode returns to normal and you may proceed; if they ask for changes, refine and call `exit_plan` again.
+- When your plan is ready, call `exit_plan` with the plan as Markdown. bob saves it as a document under `~/.bob/plans/` and presents it to the user for approval. If they approve, mode returns to normal and you may proceed; if they ask for changes, refine and call `exit_plan` again with the revised plan.
 - Do NOT attempt edits in plan mode — they will be denied. Only leave plan mode via `exit_plan` approval.
 
 # Asking the user
@@ -77,30 +80,151 @@ pub fn build_system_prompt(user_override: Option<&str>, cwd: &Path) -> String {
     out
 }
 
-/// A short live-context block. Timestamp is passed in by the caller (core avoids
-/// wall-clock calls); here we include only what we can derive statically.
+/// A short live-context block: cwd, OS, today's date, and git status so the model
+/// has temporal + repository awareness (it otherwise has none).
 fn environment_block(cwd: &Path) -> String {
-    format!(
-        "# Environment\n- Working directory: {}\n- OS: {}\n- The user is running you in a terminal UI; output is rendered as Markdown.",
+    let mut s = format!(
+        "# Environment\n- Working directory: {}\n- OS: {}\n- Today's date: {}",
         cwd.display(),
         std::env::consts::OS,
-    )
+        today_iso(),
+    );
+    if let Some(git) = git_context(cwd) {
+        s.push_str(&git);
+    }
+    s.push_str("\n- The user is running you in a terminal UI; output is rendered as Markdown.");
+    s
 }
 
-/// Load project-specific instructions from AGENTS.md or CLAUDE.md at the cwd, if
-/// present. This is how a project teaches bob its conventions.
+/// A one-or-two-line git summary (branch + whether the tree is dirty), or None if
+/// the cwd isn't a git repo. Read straight from `.git` without shelling out, so it
+/// stays cheap and dependency-free.
+fn git_context(cwd: &Path) -> Option<String> {
+    let git_dir = find_git_dir(cwd)?;
+    // Current branch from HEAD: "ref: refs/heads/<branch>" for a normal checkout,
+    // or a raw sha when detached.
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head = head.trim();
+    let branch = head
+        .strip_prefix("ref: refs/heads/")
+        .map(|b| b.to_string())
+        .unwrap_or_else(|| format!("detached at {}", &head[..head.len().min(8)]));
+    Some(format!("\n- Git branch: {}", branch))
+}
+
+/// Walk up from `cwd` looking for a `.git` directory; return the git dir path.
+fn find_git_dir(cwd: &Path) -> Option<std::path::PathBuf> {
+    let mut dir = Some(cwd);
+    while let Some(d) = dir {
+        let candidate = d.join(".git");
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+        dir = d.parent();
+    }
+    None
+}
+
+/// Today's date as `YYYY-MM-DD` (UTC), computed from the system clock without a
+/// calendar dependency via Howard Hinnant's civil-from-days algorithm.
+fn today_iso() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let days = secs.div_euclid(86_400);
+    let (y, m, d) = civil_from_days(days);
+    format!("{:04}-{:02}-{:02}", y, m, d)
+}
+
+/// Convert a count of days since the Unix epoch into a (year, month, day) Gregorian
+/// date. See http://howardhinnant.github.io/date_algorithms.html#civil_from_days.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as i64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// Gather project + user instructions, in priority order (broadest first, nearest
+/// last, so the most specific context is freshest in the model's mind):
+///   1. the user-global `~/.bob/AGENTS.md` (personal conventions across projects),
+///   2. AGENTS.md / CLAUDE.md found by walking from the repo root DOWN to the cwd
+///      (so a monorepo's root conventions and a subdir's local ones both apply).
+/// Returns None if nothing was found.
 fn project_context(cwd: &Path) -> Option<String> {
-    for name in ["AGENTS.md", "CLAUDE.md", ".bob/AGENTS.md"] {
-        let path = cwd.join(name);
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            let text = text.trim();
-            if !text.is_empty() {
-                return Some(format!(
-                    "# Project instructions (from {})\nThe following are conventions and context for THIS project. Follow them.\n\n{}",
-                    name, text
+    let mut blocks: Vec<String> = Vec::new();
+
+    // 1. User-global memory.
+    if let Some(home) = dirs::home_dir() {
+        if let Some(text) = read_nonempty(&home.join(".bob").join("AGENTS.md")) {
+            blocks.push(format!(
+                "# Personal instructions (from ~/.bob/AGENTS.md)\nYour user's standing preferences across all projects.\n\n{}",
+                text
+            ));
+        }
+    }
+
+    // 2. Project memory: from the outermost ancestor down to the cwd. Stop climbing
+    // at the git root (or the filesystem root) so we don't wander outside the repo.
+    let git_root = find_git_dir(cwd).and_then(|g| g.parent().map(|p| p.to_path_buf()));
+    let mut chain: Vec<&Path> = Vec::new();
+    let mut dir = Some(cwd);
+    while let Some(d) = dir {
+        chain.push(d);
+        if Some(d) == git_root.as_deref() {
+            break;
+        }
+        dir = d.parent();
+    }
+    // chain is cwd..root; reverse so the nearest dir is appended LAST.
+    for d in chain.into_iter().rev() {
+        for name in ["AGENTS.md", "CLAUDE.md", ".bob/AGENTS.md"] {
+            if let Some(text) = read_nonempty(&d.join(name)) {
+                blocks.push(format!(
+                    "# Project instructions (from {}/{})\nConventions and context for THIS project. Follow them.\n\n{}",
+                    d.display(),
+                    name,
+                    text
                 ));
+                break; // one file per directory
             }
         }
     }
-    None
+
+    if blocks.is_empty() {
+        None
+    } else {
+        Some(blocks.join("\n\n"))
+    }
+}
+
+/// Read a file, returning its trimmed contents only if non-empty.
+fn read_nonempty(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let text = text.trim();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::civil_from_days;
+
+    #[test]
+    fn civil_from_days_known_dates() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1)); // epoch
+        assert_eq!(civil_from_days(18_993), (2022, 1, 1));
+        assert_eq!(civil_from_days(19_723), (2024, 1, 1)); // leap year boundary
+        assert_eq!(civil_from_days(-1), (1969, 12, 31)); // before epoch
+    }
 }

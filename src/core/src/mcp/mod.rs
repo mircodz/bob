@@ -6,7 +6,7 @@
 
 use crate::core::config::McpServerConfig;
 use crate::core::types::ToolSpec;
-use crate::tools::registry::{Tool, ToolContext};
+use crate::tools::registry::{Tool, ToolContext, ToolError, ToolResult};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -221,11 +221,11 @@ impl Tool for McpTool {
         self.spec.clone()
     }
 
-    async fn execute(&self, input: Value, _ctx: &ToolContext) -> String {
-        match self.client.call_tool(&self.raw_name, input).await {
-            Ok(text) => text,
-            Err(e) => format!("error: {}", e),
-        }
+    async fn execute(&self, input: Value, _ctx: &ToolContext) -> ToolResult {
+        self.client
+            .call_tool(&self.raw_name, input)
+            .await
+            .map_err(|e| ToolError::failed(e.to_string()))
     }
 }
 

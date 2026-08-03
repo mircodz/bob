@@ -83,7 +83,7 @@ impl LspClient {
         let server_root = repo_root.join(&cfg.root);
         let root_uri = path_to_uri(&server_root);
 
-        let mut command = tokio::process::Command::new(&cfg.command);
+        let mut command = tokio::process::Command::new(resolve_command(&cfg.command));
         command
             .args(&cfg.args)
             .current_dir(&server_root)
@@ -91,9 +91,16 @@ impl LspClient {
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
 
-        let mut child = command
-            .spawn()
-            .map_err(|e| anyhow::anyhow!("failed to start LSP '{}': {}", cfg.name, e))?;
+        let mut child = command.spawn().map_err(|e| {
+            anyhow::anyhow!(
+                "failed to start LSP '{}' (command '{}'): {}. \
+                 Ensure it's installed and on PATH — if it lives in ~/.cargo/bin or \
+                 another dir, launch bob with that dir on PATH.",
+                cfg.name,
+                cfg.command,
+                e
+            )
+        })?;
         let stdin = child
             .stdin
             .take()
@@ -245,6 +252,59 @@ impl LspClient {
         stdin.flush().await?;
         Ok(())
     }
+}
+
+/// Resolve an LSP server command to an executable path. If `command` already
+/// contains a path separator, or bob's inherited `PATH` can find it, it's used
+/// verbatim (the OS resolves it). Otherwise we probe common install dirs that a
+/// GUI/non-login launch often misses — most importantly `~/.cargo/bin`, where
+/// rustup places the `rust-analyzer` shim. Returns the original name if nothing
+/// matches, so the spawn still surfaces a clear "not found" error.
+fn resolve_command(command: &str) -> std::path::PathBuf {
+    let as_path = Path::new(command);
+    if as_path.is_absolute() || command.contains('/') {
+        return as_path.to_path_buf();
+    }
+    // Already resolvable via the inherited PATH? Trust it.
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            if is_executable(&dir.join(command)) {
+                return as_path.to_path_buf(); // let the OS resolve it normally
+            }
+        }
+    }
+    // Fall back to common install locations the launch env may have dropped.
+    let home = dirs::home_dir();
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(h) = &home {
+        candidates.push(h.join(".cargo/bin").join(command));
+        candidates.push(h.join(".local/bin").join(command));
+        candidates.push(h.join("go/bin").join(command));
+    }
+    candidates.push(std::path::PathBuf::from("/opt/homebrew/bin").join(command));
+    candidates.push(std::path::PathBuf::from("/usr/local/bin").join(command));
+    candidates.push(std::path::PathBuf::from("/usr/bin").join(command));
+    for c in candidates {
+        if is_executable(&c) {
+            return c;
+        }
+    }
+    as_path.to_path_buf()
+}
+
+/// Whether `path` is an existing file we can execute.
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+/// On non-unix, treat any existing file as runnable (the OS handles the rest).
+#[cfg(not(unix))]
+fn is_executable(path: &Path) -> bool {
+    path.is_file()
 }
 
 /// Background task: read framed messages, correlate responses to pending

@@ -4,7 +4,7 @@
 use crate::core::types::ToolSpec;
 use crate::tools::builtin::resolve_path;
 use crate::tools::diff::{compact_diff, diff_lines, diff_stat, format_unified};
-use crate::tools::registry::{Tool, ToolContext};
+use crate::tools::registry::{Tool, ToolContext, ToolError, ToolResult};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
@@ -126,7 +126,7 @@ impl Tool for EditFileTool {
         }
     }
 
-    async fn execute(&self, input: Value, ctx: &ToolContext) -> String {
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
         let path = input["path"].as_str().unwrap_or("");
         let old_string = input["old_string"].as_str().unwrap_or("");
         let new_string = input["new_string"].as_str().unwrap_or("");
@@ -135,23 +135,16 @@ impl Tool for EditFileTool {
         let full_str = full.to_string_lossy().to_string();
 
         if let Some(stale) = ctx.files.check_editable(&full_str) {
-            return format!("error: {}", stale);
+            return Err(ToolError::failed(stale));
         }
 
-        let content = match std::fs::read_to_string(&full) {
-            Ok(c) => c,
-            Err(e) => return format!("error: {}", e),
-        };
-        let updated = match apply_edit(&content, old_string, new_string, replace_all, "") {
-            Ok(u) => u,
-            Err(e) => return format!("error: {}", e),
-        };
+        let content = std::fs::read_to_string(&full)?;
+        let updated = apply_edit(&content, old_string, new_string, replace_all, "")
+            .map_err(ToolError::invalid_input)?;
 
-        if let Err(e) = std::fs::write(&full, &updated) {
-            return format!("error: {}", e);
-        }
+        std::fs::write(&full, &updated)?;
         ctx.files.record_write(&full_str);
-        edit_result(path, &content, &updated)
+        Ok(edit_result(path, &content, &updated))
     }
 
     fn preview(&self, input: &Value, ctx: &ToolContext) -> Option<String> {
@@ -203,44 +196,37 @@ impl Tool for MultiEditTool {
         }
     }
 
-    async fn execute(&self, input: Value, ctx: &ToolContext) -> String {
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
         let path = input["path"].as_str().unwrap_or("");
         let full = resolve_path(&ctx.cwd, path);
         let full_str = full.to_string_lossy().to_string();
 
         if let Some(stale) = ctx.files.check_editable(&full_str) {
-            return format!("error: {}", stale);
+            return Err(ToolError::failed(stale));
         }
 
         let empty = vec![];
         let edits = input["edits"].as_array().unwrap_or(&empty);
-        let mut content = match std::fs::read_to_string(&full) {
-            Ok(c) => c,
-            Err(e) => return format!("error: {}", e),
-        };
+        let mut content = std::fs::read_to_string(&full)?;
         let original = content.clone();
 
         for (i, e) in edits.iter().enumerate() {
             let old_string = e["old_string"].as_str().unwrap_or("");
             let new_string = e["new_string"].as_str().unwrap_or("");
             let replace_all = e["replace_all"].as_bool().unwrap_or(false);
-            content = match apply_edit(
+            content = apply_edit(
                 &content,
                 old_string,
                 new_string,
                 replace_all,
                 &format!("edit {i}: "),
-            ) {
-                Ok(u) => u,
-                Err(err) => return format!("error: {}", err),
-            };
+            )
+            .map_err(ToolError::invalid_input)?;
         }
 
-        if let Err(e) = std::fs::write(&full, &content) {
-            return format!("error: {}", e);
-        }
+        std::fs::write(&full, &content)?;
         ctx.files.record_write(&full_str);
-        edit_result(path, &original, &content)
+        Ok(edit_result(path, &original, &content))
     }
 
     fn preview(&self, input: &Value, ctx: &ToolContext) -> Option<String> {

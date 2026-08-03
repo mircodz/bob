@@ -2,7 +2,7 @@
 //! struct implementing the `Tool` trait. (The `bash` tool lives in `bash.rs`.)
 
 use crate::core::types::ToolSpec;
-use crate::tools::registry::{Tool, ToolContext};
+use crate::tools::registry::{Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -42,31 +42,50 @@ impl Tool for ReadFileTool {
         }
     }
 
-    async fn execute(&self, input: Value, ctx: &ToolContext) -> String {
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
         let path = input["path"].as_str().unwrap_or("");
         let full = resolve_path(&ctx.cwd, path);
-        let text = match std::fs::read_to_string(&full) {
-            Ok(t) => t,
-            Err(e) => return format!("error: {}", e),
-        };
+        let text = std::fs::read_to_string(&full)?;
         ctx.files.record_read(&full.to_string_lossy());
 
+        // Default caps mirror Claude Code: at most ~2000 lines, and each line
+        // truncated to ~2000 chars, so a large or minified file can't flood the
+        // context window. An explicit offset/limit overrides the line cap.
+        const DEFAULT_LINE_LIMIT: usize = 2000;
+        const MAX_LINE_CHARS: usize = 2000;
+
         let lines: Vec<&str> = text.split('\n').collect();
+        let total = lines.len();
         let offset = input["offset"].as_u64().unwrap_or(0) as usize;
         let start = if offset > 0 { offset - 1 } else { 0 };
         let end = match input["limit"].as_u64() {
-            Some(l) => (start + l as usize).min(lines.len()),
-            None => lines.len(),
+            Some(l) => (start + l as usize).min(total),
+            None => (start + DEFAULT_LINE_LIMIT).min(total),
         };
-        if start >= lines.len() {
-            return String::new();
+        if start >= total {
+            return Ok(String::new());
         }
-        lines[start..end]
+        let mut out = lines[start..end]
             .iter()
             .enumerate()
-            .map(|(i, l)| format!("{:>6}\t{}", start + i + 1, l))
+            .map(|(i, l)| {
+                let shown = if l.chars().count() > MAX_LINE_CHARS {
+                    let head: String = l.chars().take(MAX_LINE_CHARS).collect();
+                    format!("{head}... [line truncated]")
+                } else {
+                    (*l).to_string()
+                };
+                format!("{:>6}\t{}", start + i + 1, shown)
+            })
             .collect::<Vec<_>>()
-            .join("\n")
+            .join("\n");
+        if end < total {
+            out.push_str(&format!(
+                "\n\n... [{} more lines; use offset/limit to read further]",
+                total - end
+            ));
+        }
+        Ok(out)
     }
 }
 
@@ -95,18 +114,16 @@ impl Tool for WriteFileTool {
         }
     }
 
-    async fn execute(&self, input: Value, ctx: &ToolContext) -> String {
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
         let path = input["path"].as_str().unwrap_or("");
         let content = input["content"].as_str().unwrap_or("");
         let full = resolve_path(&ctx.cwd, path);
         if let Some(parent) = full.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        if let Err(e) = std::fs::write(&full, content) {
-            return format!("error: {}", e);
-        }
+        std::fs::write(&full, content)?;
         ctx.files.record_write(&full.to_string_lossy());
-        format!("wrote {} bytes to {}", content.len(), path)
+        Ok(format!("wrote {} bytes to {}", content.len(), path))
     }
 
     fn preview(&self, input: &Value, ctx: &ToolContext) -> Option<String> {
@@ -157,21 +174,65 @@ impl Tool for ListDirTool {
         }
     }
 
-    async fn execute(&self, input: Value, ctx: &ToolContext) -> String {
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
         let path = input["path"].as_str().unwrap_or(".");
         let full = resolve_path(&ctx.cwd, path);
-        let mut entries: Vec<String> = match std::fs::read_dir(&full) {
-            Ok(rd) => rd
-                .filter_map(|e| e.ok())
-                .map(|e| e.file_name().to_string_lossy().to_string())
-                .collect(),
-            Err(e) => return format!("error: {}", e),
-        };
+        let mut entries: Vec<String> = std::fs::read_dir(&full)?
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
         entries.sort();
-        if entries.is_empty() {
+        Ok(if entries.is_empty() {
             "(empty)".to_string()
         } else {
             entries.join("\n")
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::registry::ToolErrorKind;
+
+    fn ctx(cwd: &str) -> ToolContext {
+        ToolContext {
+            cwd: cwd.to_string(),
+            files: std::sync::Arc::new(crate::tools::file_tracker::FileTracker::new()),
+            todos: std::sync::Arc::new(crate::tools::todo::TodoStore::new()),
+            jobs: crate::tools::jobs::JobRegistry::new(),
+            user_asker: None,
+            lsp: None,
+            coord: None,
         }
+    }
+
+    /// The whole point of the typed-error refactor: a file whose CONTENT starts
+    /// with "error:" must read successfully, not be misclassified as a failure
+    /// (the old `output.starts_with("error:")` bug).
+    #[tokio::test]
+    async fn reading_a_file_containing_error_text_is_ok() {
+        let dir = std::env::temp_dir().join(format!("bobtest_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("log.txt");
+        std::fs::write(&path, "error: mismatched types\nsecond line").unwrap();
+
+        let result = ReadFileTool
+            .execute(json!({ "path": path.to_string_lossy() }), &ctx("."))
+            .await;
+        assert!(result.is_ok(), "reading a file must not be an error");
+        assert!(result.unwrap().contains("error: mismatched types"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A missing file yields a typed NotFound (from the io::Error conversion),
+    /// so the model can react to the category rather than parse prose.
+    #[tokio::test]
+    async fn reading_a_missing_file_is_not_found() {
+        let result = ReadFileTool
+            .execute(json!({ "path": "/no/such/bob/file.xyz" }), &ctx("."))
+            .await;
+        let err = result.expect_err("missing file must be an error");
+        assert_eq!(err.kind, ToolErrorKind::NotFound);
     }
 }

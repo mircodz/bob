@@ -55,6 +55,10 @@ impl ResponsesProvider {
         // Reasoning intensity (gpt-5.x / o-series). Off → omit the field.
         if let Some(effort) = opts.reasoning.as_str() {
             body["reasoning"] = json!({ "effort": effort });
+            // With store:false the backend keeps no server-side state, so we must
+            // fetch the encrypted reasoning items and echo them back on the next
+            // request to preserve reasoning continuity across tool calls.
+            body["include"] = json!(["reasoning.encrypted_content"]);
         }
         if !opts.tools.is_empty() {
             // Responses API tool shape: flat {type:function, name, description, parameters}.
@@ -103,8 +107,10 @@ impl Provider for ResponsesProvider {
         let mut rx = self.stream(opts).await?;
         let mut completion = None;
         while let Some(evt) = rx.recv().await {
-            if let StreamEvent::MessageStop { completion: c } = evt {
-                completion = Some(c);
+            match evt {
+                StreamEvent::MessageStop { completion: c } => completion = Some(c),
+                StreamEvent::Error { message } => anyhow::bail!("{}", message),
+                _ => {}
             }
         }
         completion.ok_or_else(|| anyhow::anyhow!("responses stream ended without completion"))
@@ -115,21 +121,21 @@ impl Provider for ResponsesProvider {
         opts: GenerateOptions,
     ) -> anyhow::Result<mpsc::UnboundedReceiver<StreamEvent>> {
         let body = self.build_body(&opts);
-        let res = self.request(body).await?.send().await?;
-        if !res.status().is_success() {
-            let status = res.status();
-            anyhow::bail!(
-                "responses {}: {}",
-                status,
-                res.text().await.unwrap_or_default()
-            );
-        }
+        let res =
+            crate::providers::provider::send_with_retry(self.request(body).await?, "responses")
+                .await?;
 
         let (tx, rx) = mpsc::unbounded_channel();
         tokio::spawn(async move {
             let mut text = String::new();
             // Tool calls accumulate by output index → (call_id, name, args).
             let mut tools: BTreeMap<i64, (String, String, String)> = BTreeMap::new();
+            // Reasoning items captured verbatim by output index, to be echoed
+            // back on the next request (reasoning continuity with store:false).
+            let mut reasoning: BTreeMap<i64, Value> = BTreeMap::new();
+            // The output_index the assistant text lives at, so it can be placed in
+            // the right spot among reasoning/tool blocks when finalizing.
+            let mut text_index: Option<i64> = None;
             let mut usage = Usage::default();
 
             let _ = parse_sse(res, |evt| {
@@ -138,10 +144,22 @@ impl Provider for ResponsesProvider {
                     // Streamed assistant text.
                     "response.output_text.delta" => {
                         if let Some(d) = evt["delta"].as_str() {
+                            if text_index.is_none() {
+                                text_index = Some(evt["output_index"].as_i64().unwrap_or(0));
+                            }
                             text.push_str(d);
                             let _ = tx.send(StreamEvent::TextDelta {
                                 text: d.to_string(),
                             });
+                        }
+                    }
+                    // A finished output item — capture reasoning items verbatim
+                    // (they carry the encrypted_content we must echo back).
+                    "response.output_item.done" => {
+                        let item = &evt["item"];
+                        if item["type"] == "reasoning" {
+                            let idx = evt["output_index"].as_i64().unwrap_or(0);
+                            reasoning.insert(idx, item.clone());
                         }
                     }
                     // A new output item — capture function-call metadata.
@@ -187,21 +205,39 @@ impl Provider for ResponsesProvider {
                             .unwrap_or(0);
 
                         let mut content: Vec<ContentBlock> = Vec::new();
-                        if !text.is_empty() {
-                            content.push(ContentBlock::Text { text: text.clone() });
+                        // Emit blocks in output_index order so each reasoning item
+                        // immediately precedes the function_call it justifies (the
+                        // backend requires this pairing when we echo them back with
+                        // store:false). Merge reasoning + tool calls + the assistant
+                        // text into one index-sorted sequence.
+                        let mut ordered: Vec<(i64, ContentBlock)> = Vec::new();
+                        for (idx, item) in &reasoning {
+                            ordered
+                                .push((*idx, ContentBlock::ReasoningItem { item: item.clone() }));
                         }
-                        for (id, name, args) in tools.values() {
+                        if !text.is_empty() {
+                            ordered.push((
+                                text_index.unwrap_or(i64::MAX),
+                                ContentBlock::Text { text: text.clone() },
+                            ));
+                        }
+                        for (idx, (id, name, args)) in &tools {
                             let input = if args.is_empty() {
                                 json!({})
                             } else {
                                 serde_json::from_str(args).unwrap_or(json!({}))
                             };
-                            content.push(ContentBlock::ToolUse {
-                                id: id.clone(),
-                                name: name.clone(),
-                                input,
-                            });
+                            ordered.push((
+                                *idx,
+                                ContentBlock::ToolUse {
+                                    id: id.clone(),
+                                    name: name.clone(),
+                                    input,
+                                },
+                            ));
                         }
+                        ordered.sort_by_key(|(idx, _)| *idx);
+                        content.extend(ordered.into_iter().map(|(_, b)| b));
                         let stop = if tools.is_empty() {
                             StopReason::EndTurn
                         } else {
@@ -218,22 +254,16 @@ impl Provider for ResponsesProvider {
                         let _ = tx.send(StreamEvent::MessageStop { completion });
                     }
                     "response.failed" | "error" => {
-                        // Surface an empty completion so the loop unwinds.
+                        // A real API failure — propagate it as an error event so the
+                        // agent loop surfaces it (and can retry), rather than
+                        // fabricating an assistant turn that poisons history.
                         let msg = evt["response"]["error"]["message"]
                             .as_str()
                             .or_else(|| evt["message"].as_str())
                             .unwrap_or("responses stream error");
-                        let completion = Completion {
-                            message: Message {
-                                role: Role::Assistant,
-                                content: vec![ContentBlock::Text {
-                                    text: format!("error: {}", msg),
-                                }],
-                            },
-                            stop_reason: StopReason::EndTurn,
-                            usage,
-                        };
-                        let _ = tx.send(StreamEvent::MessageStop { completion });
+                        let _ = tx.send(StreamEvent::Error {
+                            message: format!("responses: {}", msg),
+                        });
                     }
                     _ => {}
                 }
@@ -294,6 +324,13 @@ fn to_input_items(m: &Message) -> Vec<Value> {
             .collect(),
         Role::Assistant => {
             let mut items = Vec::new();
+            // Reasoning items first — echo them back verbatim so the backend can
+            // continue the reasoning chain across tool calls (store:false).
+            for b in &m.content {
+                if let ContentBlock::ReasoningItem { item } = b {
+                    items.push(item.clone());
+                }
+            }
             let text: String = m
                 .content
                 .iter()

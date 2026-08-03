@@ -4,52 +4,50 @@
 //! child module, they can access App's private fields directly.
 
 use super::theme::Palette;
-use super::{indent_line, render, shimmer_spans, theme, truncate_mid, view, wrap_line, App};
+use super::{indent_line, render, shimmer_spans, team, theme, truncate_mid, view, wrap_line, App};
 use bob_core::core::permissions::Mode;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 
+/// Horizontal breathing room inside the input band, in columns per side. The
+/// height calc and the renderer BOTH inset the text by this, so wrapping agrees
+/// and the band grows to fit exactly (mismatched widths clipped long lines).
+const INPUT_PAD: u16 = 3;
+
 impl App {
-    /// Build the fully wrapped, prompt-prefixed display lines for the input box,
-    /// given the usable text width. Used for BOTH the height calc and rendering
-    /// so they never disagree (which is what clipped long lines).
+    /// Build the wrapped, prompt-prefixed display lines for the input box, given
+    /// the usable text width. Used for BOTH the height calc and rendering so they
+    /// never disagree. The first row carries a `›` marker, wrapped/continuation
+    /// rows a 2-space indent, so text stays aligned under the marker.
     fn input_lines(&self, width: usize, busy: bool) -> Vec<Line<'static>> {
-        let prompt = || {
-            Span::styled(
-                "› ",
-                Style::default()
-                    .fg(Palette::ACCENT())
-                    .add_modifier(Modifier::BOLD),
-            )
-        };
+        // The prompt marker + its continuation indent are both 2 columns wide, so
+        // content wraps at `width - 2` and every visual row aligns.
+        const PREFIX: usize = 2;
+        let text_color = Style::default().fg(Palette::TEXT());
+        let marker = || Span::styled("› ", Style::default().fg(Palette::DIM()));
+        let indent = || Span::styled("  ", Style::default());
+
         if self.input.text().is_empty() && !busy {
             return vec![Line::from(vec![
-                prompt(),
+                marker(),
                 Span::styled(
                     "send a message...  (Ctrl+J or Shift+Enter for newline)",
                     Style::default().fg(Palette::FAINT()),
                 ),
             ])];
         }
-        let mut out: Vec<Line<'static>> = Vec::new();
-        for (i, l) in self.input.display_lines().iter().enumerate() {
-            let prefix = if i == 0 {
-                prompt()
-            } else {
-                Span::styled("  ", Style::default())
-            };
-            let logical = Line::from(vec![
-                prefix,
-                Span::styled(l.to_string(), Style::default().fg(Palette::TEXT())),
-            ]);
-            // Wrap each logical line so long content (pasted code) never clips.
-            for wl in wrap_line(logical, width.max(1)) {
-                out.push(wl);
-            }
-        }
-        out
+
+        let content_width = width.saturating_sub(PREFIX).max(1);
+        let (rows, _, _) = self.input.wrapped(content_width);
+        rows.into_iter()
+            .enumerate()
+            .map(|(i, row)| {
+                let prefix = if i == 0 { marker() } else { indent() };
+                Line::from(vec![prefix, Span::styled(row, text_color)])
+            })
+            .collect()
     }
 
     pub(super) fn draw(&mut self, f: &mut ratatui::Frame) {
@@ -63,12 +61,13 @@ impl App {
         );
         // The input band grows with the number of *wrapped* text lines
         // (1 pad row above + N text rows + 1 pad row below), capped so it can't
-        // eat the whole screen.
-        let text_width = area.width.saturating_sub(2) as usize;
+        // eat the whole screen. Use the SAME inset width the renderer uses, or the
+        // height won't match the wrapped line count.
+        let text_width = area.width.saturating_sub(INPUT_PAD * 2) as usize;
         let wrapped = self
             .input_lines(text_width, self.running || self.view.busy)
             .len();
-        let text_rows = (wrapped as u16).clamp(1, 10);
+        let text_rows = (wrapped as u16).clamp(1, 12);
         let input_height = text_rows + 2;
 
         // The band above the input shows either a permission prompt or a user
@@ -92,12 +91,21 @@ impl App {
 
         // A sticky todo panel sits just above the input while the list is
         // non-empty (one row per item + a header), capped so it can't dominate.
+        // Hidden when the user toggles it off (Ctrl+L).
         let todo_items = self.todos.as_ref().map(|t| t.items()).unwrap_or_default();
-        let todos_height = if todo_items.is_empty() {
+        let todos_height = if todo_items.is_empty() || !self.show_todos {
             0
         } else {
             // header + one blank line of padding above and below.
             (todo_items.len() as u16 + 3).min(14)
+        };
+
+        // A pinned "queued messages" panel sits just above the input when messages
+        // are waiting to be sent after the current turn (one row per chip + header).
+        let queue_height = if self.queue.is_empty() {
+            0
+        } else {
+            (self.queue.len() as u16 + 1).min(6)
         };
 
         let chunks = Layout::default()
@@ -107,6 +115,7 @@ impl App {
                 Constraint::Length(prompt_height),
                 Constraint::Length(todos_height),
                 Constraint::Length(jobs_height),
+                Constraint::Length(queue_height),
                 Constraint::Length(input_height),
                 Constraint::Length(1), // status bar below the input
             ])
@@ -124,14 +133,24 @@ impl App {
         if jobs_height > 0 {
             self.draw_jobs(f, chunks[3], &job_rows);
         }
-        self.draw_input(f, chunks[4]);
-        self.draw_status_bar(f, chunks[5]);
+        if queue_height > 0 {
+            self.draw_queue(f, chunks[4]);
+        }
+        self.draw_input(f, chunks[5]);
+        self.draw_status_bar(f, chunks[6]);
 
         if !self.menu.is_empty() {
-            self.draw_menu(f, chunks[4]);
+            self.draw_menu(f, chunks[5]);
         }
         if !self.file_menu.is_empty() {
-            self.draw_file_menu(f, chunks[4]);
+            self.draw_file_menu(f, chunks[5]);
+        }
+        // The team drawer is a full overlay above everything else.
+        if self.team_drawer.is_some() {
+            self.draw_team_drawer(f, area);
+        } else {
+            // Drop the stale roster hit-box so clicks don't select a hidden agent.
+            self.roster_rect = None;
         }
         if let Some(toast) = self.toast.clone() {
             self.draw_toast(f, area, &toast);
@@ -257,99 +276,352 @@ impl App {
         );
     }
 
-    fn draw_scrollback(&mut self, f: &mut ratatui::Frame, full: Rect) {
-        // Content is inset with a small left/right margin, EXCEPT the user-message
-        // band which spans full width (rendered against `full.width`). Non-user
-        // cells get the inset via a left pad inside their lines... simplest: we
-        // render at full width and inset all lines that aren't the user band.
-        let area = full;
+    /// Pinned "queued messages" panel: the messages waiting to be sent after the
+    /// current turn, shown as chips above the input (not in the transcript). The
+    /// last chip can be popped back for editing with Backspace on an empty prompt.
+    fn draw_queue(&self, f: &mut ratatui::Frame, area: Rect) {
+        f.render_widget(Clear, area);
+        let mut lines: Vec<Line> = vec![Line::from(Span::styled(
+            format!(" queued · {} · sent after this turn ", self.queue.len()),
+            Style::default()
+                .fg(Palette::ACCENT())
+                .add_modifier(Modifier::BOLD),
+        ))];
+        for msg in self
+            .queue
+            .iter()
+            .take(area.height.saturating_sub(1) as usize)
+        {
+            lines.push(Line::from(vec![
+                Span::styled("  › ", Style::default().fg(Palette::DIM())),
+                Span::styled(
+                    truncate_mid(
+                        &msg.replace('\n', " "),
+                        area.width.saturating_sub(4) as usize,
+                    ),
+                    Style::default().fg(Palette::TEXT()),
+                ),
+            ]));
+        }
+        f.render_widget(
+            Paragraph::new(lines).style(Style::default().bg(Palette::BG())),
+            area,
+        );
+    }
+    /// on the right, the selected agent's live transcript. Toggled with Ctrl+T.
+    fn draw_team_drawer(&mut self, f: &mut ratatui::Frame, area: Rect) {
+        let Some(drawer) = self.team_drawer.as_ref() else {
+            return;
+        };
+        // Snapshot the fields we need so we can later take a mutable borrow of
+        // `self.team_drawer` to write the clamped scroll back without a conflict.
+        let sel = drawer.selected;
+        let hovered = drawer.hovered;
+        let drawer_scroll = drawer.scroll;
+        let compose_buf: Option<String> = drawer.composing.clone();
+        let composing = compose_buf.is_some();
+        // A distinct popup background sets the drawer apart from the main log.
+        // Minimal, chrome-free overlay matching the rest of the TUI: base
+        // background, dim prose, one colored status dot per agent, the selected
+        // agent bold, separation by whitespace (no boxes/borders/dividers/bars).
+        f.render_widget(Clear, area);
+        f.render_widget(
+            Block::default().style(Style::default().bg(Palette::BG())),
+            area,
+        );
 
-        let mut raw: Vec<Line> = Vec::new();
-        // Parallel to `raw`: whether each line should get the 2-col non-user
-        // inset (applied after wrapping so continuation lines stay aligned).
-        let mut inset_flags: Vec<bool> = Vec::new();
+        // Header · body · hint, all on the base background.
+        let outer = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2), // blank + header
+                Constraint::Min(1),    // body
+                Constraint::Length(1), // hint
+            ])
+            .split(area);
+
+        let order = self.teams.display_order();
+        let running = order
+            .iter()
+            .filter(|id| {
+                matches!(
+                    self.teams.get(id).map(|t| t.status),
+                    Some(team::ThreadStatus::Running)
+                )
+            })
+            .count();
+        // Terse lowercase header, like the jobs/todos panels.
+        let header = Line::from(Span::styled(
+            format!("  team · {} agents · {} running", order.len(), running),
+            Style::default().fg(Palette::DIM()),
+        ));
+        f.render_widget(
+            Paragraph::new(vec![Line::from(""), header]).style(Style::default().bg(Palette::BG())),
+            outer[0],
+        );
+
+        // Roster on the left, transcript on the right, split by whitespace only.
+        let body = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(24), Constraint::Min(10)])
+            .split(outer[1]);
+        // Remember the roster rect so left-clicks can select an agent. The roster
+        // has one leading blank line, so agent `i` sits at row `body[0].y + 1 + i`.
+        self.roster_rect = Some(body[0]);
+
+        // Left: agent roster (running first, finished at the bottom & dimmed).
+        let mut roster: Vec<Line> = vec![Line::from("")];
+        for (i, id) in order.iter().enumerate() {
+            let Some(t) = self.teams.get(id) else {
+                continue;
+            };
+            let finished = !matches!(t.status, team::ThreadStatus::Running);
+            let dot_color = match t.status {
+                team::ThreadStatus::Running => Palette::RUNNING(),
+                team::ThreadStatus::Done => Palette::OK(),
+                team::ThreadStatus::Failed => Palette::ERROR(),
+            };
+            let selected = i == sel;
+            let hover = hovered == Some(i);
+            // Names are white (TEXT) and legible; the SELECTED or HOVERED row is
+            // bold so the agent under the cursor/selection stands out. Finished
+            // agents are faint. No accent color or pointer — keep it plain.
+            let name_style = if selected || hover {
+                Style::default()
+                    .fg(Palette::TEXT())
+                    .add_modifier(Modifier::BOLD)
+            } else if finished {
+                Style::default().fg(Palette::FAINT())
+            } else {
+                Style::default().fg(Palette::TEXT())
+            };
+            let depth = self.teams.depth_of(id);
+            let indent = "  ".repeat(depth);
+            let mut spans = vec![
+                Span::styled(format!("  {}• ", indent), Style::default().fg(dot_color)),
+                Span::styled(
+                    truncate_mid(&t.name, 16usize.saturating_sub(depth * 2)),
+                    name_style,
+                ),
+            ];
+            if t.unread > 0 && !finished {
+                spans.push(Span::styled(
+                    format!(" ({})", t.unread),
+                    Style::default().fg(Palette::DIM()),
+                ));
+            }
+            roster.push(Line::from(spans));
+        }
+        f.render_widget(
+            Paragraph::new(roster).style(Style::default().bg(Palette::BG())),
+            body[0],
+        );
+
+        // Right: the selected agent's transcript, rendered with the same cells as
+        // the main scrollback. A faint task subheader, then a blank line.
+        let mut transcript: Vec<Line> = vec![Line::from("")];
+        if let Some(id) = order.get(sel) {
+            if let Some(t) = self.teams.get(id) {
+                if !t.task.is_empty() {
+                    transcript.push(Line::from(Span::styled(
+                        truncate_mid(&t.task, body[1].width.saturating_sub(2) as usize),
+                        Style::default().fg(Palette::FAINT()),
+                    )));
+                    transcript.push(Line::from(""));
+                }
+                for cell in &t.cells {
+                    render::render_cell(cell, body[1].width as usize, &mut transcript);
+                }
+            }
+        }
+        // Wrap long lines to the transcript pane width so conversations don't get
+        // clipped at the right edge (the same wrapping the main scrollback uses).
+        // Wrapping BEFORE the scroll math keeps the offset counted in real rows.
+        let tw = body[1].width as usize;
+        let transcript: Vec<Line> = transcript
+            .into_iter()
+            .flat_map(|l| super::wrap_line(l, tw))
+            .collect();
+        // Apply the drawer's scroll offset, clamping it and WRITING IT BACK so the
+        // stored value can't run past the end. Otherwise a fast wheel flick keeps
+        // incrementing `scroll` past max, and you have to scroll back down through
+        // all that phantom overshoot before the view visibly moves ("runoff").
+        let view_h = body[1].height as usize;
+        let max_scroll = transcript.len().saturating_sub(view_h);
+        let scroll = (drawer_scroll as usize).min(max_scroll);
+        if let Some(d) = self.team_drawer.as_mut() {
+            d.scroll = scroll as u16;
+        }
+        let visible: Vec<Line> = transcript.into_iter().skip(scroll).collect();
+        f.render_widget(
+            Paragraph::new(visible).style(Style::default().bg(Palette::BG())),
+            body[1],
+        );
+
+        // Terse dim hint / compose line — no filled bar.
+        let hint = if composing {
+            let buf = compose_buf.as_deref().unwrap_or("");
+            Line::from(vec![
+                Span::styled("  › ", Style::default().fg(Palette::ACCENT())),
+                Span::styled(buf.to_string(), Style::default().fg(Palette::TEXT())),
+            ])
+        } else {
+            Line::from(Span::styled(
+                "  ↑↓ select · i message · esc close",
+                Style::default().fg(Palette::FAINT()),
+            ))
+        };
+        f.render_widget(
+            Paragraph::new(hint).style(Style::default().bg(Palette::BG())),
+            outer[2],
+        );
+    }
+
+    fn draw_scrollback(&mut self, f: &mut ratatui::Frame, full: Rect) {
+        use std::hash::{Hash, Hasher};
+        // Inset the whole scrollback horizontally so content (and the full-width
+        // user band) has breathing room on BOTH sides, not just a left indent.
+        const SIDE_PAD: u16 = 2;
+        let full = Rect {
+            x: full.x + SIDE_PAD,
+            y: full.y,
+            width: full.width.saturating_sub(SIDE_PAD * 2),
+            height: full.height,
+        };
         let width_full = full.width as usize;
+        // The inset wrap width for non-user cells (2-col hanging indent).
+        let width = full.width.max(1) as usize;
         let theme_gen = theme::generation();
         let cells = &self.view.cells;
         // Keep the cache index-aligned with the cell list.
         if self.render_cache.len() != cells.len() {
             self.render_cache.resize(cells.len(), (0, Vec::new()));
         }
-        for (i, cell) in cells.iter().enumerate() {
-            let is_user = matches!(cell, view::Cell::User(_));
 
-            // Cache key: content + width + theme generation. A hit means this cell
-            // renders identically to last frame, so we reuse its Lines and skip
-            // markdown/syntax-highlighting entirely.
-            let key = {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                cell.fingerprint().hash(&mut h);
-                width_full.hash(&mut h);
-                theme_gen.hash(&mut h);
-                h.finish()
-            };
-            let slot = &mut self.render_cache[i];
-            if slot.0 != key {
-                let mut rendered = Vec::new();
-                render::render_cell(cell, width_full, &mut rendered);
-                *slot = (key, rendered);
-            }
-            for line in &slot.1 {
-                raw.push(line.clone());
-                inset_flags.push(!is_user);
-            }
-        }
-
-        // While a turn runs, append a live "Working" line: a
-        // shimmering label with elapsed seconds and the interrupt hint. It's not
-        // a stored cell — it's transient, regenerated each frame.
-        if self.running || self.view.busy {
-            let secs = self
-                .turn_started
+        // Cheap rebuild trigger: the view's revision counter (bumped only when cells
+        // actually change) plus width/theme and the transient working-line tick. A
+        // pure scroll never mutates the view, so `sig` is stable and we skip the
+        // rebuild entirely — no per-cell hashing, so cost is O(1) per scroll frame
+        // regardless of transcript length. (Hashing every cell each frame was what
+        // made scrolling get slower as the conversation grew.)
+        let working = self.running || self.view.busy;
+        let mut sig_hasher = std::collections::hash_map::DefaultHasher::new();
+        self.view.revision.hash(&mut sig_hasher);
+        width_full.hash(&mut sig_hasher);
+        theme_gen.hash(&mut sig_hasher);
+        working.hash(&mut sig_hasher);
+        if working {
+            self.spinner.hash(&mut sig_hasher);
+            self.turn_started
                 .map(|t| t.elapsed().as_secs())
-                .unwrap_or(0);
-            let mut spans: Vec<Span> = vec![Span::styled(
-                "  • ",
-                Style::default().fg(Palette::RUNNING()),
-            )];
-            spans.extend(shimmer_spans("Working", self.spinner));
-            spans.push(Span::styled(
-                format!(" ({}s · esc to interrupt)", secs),
-                Style::default().fg(Palette::FAINT()),
-            ));
-            raw.push(Line::from(spans));
-            inset_flags.push(false); // already carries its own leading spaces
+                .unwrap_or(0)
+                .hash(&mut sig_hasher);
         }
+        let sig = sig_hasher.finish();
 
-        // Manually wrap into display lines so scroll math is exact and wide
-        // content (tables/code) is clipped rather than reflowed mid-border.
-        // Non-user lines get a 2-col hanging indent: we wrap at width-2 then
-        // prefix EVERY wrapped line (including continuations) with the pad, so
-        // wrapped text stays aligned under its first line.
-        let width = area.width.max(1) as usize;
-        let mut lines: Vec<Line> = Vec::new();
-        for (idx, l) in raw.into_iter().enumerate() {
-            let inset = inset_flags.get(idx).copied().unwrap_or(false);
-            let wrap_width = if inset {
-                width.saturating_sub(2).max(1)
-            } else {
-                width
-            };
-            for mut wl in wrap_line(l, wrap_width) {
-                if inset {
-                    wl.spans.insert(0, Span::raw("  "));
+        // Rebuild the flattened display lines only when the signature changed. The
+        // per-cell render_cache still avoids re-rendering unchanged cells during a
+        // rebuild (only the one cell that changed is re-wrapped).
+        let stale = self.display_cache.is_empty() && !cells.is_empty();
+        if sig != self.display_sig || stale {
+            let mut flat: Vec<Line> = Vec::new();
+            let mut owners: Vec<Option<usize>> = Vec::new();
+            for (i, cell) in cells.iter().enumerate() {
+                let is_user = matches!(cell, view::Cell::User(_));
+                let key = {
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    cell.fingerprint().hash(&mut h);
+                    width_full.hash(&mut h);
+                    theme_gen.hash(&mut h);
+                    h.finish()
+                };
+                let slot = &mut self.render_cache[i];
+                if slot.0 != key {
+                    // Render, then wrap + inset once, storing display-ready lines.
+                    let mut rendered = Vec::new();
+                    render::render_cell(cell, width_full, &mut rendered);
+                    let wrap_width = if is_user {
+                        width
+                    } else {
+                        // Reserve columns for BOTH the 2-col left hanging indent and
+                        // a matching 2-col right margin, so wrapped text has even
+                        // breathing room on each side instead of hugging the edge.
+                        width.saturating_sub(4).max(1)
+                    };
+                    let mut display = Vec::new();
+                    for l in rendered {
+                        for mut wl in wrap_line(l, wrap_width) {
+                            if !is_user {
+                                wl.spans.insert(0, Span::raw("  "));
+                            }
+                            display.push(wl);
+                        }
+                    }
+                    *slot = (key, display);
                 }
-                lines.push(wl);
+                for line in &slot.1 {
+                    flat.push(line.clone());
+                    owners.push(Some(i));
+                }
             }
+
+            // The transient "Working" line: a shimmering label with elapsed seconds
+            // and the interrupt hint. Regenerated as part of a rebuild (its state is
+            // folded into `sig`, so it refreshes each tick while running).
+            if working {
+                let secs = self
+                    .turn_started
+                    .map(|t| t.elapsed().as_secs())
+                    .unwrap_or(0);
+                let mut spans: Vec<Span> = vec![Span::styled(
+                    "  • ",
+                    Style::default().fg(Palette::RUNNING()),
+                )];
+                spans.extend(shimmer_spans("Working", self.spinner));
+                spans.push(Span::styled(
+                    format!(" ({}s · esc to interrupt)", secs),
+                    Style::default().fg(Palette::FAINT()),
+                ));
+                for wl in wrap_line(Line::from(spans), width) {
+                    flat.push(wl);
+                    owners.push(None);
+                }
+            }
+
+            self.display_cache = flat;
+            self.line_owner = owners;
+            self.display_sig = sig;
         }
 
+        let area = full;
         let viewport = area.height as usize;
-        let total = lines.len();
+        let total = self.display_cache.len();
         let max_scroll = total.saturating_sub(viewport);
+        // Keep the user's ABSOLUTE scroll position fixed across content changes that
+        // aren't new output at the bottom — expanding/collapsing a tool cell, etc.
+        // `scroll_up` is distance-from-bottom, so when `max_scroll` changes we shift
+        // it by the SAME delta (grow OR shrink) so `start = max_scroll - scroll_up`
+        // is unchanged and the viewport doesn't move. Only when pinned to the bottom
+        // (scroll_up == 0) do we intentionally keep following new output.
+        if self.scroll_up > 0 {
+            let delta = max_scroll as i64 - self.prev_max_scroll as i64;
+            let adjusted = (self.scroll_up as i64 + delta).clamp(0, max_scroll as i64);
+            self.scroll_up = adjusted as u16;
+        }
+        self.prev_max_scroll = max_scroll;
         self.scroll_up = self.scroll_up.min(max_scroll as u16);
         let start = max_scroll.saturating_sub(self.scroll_up as usize);
-        let window: Vec<Line> = lines.into_iter().skip(start).take(viewport).collect();
+        // Remember the viewport + first-visible line so a click can map a screen row
+        // back to a cell (via line_owner).
+        self.scrollback_rect = Some(area);
+        self.scrollback_start = start;
+        let window: Vec<Line> = self
+            .display_cache
+            .iter()
+            .skip(start)
+            .take(viewport)
+            .cloned()
+            .collect();
 
         f.render_widget(Paragraph::new(window), area);
 
@@ -435,6 +707,34 @@ impl App {
             height: 1,
         };
         f.render_widget(Paragraph::new(Line::from(spans)), bar);
+
+        // Right-aligned key hints: team drawer (only when agents exist) + the
+        // todo-panel toggle. Kept terse so they don't crowd the status info.
+        let hint = Style::default().fg(Palette::FAINT());
+        let mut hints: Vec<Span> = Vec::new();
+        if !self.teams.is_empty() {
+            hints.push(Span::styled("^T team", hint));
+            hints.push(Span::styled("  ", hint));
+        }
+        let todos_present = self
+            .todos
+            .as_ref()
+            .map(|t| !t.items().is_empty())
+            .unwrap_or(false);
+        if todos_present {
+            let label = if self.show_todos {
+                "^L hide todos"
+            } else {
+                "^L show todos"
+            };
+            hints.push(Span::styled(label, hint));
+        }
+        if !hints.is_empty() {
+            f.render_widget(
+                Paragraph::new(Line::from(hints)).alignment(ratatui::layout::Alignment::Right),
+                bar,
+            );
+        }
     }
 
     fn draw_input(&mut self, f: &mut ratatui::Frame, area: Rect) {
@@ -444,23 +744,22 @@ impl App {
         f.render_widget(bg, area);
 
         let busy = self.running || self.view.busy;
-        // Status sits on the top padding row, right-aligned. Mode is shown in the
-        // status bar below the input; the top row only notes queued prompts while
-        // a turn is running.
-        let status_line = if busy && !self.queue.is_empty() {
+        // Status sits on the top padding row, right-aligned. While a turn runs, hint
+        // that Enter queues and Alt+Enter steers — the queued chips themselves show
+        // in their own panel above.
+        let status_line = if busy {
             Line::from(Span::styled(
-                format!("{} queued ", self.queue.len()),
-                Style::default().fg(Palette::DIM()),
+                "enter queues · alt+enter steers ",
+                Style::default().fg(Palette::FAINT()),
             ))
         } else {
             Line::from("")
         };
         // Horizontal breathing room inside the input band.
-        const PAD: u16 = 3;
         let status_area = Rect {
             x: area.x,
             y: area.y,
-            width: area.width.saturating_sub(PAD),
+            width: area.width.saturating_sub(INPUT_PAD),
             height: 1,
         };
         f.render_widget(
@@ -470,34 +769,47 @@ impl App {
             status_area,
         );
 
-        // Text area: rows between the top and bottom pad rows, inset by PAD.
+        // Text area: rows between the top and bottom pad rows, inset by INPUT_PAD.
         let text_rows = area.height.saturating_sub(2).max(1);
         let text_area = Rect {
-            x: area.x + PAD,
+            x: area.x + INPUT_PAD,
             y: area.y + 1,
-            width: area.width.saturating_sub(PAD * 2),
+            width: area.width.saturating_sub(INPUT_PAD * 2),
             height: text_rows,
         };
 
-        // Wrapped, prompt-prefixed lines (same builder as the height calc). Show
-        // the tail if the content is taller than the visible rows.
+        // Wrapped, prompt-prefixed lines (same builder + width as the height calc).
+        // Show the tail if the content is taller than the visible rows. Each line
+        // is padded to the full text width so the input background fills edge to
+        // edge (an unpadded line leaves the tail of the row the terminal's bg).
         let all = self.input_lines(text_area.width as usize, busy);
-        let visible: Vec<Line> = if all.len() > text_rows as usize {
+        let total_rows = all.len();
+        let mut visible: Vec<Line> = if all.len() > text_rows as usize {
             all[all.len() - text_rows as usize..].to_vec()
         } else {
             all
         };
-        f.render_widget(
-            Paragraph::new(visible).style(Style::default().bg(Palette::INPUT_BG())),
-            text_area,
-        );
+        let ibg = Style::default().bg(Palette::INPUT_BG());
+        for line in &mut visible {
+            let used: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+            let pad = (text_area.width as usize).saturating_sub(used);
+            if pad > 0 {
+                line.spans.push(Span::styled(" ".repeat(pad), ibg));
+            }
+        }
+        f.render_widget(Paragraph::new(visible).style(ibg), text_area);
 
-        // Cursor at its row/col (accounting for the 2-col prompt/indent prefix).
-        let (row, col) = self.input.cursor_row_col();
-        let row = row.min(text_rows.saturating_sub(1) as usize) as u16;
-        let cursor_x = text_area.x + 2 + col as u16;
-        if cursor_x < text_area.x + text_area.width {
-            f.set_cursor_position((cursor_x, text_area.y + row));
+        // Cursor position from the SAME wrap the renderer used, so they agree.
+        // `wrapped` gives (row, col) in content coordinates; add the 2-col prefix
+        // for x, and shift the row up by the tail-scroll offset applied above.
+        const PREFIX: u16 = 2;
+        let content_width = (text_area.width as usize).saturating_sub(PREFIX as usize);
+        let (_, cur_row, cur_col) = self.input.wrapped(content_width);
+        let scrolled = total_rows.saturating_sub(text_rows as usize);
+        let vis_row = cur_row.saturating_sub(scrolled) as u16;
+        let cursor_x = text_area.x + PREFIX + cur_col as u16;
+        if vis_row < text_rows && cursor_x < text_area.x + text_area.width {
+            f.set_cursor_position((cursor_x, text_area.y + vis_row));
         }
     }
 

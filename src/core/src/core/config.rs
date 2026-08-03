@@ -165,6 +165,12 @@ pub fn global_config_path() -> anyhow::Result<std::path::PathBuf> {
     Ok(home.join(".bob").join("config.toml"))
 }
 
+/// `~/.bob/plans` — where plan-mode documents are saved by `exit_plan`.
+pub fn plans_dir() -> anyhow::Result<std::path::PathBuf> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("no home directory"))?;
+    Ok(home.join(".bob").join("plans"))
+}
+
 /// The default global config as commented TOML — the scaffold `bob config init`
 /// writes. Documents every option so the file is self-explanatory. Values mirror
 /// `BobConfig::default()`.

@@ -29,8 +29,10 @@ fn tool_display(name: &str, input: &Value) -> (String, String) {
         "grep" => ("Grep".into(), arg("pattern")),
         "bash" => ("Bash".into(), arg("command")),
         "web_fetch" => ("Fetch".into(), arg("url")),
+        "web_search" => ("Search".into(), arg("query")),
         "todo_write" => ("Plan".into(), String::new()),
         "task" => ("Task".into(), String::new()),
+        "explore" => ("Explore".into(), arg("description")),
         // spawn_agent's tool cell is suppressed in render_tool; its visible
         // artifact is the separate "• Spawned <name> agent" Subagent line.
         "spawn_agent" => ("Agent".into(), arg("name")),
@@ -55,8 +57,9 @@ pub fn render_cell(cell: &Cell, width: usize, out: &mut Vec<Line<'static>>) {
     match cell {
         Cell::User(text) => {
             // A full-width band with the input background: blank padded row above
-            // and below, and the message row padded out to `width` so the bg
-            // fills edge-to-edge (no ragged right side).
+            // and below, and the message row padded out to `width` so the bg fills
+            // edge-to-edge. Styled like the live prompt — a dim `› ` marker + the
+            // message in the normal text color (no bold, no accent/user blue).
             let bg = Style::default().bg(Palette::INPUT_BG());
             let pad_row = |w: usize| Line::from(Span::styled(" ".repeat(w), bg));
             out.push(pad_row(width));
@@ -64,14 +67,8 @@ pub fn render_cell(cell: &Cell, width: usize, out: &mut Vec<Line<'static>>) {
             let used = prefix.chars().count() + text.chars().count();
             let trailing = width.saturating_sub(used);
             out.push(Line::from(vec![
-                Span::styled(
-                    prefix,
-                    bg.fg(Palette::ACCENT()).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    text.clone(),
-                    bg.fg(Palette::USER()).add_modifier(Modifier::BOLD),
-                ),
+                Span::styled(prefix, bg.fg(Palette::DIM())),
+                Span::styled(text.clone(), bg.fg(Palette::TEXT())),
                 Span::styled(" ".repeat(trailing), bg),
             ]));
             out.push(pad_row(width));
@@ -88,9 +85,10 @@ pub fn render_cell(cell: &Cell, width: usize, out: &mut Vec<Line<'static>>) {
             input,
             status,
             output,
+            expanded,
             ..
         } => {
-            render_tool(name, input, *status, output.as_deref(), out);
+            render_tool(name, input, *status, output.as_deref(), *expanded, out);
         }
         Cell::Subagent {
             agent_id,
@@ -163,6 +161,20 @@ pub fn render_cell(cell: &Cell, width: usize, out: &mut Vec<Line<'static>>) {
             ]));
             out.push(Line::from(""));
         }
+        Cell::AgentMsg { from, text } => {
+            // A message to/from an agent, shown in the team drawer's per-agent
+            // thread: a dim "<from> ›" prefix then the message text.
+            out.push(Line::from(vec![
+                Span::styled(
+                    format!("{} › ", from),
+                    Style::default()
+                        .fg(Palette::ACCENT())
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(text.clone(), Style::default().fg(Palette::TEXT())),
+            ]));
+            out.push(Line::from(""));
+        }
     }
 }
 
@@ -171,6 +183,7 @@ fn render_tool(
     input: &Value,
     status: ToolStatus,
     output: Option<&str>,
+    expanded: bool,
     out: &mut Vec<Line<'static>>,
 ) {
     // Neither `spawn_agent` nor `todo_write` renders a tool cell in the
@@ -213,10 +226,12 @@ fn render_tool(
     }
     out.push(Line::from(header));
 
-    // `task` and `spawn_agent` are followed by their own Subagent cells (the
-    // "• Spawned <name> agent" lines), so they emit no trailing blank and
-    // suppress their tool output — the Subagent cell provides the spacing.
-    if name == "task" || name == "spawn_agent" {
+    // `task`, `explore`, and `spawn_agent` are followed by their own Subagent
+    // cells (the "• Spawned <name> agent" lines). Emit a blank spacer after the
+    // header so the subagent block is separated, then suppress the tool output (the
+    // Subagent cells carry it).
+    if name == "task" || name == "explore" || name == "spawn_agent" {
+        out.push(Line::from(""));
         return;
     }
 
@@ -225,8 +240,9 @@ fn render_tool(
         out.push(Line::from(""));
         return;
     };
-    // Read and List show only the path in the header — no content dump.
-    if name == "read_file" || name == "list_dir" {
+    // Read and List show only the path in the header — no content dump — UNLESS
+    // the user expanded the cell (then show the full content below).
+    if (name == "read_file" || name == "list_dir") && !expanded {
         out.push(Line::from(""));
         return;
     }
@@ -245,23 +261,30 @@ fn render_tool(
         return;
     }
 
-    // Generic: show a short dim preview (first few lines).
-    let is_error = output.starts_with("error:");
+    // Generic: a short dim preview (first few lines) by default, or the FULL output
+    // when expanded. Error coloring comes from the tool's real status (the typed
+    // is_error flag), not text sniffing.
+    let is_error = status == ToolStatus::Error;
     let color = if is_error {
         Palette::ERROR()
     } else {
         Palette::FAINT()
     };
-    for line in output.split('\n').take(6) {
+    // A generous cap even when expanded, so one giant result can't blow the buffer.
+    const PREVIEW: usize = 6;
+    const EXPANDED_MAX: usize = 500;
+    let limit = if expanded { EXPANDED_MAX } else { PREVIEW };
+    let total = output.split('\n').count();
+    for line in output.split('\n').take(limit) {
         out.push(Line::from(Span::styled(
-            format!("    {}", truncate(line, 100)),
+            format!("    {}", truncate(line, 200)),
             Style::default().fg(color),
         )));
     }
-    let extra = output.split('\n').count().saturating_sub(6);
+    let extra = total.saturating_sub(limit);
     if extra > 0 {
         out.push(Line::from(Span::styled(
-            format!("    ... {} more lines", extra),
+            format!("    ... {} more lines (click to expand)", extra),
             Style::default().fg(Palette::FAINT()),
         )));
     }

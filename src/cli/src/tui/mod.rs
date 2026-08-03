@@ -10,6 +10,7 @@ mod highlight;
 mod input;
 mod markdown;
 mod render;
+mod team;
 mod theme;
 mod view;
 
@@ -35,10 +36,12 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, BeginSynchronizedUpdate, EndSynchronizedUpdate,
+    EnterAlternateScreen, LeaveAlternateScreen,
 };
 use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::Terminal;
@@ -207,30 +210,15 @@ fn describe_input(tool: &str, input: &serde_json::Value) -> String {
     }
 }
 
-/// Return true if an event should reach the UI. All root-agent events pass;
-/// from subagents we let ToolCall and TurnEnd through (the view uses them to
-/// update the spawn cell's tool count + done state) but drop their text/results
-/// so the transcript stays clean.
+/// Return true if an event should reach the App. Root-agent events feed the main
+/// transcript; subagent events + inter-agent messages feed the team drawer's
+/// per-agent threads (`App.teams`). Effectively everything is forwarded now; the
+/// apply site routes each event to the right place by agent id.
 fn is_ui_event(e: &AgentEvent) -> bool {
-    match e {
-        AgentEvent::SubagentSpawn { .. } => true,
-        // A spawned agent finishing — updates its cell's status (green/red).
-        AgentEvent::SubagentDone { .. } => true,
-        // Inter-agent coordination chatter is internal — never surfaced in the
-        // user transcript (it's used by the receiving agent, not shown to you).
-        AgentEvent::AgentMessage { .. } => false,
-        // ToolCall/TurnEnd pass from any agent: the view routes subagent ones to
-        // update the spawn cell's count/done state.
-        AgentEvent::ToolCall { .. } | AgentEvent::TurnEnd { .. } => true,
-        // Completion events (usage accounting) pass from every agent.
-        AgentEvent::Completion { .. } => true,
-        AgentEvent::TurnStart { agent_id }
-        | AgentEvent::TextDelta { agent_id, .. }
-        | AgentEvent::Message { agent_id, .. }
-        | AgentEvent::ToolResult { agent_id, .. }
-        | AgentEvent::Compaction { agent_id, .. }
-        | AgentEvent::Error { agent_id, .. } => agent_id == "root",
-    }
+    // Completion events carry only usage accounting; still forwarded so the usage
+    // interceptor at the apply site sees them.
+    let _ = e;
+    true
 }
 
 fn now_stamp() -> String {
@@ -307,6 +295,34 @@ fn spawn_turn(
             Err(e) => Some(e.to_string()),
         };
         let _ = done_tx.send(err);
+    });
+}
+
+/// The result of a piece of work run off the event loop, applied back on the
+/// loop thread via [`App::apply_bg`]. To offload any new expensive feature: add
+/// a variant here, call [`spawn_bg`] with a future that produces it, and handle
+/// it in `apply_bg`. No other plumbing — the select loop already drains these.
+enum BgOutcome {
+    /// A provider was (re)built for a model switch (slow: network/auth). Ok holds
+    /// the resolved `provider_id` + the ready provider; Err is a message.
+    ProviderSwitched(Result<(String, Arc<dyn Provider>), String>),
+    /// A provider's model list came back for the `/models` picker.
+    ModelList(Result<Vec<String>, String>),
+    /// The `@file` candidate list finished gathering (git ls-files / walk).
+    FileList(Vec<String>),
+}
+
+/// Run `fut` off the event loop and deliver its [`BgOutcome`] back to the UI.
+/// This is the single seam for keeping the render/input loop responsive: the
+/// expensive work happens on a Tokio worker, the cheap UI update happens on the
+/// loop when the outcome arrives.
+fn spawn_bg<F>(tx: &mpsc::UnboundedSender<BgOutcome>, fut: F)
+where
+    F: std::future::Future<Output = BgOutcome> + Send + 'static,
+{
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let _ = tx.send(fut.await);
     });
 }
 
@@ -421,6 +437,9 @@ pub async fn run(
     let agent = Arc::new(Mutex::new(agent));
 
     // --- terminal setup ---
+    // Restore the terminal from a single place (RAII + panic hook) so a panic in
+    // the draw path or any `?`-propagated error can't leave the user's shell in
+    // raw mode / the alternate screen.
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     execute!(
@@ -429,16 +448,37 @@ pub async fn run(
         EnableBracketedPaste,
         EnableMouseCapture
     )?;
+    // A guard whose Drop restores the terminal, covering both the normal return
+    // and any early `?`/unwind out of `run`.
+    let _guard = TerminalGuard;
+    // On panic, restore the terminal *before* the default hook prints the panic
+    // message, so the backtrace is readable and the shell isn't wrecked.
+    {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            restore_terminal();
+            default_hook(info);
+        }));
+    }
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(jobs.clone(), permissions.clone(), cancel.clone());
+    let mut app = App::new(
+        jobs.clone(),
+        permissions.clone(),
+        cancel.clone(),
+        team.clone(),
+    );
     app.provider_id = provider_spec.split(':').next().unwrap_or("").to_string();
     app.model_label = provider.model().to_string();
     app.cwd_label = abbreviate_home(&cwd);
     app.branch = git_branch(&cwd);
     app.lsp = lsp.clone();
     app.todos = Some(todos);
+    // Restore per-agent drawer transcripts from a resumed session.
+    if !session.agent_threads.is_empty() {
+        app.teams = team::AgentTranscripts::from_persisted(&session.agent_threads);
+    }
     app.theme_name = config.theme.clone().unwrap_or_else(|| "dark".to_string());
     // Seed usage totals: this session's prior usage + the global ledger.
     app.session_usage = bob_core::core::usage::total_of(&session.usage);
@@ -458,27 +498,71 @@ pub async fn run(
 
     let mut keys = EventStream::new();
     let mut ticker = tokio::time::interval(Duration::from_millis(100));
+    // Frame-rate–capped redraw. Input and agent events set `dirty`; the loop
+    // repaints at most once per `FRAME`. A trackpad flick emits a burst of scroll
+    // events arriving milliseconds apart — drawing once per event makes repaints
+    // queue behind real time ("runoff"). Coalescing every event within a frame
+    // window into ONE repaint keeps scrolling locked to your fingers.
+    const FRAME: Duration = Duration::from_millis(16);
+    draw_frame(&mut terminal, &mut app)?;
+    let mut last_draw = tokio::time::Instant::now();
+    let mut dirty = false;
 
     let result = 'outer: loop {
-        terminal.draw(|f| app.draw(f))?;
+        if dirty && last_draw.elapsed() >= FRAME {
+            draw_frame(&mut terminal, &mut app)?;
+            last_draw = tokio::time::Instant::now();
+            dirty = false;
+        }
+        // If a repaint is pending but the frame budget hasn't elapsed, wake exactly
+        // at the deadline; otherwise sleep far out (real events/ticker still wake us).
+        let redraw_deadline = if dirty {
+            last_draw + FRAME
+        } else {
+            tokio::time::Instant::now() + Duration::from_secs(3600)
+        };
 
         tokio::select! {
+            _ = tokio::time::sleep_until(redraw_deadline) => {
+                // Wake to repaint at the frame boundary; the top of the loop draws.
+            }
             maybe_key = keys.next() => {
+                // Assume this event changes something; the arms that DON'T (a key
+                // release, an unhandled event, a no-op mouse move) reset it. On
+                // Windows every key press has a matching release and the mouse emits
+                // a stream of move events — repainting on those forces a 60fps redraw
+                // that shows as a flickering cursor, so only repaint on real changes.
+                dirty = true;
                 match maybe_key {
                     Some(Ok(CtEvent::Key(key))) if key.kind != KeyEventKind::Release => {
                         match app.on_key(key.code, key.modifiers) {
                             KeyOutcome::Quit => break 'outer Ok(()),
                             KeyOutcome::Submit(text) => {
-                                app.view.push_user(text.clone());
-                                app.stick_to_bottom();
                                 if app.running {
-                                    // A turn is in flight — queue this for later.
+                                    // A turn is in flight — queue this as a pinned
+                                    // chip above the input (NOT the transcript). It's
+                                    // pushed to the transcript + dispatched when the
+                                    // turn ends. Alt+Enter steers instead of queueing.
                                     app.queue.push_back(text);
                                 } else {
+                                    app.view.push_user(text.clone());
+                                    app.stick_to_bottom();
                                     app.running = true;
                                     app.current_prompt = Some(text.clone());
                                     app.turn_started = Some(std::time::Instant::now());
                                     spawn_turn(&agent, &app.turn_done_tx, text);
+                                }
+                            }
+                            KeyOutcome::Steer(text) => {
+                                // Deliver into the root agent's inbox now, so the
+                                // running turn folds it in at its next step (mid-turn
+                                // course-correction). Shown in the transcript as a
+                                // user line so there's a record of what was said.
+                                if app.agent_team.send("root", "user", &text) {
+                                    app.view.push_user(text);
+                                    app.stick_to_bottom();
+                                } else {
+                                    app.toast = Some("couldn't steer — no running agent".into());
                                 }
                             }
                             KeyOutcome::SwitchModel(spec) => {
@@ -492,23 +576,18 @@ pub async fn run(
                                     } else {
                                         format!("{}:{}", app.provider_id, spec)
                                     };
-                                    match create_provider(&full).await {
-                                        Ok(p) => {
-                                            let id = full.split(':').next().unwrap_or("").to_string();
-                                            let model = p.model().to_string();
-                                            agent.lock().await.set_provider(p);
-                                            app.provider_id = id;
-                                            app.model_label = model.clone();
-                                            // Chain into the reasoning picker so the
-                                            // user sets model + effort together.
-                                            let cur = app.reasoning;
-                                            app.open_reasoning_picker(cur);
-                                        }
-                                        Err(e) => {
-                                            app.view.push_notice(format!("error: {}", e));
-                                        }
-                                    }
-                                    app.stick_to_bottom();
+                                    // Building a provider does network/auth work —
+                                    // run it off the loop so the UI stays live.
+                                    app.toast = Some("switching model…".into());
+                                    spawn_bg(&app.bg_tx, async move {
+                                        let id = full.split(':').next().unwrap_or("").to_string();
+                                        BgOutcome::ProviderSwitched(
+                                            create_provider(&full)
+                                                .await
+                                                .map(|p| (id, p))
+                                                .map_err(|e| e.to_string()),
+                                        )
+                                    });
                                 }
                             }
                             KeyOutcome::ListReasoning => {
@@ -518,71 +597,49 @@ pub async fn run(
                             KeyOutcome::SetReasoning(label) => {
                                 let effort = bob_core::core::types::ReasoningEffort::parse(&label)
                                     .unwrap_or(bob_core::core::types::ReasoningEffort::Off);
-                                app.reasoning = effort;
-                                agent.lock().await.set_reasoning(effort);
-                                app.view.push_event(format!(
-                                    "Model changed to {} {}",
-                                    app.model_label,
-                                    effort.label()
-                                ));
-                                app.stick_to_bottom();
-                            }
-                            KeyOutcome::ListModels => {
-                                // Fetch the current provider's models and open a
-                                // picker showing bare model ids. The switch step
-                                // recombines with the current provider id.
-                                let prov = agent.lock().await.provider();
-                                app.toast = Some("fetching models…".into());
-                                match prov.list_models().await {
-                                    Ok(models) => {
-                                        // Backends that don't list (ChatGPT/Codex
-                                        // Responses) fall back to the known set.
-                                        let options: Vec<String> = if models.is_empty() {
-                                            if app.provider_id == "openai" {
-                                                bob_core::providers::RESPONSES_MODELS
-                                                    .iter()
-                                                    .map(|s| s.to_string())
-                                                    .collect()
-                                            } else {
-                                                vec![]
-                                            }
-                                        } else {
-                                            models
-                                        };
-                                        if options.is_empty() {
-                                            app.toast = None;
-                                            app.view.push_notice(
-                                                "provider returned no models; use `/models <spec>`".into(),
-                                            );
-                                            app.stick_to_bottom();
-                                        } else {
-                                            app.pending_query = Some(PendingQuery {
-                                                query: bob_core::tools::registry::UserQuery {
-                                                    title: format!("Select a model (current: {})", app.model_label),
-                                                    detail: String::new(),
-                                                    options,
-                                                    allow_other: true,
-                                                },
-                                                selected: 0,
-                                                other_text: None,
-                                                purpose: QueryPurpose::ModelPicker,
-                                            });
-                                            app.toast = None;
-                                        }
-                                    }
-                                    Err(e) => {
-                                        app.toast = None;
-                                        app.view.push_notice(format!("error listing models: {}", e));
-                                        app.stick_to_bottom();
-                                    }
+                                // Never block the loop: if a turn holds the agent
+                                // lock, apply on the next idle boundary via a toast.
+                                if let Ok(mut a) = agent.try_lock() {
+                                    a.set_reasoning(effort);
+                                    app.reasoning = effort;
+                                    app.view.push_event(format!(
+                                        "Model changed to {} {}",
+                                        app.model_label,
+                                        effort.label()
+                                    ));
+                                    app.stick_to_bottom();
+                                } else {
+                                    app.toast = Some("busy — try again after this turn".into());
                                 }
                             }
+                            KeyOutcome::ListModels => {
+                                // Fetch the current provider's models off the loop,
+                                // then open the picker when the list arrives.
+                                let prov = match agent.try_lock() {
+                                    Ok(a) => a.provider(),
+                                    Err(_) => {
+                                        app.toast = Some("busy — try again after this turn".into());
+                                        continue 'outer;
+                                    }
+                                };
+                                app.toast = Some("fetching models…".into());
+                                spawn_bg(&app.bg_tx, async move {
+                                    BgOutcome::ModelList(
+                                        prov.list_models().await.map_err(|e| e.to_string()),
+                                    )
+                                });
+                            }
                             KeyOutcome::ShowContext => {
-                                let a = agent.lock().await;
-                                let used = bob_core::agent::compaction::estimate_history_tokens(a.messages());
-                                let msgs = a.messages().len();
-                                drop(a);
-                                app.show_context(used, msgs);
+                                // Reading history needs the lock; skip cleanly if a
+                                // turn holds it rather than freezing the UI.
+                                if let Ok(a) = agent.try_lock() {
+                                    let used = bob_core::agent::compaction::estimate_history_tokens(a.messages());
+                                    let msgs = a.messages().len();
+                                    drop(a);
+                                    app.show_context(used, msgs);
+                                } else {
+                                    app.toast = Some("busy — try again after this turn".into());
+                                }
                             }
                             KeyOutcome::None => {}
                         }
@@ -590,23 +647,50 @@ pub async fn run(
                     Some(Ok(CtEvent::Paste(text))) => app.input.paste(&text),
                     Some(Ok(CtEvent::Mouse(m))) => match m.kind {
                         MouseEventKind::ScrollUp => {
-                            app.scroll_up = app.scroll_up.saturating_add(3);
+                            // One line per wheel notch for a smooth, precise feel
+                            // (batching coalesces a fast flick into one redraw).
+                            if let Some(d) = app.team_drawer.as_mut() {
+                                d.scroll = d.scroll.saturating_sub(1);
+                            } else {
+                                app.scroll_up = app.scroll_up.saturating_add(1);
+                            }
                         }
                         MouseEventKind::ScrollDown => {
-                            app.scroll_up = app.scroll_up.saturating_sub(3);
+                            if let Some(d) = app.team_drawer.as_mut() {
+                                d.scroll = d.scroll.saturating_add(1);
+                            } else {
+                                app.scroll_up = app.scroll_up.saturating_sub(1);
+                            }
                         }
                         MouseEventKind::Down(MouseButton::Left) => {
-                            // A plain click sticks back to the bottom; Shift+drag
-                            // is handled natively by the terminal for selection.
-                            app.stick_to_bottom();
+                            // In the drawer, a click on a roster row selects that
+                            // agent. In the main view, a click on a tool cell
+                            // expands/collapses its output; a click elsewhere sticks
+                            // to the bottom.
+                            if app.team_drawer.is_some() {
+                                app.click_roster(m.column, m.row);
+                            } else if !app.click_scrollback(m.column, m.row) {
+                                app.stick_to_bottom();
+                            }
+                        }
+                        MouseEventKind::Moved => {
+                            // Hover highlight in the drawer. Only a CHANGE in the
+                            // hovered row warrants a repaint (mouse-move fires a lot).
+                            let changed = if app.team_drawer.is_some() {
+                                app.hover_roster(m.column, m.row)
+                            } else {
+                                false
+                            };
+                            dirty = changed;
                         }
                         _ => {}
                     },
-                    Some(Ok(_)) => {}
+                    Some(Ok(_)) => dirty = false,
                     Some(Err(_)) | None => break 'outer Ok(()),
                 }
             }
             Some(evt) = evt_rx.recv() => {
+                dirty = true;
                 // Intercept usage accounting before handing the event to the view.
                 if let AgentEvent::Completion { agent_id, model, usage } = &evt {
                     let entry = bob_core::core::usage::UsageEntry {
@@ -621,10 +705,25 @@ pub async fn run(
                     app.session_usage.add(usage);
                     let _ = bob_core::core::usage::append_global(&entry);
                 }
+                // Route to the right transcript: the main view always sees the
+                // event (it updates the "• Spawned" cell for subagents and ignores
+                // their prose), and the team store captures each subagent's full
+                // thread for the drawer.
+                let showing = app
+                    .team_drawer
+                    .as_ref()
+                    .and_then(|d| app.teams.display_order().get(d.selected).cloned());
+                app.teams.apply(&evt, showing.as_deref());
                 app.view.apply(&evt);
-                app.stick_to_bottom();
+                // Follow new output only when already pinned to the bottom. If the
+                // user has scrolled up to read, don't yank them back down on every
+                // streamed token.
+                if app.scroll_up == 0 {
+                    app.stick_to_bottom();
+                }
             }
             Some(prompt) = perm_rx.recv() => {
+                dirty = true;
                 app.pending_perm = Some(PendingPerm {
                     title: prompt.title,
                     detail: prompt.detail,
@@ -635,6 +734,7 @@ pub async fn run(
                 });
             }
             Some(q) = query_rx.recv() => {
+                dirty = true;
                 app.pending_query = Some(PendingQuery {
                     query: q.query,
                     selected: 0,
@@ -643,6 +743,7 @@ pub async fn run(
                 });
             }
             Some(err) = app.turn_done_rx.recv() => {
+                dirty = true;
                 // Surface a failed turn (provider error, etc.) instead of
                 // silently ending.
                 if let Some(msg) = err {
@@ -656,6 +757,7 @@ pub async fn run(
                 if let Some(todos) = &app.todos {
                     session.todos = todos.items();
                 }
+                session.agent_threads = app.teams.to_persisted();
                 session.updated_at = now_stamp();
                 let _ = save_session(&session);
                 drop(a);
@@ -664,9 +766,13 @@ pub async fn run(
                     app.jobs.finish(&job_id, bob_core::tools::jobs::JobStatus::Done, "turn finished".to_string());
                 }
                 app.current_prompt = None;
-                // Dispatch the next queued prompt, if any.
+                // Dispatch the next queued prompt, if any. Queued chips weren't in
+                // the transcript, so push it as a user turn now that it's actually
+                // being sent.
                 match app.queue.pop_front() {
                     Some(next) => {
+                        app.view.push_user(next.clone());
+                        app.stick_to_bottom();
                         app.current_prompt = Some(next.clone());
                         app.turn_started = Some(std::time::Instant::now());
                         spawn_turn(&agent, &app.turn_done_tx, next);
@@ -677,41 +783,110 @@ pub async fn run(
                     }
                 }
             }
+            Some(outcome) = app.bg_rx.recv() => {
+                dirty = true;
+                app.apply_bg(outcome, &agent);
+            }
             _ = ticker.tick() => {
-                app.spinner = app.spinner.wrapping_add(1);
+                // Only the animated states (spinner/Working line, toast) need a
+                // periodic repaint. When fully idle, leave `dirty` false so the loop
+                // parks in sleep_until instead of repainting 10×/s for nothing.
+                if app.running || app.view.busy || app.toast.is_some() {
+                    app.spinner = app.spinner.wrapping_add(1);
+                    dirty = true;
+                }
                 // Coordination wake: if idle but a spawned agent has reported back,
                 // drive a fresh empty-prompt turn so the root folds the result into
                 // history and acts on it — an idle agent is re-driven by a new turn
                 // rather than blocking.
                 if !app.running {
                     let pending = {
-                        let mut a = agent.lock().await;
-                        a.has_pending_coordination()
+                        // try_lock: an in-flight turn holds this; we'll re-check on
+                        // the next tick. Never block the render loop.
+                        match agent.try_lock() {
+                            Ok(mut a) => a.has_pending_coordination(),
+                            Err(_) => false,
+                        }
                     };
                     if pending {
                         app.running = true;
                         app.turn_started = Some(std::time::Instant::now());
                         spawn_turn(&agent, &app.turn_done_tx, String::new());
+                        dirty = true;
                     }
                 }
             }
         }
     };
 
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
+    // Final save on exit: the per-turn save only runs when a turn completes, so a
+    // quit (Quit/​/exit/Ctrl+C) or a stream error would otherwise drop everything
+    // since the last completed turn. Snapshot the agent's full history + state now.
+    {
+        let a = agent.lock().await;
+        session.messages = a.messages().to_vec();
+        drop(a);
+        session.grants = permissions.export_grants();
+        if let Some(todos) = &app.todos {
+            session.todos = todos.items();
+        }
+        session.agent_threads = app.teams.to_persisted();
+        session.updated_at = now_stamp();
+        let _ = save_session(&session);
+    }
+
+    // Terminal restore is handled by `_guard` (Drop) — covers the normal return,
+    // the `?` error paths above, and panics (via the hook). Nothing to do here.
+    result
+}
+
+/// Render one frame wrapped in a *synchronized update* (DEC private mode 2026).
+/// The terminal buffers every byte between Begin/End and paints the frame
+/// atomically, so partial frames and a flickering cursor are impossible — this is
+/// what fixes the flicker on Windows Terminal/conhost and the same technique the
+/// harness renderer uses. Terminals that don't support 2026 ignore the sequence,
+/// so it's safe everywhere. `terminal.draw` already diffs cells, so combined with
+/// this each frame is one atomic, minimal write.
+fn draw_frame(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    app: &mut App,
+) -> std::io::Result<()> {
+    let _ = execute!(std::io::stdout(), BeginSynchronizedUpdate);
+    let res = terminal.draw(|f| app.draw(f));
+    let _ = execute!(std::io::stdout(), EndSynchronizedUpdate);
+    res.map(|_| ())
+}
+
+/// Best-effort restore of the terminal to its pre-TUI state. Safe to call more
+/// than once (idempotent) and from a panic hook — every step ignores errors.
+fn restore_terminal() {
+    let mut stdout = std::io::stdout();
+    let _ = execute!(
+        stdout,
         LeaveAlternateScreen,
         DisableBracketedPaste,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
-    result
+        DisableMouseCapture,
+        crossterm::cursor::Show,
+    );
+    let _ = disable_raw_mode();
+}
+
+/// RAII guard: restores the terminal on Drop, so an early return or unwind out
+/// of `run` can never leave the shell in raw mode / the alternate screen.
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        restore_terminal();
+    }
 }
 
 enum KeyOutcome {
     None,
     Submit(String),
+    /// Steer the RUNNING turn: deliver this text to the root agent's inbox now
+    /// (Alt+Enter), instead of queueing it for after the turn.
+    Steer(String),
     /// Switch the active provider/model to this spec (e.g. "anthropic:claude...").
     SwitchModel(String),
     /// Open the reasoning-effort picker.
@@ -739,6 +914,8 @@ struct App {
     /// current filtered matches, and the selected index. `file_at` is the byte
     /// offset of the active `@` in the input buffer while completing.
     all_files: Vec<String>,
+    /// True while a background `@file` gather is in flight (so we kick it off once).
+    files_loading: bool,
     file_menu: Vec<String>,
     file_sel: usize,
     file_at: Option<usize>,
@@ -772,6 +949,10 @@ struct App {
     provider_id: String,
     turn_done_tx: mpsc::UnboundedSender<Option<String>>,
     turn_done_rx: mpsc::UnboundedReceiver<Option<String>>,
+    /// Channel for background work (model switch/list, file gathering, …). The
+    /// select loop drains `bg_rx` and applies each outcome via `apply_bg`.
+    bg_tx: mpsc::UnboundedSender<BgOutcome>,
+    bg_rx: mpsc::UnboundedReceiver<BgOutcome>,
     /// When the current turn started (for the "Working (Ns)" line).
     turn_started: Option<std::time::Instant>,
     /// Working directory (shown in the status line, abbreviated with ~).
@@ -788,6 +969,38 @@ struct App {
     /// the cell fingerprint, group flag, width, and theme generation, so a hit
     /// means the cell renders identically and we can skip markdown/highlighting.
     render_cache: Vec<(u64, Vec<Line<'static>>)>,
+    /// Flattened, display-ready lines for the WHOLE scrollback (all cells wrapped +
+    /// inset, concatenated). Rebuilt only when `display_sig` changes; a plain scroll
+    /// reuses it and just re-windows, so scrolling an idle transcript is O(viewport)
+    /// rather than O(total lines).
+    display_cache: Vec<Line<'static>>,
+    /// Signature of the inputs that produced `display_cache` (folded cell keys +
+    /// width + theme + the transient working line). A mismatch triggers a rebuild.
+    display_sig: u64,
+    /// Parallel to `display_cache`: the source cell index for each display line (or
+    /// `None` for the transient working line / spacers). Lets a click in the
+    /// scrollback map back to which tool cell to expand/collapse.
+    line_owner: Vec<Option<usize>>,
+    /// The scrollback viewport rect + the index of the first visible display line,
+    /// captured each draw so a click row maps to a `line_owner` entry.
+    scrollback_rect: Option<Rect>,
+    scrollback_start: usize,
+    /// The `max_scroll` from the previous scrollback draw. When new lines are
+    /// generated while the user is scrolled up, we bump `scroll_up` by the growth so
+    /// their ABSOLUTE view stays put (scroll_up is distance-from-bottom, so without
+    /// this the viewport drifts down one line per generated line).
+    prev_max_scroll: usize,
+    /// Per-agent transcripts for the team drawer (fed by subagent events).
+    teams: team::AgentTranscripts,
+    /// Team drawer overlay state; `None` when closed.
+    team_drawer: Option<team::TeamDrawer>,
+    /// Screen rect of the drawer's agent roster (set each draw), so left-clicks can
+    /// be hit-tested to select an agent. `None` when the drawer is closed.
+    roster_rect: Option<Rect>,
+    /// Whether the sticky todo panel is shown (toggled with Ctrl+L).
+    show_todos: bool,
+    /// Shared team roster, so the drawer can message agents (send_message path).
+    agent_team: bob_core::agent::team::AgentRegistry,
 }
 
 const COMMANDS: &[(&str, &str)] = &[
@@ -813,8 +1026,10 @@ impl App {
         jobs: bob_core::tools::jobs::JobRegistry,
         permissions: Arc<PermissionEngine>,
         cancel: Arc<std::sync::atomic::AtomicBool>,
+        agent_team: bob_core::agent::team::AgentRegistry,
     ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
+        let (bg_tx, bg_rx) = mpsc::unbounded_channel();
         App {
             view: ViewModel::new(),
             input: input::Input::new(),
@@ -824,6 +1039,7 @@ impl App {
             menu: Vec::new(),
             menu_sel: 0,
             all_files: Vec::new(),
+            files_loading: false,
             file_menu: Vec::new(),
             file_sel: 0,
             file_at: None,
@@ -843,6 +1059,8 @@ impl App {
             provider_id: String::new(),
             turn_done_tx: tx,
             turn_done_rx: rx,
+            bg_tx,
+            bg_rx,
             turn_started: None,
             cwd_label: String::new(),
             branch: None,
@@ -850,6 +1068,17 @@ impl App {
             todos: None,
             theme_name: "dark".to_string(),
             render_cache: Vec::new(),
+            display_cache: Vec::new(),
+            display_sig: 0,
+            line_owner: Vec::new(),
+            scrollback_rect: None,
+            scrollback_start: 0,
+            prev_max_scroll: 0,
+            teams: team::AgentTranscripts::new(),
+            team_drawer: None,
+            roster_rect: None,
+            show_todos: true,
+            agent_team,
         }
     }
 
@@ -873,16 +1102,106 @@ impl App {
         self.refresh_file_menu();
     }
 
+    /// Apply a completed [`BgOutcome`] on the event-loop thread. All the slow
+    /// work already happened off-loop; here we only touch UI state (and the
+    /// agent via `try_lock`, which never blocks — a switch is disallowed mid-turn
+    /// anyway, so the lock is free).
+    fn apply_bg(&mut self, outcome: BgOutcome, agent: &Arc<Mutex<Agent>>) {
+        match outcome {
+            BgOutcome::ProviderSwitched(Ok((id, provider))) => {
+                let model = provider.model().to_string();
+                if let Ok(mut a) = agent.try_lock() {
+                    a.set_provider(provider);
+                } else {
+                    self.toast = Some("busy — try switching again".into());
+                    return;
+                }
+                self.provider_id = id;
+                self.model_label = model;
+                self.toast = None;
+                // Chain into the reasoning picker so model + effort are set together.
+                let cur = self.reasoning;
+                self.open_reasoning_picker(cur);
+                self.stick_to_bottom();
+            }
+            BgOutcome::ProviderSwitched(Err(e)) => {
+                self.toast = None;
+                self.view.push_notice(format!("error: {}", e));
+                self.stick_to_bottom();
+            }
+            BgOutcome::ModelList(Ok(models)) => {
+                // Backends that don't list (ChatGPT/Codex Responses) fall back to
+                // the known set.
+                let options: Vec<String> = if models.is_empty() {
+                    if self.provider_id == "openai" {
+                        bob_core::providers::RESPONSES_MODELS
+                            .iter()
+                            .map(|s| s.to_string())
+                            .collect()
+                    } else {
+                        vec![]
+                    }
+                } else {
+                    models
+                };
+                self.toast = None;
+                if options.is_empty() {
+                    self.view
+                        .push_notice("provider returned no models; use `/models <spec>`".into());
+                    self.stick_to_bottom();
+                } else {
+                    self.pending_query = Some(PendingQuery {
+                        query: bob_core::tools::registry::UserQuery {
+                            title: format!("Select a model (current: {})", self.model_label),
+                            detail: String::new(),
+                            options,
+                            allow_other: true,
+                        },
+                        selected: 0,
+                        other_text: None,
+                        purpose: QueryPurpose::ModelPicker,
+                    });
+                }
+            }
+            BgOutcome::ModelList(Err(e)) => {
+                self.toast = None;
+                self.view
+                    .push_notice(format!("error listing models: {}", e));
+                self.stick_to_bottom();
+            }
+            BgOutcome::FileList(files) => {
+                self.all_files = files;
+                self.files_loading = false;
+                // Re-filter now that candidates are available (the user may have
+                // typed more since the gather started).
+                self.refresh_file_menu();
+            }
+        }
+    }
+
     /// Update the `@file` completion menu from the token under the cursor.
     fn refresh_file_menu(&mut self) {
         match self.input.at_token() {
             Some((start, query)) => {
-                // Lazily gather the project file list on first use.
-                if self.all_files.is_empty() {
-                    let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-                    self.all_files = files::gather_files(&cwd);
-                }
                 self.file_at = Some(start);
+                // Gather the project file list lazily and OFF the keystroke path —
+                // `git ls-files` / a filesystem walk can take real time on a big
+                // repo. Kick it off once; `BgOutcome::FileList` fills `all_files`
+                // and re-filters. Until then we just show whatever we have (empty).
+                if self.all_files.is_empty() && !self.files_loading {
+                    self.files_loading = true;
+                    let bg_tx = self.bg_tx.clone();
+                    spawn_bg(&bg_tx, async move {
+                        // Blocking fs/subprocess work → a blocking-safe worker.
+                        let files = tokio::task::spawn_blocking(|| {
+                            let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+                            files::gather_files(&cwd)
+                        })
+                        .await
+                        .unwrap_or_default();
+                        BgOutcome::FileList(files)
+                    });
+                }
                 self.file_menu = files::fuzzy_rank(&self.all_files, &query, 8)
                     .into_iter()
                     .map(|s| s.to_string())
@@ -1117,12 +1436,215 @@ impl App {
         });
     }
 
+    /// Open the team drawer (if any agents exist) or close it if already open.
+    fn toggle_team_drawer(&mut self) {
+        if self.team_drawer.is_some() {
+            self.team_drawer = None;
+            return;
+        }
+        if self.teams.is_empty() {
+            self.toast = Some("no agents yet".into());
+            return;
+        }
+        if let Some(id) = self.teams.display_order().first().cloned() {
+            self.teams.mark_read(&id);
+        }
+        self.team_drawer = Some(team::TeamDrawer::default());
+    }
+
+    /// Select a drawer agent by mouse click. `col`/`row` are terminal cells. The
+    /// roster has one leading blank line, so agent `i` is at `rect.y + 1 + i`.
+    fn click_roster(&mut self, col: u16, row: u16) {
+        let Some(rect) = self.roster_rect else {
+            return;
+        };
+        // Ignore clicks outside the roster column (e.g. on the transcript pane).
+        if col < rect.x || col >= rect.x + rect.width {
+            return;
+        }
+        if row <= rect.y {
+            return; // header/blank line
+        }
+        let idx = (row - rect.y - 1) as usize;
+        let order = self.teams.display_order();
+        if idx >= order.len() {
+            return;
+        }
+        if let Some(drawer) = self.team_drawer.as_mut() {
+            if drawer.selected != idx {
+                drawer.selected = idx;
+                drawer.scroll = 0;
+            }
+        }
+        if let Some(id) = order.get(idx) {
+            self.teams.mark_read(id);
+        }
+    }
+
+    /// Toggle a tool cell's expanded state when the scrollback is clicked at
+    /// `col`/`row`. Maps the screen row → display line → owning cell via
+    /// `line_owner`; only `Cell::Tool` cells toggle. Returns true if something
+    /// toggled (so the caller can mark dirty + bump the view revision).
+    fn click_scrollback(&mut self, _col: u16, row: u16) -> bool {
+        let Some(rect) = self.scrollback_rect else {
+            return false;
+        };
+        if row < rect.y || row >= rect.y + rect.height {
+            return false;
+        }
+        let line_idx = self.scrollback_start + (row - rect.y) as usize;
+        let Some(Some(cell_idx)) = self.line_owner.get(line_idx).copied() else {
+            return false;
+        };
+        if let Some(view::Cell::Tool { expanded, .. }) = self.view.cells.get_mut(cell_idx) {
+            *expanded = !*expanded;
+            self.view.revision += 1;
+            return true;
+        }
+        false
+    }
+
+    /// `hovered` to the roster index under the cursor, or `None` when off-roster.
+    /// Returns true if the hover state changed (so the caller can mark dirty).
+    fn hover_roster(&mut self, col: u16, row: u16) -> bool {
+        let new_hover = self.roster_rect.and_then(|rect| {
+            if col < rect.x || col >= rect.x + rect.width || row <= rect.y {
+                return None;
+            }
+            let idx = (row - rect.y - 1) as usize;
+            (idx < self.teams.display_order().len()).then_some(idx)
+        });
+        if let Some(drawer) = self.team_drawer.as_mut() {
+            if drawer.hovered != new_hover {
+                drawer.hovered = new_hover;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Keys while the team drawer is open. ↑/↓ (or j/k) select an agent, PgUp/
+    /// PgDn scroll the transcript, `i` compose a message, Esc/Ctrl+T close.
+    fn handle_drawer_key(&mut self, code: KeyCode) -> KeyOutcome {
+        let count = self.teams.len();
+        // Compose mode: keys edit/submit the message to the selected agent.
+        if self
+            .team_drawer
+            .as_ref()
+            .is_some_and(|d| d.composing.is_some())
+        {
+            return self.handle_drawer_compose_key(code);
+        }
+        let Some(drawer) = self.team_drawer.as_mut() else {
+            return KeyOutcome::None;
+        };
+        let mut selection_changed = false;
+        match code {
+            KeyCode::Esc => {
+                self.team_drawer = None;
+                return KeyOutcome::None;
+            }
+            KeyCode::Char('i') => {
+                drawer.composing = Some(String::new());
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if drawer.selected > 0 {
+                    drawer.selected -= 1;
+                    drawer.scroll = 0;
+                    selection_changed = true;
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if drawer.selected + 1 < count {
+                    drawer.selected += 1;
+                    drawer.scroll = 0;
+                    selection_changed = true;
+                }
+            }
+            KeyCode::PageUp => {
+                drawer.scroll = drawer.scroll.saturating_sub(5);
+            }
+            KeyCode::PageDown => {
+                drawer.scroll = drawer.scroll.saturating_add(5);
+            }
+            _ => {}
+        }
+        if selection_changed {
+            let sel = drawer.selected;
+            if let Some(id) = self.teams.display_order().get(sel).cloned() {
+                self.teams.mark_read(&id);
+            }
+        }
+        KeyOutcome::None
+    }
+
+    /// Keys while composing a drawer message. Enter sends it into the selected
+    /// agent's inbox (the send_message path); Esc cancels; chars/backspace edit.
+    fn handle_drawer_compose_key(&mut self, code: KeyCode) -> KeyOutcome {
+        match code {
+            KeyCode::Esc => {
+                if let Some(d) = self.team_drawer.as_mut() {
+                    d.composing = None;
+                }
+            }
+            KeyCode::Char(c) => {
+                if let Some(buf) = self.team_drawer.as_mut().and_then(|d| d.composing.as_mut()) {
+                    buf.push(c);
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(buf) = self.team_drawer.as_mut().and_then(|d| d.composing.as_mut()) {
+                    buf.pop();
+                }
+            }
+            KeyCode::Enter => {
+                self.send_drawer_message();
+            }
+            _ => {}
+        }
+        KeyOutcome::None
+    }
+
+    /// Deliver the composed message into the selected agent's inbox, mirroring the
+    /// `send_message` tool, and echo it into that agent's thread immediately.
+    fn send_drawer_message(&mut self) {
+        let Some(drawer) = self.team_drawer.as_mut() else {
+            return;
+        };
+        let text = drawer.composing.take().unwrap_or_default();
+        let text = text.trim().to_string();
+        let sel = drawer.selected;
+        if text.is_empty() {
+            return;
+        }
+        let Some(id) = self.teams.display_order().get(sel).cloned() else {
+            return;
+        };
+        // Route through the shared team registry (same path SendMessageTool uses),
+        // so the agent is woken to process it by the coordination loop.
+        if self.agent_team.send(&id, "user", &text) {
+            self.teams.push_message(&id, "user", &text, Some(&id));
+        } else {
+            self.toast = Some(format!("{} is not reachable", id));
+        }
+    }
+
     fn on_key(&mut self, code: KeyCode, mods: KeyModifiers) -> KeyOutcome {
         // 0) Shift+Tab cycles the interaction mode (normal → auto-accept → plan).
         if code == KeyCode::BackTab {
             let next = self.permissions.mode().next();
             self.permissions.set_mode(next);
             return KeyOutcome::None;
+        }
+
+        // 0a) Ctrl+T toggles the team drawer (only meaningful once agents exist).
+        if code == KeyCode::Char('t') && mods.contains(KeyModifiers::CONTROL) {
+            self.toggle_team_drawer();
+            return KeyOutcome::None;
+        }
+        // 0a') While the drawer is open it owns the keyboard.
+        if self.team_drawer.is_some() {
+            return self.handle_drawer_key(code);
         }
 
         // 0b) A pending user question (ask_user / exit_plan) takes priority.
@@ -1175,6 +1697,11 @@ impl App {
             }
             (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
                 self.detach_current_turn();
+                return KeyOutcome::None;
+            }
+            (KeyCode::Char('l'), KeyModifiers::CONTROL) => {
+                // Toggle the sticky todo (work items) panel.
+                self.show_todos = !self.show_todos;
                 return KeyOutcome::None;
             }
             (KeyCode::Esc, _) => {
@@ -1259,8 +1786,10 @@ impl App {
         // 4) Input editing.
         match code {
             KeyCode::Enter => {
-                // Shift+Enter / Alt+Enter insert a newline (multi-line prompts).
-                if mods.contains(KeyModifiers::SHIFT) || mods.contains(KeyModifiers::ALT) {
+                // Shift+Enter inserts a newline (multi-line prompts). Alt+Enter is
+                // "steer": deliver the text to the running turn immediately; when
+                // idle it falls through to a normal submit.
+                if mods.contains(KeyModifiers::SHIFT) {
                     self.input.insert_newline();
                     return KeyOutcome::None;
                 }
@@ -1272,10 +1801,15 @@ impl App {
                 let text = self.input.resolved_text().trim().to_string();
                 self.input.submit();
                 self.menu.clear();
+                // Slash-commands are never steered/queued — run them inline.
                 if let Some(out) = self.handle_command(&display) {
                     return out;
                 }
-                KeyOutcome::Submit(text)
+                if mods.contains(KeyModifiers::ALT) && self.running {
+                    KeyOutcome::Steer(text)
+                } else {
+                    KeyOutcome::Submit(text)
+                }
             }
             KeyCode::Up => {
                 self.input.history_prev();
@@ -1283,6 +1817,14 @@ impl App {
             }
             KeyCode::Down => {
                 self.input.history_next();
+                KeyOutcome::None
+            }
+            KeyCode::Backspace if self.input.text().is_empty() && !self.queue.is_empty() => {
+                // Backspace on an empty prompt pops the LAST queued chip back into
+                // the input, so you can edit or delete a message you queued.
+                if let Some(last) = self.queue.pop_back() {
+                    self.input.set(&last);
+                }
                 KeyOutcome::None
             }
             _ => {
@@ -1303,6 +1845,7 @@ impl App {
             "/exit" => Some(KeyOutcome::Quit),
             "/clear" => {
                 self.view.cells.clear();
+                self.view.revision += 1;
                 Some(KeyOutcome::None)
             }
             "/copy" => {

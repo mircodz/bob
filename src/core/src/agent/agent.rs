@@ -52,7 +52,13 @@ pub struct AgentConfig {
 pub struct Agent {
     pub id: String,
     cfg: AgentConfig,
+    /// The working history sent to the provider. May be compacted in place once it
+    /// approaches the context window (older turns collapsed into a summary).
     history: Vec<Message>,
+    /// The full, never-compacted transcript — every user/assistant/tool message in
+    /// order. This is what gets persisted so a resumed session shows the WHOLE
+    /// conversation, not the compacted view the model happened to last run on.
+    full_history: Vec<Message>,
     files: Arc<FileTracker>,
     todos: Arc<TodoStore>,
     /// Cooperative cancel flag. When set, the run loop finishes the current
@@ -69,6 +75,7 @@ impl Agent {
             id,
             cfg,
             history: Vec::new(),
+            full_history: Vec::new(),
             files: Arc::new(FileTracker::new()),
             todos: Arc::new(TodoStore::new()),
             cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -76,8 +83,11 @@ impl Agent {
         }
     }
 
+    /// The full, never-compacted transcript. This is what the frontend persists so
+    /// a resumed session shows the entire conversation. (The compacted working view
+    /// is an internal detail of staying under the context window.)
     pub fn messages(&self) -> &[Message] {
-        &self.history
+        &self.full_history
     }
 
     pub fn todos(&self) -> Arc<TodoStore> {
@@ -85,26 +95,47 @@ impl Agent {
     }
 
     /// Whether this agent should be woken to process coordination messages. It
-    /// wakes only when there is a pending message AND no team member is still
-    /// running — so when several agents were spawned, the parent wakes ONCE after
-    /// they've all reported, seeing every result together, and can write a single
+    /// wakes only when there is a pending message AND none of its OWN children are
+    /// still running — so when it spawned several agents, it wakes ONCE after they
+    /// have all reported, sees every result together, and can write a single
     /// synthesized reply rather than one dribbled paragraph per agent. (If a
-    /// message is waiting but a sibling is still running, we hold off; that
-    /// sibling's completion will re-trigger the check.) The frontend polls this on
-    /// an idle agent and, if true, drives a fresh empty-prompt "wake" turn.
+    /// message is waiting but one of its children is still running, we hold off;
+    /// that child's completion will re-trigger the check.) Gating on its OWN
+    /// children — not the whole team — means an unrelated slow agent elsewhere
+    /// can't stall this agent. The frontend polls this on an idle agent and, if
+    /// true, drives a fresh empty-prompt "wake" turn.
     pub fn has_pending_coordination(&mut self) -> bool {
-        let team_still_running = self.cfg.team.as_ref().is_some_and(|team| {
-            team.roster().iter().any(|(name, _, status)| {
-                name != &self.cfg.name && *status == crate::agent::team::AgentStatus::Running
-            })
-        });
-        if team_still_running {
+        let own_children_running = self
+            .cfg
+            .team
+            .as_ref()
+            .is_some_and(|team| team.has_running_children(&self.cfg.name));
+        if own_children_running {
             return false;
         }
         self.cfg
             .inbox
             .as_mut()
             .is_some_and(|inbox| inbox.has_pending())
+    }
+
+    /// Whether this agent still has coordination work outstanding: either a message
+    /// waiting to be processed, OR one of its own children still running (whose
+    /// result will arrive later). A driver loop keeps the agent alive until this is
+    /// false. (`has_pending_coordination` is the stricter "ready to wake NOW" gate;
+    /// this is the looser "not done yet" gate the remote host polls on.)
+    pub fn has_outstanding_coordination(&mut self) -> bool {
+        let own_children_running = self
+            .cfg
+            .team
+            .as_ref()
+            .is_some_and(|team| team.has_running_children(&self.cfg.name));
+        own_children_running
+            || self
+                .cfg
+                .inbox
+                .as_mut()
+                .is_some_and(|inbox| inbox.has_pending())
     }
 
     /// A handle to this agent's cancel flag. Set it to `true` (from the UI on
@@ -118,7 +149,8 @@ impl Agent {
     }
 
     pub fn load_history(&mut self, messages: Vec<Message>) {
-        self.history = messages;
+        self.history = messages.clone();
+        self.full_history = messages;
     }
 
     pub fn set_provider(&mut self, provider: Arc<dyn Provider>) {
@@ -164,7 +196,9 @@ impl Agent {
         // coordination "wake" — no user message; the inbox drain below provides
         // the content (a team member's result). Skip pushing an empty user turn.
         if !prompt.is_empty() {
-            self.history.push(Message::user_text(prompt));
+            let m = Message::user_text(prompt);
+            self.history.push(m.clone());
+            self.full_history.push(m);
         }
         self.cfg.bus.emit(AgentEvent::TurnStart {
             agent_id: self.id.clone(),
@@ -194,9 +228,11 @@ impl Agent {
             if let Some(inbox) = self.cfg.inbox.as_mut() {
                 let messages = inbox.drain();
                 for m in messages {
-                    self.history.push(Message::user_text(
-                        crate::agent::team::format_coord_message(&m.from, &m.text),
+                    let msg = Message::user_text(crate::agent::team::format_coord_message(
+                        &m.from, &m.text,
                     ));
+                    self.history.push(msg.clone());
+                    self.full_history.push(msg);
                     self.cfg.bus.emit(AgentEvent::AgentMessage {
                         to: self.id.clone(),
                         from: m.from.clone(),
@@ -204,7 +240,27 @@ impl Agent {
                     });
                 }
             }
-            // Compact history if approaching the context window.
+            // Compact history if approaching the context window. The overhead of
+            // the system prompt + every tool schema is counted toward the budget so
+            // we compact before the real request (system + tools + history) exceeds
+            // the window, not just when the message text alone does.
+            let system_overhead_tokens = self
+                .cfg
+                .system
+                .as_deref()
+                .map(crate::agent::compaction::estimate_tokens)
+                .unwrap_or(0)
+                + self
+                    .cfg
+                    .tools
+                    .specs()
+                    .iter()
+                    .map(|s| {
+                        crate::agent::compaction::estimate_tokens(&s.name)
+                            + crate::agent::compaction::estimate_tokens(&s.description)
+                            + crate::agent::compaction::estimate_tokens(&s.input_schema.to_string())
+                    })
+                    .sum::<usize>();
             let history = std::mem::take(&mut self.history);
             let compaction = maybe_compact(
                 history,
@@ -213,6 +269,7 @@ impl Agent {
                     context_window: self.cfg.context_window,
                     threshold: self.cfg.compact_threshold,
                     keep_recent: self.cfg.keep_recent,
+                    system_overhead_tokens,
                 },
             )
             .await;
@@ -237,6 +294,7 @@ impl Agent {
             let mut rx = self.cfg.provider.stream(opts).await?;
 
             let mut completion = None;
+            let mut stream_error = None;
             while let Some(evt) = rx.recv().await {
                 match evt {
                     StreamEvent::TextDelta { text } => {
@@ -248,6 +306,10 @@ impl Agent {
                     StreamEvent::MessageStop { completion: c } => {
                         completion = Some(c);
                     }
+                    StreamEvent::Error { message } => {
+                        stream_error = Some(message);
+                        break;
+                    }
                     _ => {}
                 }
                 // Stop consuming the stream promptly on interrupt. Dropping `rx`
@@ -255,6 +317,11 @@ impl Agent {
                 if self.is_cancelled() {
                     break;
                 }
+            }
+            // A real mid-stream API failure: surface it as an error so the caller
+            // can retry/report, rather than poisoning history with a fake turn.
+            if let Some(message) = stream_error {
+                anyhow::bail!("{}", message);
             }
             // Interrupted mid-stream before the model finished: stop cleanly. The
             // history still ends on a valid boundary (no assistant message pushed
@@ -279,6 +346,7 @@ impl Agent {
             });
 
             self.history.push(completion.message.clone());
+            self.full_history.push(completion.message.clone());
             self.cfg.bus.emit(AgentEvent::Message {
                 agent_id: self.id.clone(),
                 message: completion.message.clone(),
@@ -316,48 +384,70 @@ impl Agent {
                         is_error: Some(true),
                     })
                     .collect();
-                self.history.push(Message {
+                let msg = Message {
                     role: Role::Tool,
                     content: results,
-                });
+                };
+                self.history.push(msg.clone());
+                self.full_history.push(msg);
                 final_text = "[interrupted]".to_string();
                 break;
             }
 
-            // Execute all requested tools concurrently and feed results back.
-            let mut futs = Vec::new();
-            for (id, name, input) in tool_uses {
+            // Execute the requested tools. Read-only tools (reads/searches/status)
+            // run concurrently for speed; mutating tools (edits, writes, bash,
+            // refactors, coordination) run sequentially so two edits to the same
+            // file in one turn can't race and corrupt each other. Order within the
+            // turn is preserved so results map back to their tool_use ids.
+            for (id, name, input) in &tool_uses {
                 self.cfg.bus.emit(AgentEvent::ToolCall {
                     agent_id: self.id.clone(),
                     tool_use_id: id.clone(),
                     name: name.clone(),
                     input: input.clone(),
                 });
-                let tools = self.cfg.tools.clone();
-                let bus = self.cfg.bus.clone();
-                let agent_id = self.id.clone();
-                let ctx = ctx.clone();
-                futs.push(async move {
-                    let output = tools.execute(&name, input, &ctx).await;
-                    let is_error = output.starts_with("error:");
-                    bus.emit(AgentEvent::ToolResult {
-                        agent_id,
-                        tool_use_id: id.clone(),
-                        output: output.clone(),
-                        is_error,
-                    });
-                    ContentBlock::ToolResult {
-                        tool_use_id: id,
-                        content: output,
-                        is_error: Some(is_error),
-                    }
-                });
             }
-            let results = futures::future::join_all(futs).await;
-            self.history.push(Message {
+            let mut results: Vec<ContentBlock> = Vec::with_capacity(tool_uses.len());
+            let mut concurrent = Vec::new();
+            for (id, name, input) in &tool_uses {
+                if is_read_only(name) {
+                    let tools = self.cfg.tools.clone();
+                    let bus = self.cfg.bus.clone();
+                    let agent_id = self.id.clone();
+                    let ctx = ctx.clone();
+                    let (id, name, input) = (id.clone(), name.clone(), input.clone());
+                    concurrent.push(async move {
+                        run_one(&tools, &bus, &agent_id, &ctx, id, name, input).await
+                    });
+                }
+            }
+            let mut concurrent_results = futures::future::join_all(concurrent).await.into_iter();
+            for (id, name, input) in &tool_uses {
+                if is_read_only(name) {
+                    if let Some(r) = concurrent_results.next() {
+                        results.push(r);
+                    }
+                } else {
+                    results.push(
+                        run_one(
+                            &self.cfg.tools,
+                            &self.cfg.bus,
+                            &self.id,
+                            &ctx,
+                            id.clone(),
+                            name.clone(),
+                            input.clone(),
+                        )
+                        .await,
+                    );
+                }
+            }
+            let msg = Message {
                 role: Role::Tool,
                 content: results,
-            });
+            };
+            self.history.push(msg.clone());
+            self.full_history.push(msg);
         }
 
         // If the turn loop ran to exhaustion without the model finishing, return
@@ -375,5 +465,52 @@ impl Agent {
             usage: total,
         });
         Ok(final_text)
+    }
+}
+
+/// Whether a tool only observes state (safe to run concurrently with siblings) or
+/// mutates the workspace / shared state (must be serialized within a turn). Unknown
+/// tools are treated as mutating — the conservative default.
+fn is_read_only(name: &str) -> bool {
+    matches!(
+        name,
+        "read_file"
+            | "list_dir"
+            | "glob"
+            | "grep"
+            | "lsp"
+            | "job_status"
+            | "job_output"
+            | "list_agents"
+            | "web_fetch"
+            | "web_search"
+    )
+}
+
+/// Execute one tool call, emit its result event, and return the tool_result block.
+/// `is_error` comes from the typed Result, not from sniffing the text.
+async fn run_one(
+    tools: &ToolRegistry,
+    bus: &EventBus,
+    agent_id: &str,
+    ctx: &ToolContext,
+    id: String,
+    name: String,
+    input: serde_json::Value,
+) -> ContentBlock {
+    let (content, is_error) = match tools.execute(&name, input, ctx).await {
+        Ok(output) => (output, false),
+        Err(e) => (e.wire(), true),
+    };
+    bus.emit(AgentEvent::ToolResult {
+        agent_id: agent_id.to_string(),
+        tool_use_id: id.clone(),
+        output: content.clone(),
+        is_error,
+    });
+    ContentBlock::ToolResult {
+        tool_use_id: id,
+        content,
+        is_error: Some(is_error),
     }
 }

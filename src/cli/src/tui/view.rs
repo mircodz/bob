@@ -25,6 +25,9 @@ pub enum Cell {
         input: Value,
         status: ToolStatus,
         output: Option<String>,
+        /// Whether the user has clicked to expand this cell's output to its full
+        /// text (default false = short preview). Toggled by clicking the cell.
+        expanded: bool,
     },
     /// A subagent spawn notice, with a running count of tools it has called.
     Subagent {
@@ -43,6 +46,9 @@ pub enum Cell {
     /// A system event surfaced inline as a bulleted line (model/mode switches),
     /// e.g. "• Model changed to gpt-5.5 medium".
     Event(String),
+    /// A message delivered to/from an agent (shown only in the team drawer's
+    /// per-agent threads). `from` is the sender ("root", "user", or an agent name).
+    AgentMsg { from: String, text: String },
 }
 
 impl Cell {
@@ -65,6 +71,7 @@ impl Cell {
                 input,
                 status,
                 output,
+                expanded,
                 ..
             } => {
                 name.hash(&mut h);
@@ -72,6 +79,7 @@ impl Cell {
                 input.to_string().hash(&mut h);
                 (*status as u8).hash(&mut h);
                 output.hash(&mut h);
+                expanded.hash(&mut h);
             }
             Cell::Subagent {
                 agent_id,
@@ -93,8 +101,116 @@ impl Cell {
                 after.hash(&mut h);
             }
             Cell::Notice(t) | Cell::Event(t) => t.hash(&mut h),
+            Cell::AgentMsg { from, text } => {
+                from.hash(&mut h);
+                text.hash(&mut h);
+            }
         }
         h.finish()
+    }
+}
+
+/// The index of a currently-open (streaming) assistant cell at the tail of
+/// `cells`, if any. Shared by the main ViewModel and per-agent threads.
+fn open_assistant_in(cells: &mut [Cell]) -> Option<&mut Cell> {
+    match cells.last_mut() {
+        Some(c @ Cell::Assistant { .. }) => match c {
+            Cell::Assistant { open, .. } if *open => Some(c),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The most recent Tool cell with the given tool_use_id, if any.
+fn find_tool_in<'a>(cells: &'a mut [Cell], id: &str) -> Option<&'a mut Cell> {
+    cells
+        .iter_mut()
+        .rev()
+        .find(|c| matches!(c, Cell::Tool { id: tid, .. } if tid == id))
+}
+
+/// Apply one agent event to a bare list of content cells — the reduction shared
+/// by the main transcript and each per-agent thread. Handles the *content*
+/// events (text, tool call/result, compaction, error, inter-agent messages);
+/// callers layer their own handling for spawn cells / busy state on top.
+///
+/// `include_messages` controls whether `AgentMessage` events append an `AgentMsg`
+/// cell: true for per-agent threads (where the conversation should show), false
+/// for the main transcript (which keeps coordination chatter internal).
+pub fn apply_content_event(cells: &mut Vec<Cell>, event: &AgentEvent, include_messages: bool) {
+    match event {
+        AgentEvent::TextDelta { text, .. } => {
+            if let Some(Cell::Assistant { text: buf, .. }) = open_assistant_in(cells) {
+                buf.push_str(text);
+            } else {
+                cells.push(Cell::Assistant {
+                    text: text.clone(),
+                    open: true,
+                });
+            }
+        }
+        AgentEvent::Message { .. } => {
+            if let Some(Cell::Assistant { open, .. }) = open_assistant_in(cells) {
+                *open = false;
+            }
+        }
+        AgentEvent::ToolCall {
+            tool_use_id,
+            name,
+            input,
+            ..
+        } => {
+            if let Some(Cell::Assistant { open, .. }) = open_assistant_in(cells) {
+                *open = false;
+            }
+            cells.push(Cell::Tool {
+                id: tool_use_id.clone(),
+                name: name.clone(),
+                input: input.clone(),
+                status: ToolStatus::Running,
+                output: None,
+                expanded: false,
+            });
+        }
+        AgentEvent::ToolResult {
+            tool_use_id,
+            output,
+            is_error,
+            ..
+        } => {
+            if let Some(Cell::Tool {
+                status, output: o, ..
+            }) = find_tool_in(cells, tool_use_id)
+            {
+                *status = if *is_error {
+                    ToolStatus::Error
+                } else {
+                    ToolStatus::Ok
+                };
+                *o = Some(output.clone());
+            }
+        }
+        AgentEvent::Compaction {
+            before_tokens,
+            after_tokens,
+            ..
+        } => {
+            cells.push(Cell::Compaction {
+                before: *before_tokens,
+                after: *after_tokens,
+            });
+        }
+        AgentEvent::Error { message, .. } => {
+            cells.push(Cell::Notice(format!("error: {}", message)));
+        }
+        AgentEvent::AgentMessage { from, text, .. } if include_messages => {
+            cells.push(Cell::AgentMsg {
+                from: from.clone(),
+                text: text.clone(),
+            });
+        }
+        _ => {}
     }
 }
 
@@ -103,6 +219,11 @@ pub struct ViewModel {
     pub cells: Vec<Cell>,
     /// Whether the agent is currently working (drives the spinner + input lock).
     pub busy: bool,
+    /// Monotonic counter bumped whenever `cells` changes. The renderer compares it
+    /// to decide whether to rebuild its flattened line cache — a pure scroll (which
+    /// never mutates the view) leaves it untouched, so scrolling does no rebuild
+    /// work regardless of transcript length.
+    pub revision: u64,
 }
 
 impl ViewModel {
@@ -112,16 +233,19 @@ impl ViewModel {
 
     pub fn push_user(&mut self, text: String) {
         self.cells.push(Cell::User(text));
+        self.revision += 1;
     }
 
     pub fn push_notice(&mut self, text: String) {
         self.cells.push(Cell::Notice(text));
+        self.revision += 1;
     }
 
     /// Push an inline system-event line (model/mode switch), rendered with a
     /// bullet like a tool cell.
     pub fn push_event(&mut self, text: String) {
         self.cells.push(Cell::Event(text));
+        self.revision += 1;
     }
 
     /// Rebuild the scrollback from a stored message history (on `--resume`).
@@ -171,6 +295,7 @@ impl ViewModel {
                                     input: input.clone(),
                                     status: ToolStatus::Ok,
                                     output: None,
+                                    expanded: false,
                                 });
                                 // Subagent tree cells come from live SubagentSpawn
                                 // *events*, which aren't in the message history. On
@@ -206,6 +331,7 @@ impl ViewModel {
                 Role::System => {}
             }
         }
+        self.revision += 1;
     }
 
     /// Reconstruct Subagent tree cells from a persisted `task`/`spawn_agent` tool
@@ -266,6 +392,10 @@ impl ViewModel {
 
     /// Apply one agent event to the model.
     pub fn apply(&mut self, event: &AgentEvent) {
+        // Any applied event may mutate cells (append, or update a tool/subagent
+        // cell in place). Bump the revision so the renderer rebuilds its line cache;
+        // this is per-EVENT, not per-frame, so scrolling stays free.
+        self.revision += 1;
         // Events from spawned subagents (agent_id like "task_1") only update the
         // count/done state of their Subagent cell — their inner chatter is never
         // rendered as its own cells.
@@ -290,61 +420,11 @@ impl ViewModel {
             AgentEvent::TurnStart { .. } => {
                 self.busy = true;
             }
-            AgentEvent::TextDelta { text, .. } => {
-                if let Some(Cell::Assistant { text: buf, .. }) = self.open_assistant() {
-                    buf.push_str(text);
-                } else {
-                    self.cells.push(Cell::Assistant {
-                        text: text.clone(),
-                        open: true,
-                    });
-                }
-            }
-            AgentEvent::Message { .. } => {
-                // Close any open assistant cell; tool calls / next turn start fresh.
-                if let Some(Cell::Assistant { open, .. }) = self.open_assistant() {
-                    *open = false;
-                }
-            }
-            AgentEvent::ToolCall {
-                tool_use_id,
-                name,
-                input,
-                ..
-            } => {
-                if let Some(Cell::Assistant { open, .. }) = self.open_assistant() {
-                    *open = false;
-                }
-                self.cells.push(Cell::Tool {
-                    id: tool_use_id.clone(),
-                    name: name.clone(),
-                    input: input.clone(),
-                    status: ToolStatus::Running,
-                    output: None,
-                });
-            }
-            AgentEvent::ToolResult {
-                tool_use_id,
-                output,
-                is_error,
-                ..
-            } => {
-                if let Some(Cell::Tool {
-                    status, output: o, ..
-                }) = self.find_tool(tool_use_id)
-                {
-                    *status = if *is_error {
-                        ToolStatus::Error
-                    } else {
-                        ToolStatus::Ok
-                    };
-                    *o = Some(output.clone());
-                }
-            }
             AgentEvent::SubagentSpawn {
                 agent_id,
                 parent_id,
                 task,
+                ..
             } => {
                 self.cells.push(Cell::Subagent {
                     agent_id: agent_id.clone(),
@@ -364,16 +444,6 @@ impl ViewModel {
                     *f = *failed;
                 }
             }
-            AgentEvent::Compaction {
-                before_tokens,
-                after_tokens,
-                ..
-            } => {
-                self.cells.push(Cell::Compaction {
-                    before: *before_tokens,
-                    after: *after_tokens,
-                });
-            }
             AgentEvent::TurnEnd { .. } => {
                 if let Some(Cell::Assistant { open, .. }) = self.open_assistant() {
                     *open = false;
@@ -383,15 +453,22 @@ impl ViewModel {
                 // in the status bar and the /usage command.
                 self.busy = false;
             }
-            AgentEvent::Error { message, .. } => {
-                self.cells.push(Cell::Notice(format!("error: {}", message)));
+            AgentEvent::Error { .. } => {
+                apply_content_event(&mut self.cells, event, false);
                 self.busy = false;
             }
             // Usage accounting is handled by the run-loop, not the view.
             AgentEvent::Completion { .. } => {}
-            // Inter-agent coordination chatter is internal — filtered out before
-            // it reaches the view (see is_ui_event); never rendered to the user.
-            AgentEvent::AgentMessage { .. } => {}
+            // Inter-agent coordination chatter is internal. In the MAIN transcript
+            // we only surface when the root agent SENDS a message to a subagent, as
+            // a simple one-liner — we don't care about the precise content (it's the
+            // agent's own output) or messages between subagents.
+            AgentEvent::AgentMessage { to, from, .. } if from == "root" => {
+                self.cells
+                    .push(Cell::Event(format!("Sent a message to {}", to)));
+            }
+            // All other content events reduce via the shared helper (messages off).
+            _ => apply_content_event(&mut self.cells, event, false),
         }
     }
 }

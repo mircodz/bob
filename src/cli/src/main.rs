@@ -158,6 +158,28 @@ fn make_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
+/// A short human "time ago" for a unix-seconds timestamp string, so same-titled
+/// sessions in the picker are distinguishable (e.g. "3m ago", "2h ago").
+fn time_ago(updated_at: &str) -> String {
+    let then: u64 = updated_at.parse().unwrap_or(0);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let secs = now.saturating_sub(then);
+    if then == 0 {
+        "?".to_string()
+    } else if secs < 60 {
+        "just now".to_string()
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86_400)
+    }
+}
+
 /// Interactive session picker shown for a bare `--resume`. Prints the stored
 /// sessions (same list bob-remote's drawer shows, via `list_sessions`) and lets
 /// the user choose one by number. Enter/empty or `n` starts a new session.
@@ -168,11 +190,15 @@ fn pick_session() -> anyhow::Result<Option<Session>> {
     }
     println!("\x1b[1mResume a session:\x1b[0m");
     for (i, s) in summaries.iter().enumerate() {
+        // Short id + relative time disambiguate sessions that share a title.
+        let short_id = s.id.get(..8).unwrap_or(&s.id);
         println!(
-            "  \x1b[36m{:>2}\x1b[0m  {}  \x1b[90m({} msgs · {})\x1b[0m",
+            "  \x1b[36m{:>2}\x1b[0m  {}  \x1b[90m({} msgs · {} · {} · {})\x1b[0m",
             i + 1,
             s.title,
             s.message_count,
+            time_ago(&s.updated_at),
+            short_id,
             s.provider,
         );
     }

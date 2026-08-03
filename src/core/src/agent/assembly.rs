@@ -23,7 +23,7 @@ use std::sync::Arc;
 const CONTEXT_WINDOW: usize = 200_000;
 const COMPACT_THRESHOLD: f64 = 0.8;
 const KEEP_RECENT: usize = 6;
-const DEFAULT_MAX_TURNS: u32 = 20;
+const DEFAULT_MAX_TURNS: u32 = 200;
 
 /// Everything a frontend must supply to build the root agent. The frontend still
 /// owns process-level concerns (event bus, permission engine, how it asks the
@@ -100,10 +100,18 @@ pub fn build_root_agent(p: RootAgentParams) -> Agent {
         jobs: p.jobs.clone(),
         lsp: p.lsp.clone(),
     }));
+    tools.add(Arc::new(crate::tools::task::ExploreTool {
+        provider: p.provider.clone(),
+        subagent_tools: subagent_tools.clone(),
+        bus: p.bus.clone(),
+        cwd: p.cwd.clone(),
+        jobs: p.jobs.clone(),
+        lsp: p.lsp.clone(),
+    }));
 
     // Coordination tools: spawn children from the same deps as `task`, and let the
     // root message + inspect the team. Children get send/list via subagent_tools;
-    // nesting depth is enforced at runtime by spawn_agent.
+    // spawn_agent enforces the nesting-depth and running-agent caps at runtime.
     let deps = CoordDeps {
         provider: p.provider.clone(),
         subagent_tools: subagent_tools.clone(),
@@ -125,7 +133,8 @@ pub fn build_root_agent(p: RootAgentParams) -> Agent {
     // Register the root as a team member with its own mailbox, so spawned agents
     // can report their results back to "root" and wake it for a fresh turn.
     let (root_inbox, root_tx) = mailbox();
-    p.team.register("root".to_string(), 0, root_tx);
+    p.team
+        .register("root".to_string(), 0, String::new(), root_tx);
 
     Agent::new(AgentConfig {
         provider: p.provider.clone(),

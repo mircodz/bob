@@ -21,7 +21,7 @@ use crate::core::events::EventBus;
 use crate::core::types::ToolSpec;
 use crate::providers::provider::Provider;
 use crate::tools::jobs::JobRegistry;
-use crate::tools::registry::{Tool, ToolContext, ToolRegistry};
+use crate::tools::registry::{Tool, ToolContext, ToolError, ToolRegistry, ToolResult};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -78,34 +78,50 @@ impl Tool for SpawnAgentTool {
         }
     }
 
-    async fn execute(&self, input: Value, ctx: &ToolContext) -> String {
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
         let coord = match &ctx.coord {
             Some(c) => c,
-            None => return "error: coordination is not available in this context".to_string(),
+            None => {
+                return Err(ToolError::unavailable(
+                    "coordination is not available in this context",
+                ))
+            }
         };
         let name = input["name"].as_str().unwrap_or("").trim().to_string();
         let task = input["task"].as_str().unwrap_or("").to_string();
         if name.is_empty() {
-            return "error: name is required".to_string();
+            return Err(ToolError::invalid_input("name is required"));
         }
         if task.is_empty() {
-            return "error: task is required".to_string();
+            return Err(ToolError::invalid_input("task is required"));
         }
-        if coord.team.contains(&name) {
-            return format!("error: an agent named '{}' already exists", name);
+        if coord.team.name_in_use(&name) {
+            return Err(ToolError::invalid_input(format!(
+                "an agent named '{}' is already running",
+                name
+            )));
         }
-        if coord.team.len() >= crate::agent::team::MAX_TEAM_SIZE {
-            return format!(
-                "error: team is at the maximum of {} agents",
+        let child_depth = coord.depth + 1;
+        if child_depth > crate::agent::team::MAX_SPAWN_DEPTH {
+            return Err(ToolError::invalid_input(format!(
+                "spawn nesting too deep (max {} levels); do this work directly instead \
+                 of spawning another agent",
+                crate::agent::team::MAX_SPAWN_DEPTH
+            )));
+        }
+        if coord.team.active_len() >= crate::agent::team::MAX_TEAM_SIZE {
+            return Err(ToolError::invalid_input(format!(
+                "team is at the maximum of {} running agents; wait for some to finish",
                 crate::agent::team::MAX_TEAM_SIZE
-            );
+            )));
         }
 
         // Build the child's mailbox and register it in the team before spawning,
         // so a sibling can message it immediately.
         let (inbox, tx) = mailbox();
-        let child_depth = coord.depth + 1;
-        coord.team.register(name.clone(), child_depth, tx);
+        coord
+            .team
+            .register(name.clone(), child_depth, coord.name.clone(), tx);
 
         // Announce the spawn so the UI shows a subagent cell (same signal the
         // `task` tool emits). Prefer the short `description` for the label; fall
@@ -123,6 +139,7 @@ impl Tool for SpawnAgentTool {
                 parent_id: coord.name.clone(),
                 agent_id: name.clone(),
                 task: label,
+                prompt: task.clone(),
             });
 
         // The child gets the same tool set PLUS the coordination tools, so nesting
@@ -190,11 +207,11 @@ impl Tool for SpawnAgentTool {
             team.send(&spawner, &child_name, &format!("finished: {}", result));
         });
 
-        format!(
+        Ok(format!(
             "spawned agent '{}'. It runs in the background; its result will arrive as a message \
              from it. Use send_message to steer it or list_agents to check status.",
             name
-        )
+        ))
     }
 }
 
@@ -224,20 +241,29 @@ impl Tool for SendMessageTool {
         }
     }
 
-    async fn execute(&self, input: Value, ctx: &ToolContext) -> String {
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
         let from = match &ctx.coord {
             Some(c) => c.name.clone(),
-            None => return "error: coordination is not available in this context".to_string(),
+            None => {
+                return Err(ToolError::unavailable(
+                    "coordination is not available in this context",
+                ))
+            }
         };
         let to = input["to"].as_str().unwrap_or("").trim();
         let message = input["message"].as_str().unwrap_or("");
         if to.is_empty() || message.is_empty() {
-            return "error: both 'to' and 'message' are required".to_string();
+            return Err(ToolError::invalid_input(
+                "both 'to' and 'message' are required",
+            ));
         }
         if self.team.send(to, &from, message) {
-            format!("delivered to '{}'", to)
+            Ok(format!("delivered to '{}'", to))
         } else {
-            format!("error: no agent named '{}' (it may have finished)", to)
+            Err(ToolError::not_found(format!(
+                "no agent named '{}' (it may have finished)",
+                to
+            )))
         }
     }
 }
@@ -261,10 +287,10 @@ impl Tool for ListAgentsTool {
         }
     }
 
-    async fn execute(&self, _input: Value, _ctx: &ToolContext) -> String {
+    async fn execute(&self, _input: Value, _ctx: &ToolContext) -> ToolResult {
         let roster = self.team.roster();
         if roster.is_empty() {
-            return "no agents in the team yet.".to_string();
+            return Ok("no agents in the team yet.".to_string());
         }
         let mut out = String::from("team:\n");
         for (name, depth, status) in roster {
@@ -275,6 +301,6 @@ impl Tool for ListAgentsTool {
             };
             out.push_str(&format!("  {} (depth {}) — {}\n", name, depth, s));
         }
-        out
+        Ok(out)
     }
 }

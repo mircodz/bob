@@ -173,6 +173,8 @@ pub enum AgentEventDto {
         parent_id: String,
         agent_id: String,
         task: String,
+        #[serde(default)]
+        prompt: String,
     },
     SubagentDone {
         agent_id: String,
@@ -243,10 +245,12 @@ impl From<&AgentEvent> for AgentEventDto {
                 parent_id,
                 agent_id,
                 task,
+                prompt,
             } => AgentEventDto::SubagentSpawn {
                 parent_id: parent_id.clone(),
                 agent_id: agent_id.clone(),
                 task: task.clone(),
+                prompt: prompt.clone(),
             },
             AgentEvent::SubagentDone { agent_id, failed } => AgentEventDto::SubagentDone {
                 agent_id: agent_id.clone(),

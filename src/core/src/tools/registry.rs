@@ -66,12 +66,108 @@ pub struct CoordContext {
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
-    async fn execute(&self, input: Value, ctx: &ToolContext) -> String;
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult;
     /// Optionally produce a human-readable preview of what this call *would* do,
     /// computed WITHOUT side effects. Shown in the permission prompt before the
     /// user approves. Edit/write tools return a ```diff block; most return None.
     fn preview(&self, _input: &Value, _ctx: &ToolContext) -> Option<String> {
         None
+    }
+}
+
+/// A tool's outcome: `Ok` carries the success text shown to the model; `Err`
+/// carries a typed failure. This replaces the old `"error:"` string convention —
+/// the agent loop derives `is_error` from the variant, not by sniffing text, so a
+/// `read_file` on a file that literally contains "error:" is no longer misread as
+/// a failure.
+pub type ToolResult = Result<String, ToolError>;
+
+/// The category of a tool failure. Lets the model and UI branch on *why* a call
+/// failed (retry a path, fix an argument, ask the user) instead of parsing prose.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolErrorKind {
+    /// A referenced file/symbol/agent doesn't exist.
+    NotFound,
+    /// The call's arguments were missing or malformed.
+    InvalidInput,
+    /// The permission engine (or the OS) denied the action.
+    PermissionDenied,
+    /// The operation timed out.
+    Timeout,
+    /// A required facility isn't available here (no LSP, no UI, no team).
+    Unavailable,
+    /// A catch-all runtime failure (a command exited non-zero, IO error, etc.).
+    Failed,
+}
+
+impl ToolErrorKind {
+    /// Stable snake_case slug, used as the wire prefix the model sees.
+    pub fn slug(self) -> &'static str {
+        match self {
+            ToolErrorKind::NotFound => "not_found",
+            ToolErrorKind::InvalidInput => "invalid_input",
+            ToolErrorKind::PermissionDenied => "permission_denied",
+            ToolErrorKind::Timeout => "timeout",
+            ToolErrorKind::Unavailable => "unavailable",
+            ToolErrorKind::Failed => "failed",
+        }
+    }
+}
+
+/// A typed tool failure: a category plus a human-readable message.
+#[derive(Clone, Debug)]
+pub struct ToolError {
+    pub kind: ToolErrorKind,
+    pub message: String,
+}
+
+impl ToolError {
+    pub fn new(kind: ToolErrorKind, message: impl Into<String>) -> Self {
+        ToolError {
+            kind,
+            message: message.into(),
+        }
+    }
+    pub fn not_found(message: impl Into<String>) -> Self {
+        ToolError::new(ToolErrorKind::NotFound, message)
+    }
+    pub fn invalid_input(message: impl Into<String>) -> Self {
+        ToolError::new(ToolErrorKind::InvalidInput, message)
+    }
+    pub fn permission_denied(message: impl Into<String>) -> Self {
+        ToolError::new(ToolErrorKind::PermissionDenied, message)
+    }
+    pub fn timeout(message: impl Into<String>) -> Self {
+        ToolError::new(ToolErrorKind::Timeout, message)
+    }
+    pub fn unavailable(message: impl Into<String>) -> Self {
+        ToolError::new(ToolErrorKind::Unavailable, message)
+    }
+    pub fn failed(message: impl Into<String>) -> Self {
+        ToolError::new(ToolErrorKind::Failed, message)
+    }
+
+    /// The text the model sees in a `tool_result` block: `"<kind>: <message>"`.
+    /// The prefix gives the model a machine-stable category to reason about.
+    pub fn wire(&self) -> String {
+        format!("{}: {}", self.kind.slug(), self.message)
+    }
+}
+
+impl std::fmt::Display for ToolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.wire())
+    }
+}
+
+impl From<std::io::Error> for ToolError {
+    fn from(e: std::io::Error) -> Self {
+        use std::io::ErrorKind;
+        match e.kind() {
+            ErrorKind::NotFound => ToolError::not_found(e.to_string()),
+            ErrorKind::PermissionDenied => ToolError::permission_denied(e.to_string()),
+            _ => ToolError::failed(e.to_string()),
+        }
     }
 }
 
@@ -104,6 +200,31 @@ impl ToolRegistry {
         self.tools.get(name).cloned()
     }
 
+    /// A new registry containing only the read-only tools from this one — reads,
+    /// searches, navigation, web. Used to build the `explore` subagent, which must
+    /// not mutate the workspace. Unknown/mutating tools (edit, write, bash, etc.)
+    /// are dropped, so an explore agent physically cannot change anything.
+    pub fn read_only_subset(&self) -> ToolRegistry {
+        const READ_ONLY: &[&str] = &[
+            "read_file",
+            "list_dir",
+            "glob",
+            "grep",
+            "lsp",
+            "web_fetch",
+            "web_search",
+        ];
+        let mut out = ToolRegistry::new(self.permissions.clone());
+        for name in &self.order {
+            if READ_ONLY.contains(&name.as_str()) {
+                if let Some(t) = self.tools.get(name) {
+                    out.add(t.clone());
+                }
+            }
+        }
+        out
+    }
+
     pub fn specs(&self) -> Vec<ToolSpec> {
         self.order
             .iter()
@@ -111,10 +232,10 @@ impl ToolRegistry {
             .collect()
     }
 
-    pub async fn execute(&self, name: &str, input: Value, ctx: &ToolContext) -> String {
+    pub async fn execute(&self, name: &str, input: Value, ctx: &ToolContext) -> ToolResult {
         let tool = match self.tools.get(name) {
             Some(t) => t.clone(),
-            None => return format!("error: unknown tool \"{}\"", name),
+            None => return Err(ToolError::not_found(format!("unknown tool \"{}\"", name))),
         };
 
         // Gate every call through the permission engine, if configured.
@@ -136,7 +257,10 @@ impl ToolRegistry {
                 preview,
             };
             if !perms.check(&req).await {
-                return format!("error: permission denied for tool \"{}\"", name);
+                return Err(ToolError::permission_denied(format!(
+                    "permission denied for tool \"{}\"",
+                    name
+                )));
             }
         }
 

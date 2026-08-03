@@ -34,6 +34,10 @@ pub enum AgentEvent {
         parent_id: String,
         agent_id: String,
         task: String,
+        /// The full instructions the parent gave the subagent (the run prompt).
+        /// Surfaced in the drawer so you can see exactly what was delegated;
+        /// `task` above is only the short label.
+        prompt: String,
     },
     /// A spawned agent finished. `failed` marks an error exit (shown red).
     SubagentDone {
