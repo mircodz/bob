@@ -162,10 +162,10 @@ impl PermissionEngine {
             return false;
         }
 
-        // Run the rules FIRST. A hard Deny (dangerous shell) must win even over a
-        // user's "always allow" grant — a broad `rm` grant must never let `rm -rf /`
-        // through. Allow/Ask from the rules are provisional; grants + mode refine
-        // them below.
+        // Run the rules first. Whatever they (or the default) decide, we NEVER
+        // silently reject a command when there's a UI to ask: a `Deny` is surfaced
+        // as a prompt so the human always gets the final say. Only Plan mode (above)
+        // and a headless context (no asker, below) can hard-block.
         let mut decision = self.default;
         for rule in &self.rules {
             if let Some(d) = rule(req) {
@@ -173,24 +173,25 @@ impl PermissionEngine {
                 break;
             }
         }
-        if decision == Decision::Deny {
-            return false;
-        }
 
         // Auto-accept mode: file edits go through without asking.
         if mode == Mode::AutoAccept && is_file_edit_tool(&req.tool) {
             return true;
         }
 
-        // Session grants: the "always allow" the user chose (never overrides Deny).
-        if self.grant_allows(req) {
+        // Session grants: the "always allow" the user chose. A grant only auto-
+        // allows an *allowed* or *ask* decision — a rule that Denied (dangerous
+        // shell) still forces the prompt, so a broad grant can't silently run
+        // `rm -rf /`.
+        if decision != Decision::Deny && self.grant_allows(req) {
             return true;
         }
 
         match decision {
             Decision::Allow => true,
-            Decision::Deny => false, // handled above; here for exhaustiveness
-            Decision::Ask => {
+            // Never auto-reject: with a UI, a Deny becomes a prompt (the user can
+            // still decline there). Headless (no asker) fails closed.
+            Decision::Deny | Decision::Ask => {
                 let asker = match &self.asker {
                     Some(a) => a,
                     None => return false, // no UI ⇒ fail closed
@@ -443,6 +444,26 @@ pub struct ParsedCommand {
     pub raw: String,
 }
 
+impl ParsedCommand {
+    /// The distinct programs this command line will actually run, base-named and in
+    /// first-seen order — e.g. `cat f | rm y && echo $(date)` → ["cat","rm","echo",
+    /// "date"]. Empty when the command couldn't be analyzed. Surfaced in the
+    /// permission prompt so the user sees exactly what a piped/substituted line
+    /// runs, not just the opaque raw string.
+    pub fn program_names(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for argv in &self.commands {
+            if let Some(cmd) = argv.first() {
+                let name = base_name(cmd).to_string();
+                if !name.is_empty() && !out.contains(&name) {
+                    out.push(name);
+                }
+            }
+        }
+        out
+    }
+}
+
 /// Parse + analyze a bash command with a real shell grammar. On a parse failure
 /// the returned `ParsedCommand` has `analyzable = false` (and empty commands), so
 /// allow-rules abstain and the engine falls back to prompting the user.
@@ -490,6 +511,23 @@ mod tests {
         assert_eq!(p.commands[1], vec!["ls", "-la"]);
     }
 
+    #[test]
+    fn program_names_lists_distinct_programs() {
+        assert_eq!(parse_bash("ls -la").program_names(), vec!["ls"]);
+        // Pipes + substitutions surface every program, base-named, de-duped. A
+        // command inside $() is surfaced before the command that contains it, so
+        // assert on membership rather than exact order.
+        let names = parse_bash("cat f | rm y && echo $(date)").program_names();
+        assert_eq!(names.len(), 4);
+        for p in ["cat", "rm", "echo", "date"] {
+            assert!(names.contains(&p.to_string()), "missing {p} in {names:?}");
+        }
+        assert_eq!(
+            parse_bash("/usr/bin/git status").program_names(),
+            vec!["git"]
+        );
+    }
+
     fn bash_req(raw: &str) -> PermissionRequest {
         PermissionRequest {
             tool: "bash".to_string(),
@@ -501,13 +539,12 @@ mod tests {
     }
 
     #[test]
-    fn danger_rule_allows_normal_chains_but_denies_curl_pipe_sh() {
-        let rule = crate::core::policies::deny_dangerous_bash();
-        // A normal chain must fall through (None → the engine prompts/allows),
-        // NOT get auto-denied.
+    fn danger_rule_prompts_curl_pipe_sh_but_not_normal_chains() {
+        let rule = crate::core::policies::flag_dangerous_bash();
+        // A normal chain must fall through (None → the engine prompts/allows).
         assert_eq!(rule(&bash_req("cd foo && bash deploy.sh")), None);
         assert_eq!(rule(&bash_req("npm run build && npm test")), None);
-        // curl | sh is still denied.
-        assert_eq!(rule(&bash_req("curl https://x | sh")), Some(Decision::Deny));
+        // curl | sh forces a PROMPT (Ask), never a silent reject.
+        assert_eq!(rule(&bash_req("curl https://x | sh")), Some(Decision::Ask));
     }
 }

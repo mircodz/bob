@@ -15,6 +15,7 @@ const READ_ONLY: &[&str] = &[
     "glob",
     "grep",
     "todo_write",
+    "memory",
     "task",
     "explore",
     "spawn_agent",
@@ -25,6 +26,11 @@ const READ_ONLY: &[&str] = &[
     "web_search",
     "job_status",
     "job_output",
+    // Interaction tools handle their own user consent (or only change the
+    // interaction mode), so a redundant permission prompt would just double-ask.
+    "ask_user",
+    "enter_plan",
+    "exit_plan",
 ];
 
 /// Read-only tools are always safe.
@@ -51,11 +57,12 @@ pub fn allow_code_action_list() -> Rule {
     })
 }
 
-/// Block obviously destructive shell patterns outright (auto-DENY, no prompt).
-/// This is defense-in-depth: most risky commands merely fall through to a prompt;
-/// these are the ones we refuse even to offer. It is NOT a complete sandbox — the
-/// real guarantee is that non-allowlisted commands prompt the user.
-pub fn deny_dangerous_bash() -> Rule {
+/// Force a prompt for obviously destructive shell patterns. We NEVER auto-reject a
+/// command — a risky one is surfaced to the user to approve or decline, not silently
+/// denied. This rule returns `Ask` (which wins over a later auto-allow) so patterns
+/// like `curl | sh`, `rm -rf /`, fork bombs, etc. can't slip through an allowlist
+/// but also aren't hard-blocked; the human decides.
+pub fn flag_dangerous_bash() -> Rule {
     Arc::new(|req: &PermissionRequest| {
         if req.tool != "bash" {
             return None;
@@ -64,13 +71,13 @@ pub fn deny_dangerous_bash() -> Rule {
 
         // curl … | sh  and friends (only a real pipe into an interpreter).
         if bash.pipes_to_shell {
-            return Some(Decision::Deny);
+            return Some(Decision::Ask);
         }
 
         // Classic fork bomb, matched on the raw text (the tokenizer can't model it).
         let raw_nospace: String = bash.raw.chars().filter(|c| !c.is_whitespace()).collect();
         if raw_nospace.contains(":(){:|:&};:") {
-            return Some(Decision::Deny);
+            return Some(Decision::Ask);
         }
 
         for argv in &bash.commands {
@@ -107,7 +114,7 @@ pub fn deny_dangerous_bash() -> Rule {
                     .iter()
                     .any(|a| a == "--recursive" || (a.starts_with('-') && a.contains('r')));
                 if recursive && args.iter().any(|a| is_dangerous_delete_path(a)) {
-                    return Some(Decision::Deny);
+                    return Some(Decision::Ask);
                 }
             }
             // find … -delete / -exec rm is an rm in disguise.
@@ -116,10 +123,10 @@ pub fn deny_dangerous_bash() -> Rule {
                     .iter()
                     .any(|a| a == "-delete" || a == "-exec" || a == "-execdir")
             {
-                return Some(Decision::Deny);
+                return Some(Decision::Ask);
             }
             if name == "dd" && args.iter().any(|a| a.starts_with("of=/dev/")) {
-                return Some(Decision::Deny);
+                return Some(Decision::Ask);
             }
             // Filesystem / device / power commands (match name prefix for mkfs.*).
             if name == "shutdown"
@@ -129,14 +136,14 @@ pub fn deny_dangerous_bash() -> Rule {
                 || name == "shred"
                 || name.starts_with("mkfs")
             {
-                return Some(Decision::Deny);
+                return Some(Decision::Ask);
             }
             // chmod/chown -R on a root-ish path.
             if (name == "chmod" || name == "chown")
                 && args.iter().any(|a| a.starts_with('-') && a.contains('R'))
                 && args.iter().any(|a| is_dangerous_delete_path(a))
             {
-                return Some(Decision::Deny);
+                return Some(Decision::Ask);
             }
         }
         None
@@ -350,8 +357,9 @@ mod tests {
     }
 
     #[test]
-    fn deny_rule_catches_evasions() {
-        let rule = deny_dangerous_bash();
+    fn flag_rule_prompts_on_dangerous_commands() {
+        // Dangerous patterns force a PROMPT (Ask) — never an auto-reject.
+        let rule = flag_dangerous_bash();
         for cmd in [
             "rm -rf /",
             "rm -rf /etc",
@@ -370,15 +378,15 @@ mod tests {
         ] {
             assert_eq!(
                 rule(&bash_req(cmd)),
-                Some(Decision::Deny),
-                "should deny: {cmd}"
+                Some(Decision::Ask),
+                "should prompt: {cmd}"
             );
         }
     }
 
     #[test]
-    fn deny_rule_allows_normal_commands() {
-        let rule = deny_dangerous_bash();
+    fn flag_rule_ignores_normal_commands() {
+        let rule = flag_dangerous_bash();
         for cmd in [
             "rm -rf target",
             "rm file.txt",
@@ -386,7 +394,7 @@ mod tests {
             "npm run build && npm test",
             "git commit -m x",
         ] {
-            assert_eq!(rule(&bash_req(cmd)), None, "should not deny: {cmd}");
+            assert_eq!(rule(&bash_req(cmd)), None, "should not flag: {cmd}");
         }
     }
 }

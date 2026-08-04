@@ -22,8 +22,8 @@ use bob_core::core::permissions::{
     Asker, Decision, Mode, PermissionEngine, PermissionOption, PermissionRequest,
 };
 use bob_core::core::policies::{
-    allow_bash_commands, allow_code_action_list, allow_read_only, allow_tools, deny_dangerous_bash,
-    deny_tools,
+    allow_bash_commands, allow_code_action_list, allow_read_only, allow_tools, deny_tools,
+    flag_dangerous_bash,
 };
 use bob_core::core::session::{save_session, Session};
 use bob_core::providers::create_provider;
@@ -168,22 +168,37 @@ struct PendingQuery {
 #[async_trait]
 impl Asker for TuiAsker {
     async fn ask(&self, req: &PermissionRequest, options: &[PermissionOption]) -> Option<usize> {
-        let (title, detail) = if req.tool == "bash" {
-            (
-                "Run shell command?".to_string(),
-                req.bash.as_ref().map(|b| b.raw.clone()).unwrap_or_default(),
-            )
+        let (title, detail, preview) = if req.tool == "bash" {
+            let bash = req.bash.as_ref();
+            let raw = bash.map(|b| b.raw.clone()).unwrap_or_default();
+            // Surface exactly what the line will run. With the AST parser a piped or
+            // substituted command may run several programs the raw string hides;
+            // list them so the user sees the real footprint before approving.
+            let preview = bash.and_then(|b| {
+                if !b.analyzable {
+                    Some("⚠ couldn't fully parse this command — review it carefully.".to_string())
+                } else {
+                    let names = b.program_names();
+                    if names.len() > 1 {
+                        Some(format!("runs: {}", names.join(", ")))
+                    } else {
+                        None
+                    }
+                }
+            });
+            ("Run shell command?".to_string(), raw, preview)
         } else {
             (
                 format!("Allow {}?", req.tool),
                 describe_input(&req.tool, &req.input),
+                req.preview.clone(),
             )
         };
         let (resp_tx, resp_rx) = oneshot::channel();
         let prompt = PermPrompt {
             title,
             detail,
-            preview: req.preview.clone(),
+            preview,
             options: options.to_vec(),
             resp: resp_tx,
         };
@@ -362,7 +377,7 @@ pub async fn run(
     let mut engine = PermissionEngine::new(default_decision, Some(asker));
     engine.add(allow_read_only());
     engine.add(allow_code_action_list());
-    engine.add(deny_dangerous_bash());
+    engine.add(flag_dangerous_bash());
     engine.add(allow_bash_commands(config.permissions.allow_bash.clone()));
     engine.add(allow_tools(config.permissions.allow.clone()));
     engine.add(deny_tools(config.permissions.deny.clone()));
@@ -465,6 +480,8 @@ pub async fn run(
     app.branch = git_branch(&cwd);
     app.lsp = lsp.clone();
     app.todos = Some(todos);
+    // Load user-defined slash commands from .bob/commands/*.md (global + project).
+    app.custom_commands = bob_core::core::commands::load_custom_commands(&cwd);
     // Restore per-agent drawer transcripts from a resumed session.
     if !session.agent_threads.is_empty() {
         app.teams = team::AgentTranscripts::from_persisted(&session.agent_threads);
@@ -627,6 +644,47 @@ pub async fn run(
                                     let msgs = a.messages().len();
                                     drop(a);
                                     app.show_context(used, msgs);
+                                } else {
+                                    app.toast = Some("busy — try again after this turn".into());
+                                }
+                            }
+                            KeyOutcome::ClearContext => {
+                                // Reset the conversation context: the agent forgets
+                                // all history, but we stay in the same session id.
+                                if app.running {
+                                    app.toast = Some("finish the current turn first".into());
+                                } else if let Ok(mut a) = agent.try_lock() {
+                                    a.load_history(Vec::new());
+                                    drop(a);
+                                    session.messages.clear();
+                                    app.view.clear();
+                                    app.view.push_notice("context cleared — the agent has forgotten the conversation.".into());
+                                    app.stick_to_bottom();
+                                } else {
+                                    app.toast = Some("busy — try again after this turn".into());
+                                }
+                            }
+                            KeyOutcome::NewSession => {
+                                // Start a brand-new session: fresh history + a new id
+                                // scoped to this cwd. The old session stays saved.
+                                if app.running {
+                                    app.toast = Some("finish the current turn first".into());
+                                } else if let Ok(mut a) = agent.try_lock() {
+                                    a.load_history(Vec::new());
+                                    drop(a);
+                                    session = bob_core::core::session::new_session(
+                                        provider.name(),
+                                        uuid::Uuid::new_v4().to_string(),
+                                        now_stamp(),
+                                        cwd.to_string_lossy().to_string(),
+                                    );
+                                    app.teams = team::AgentTranscripts::new();
+                                    if let Some(todos) = &app.todos {
+                                        todos.set(Vec::new());
+                                    }
+                                    app.view.clear();
+                                    app.view.push_notice(format!("started a fresh session ({}).", session.id));
+                                    app.stick_to_bottom();
                                 } else {
                                     app.toast = Some("busy — try again after this turn".into());
                                 }
@@ -887,6 +945,10 @@ enum KeyOutcome {
     ListModels,
     /// Show context-window usage (needs the agent's history, handled in loop).
     ShowContext,
+    /// Reset the conversation context (agent forgets), staying in this session.
+    ClearContext,
+    /// Start a brand-new session (fresh history + new id), handled in the loop.
+    NewSession,
     Quit,
 }
 
@@ -895,9 +957,12 @@ struct App {
     input: input::Input,
     spinner: usize,
     pending_perm: Option<PendingPerm>,
-    /// Filtered slash-command menu, when the input starts with '/'.
-    menu: Vec<(&'static str, &'static str)>,
+    /// Filtered slash-command menu, when the input starts with '/'. Owned strings
+    /// so built-in and user-defined (custom) commands can share one list.
+    menu: Vec<(String, String)>,
     menu_sel: usize,
+    /// User-defined slash commands loaded from `.bob/commands/*.md`.
+    custom_commands: Vec<bob_core::core::commands::CustomCommand>,
     /// `@file` completion: the full project file list (gathered lazily), the
     /// current filtered matches, and the selected index. `file_at` is the byte
     /// offset of the active `@` in the input buffer while completing.
@@ -968,9 +1033,20 @@ struct App {
     agent_team: bob_core::agent::team::AgentRegistry,
 }
 
+/// The turn `/init` submits: asks the agent to survey the project and write an
+/// AGENTS.md the way Claude Code's /init does.
+const INIT_PROMPT: &str = "Create an AGENTS.md file in the project root that will help future \
+    coding assistants work effectively here. Explore the codebase first (build files, README, \
+    directory layout, existing conventions), then write a concise AGENTS.md covering: what the \
+    project is, how to build/test/lint/run it (the exact commands), the high-level architecture \
+    and where key things live, and any important conventions or gotchas. Keep it tight and \
+    factual — no fluff. If an AGENTS.md already exists, improve it rather than overwriting good \
+    content.";
+
 const COMMANDS: &[(&str, &str)] = &[
+    ("/new", "start a fresh session (new conversation)"),
+    ("/clear", "clear the conversation context (agent forgets)"),
     ("/copy", "copy the last message to the clipboard"),
-    ("/clear", "clear the transcript"),
     ("/usage", "show token usage (session + all-time)"),
     ("/context", "show context-window usage"),
     ("/model", "show the current model"),
@@ -981,6 +1057,8 @@ const COMMANDS: &[(&str, &str)] = &[
     ),
     ("/theme", "switch color theme (dark/light/terminal)"),
     ("/jobs", "list background jobs"),
+    ("/memory", "show saved memories (project + global)"),
+    ("/init", "generate an AGENTS.md describing this project"),
     ("/mcp", "list configured MCP servers"),
     ("/lsp", "show language servers & their health"),
     ("/exit", "quit bob"),
@@ -1001,6 +1079,7 @@ impl App {
             spinner: 0,
             pending_perm: None,
             menu: Vec::new(),
+            custom_commands: Vec::new(),
             menu_sel: 0,
             all_files: Vec::new(),
             files_loading: false,
@@ -1047,9 +1126,16 @@ impl App {
     fn refresh_menu(&mut self) {
         let text = self.input.text();
         if text.starts_with('/') && !text.contains(' ') {
-            self.menu = COMMANDS
+            let mut all: Vec<(String, String)> = COMMANDS
                 .iter()
-                .copied()
+                .map(|(c, d)| (c.to_string(), d.to_string()))
+                .collect();
+            // Merge user-defined commands (prefixed with '/').
+            for cc in &self.custom_commands {
+                all.push((format!("/{}", cc.name), cc.description.clone()));
+            }
+            self.menu = all
+                .into_iter()
                 .filter(|(c, _)| c.starts_with(text))
                 .collect();
             self.menu_sel = self.menu_sel.min(self.menu.len().saturating_sub(1));
@@ -1788,10 +1874,8 @@ impl App {
         };
         match cmd {
             "/exit" => Some(KeyOutcome::Quit),
-            "/clear" => {
-                self.view.clear();
-                Some(KeyOutcome::None)
-            }
+            "/clear" => Some(KeyOutcome::ClearContext),
+            "/new" => Some(KeyOutcome::NewSession),
             "/copy" => {
                 self.copy_last();
                 Some(KeyOutcome::None)
@@ -1843,6 +1927,11 @@ impl App {
                 }
             }
             "/context" => Some(KeyOutcome::ShowContext),
+            "/memory" => {
+                self.show_memory();
+                Some(KeyOutcome::None)
+            }
+            "/init" => Some(KeyOutcome::Submit(INIT_PROMPT.to_string())),
             "/theme" => {
                 if arg.is_empty() {
                     self.open_theme_picker(&self.theme_name.clone());
@@ -1856,8 +1945,51 @@ impl App {
                 }
                 Some(KeyOutcome::None)
             }
-            _ => None,
+            _ => {
+                // A user-defined command (/name from .bob/commands/name.md):
+                // expand its template with the args and submit it as a turn.
+                let name = cmd.strip_prefix('/').unwrap_or(cmd);
+                if let Some(c) = self.custom_commands.iter().find(|c| c.name == name) {
+                    return Some(KeyOutcome::Submit(c.expand(arg)));
+                }
+                None
+            }
         }
+    }
+
+    /// Show saved memories: the project AGENTS.md (cwd) + the global ~/.bob/AGENTS.md.
+    fn show_memory(&mut self) {
+        let mut shown = false;
+        let project = std::env::current_dir().map(|c| c.join("AGENTS.md")).ok();
+        if let Some(path) = project {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                let text = text.trim();
+                if !text.is_empty() {
+                    self.view
+                        .push_notice(format!("memory · project ({})", path.display()));
+                    self.view.push_notice(text.to_string());
+                    shown = true;
+                }
+            }
+        }
+        if let Some(home) = dirs::home_dir() {
+            let path = home.join(".bob").join("AGENTS.md");
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                let text = text.trim();
+                if !text.is_empty() {
+                    self.view
+                        .push_notice(format!("memory · global ({})", path.display()));
+                    self.view.push_notice(text.to_string());
+                    shown = true;
+                }
+            }
+        }
+        if !shown {
+            self.view.push_notice(
+                "no memories yet. bob saves durable preferences/conventions to AGENTS.md as you work.".to_string(),
+            );
+        }
+        self.stick_to_bottom();
     }
 
     /// Print the language servers + their live health as notice cells.
@@ -2047,15 +2179,21 @@ pub(super) fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>>
     if width == 0 || line.width() <= width {
         return vec![line];
     }
+    use unicode_width::UnicodeWidthChar;
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut cur: Vec<Span<'static>> = Vec::new();
+    // Track DISPLAY columns, not char count: a CJK ideograph or emoji occupies two
+    // terminal cells, so counting chars wraps wide text one column short and clips.
     let mut col = 0usize;
 
     for span in line.spans {
         let style = span.style;
         let mut chunk = String::new();
         for ch in span.content.chars() {
-            if col >= width {
+            let w = ch.width().unwrap_or(0);
+            // Break BEFORE a glyph that would overflow the row (using its real
+            // width, so a 2-cell glyph at column width-1 moves to the next row).
+            if col + w > width && col > 0 {
                 if !chunk.is_empty() {
                     cur.push(Span::styled(std::mem::take(&mut chunk), style));
                 }
@@ -2063,7 +2201,7 @@ pub(super) fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>>
                 col = 0;
             }
             chunk.push(ch);
-            col += 1;
+            col += w;
         }
         if !chunk.is_empty() {
             cur.push(Span::styled(chunk, style));

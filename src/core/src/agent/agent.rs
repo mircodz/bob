@@ -252,6 +252,8 @@ impl Agent {
                     depth: self.cfg.depth,
                     team: team.clone(),
                 }),
+            // Injected by ToolRegistry::execute from the registry's own engine.
+            permissions: None,
         };
 
         // A non-empty prompt is a real user turn. An EMPTY prompt is a

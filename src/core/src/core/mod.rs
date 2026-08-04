@@ -1,4 +1,5 @@
 pub mod bash_parse;
+pub mod commands;
 pub mod config;
 pub mod events;
 pub mod permissions;

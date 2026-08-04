@@ -32,7 +32,10 @@ fn tool_display(name: &str, input: &Value) -> (String, String) {
         "web_fetch" => ("Fetch".into(), arg("url")),
         "web_search" => ("Search".into(), arg("query")),
         "todo_write" => ("Plan".into(), String::new()),
+        "memory" => ("Memory".into(), arg("content")),
         "task" => ("Task".into(), String::new()),
+        "enter_plan" => ("Plan mode".into(), String::new()),
+        "exit_plan" => ("Plan".into(), String::new()),
         "explore" => ("Explore".into(), arg("description")),
         // spawn_agent's tool cell is suppressed in render_tool; its visible
         // artifact is the separate "• Spawned <name> agent" Subagent line.
@@ -52,26 +55,58 @@ fn truncate(s: &str, n: usize) -> String {
     }
 }
 
+/// Wrap a plain string to `width` DISPLAY columns (width-aware, char-level).
+/// Returns at least one row. Used by the user-message band so a long message stays
+/// inside its background band on every row instead of overflowing into a broken
+/// second line.
+fn wrap_plain(text: &str, width: usize) -> Vec<String> {
+    use unicode_width::UnicodeWidthChar;
+    let width = width.max(1);
+    let mut rows: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut col = 0usize;
+    for ch in text.chars() {
+        let w = ch.width().unwrap_or(0);
+        if col + w > width && col > 0 {
+            rows.push(std::mem::take(&mut cur));
+            col = 0;
+        }
+        cur.push(ch);
+        col += w;
+    }
+    rows.push(cur);
+    rows
+}
+
 /// Render one cell into zero or more display lines. `width` is the render width,
 /// used to fill full-width background bands (the user message).
 pub fn render_cell(cell: &Cell, width: usize, out: &mut Vec<Line<'static>>) {
     match cell {
         Cell::User(text) => {
-            // A full-width band with the input background: blank padded row above
-            // and below, and the message row padded out to `width` so the bg fills
-            // edge-to-edge. Styled like the live prompt — a dim `› ` marker + the
-            // message in the normal text color (no bold, no accent/user blue).
+            // A full-width band with the input background: a blank padded row above
+            // and below, and the message wrapped to `width` with EACH row padded out
+            // so the bg fills edge to edge. Wrapping here (rather than letting an
+            // outer pass split an over-wide pre-padded line) keeps the band intact
+            // on long messages. Styled like the live prompt — a dim `› ` marker.
+            use unicode_width::UnicodeWidthStr;
             let bg = Style::default().bg(Palette::INPUT_BG());
             let pad_row = |w: usize| Line::from(Span::styled(" ".repeat(w), bg));
             out.push(pad_row(width));
+
             let prefix = "› ";
-            let used = prefix.chars().count() + text.chars().count();
-            let trailing = width.saturating_sub(used);
-            out.push(Line::from(vec![
-                Span::styled(prefix, bg.fg(Palette::DIM())),
-                Span::styled(text.clone(), bg.fg(Palette::TEXT())),
-                Span::styled(" ".repeat(trailing), bg),
-            ]));
+            let indent = "  "; // continuation rows align under the marker
+            let content_w = width.saturating_sub(prefix.width()).max(1);
+            let rows = wrap_plain(text, content_w);
+            for (i, row) in rows.iter().enumerate() {
+                let lead = if i == 0 { prefix } else { indent };
+                let used = lead.width() + row.width();
+                let trailing = width.saturating_sub(used);
+                out.push(Line::from(vec![
+                    Span::styled(lead, bg.fg(Palette::DIM())),
+                    Span::styled(row.clone(), bg.fg(Palette::TEXT())),
+                    Span::styled(" ".repeat(trailing), bg),
+                ]));
+            }
             out.push(pad_row(width));
             out.push(Line::from(""));
         }
@@ -89,7 +124,15 @@ pub fn render_cell(cell: &Cell, width: usize, out: &mut Vec<Line<'static>>) {
             expanded,
             ..
         } => {
-            render_tool(name, input, *status, output.as_deref(), *expanded, out);
+            render_tool(
+                name,
+                input,
+                *status,
+                output.as_deref(),
+                *expanded,
+                width,
+                out,
+            );
         }
         Cell::Subagent {
             agent_id,
@@ -185,6 +228,7 @@ fn render_tool(
     status: ToolStatus,
     output: Option<&str>,
     expanded: bool,
+    width: usize,
     out: &mut Vec<Line<'static>>,
 ) {
     // Neither `spawn_agent` nor `todo_write` renders a tool cell in the
@@ -262,30 +306,56 @@ fn render_tool(
         return;
     }
 
-    // Generic: a short dim preview (first few lines) by default, or the FULL output
-    // when expanded. Error coloring comes from the tool's real status (the typed
-    // is_error flag), not text sniffing.
+    // Generic output preview: a short preview (first few lines) by default, or the
+    // FULL output when expanded. Error coloring comes from the tool's real status.
+    // Bash output gets a subtle `│` gutter tying it to its command line; other
+    // tools use a plain indent.
     let is_error = status == ToolStatus::Error;
     let color = if is_error {
         Palette::ERROR()
     } else {
         Palette::FAINT()
     };
-    // A generous cap even when expanded, so one giant result can't blow the buffer.
+    // Drop trailing blank lines so the cell doesn't end in dead rows.
+    let body: Vec<&str> = {
+        let mut v: Vec<&str> = output.split('\n').collect();
+        while matches!(v.last(), Some(l) if l.trim().is_empty()) {
+            v.pop();
+        }
+        v
+    };
     const PREVIEW: usize = 6;
     const EXPANDED_MAX: usize = 500;
     let limit = if expanded { EXPANDED_MAX } else { PREVIEW };
-    let total = output.split('\n').count();
-    for line in output.split('\n').take(limit) {
-        out.push(Line::from(Span::styled(
-            format!("    {}", truncate(line, 200)),
-            Style::default().fg(color),
-        )));
+    let total = body.len();
+    let gutter = name == "bash";
+    // Pre-wrap each output line to the content width so a long line breaks with the
+    // gutter/indent repeated on EVERY visual row (the outer scrollback wrap would
+    // otherwise split it and drop the `│`). Reserve columns for the scrollback's
+    // own 2-col hanging indent plus our lead (`  │ ` or `    `, 4 cols).
+    let lead: &str = if gutter { "  │ " } else { "    " };
+    let content_w = width.saturating_sub(2 + lead.chars().count()).max(8);
+    for line in body.iter().take(limit) {
+        for (r, row) in wrap_plain(line, content_w).into_iter().enumerate() {
+            // Continuation rows align under the text (keep the gutter bar for bash,
+            // blank the marker so only the bar shows), so wrapped output stays tidy.
+            let this_lead = if r == 0 {
+                lead.to_string()
+            } else if gutter {
+                "  │ ".to_string()
+            } else {
+                "    ".to_string()
+            };
+            out.push(Line::from(vec![
+                Span::styled(this_lead, Style::default().fg(Palette::FAINT())),
+                Span::styled(row, Style::default().fg(color)),
+            ]));
+        }
     }
     let extra = total.saturating_sub(limit);
     if extra > 0 {
         out.push(Line::from(Span::styled(
-            format!("    ... {} more lines (click to expand)", extra),
+            format!("{lead}... {extra} more lines (click to expand)"),
             Style::default().fg(Palette::FAINT()),
         )));
     }

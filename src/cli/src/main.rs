@@ -1,7 +1,9 @@
 mod tui;
 
 use bob_core::core::config::load_config;
-use bob_core::core::session::{list_sessions, load_session, new_session, Session};
+use bob_core::core::session::{
+    latest_session_in, list_sessions, list_sessions_in, load_session, new_session, Session,
+};
 use bob_core::providers::create_provider;
 use clap::{Parser, Subcommand};
 use std::io::Write;
@@ -28,9 +30,13 @@ struct Cli {
     #[arg(short = 'm', long, global = true)]
     model: Option<String>,
 
-    /// Resume a session by id; omit the id to resume the most recent.
+    /// Resume a session by id; omit the id to pick from sessions in THIS directory.
     #[arg(long, visible_alias = "restore", num_args = 0..=1, default_missing_value = "")]
     resume: Option<String>,
+
+    /// Continue the most recent session in the current directory (no picker).
+    #[arg(short = 'c', long)]
+    r#continue: bool,
 }
 
 #[derive(Subcommand)]
@@ -180,15 +186,24 @@ fn time_ago(updated_at: &str) -> String {
     }
 }
 
-/// Interactive session picker shown for a bare `--resume`. Prints the stored
-/// sessions (same list bob-remote's drawer shows, via `list_sessions`) and lets
-/// the user choose one by number. Enter/empty or `n` starts a new session.
-fn pick_session() -> anyhow::Result<Option<Session>> {
-    let summaries = list_sessions();
+/// Interactive session picker shown for a bare `--resume`. Lists sessions started
+/// in the current directory (via `list_sessions_in`) and lets the user choose one
+/// by number. Enter/empty or `n` starts a new session. Falls back to ALL sessions
+/// if none exist for this directory (e.g. legacy sessions saved without a cwd).
+fn pick_session(cwd: &str) -> anyhow::Result<Option<Session>> {
+    let mut summaries = list_sessions_in(cwd);
+    let scoped = !summaries.is_empty();
+    if summaries.is_empty() {
+        summaries = list_sessions();
+    }
     if summaries.is_empty() {
         return Ok(None); // nothing to resume → caller creates a fresh one
     }
-    println!("\x1b[1mResume a session:\x1b[0m");
+    if scoped {
+        println!("\x1b[1mResume a session in this directory:\x1b[0m");
+    } else {
+        println!("\x1b[1mResume a session:\x1b[0m");
+    }
     for (i, s) in summaries.iter().enumerate() {
         // Short id + relative time disambiguate sessions that share a title.
         let short_id = s.id.get(..8).unwrap_or(&s.id);
@@ -261,16 +276,22 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // Resolve or create the session.
-    //   --resume <id>  → load that session
-    //   --resume       → interactive picker over all stored sessions
-    //   (no flag)      → fresh session
-    let session = match cli.resume {
-        Some(ref id) if !id.is_empty() => load_session(id)?,
-        Some(_) => pick_session()?,
-        None => None,
+    // Resolve or create the session, scoped to the current directory.
+    //   --continue      → resume the most recent session in THIS dir (no picker)
+    //   --resume <id>   → load that session by id
+    //   --resume        → interactive picker over sessions in THIS dir
+    //   (no flag)       → fresh session
+    let cwd_str = cwd.to_string_lossy().to_string();
+    let session = if cli.r#continue {
+        latest_session_in(&cwd_str)?
+    } else {
+        match cli.resume {
+            Some(ref id) if !id.is_empty() => load_session(id)?,
+            Some(_) => pick_session(&cwd_str)?,
+            None => None,
+        }
     }
-    .unwrap_or_else(|| new_session(provider.name(), make_id(), now_stamp()));
+    .unwrap_or_else(|| new_session(provider.name(), make_id(), now_stamp(), cwd_str.clone()));
     let session_id = session.id.clone();
 
     tui::run(config, provider, provider_spec, cwd, session).await?;

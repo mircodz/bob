@@ -194,6 +194,10 @@ impl ScrollbackRenderer {
     ) {
         let mut flat: Vec<Line> = Vec::new();
         let mut owners: Vec<Option<usize>> = Vec::new();
+        // A blank pad row at the very top so the first message has breathing room
+        // against the top edge (visible when the transcript is short).
+        flat.push(Line::from(""));
+        owners.push(None);
         for (i, cell) in cells.iter().enumerate() {
             let is_user = matches!(cell, view::Cell::User(_));
             let key = {
@@ -245,6 +249,11 @@ impl ScrollbackRenderer {
                 owners.push(None);
             }
         }
+
+        // Always end with a blank pad row so the last line (a message tail, or the
+        // "Working" indicator) never sits flush against the input box below.
+        flat.push(Line::from(""));
+        owners.push(None);
 
         self.display_cache = flat;
         self.line_owner = owners;

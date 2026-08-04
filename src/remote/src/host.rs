@@ -18,8 +18,8 @@ use bob_core::core::permissions::{
     Asker, Decision, Mode, PermissionEngine, PermissionOption, PermissionRequest,
 };
 use bob_core::core::policies::{
-    allow_bash_commands, allow_code_action_list, allow_read_only, allow_tools, deny_dangerous_bash,
-    deny_tools,
+    allow_bash_commands, allow_code_action_list, allow_read_only, allow_tools, deny_tools,
+    flag_dangerous_bash,
 };
 use bob_core::providers::create_provider;
 use bob_core::tools::registry::{UserAsker, UserQuery};
@@ -303,7 +303,7 @@ pub async fn run(
     let mut engine = PermissionEngine::new(default_decision, Some(asker));
     engine.add(allow_read_only());
     engine.add(allow_code_action_list());
-    engine.add(deny_dangerous_bash());
+    engine.add(flag_dangerous_bash());
     engine.add(allow_bash_commands(config.permissions.allow_bash.clone()));
     engine.add(allow_tools(config.permissions.allow.clone()));
     engine.add(deny_tools(config.permissions.deny.clone()));

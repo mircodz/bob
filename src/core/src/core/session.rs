@@ -17,6 +17,11 @@ pub struct Session {
     pub created_at: String,
     pub updated_at: String,
     pub provider: String,
+    /// The working directory this session was started in. Used to scope
+    /// `--resume`/`--continue` to the current project. Empty for old sessions
+    /// saved before this field existed.
+    #[serde(default)]
+    pub cwd: String,
     pub messages: Vec<Message>,
     /// "Always allow" grants the user made during this session.
     #[serde(default)]
@@ -129,15 +134,22 @@ fn open_db() -> anyhow::Result<Connection> {
          );
          CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC);",
     )?;
+    // Migration: add the `cwd` column to pre-existing databases (a fresh CREATE
+    // above doesn't include it). Ignore the error if it already exists.
+    let _ = conn.execute(
+        "ALTER TABLE sessions ADD COLUMN cwd TEXT NOT NULL DEFAULT ''",
+        [],
+    );
     Ok(conn)
 }
 
-pub fn new_session(provider: &str, id: String, now: String) -> Session {
+pub fn new_session(provider: &str, id: String, now: String, cwd: String) -> Session {
     Session {
         id,
         created_at: now.clone(),
         updated_at: now,
         provider: provider.to_string(),
+        cwd,
         messages: vec![],
         grants: vec![],
         usage: vec![],
@@ -151,13 +163,14 @@ pub fn save_session(s: &Session) -> anyhow::Result<()> {
     let conn = open_db()?;
     let data = serde_json::to_string(s)?;
     conn.execute(
-        "INSERT INTO sessions (id, updated_at, created_at, title, provider, message_count, data)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "INSERT INTO sessions (id, updated_at, created_at, title, provider, message_count, cwd, data)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
          ON CONFLICT(id) DO UPDATE SET
             updated_at=excluded.updated_at,
             title=excluded.title,
             provider=excluded.provider,
             message_count=excluded.message_count,
+            cwd=excluded.cwd,
             data=excluded.data",
         rusqlite::params![
             s.id,
@@ -166,6 +179,7 @@ pub fn save_session(s: &Session) -> anyhow::Result<()> {
             title_of(s),
             s.provider,
             s.messages.len() as i64,
+            s.cwd,
             data,
         ],
     )?;
@@ -212,6 +226,9 @@ pub struct SessionSummary {
     pub created_at: String,
     pub updated_at: String,
     pub message_count: usize,
+    /// The directory the session was started in (empty for legacy sessions).
+    #[serde(default)]
+    pub cwd: String,
 }
 
 /// A short display title for a session: its first user-message text, collapsed
@@ -240,18 +257,25 @@ pub fn title_of(session: &Session) -> String {
 /// the TUI picker and the remote drawer use this so local and remote see one
 /// identical list.
 pub fn list_sessions() -> Vec<SessionSummary> {
+    query_summaries(None)
+}
+
+/// Like [`list_sessions`], but only sessions started in `cwd` (scopes the picker
+/// to the current project). An empty `cwd` returns everything.
+pub fn list_sessions_in(cwd: &str) -> Vec<SessionSummary> {
+    if cwd.is_empty() {
+        list_sessions()
+    } else {
+        query_summaries(Some(cwd))
+    }
+}
+
+fn query_summaries(cwd: Option<&str>) -> Vec<SessionSummary> {
     let conn = match open_db() {
         Ok(c) => c,
         Err(_) => return Vec::new(),
     };
-    let mut stmt = match conn.prepare(
-        "SELECT id, title, provider, created_at, updated_at, message_count
-         FROM sessions ORDER BY updated_at DESC",
-    ) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-    let rows = stmt.query_map([], |r| {
+    let map_row = |r: &rusqlite::Row| {
         Ok(SessionSummary {
             id: r.get(0)?,
             title: r.get(1)?,
@@ -259,11 +283,54 @@ pub fn list_sessions() -> Vec<SessionSummary> {
             created_at: r.get(3)?,
             updated_at: r.get(4)?,
             message_count: r.get::<_, i64>(5)? as usize,
+            cwd: r.get::<_, String>(6).unwrap_or_default(),
         })
-    });
-    match rows {
-        Ok(iter) => iter.flatten().collect(),
-        Err(_) => Vec::new(),
+    };
+    let base =
+        "SELECT id, title, provider, created_at, updated_at, message_count, cwd FROM sessions";
+    let rows: Result<Vec<SessionSummary>, _> = match cwd {
+        Some(dir) => {
+            let sql = format!("{base} WHERE cwd = ?1 ORDER BY updated_at DESC");
+            let mut stmt = match conn.prepare(&sql) {
+                Ok(s) => s,
+                Err(_) => return Vec::new(),
+            };
+            let it = match stmt.query_map([dir], map_row) {
+                Ok(it) => it,
+                Err(_) => return Vec::new(),
+            };
+            it.collect()
+        }
+        None => {
+            let sql = format!("{base} ORDER BY updated_at DESC");
+            let mut stmt = match conn.prepare(&sql) {
+                Ok(s) => s,
+                Err(_) => return Vec::new(),
+            };
+            let it = match stmt.query_map([], map_row) {
+                Ok(it) => it,
+                Err(_) => return Vec::new(),
+            };
+            it.collect()
+        }
+    };
+    rows.unwrap_or_default()
+}
+
+/// The most recently updated session started in `cwd` (for `--continue`). None if
+/// there is no session for this directory.
+pub fn latest_session_in(cwd: &str) -> anyhow::Result<Option<Session>> {
+    let conn = open_db()?;
+    let data: Option<String> = conn
+        .query_row(
+            "SELECT data FROM sessions WHERE cwd = ?1 ORDER BY updated_at DESC LIMIT 1",
+            [cwd],
+            |r| r.get(0),
+        )
+        .ok();
+    match data {
+        Some(json) => Ok(Some(serde_json::from_str(&json)?)),
+        None => Ok(None),
     }
 }
 
@@ -296,7 +363,7 @@ mod tests {
                     },
                 ],
             }],
-            ..new_session("anthropic", "s1".into(), "now".into())
+            ..new_session("anthropic", "s1".into(), "now".into(), String::new())
         };
         let json = serde_json::to_string(&session).unwrap();
         let back: Session = serde_json::from_str(&json).unwrap();
@@ -317,5 +384,14 @@ mod tests {
         let s: Session = serde_json::from_str(json).unwrap();
         assert!(s.agent_threads.is_empty());
         assert!(s.todos.is_empty());
+        // Legacy sessions predate `cwd` → defaults to empty (so they show in the
+        // unscoped picker, never filtered out).
+        assert_eq!(s.cwd, "");
+    }
+
+    #[test]
+    fn new_session_records_cwd() {
+        let s = new_session("openai", "s2".into(), "now".into(), "/home/x/proj".into());
+        assert_eq!(s.cwd, "/home/x/proj");
     }
 }

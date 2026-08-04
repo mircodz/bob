@@ -8,6 +8,7 @@ pub mod interact;
 pub mod jobs;
 pub mod lsp;
 pub mod lsp_actions;
+pub mod memory;
 pub mod registry;
 pub mod search;
 pub mod task;
@@ -18,8 +19,9 @@ pub mod web;
 use crate::tools::bash::BashTool;
 use crate::tools::builtin::{ListDirTool, ReadFileTool, WriteFileTool};
 use crate::tools::edit::{EditFileTool, MultiEditTool};
-use crate::tools::interact::{AskUserTool, ExitPlanTool};
+use crate::tools::interact::{AskUserTool, EnterPlanTool, ExitPlanTool};
 use crate::tools::jobs::{JobOutputTool, JobStatusTool};
+use crate::tools::memory::MemoryTool;
 use crate::tools::registry::Tool;
 use crate::tools::search::{GlobTool, GrepTool};
 use crate::tools::todo_write::TodoWriteTool;
@@ -40,9 +42,11 @@ pub fn builtin_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(WebFetchTool),
         Arc::new(WebSearchTool),
         Arc::new(TodoWriteTool),
+        Arc::new(MemoryTool),
         Arc::new(JobStatusTool),
         Arc::new(JobOutputTool),
         Arc::new(AskUserTool),
+        Arc::new(EnterPlanTool),
         Arc::new(ExitPlanTool),
     ]
 }

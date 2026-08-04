@@ -219,6 +219,7 @@ mod tests {
             user_asker: None,
             lsp: None,
             coord: None,
+            permissions: None,
         }
     }
 

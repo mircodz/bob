@@ -50,6 +50,10 @@ pub struct ToolContext {
     /// list_agents) know who is calling and can address other agents. None when
     /// the agent is not part of a team (the simple `task` path).
     pub coord: Option<CoordContext>,
+    /// The permission engine, so tools that change the interaction MODE (the
+    /// `enter_plan` tool switching into read-only plan mode) can do so. None in
+    /// contexts without a permission engine.
+    pub permissions: Option<Arc<PermissionEngine>>,
 }
 
 /// The calling agent's coordination context, threaded to the coordination tools.
@@ -274,6 +278,10 @@ impl ToolRegistry {
             }
         }
 
-        tool.execute(input, ctx).await
+        // Thread the permission engine into the context so mode-changing tools
+        // (enter_plan) can reach it, then run the tool.
+        let mut ctx = ctx.clone();
+        ctx.permissions = self.permissions.clone();
+        tool.execute(input, &ctx).await
     }
 }

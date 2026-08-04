@@ -34,19 +34,28 @@ impl Input {
     /// crucially, the cursor is computed in the SAME pass, so the rendered text
     /// and the cursor can never disagree (the old split-brain wrap/cursor bug).
     pub fn wrapped(&self, width: usize) -> (Vec<String>, usize, usize) {
+        use unicode_width::UnicodeWidthChar;
         let width = width.max(1);
         let chars: Vec<char> = self.buf.chars().collect();
         let mut rows: Vec<String> = vec![String::new()];
+        // Columns are DISPLAY width (wide glyphs = 2 cells), so wrapping + the
+        // reported cursor column line up with what the terminal actually shows.
         let mut col = 0usize;
         let mut cur_row = 0usize;
         let mut cur_col = 0usize;
         let mut cursor_set = false;
 
         for (i, &ch) in chars.iter().enumerate() {
+            let w = if ch == '\n' {
+                0
+            } else {
+                ch.width().unwrap_or(0)
+            };
             // Soft-wrap BEFORE placing (or locating the cursor at) this char, so a
             // char at the boundary — and a cursor sitting before it — both land on
-            // the fresh row rather than at an off-screen column == width.
-            if ch != '\n' && col == width {
+            // the fresh row rather than at an off-screen column. A 2-cell glyph
+            // wraps when it would cross the edge, not just when col == width.
+            if ch != '\n' && col + w > width && col > 0 {
                 rows.push(String::new());
                 col = 0;
             }
@@ -60,13 +69,13 @@ impl Input {
                 col = 0;
             } else {
                 rows.last_mut().unwrap().push(ch);
-                col += 1;
+                col += w;
             }
         }
 
         // Cursor at the very end of the buffer.
         if !cursor_set {
-            if col == width {
+            if col >= width {
                 rows.push(String::new());
                 cur_row = rows.len() - 1;
                 cur_col = 0;

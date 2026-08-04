@@ -21,9 +21,12 @@ pub fn make_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-/// Create a fresh, empty conversation session.
+/// Create a fresh, empty conversation session for the host's working directory.
 pub fn fresh(provider: &str) -> Session {
-    new_session(provider, make_id(), now_stamp())
+    let cwd = std::env::current_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    new_session(provider, make_id(), now_stamp(), cwd)
 }
 
 /// Load the most-recently-updated session, or create a fresh one if none exist.

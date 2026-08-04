@@ -73,7 +73,10 @@ impl App {
         // The band above the input shows either a permission prompt or a user
         // question (they don't co-occur), sized to its content.
         let prompt_height = if self.pending_perm.is_some() {
-            (self.permission_lines(area.width as usize).len() as u16 + 1).min(24)
+            // Count lines at the SAME padded width the renderer uses (2 cols each
+            // side), +2 for the top padding row and a bottom breathing row.
+            let inner_w = (area.width.saturating_sub(4)) as usize;
+            (self.permission_lines(inner_w).len() as u16 + 2).min(24)
         } else if self.pending_query.is_some() {
             (self.query_lines(area.width as usize).len() as u16 + 1).min(24)
         } else {
@@ -360,14 +363,29 @@ impl App {
             outer[0],
         );
 
-        // Roster on the left, transcript on the right, split by whitespace only.
+        // Roster on the left, a subtle vertical divider, then the transcript.
         let body = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(24), Constraint::Min(10)])
+            .constraints([
+                Constraint::Length(24),
+                Constraint::Length(2), // divider column (│ + a space of breathing room)
+                Constraint::Min(10),
+            ])
             .split(outer[1]);
         // Remember the roster rect so left-clicks can select an agent. The roster
         // has one leading blank line, so agent `i` sits at row `body[0].y + 1 + i`.
         self.roster_rect = Some(body[0]);
+        // Draw the faint divider down the middle column.
+        {
+            let dcol = body[1];
+            let divider: Vec<Line> = (0..dcol.height)
+                .map(|_| Line::from(Span::styled(" │", Style::default().fg(Palette::FAINT()))))
+                .collect();
+            f.render_widget(
+                Paragraph::new(divider).style(Style::default().bg(Palette::BG())),
+                dcol,
+            );
+        }
 
         // Left: agent roster (running first, finished at the bottom & dimmed).
         let mut roster: Vec<Line> = vec![Line::from("")];
@@ -384,9 +402,9 @@ impl App {
             let selected = i == sel;
             let hover = hovered == Some(i);
             // Names are white (TEXT) and legible; the SELECTED or HOVERED row is
-            // bold so the agent under the cursor/selection stands out. Finished
-            // agents are faint. No accent color or pointer — keep it plain.
-            let name_style = if selected || hover {
+            // bold so the agent under the cursor/selection stands out. FINISHED
+            // agents are faint AND struck through so done work is unmistakable.
+            let mut name_style = if selected || hover {
                 Style::default()
                     .fg(Palette::TEXT())
                     .add_modifier(Modifier::BOLD)
@@ -395,6 +413,9 @@ impl App {
             } else {
                 Style::default().fg(Palette::TEXT())
             };
+            if finished {
+                name_style = name_style.add_modifier(Modifier::CROSSED_OUT);
+            }
             let depth = self.teams.depth_of(id);
             let indent = "  ".repeat(depth);
             let mut spans = vec![
@@ -418,35 +439,36 @@ impl App {
         );
 
         // Right: the selected agent's transcript, rendered with the same cells as
-        // the main scrollback. A faint task subheader, then a blank line.
+        // the main scrollback. Inset the pane horizontally so content has breathing
+        // room on both sides (and doesn't hug the divider), and so the full-width
+        // user-message band wraps/pads to the SAME width it's rendered at.
+        let pane = Rect {
+            x: body[2].x + 1,
+            y: body[2].y,
+            width: body[2].width.saturating_sub(2),
+            height: body[2].height,
+        };
+        let pane_w = pane.width as usize;
         let mut transcript: Vec<Line> = vec![Line::from("")];
         if let Some(id) = order.get(sel) {
             if let Some(t) = self.teams.get(id) {
-                if !t.task.is_empty() {
-                    transcript.push(Line::from(Span::styled(
-                        truncate_mid(&t.task, body[1].width.saturating_sub(2) as usize),
-                        Style::default().fg(Palette::FAINT()),
-                    )));
-                    transcript.push(Line::from(""));
-                }
                 for cell in &t.cells {
-                    render::render_cell(cell, body[1].width as usize, &mut transcript);
+                    render::render_cell(cell, pane_w, &mut transcript);
                 }
             }
         }
-        // Wrap long lines to the transcript pane width so conversations don't get
-        // clipped at the right edge (the same wrapping the main scrollback uses).
-        // Wrapping BEFORE the scroll math keeps the offset counted in real rows.
-        let tw = body[1].width as usize;
+        // Wrap long lines to the pane width so conversations don't get clipped at
+        // the right edge (the same wrapping the main scrollback uses). Wrapping
+        // BEFORE the scroll math keeps the offset counted in real rows.
         let transcript: Vec<Line> = transcript
             .into_iter()
-            .flat_map(|l| super::wrap_line(l, tw))
+            .flat_map(|l| super::wrap_line(l, pane_w))
             .collect();
         // Apply the drawer's scroll offset, clamping it and WRITING IT BACK so the
         // stored value can't run past the end. Otherwise a fast wheel flick keeps
         // incrementing `scroll` past max, and you have to scroll back down through
         // all that phantom overshoot before the view visibly moves ("runoff").
-        let view_h = body[1].height as usize;
+        let view_h = pane.height as usize;
         let max_scroll = transcript.len().saturating_sub(view_h);
         let scroll = (drawer_scroll as usize).min(max_scroll);
         if let Some(d) = self.team_drawer.as_mut() {
@@ -455,7 +477,7 @@ impl App {
         let visible: Vec<Line> = transcript.into_iter().skip(scroll).collect();
         f.render_widget(
             Paragraph::new(visible).style(Style::default().bg(Palette::BG())),
-            body[1],
+            pane,
         );
 
         // Terse dim hint / compose line — no filled bar.
@@ -635,7 +657,9 @@ impl App {
         };
         let ibg = Style::default().bg(Palette::INPUT_BG());
         for line in &mut visible {
-            let used: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+            // Pad to the band width in DISPLAY columns (wide glyphs count as 2), so
+            // the input background fills edge-to-edge even with CJK/emoji text.
+            let used = line.width();
             let pad = (text_area.width as usize).saturating_sub(used);
             if pad > 0 {
                 line.spans.push(Span::styled(" ".repeat(pad), ibg));
@@ -852,10 +876,24 @@ impl App {
             return;
         }
         f.render_widget(Clear, area);
-        let lines = self.permission_lines(area.width as usize);
+        // Paint the panel background across the whole band, then render the prompt
+        // into a padded inner rect (a column of margin each side + a blank top row)
+        // so the prompt doesn't hug the edges.
+        f.render_widget(
+            Block::default().style(Style::default().bg(Palette::BG())),
+            area,
+        );
+        const PAD_X: u16 = 2;
+        let inner = Rect {
+            x: area.x + PAD_X,
+            y: area.y + 1,
+            width: area.width.saturating_sub(PAD_X * 2),
+            height: area.height.saturating_sub(1),
+        };
+        let lines = self.permission_lines(inner.width as usize);
         f.render_widget(
             Paragraph::new(lines).style(Style::default().bg(Palette::BG())),
-            area,
+            inner,
         );
     }
 

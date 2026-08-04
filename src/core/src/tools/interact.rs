@@ -178,6 +178,53 @@ impl Tool for ExitPlanTool {
     }
 }
 
+/// `enter_plan`: the agent puts ITSELF into read-only plan mode. Use when a task
+/// is large, risky, or ambiguous enough to warrant researching and proposing a
+/// plan before touching anything. Switching to Plan mode blocks all mutating tools
+/// until the plan is approved via `exit_plan`.
+pub struct EnterPlanTool;
+
+#[async_trait]
+impl Tool for EnterPlanTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "enter_plan".to_string(),
+            description:
+                "Switch yourself into read-only PLAN mode before starting a large, risky, \
+                or ambiguous task. In plan mode all edits and shell commands are blocked, so you \
+                research and design first. When your plan is ready, call `exit_plan` to present it \
+                for the user's approval; only after they approve are edits unblocked. Use this \
+                proactively when a task clearly needs a plan first — don't start editing blind. \
+                Skip it for small, clear changes you can just make."
+                    .to_string(),
+            input_schema: json!({ "type": "object", "properties": {} }),
+        }
+    }
+
+    async fn execute(&self, _input: Value, ctx: &ToolContext) -> ToolResult {
+        use crate::core::permissions::Mode;
+        match &ctx.permissions {
+            Some(perms) => {
+                if perms.mode() == Mode::Plan {
+                    return Ok(
+                        "already in plan mode. Research, then call exit_plan with your plan."
+                            .to_string(),
+                    );
+                }
+                perms.set_mode(Mode::Plan);
+                Ok(
+                    "entered plan mode (read-only). Research the code, then call exit_plan with \
+                    your proposed plan for approval. Edits stay blocked until then."
+                        .to_string(),
+                )
+            }
+            None => Err(ToolError::unavailable(
+                "plan mode is not available in this context",
+            )),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::plan_slug;
