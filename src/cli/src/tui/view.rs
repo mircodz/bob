@@ -39,8 +39,13 @@ pub enum Cell {
         done: bool,
         failed: bool,
     },
-    /// A compaction notice.
-    Compaction { before: usize, after: usize },
+    /// A compaction notice. `done: false` renders as a live "Compacting…"
+    /// indicator; once the summary returns it flips to `done: true` ("Compacted").
+    Compaction {
+        before: usize,
+        after: usize,
+        done: bool,
+    },
     /// A generic dim notice (startup notices, errors).
     Notice(String),
     /// A system event surfaced inline as a bulleted line (model/mode switches),
@@ -96,9 +101,14 @@ impl Cell {
                 done.hash(&mut h);
                 failed.hash(&mut h);
             }
-            Cell::Compaction { before, after } => {
+            Cell::Compaction {
+                before,
+                after,
+                done,
+            } => {
                 before.hash(&mut h);
                 after.hash(&mut h);
+                done.hash(&mut h);
             }
             Cell::Notice(t) | Cell::Event(t) => t.hash(&mut h),
             Cell::AgentMsg { from, text } => {
@@ -199,7 +209,21 @@ pub fn apply_content_event(cells: &mut Vec<Cell>, event: &AgentEvent, include_me
             cells.push(Cell::Compaction {
                 before: *before_tokens,
                 after: *after_tokens,
+                done: true,
             });
+        }
+        AgentEvent::ContextWarning {
+            used_tokens,
+            context_window,
+            pct,
+            ..
+        } => {
+            let window_k = (*context_window as f64 / 1000.0).round() as usize;
+            let used_k = (*used_tokens as f64 / 1000.0).round() as usize;
+            cells.push(Cell::Notice(format!(
+                "context {}% full (~{}k/{}k) — will auto-compact soon; /compact to summarize now",
+                pct, used_k, window_k
+            )));
         }
         AgentEvent::Error { message, .. } => {
             cells.push(Cell::Notice(format!("error: {}", message)));
@@ -238,6 +262,36 @@ impl ViewModel {
 
     pub fn push_notice(&mut self, text: String) {
         self.cells.push(Cell::Notice(text));
+        self.revision += 1;
+    }
+
+    /// Push a live "Compacting…" indicator and return its cell index, so the
+    /// caller can flip it to "Compacted" via `finish_compaction` when the
+    /// summarization network call returns.
+    pub fn begin_compaction(&mut self) -> usize {
+        self.cells.push(Cell::Compaction {
+            before: 0,
+            after: 0,
+            done: false,
+        });
+        self.revision += 1;
+        self.cells.len() - 1
+    }
+
+    /// Flip the live compaction cell at `idx` to its finished state, recording the
+    /// before/after token estimate. If nothing was compacted, drop the indicator.
+    pub fn finish_compaction(&mut self, idx: usize, before: usize, after: usize, did: bool) {
+        if let Some(cell) = self.cells.get_mut(idx) {
+            if did {
+                *cell = Cell::Compaction {
+                    before,
+                    after,
+                    done: true,
+                };
+            } else {
+                *cell = Cell::Notice("nothing to compact yet.".into());
+            }
+        }
         self.revision += 1;
     }
 
@@ -280,6 +334,7 @@ impl ViewModel {
                         self.cells.push(Cell::Compaction {
                             before: 0,
                             after: 0,
+                            done: true,
                         });
                         continue;
                     }
@@ -494,6 +549,7 @@ fn subagent_id(event: &AgentEvent) -> Option<&str> {
         | AgentEvent::ToolCall { agent_id, .. }
         | AgentEvent::ToolResult { agent_id, .. }
         | AgentEvent::Compaction { agent_id, .. }
+        | AgentEvent::ContextWarning { agent_id, .. }
         | AgentEvent::TurnEnd { agent_id, .. }
         | AgentEvent::Completion { agent_id, .. }
         | AgentEvent::Error { agent_id, .. } => agent_id.as_str(),

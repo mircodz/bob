@@ -19,5 +19,9 @@ pub struct SecureParams {
     /// The peer's static key, required for the initiator (controller) side and
     /// unused by the responder (host, which learns it during the handshake).
     pub peer_static: Option<bob_secure::x25519::PublicKey>,
-    pub on_established: Box<dyn Fn(&channel::Established) + Send>,
+    /// Invoked once the handshake completes. Returns whether to ACCEPT the peer:
+    /// the host authorizes the connection here (trust-on-first-use bookkeeping,
+    /// safety-number display) and returns `false` to reject an unauthorized peer,
+    /// in which case the host tears the connection down before serving any agent.
+    pub on_established: Box<dyn Fn(&channel::Established) -> bool + Send>,
 }

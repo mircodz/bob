@@ -17,15 +17,29 @@ use axum::Router;
 use bob_protocol::Hello;
 use dashmap::DashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
+
+/// A peer that connects but never sends its `Hello` ties up a socket forever.
+/// Bound the handshake so a stalled/hostile dialer is dropped.
+const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Largest relayed frame. E2E payloads are small control/telemetry blobs; a frame
+/// beyond this is either a bug or an attempt to OOM the relay, so we drop it.
+const MAX_FRAME_BYTES: usize = 1 << 20; // 1 MiB
+
+/// Bound on frames queued toward one peer's socket. A peer that stops reading (or
+/// reads slowly) can't make us buffer unboundedly — past this we drop the peer
+/// rather than the relay's memory.
+const PEER_QUEUE_CAP: usize = 256;
 
 /// A pairing room: at most one host and one controller. Each slot holds a sender
 /// that pushes frames to that peer's socket writer task. `admission` records the
 /// first-arriving peer's proof, which the second peer must match.
 #[derive(Default)]
 struct Room {
-    host: Option<mpsc::UnboundedSender<Message>>,
-    controller: Option<mpsc::UnboundedSender<Message>>,
+    host: Option<mpsc::Sender<Message>>,
+    controller: Option<mpsc::Sender<Message>>,
     /// The admission proof the first peer presented for this session; the second
     /// peer must present a byte-identical one. `None` until the first peer joins.
     admission: Option<String>,
@@ -51,9 +65,10 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) ->
 }
 
 async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
-    // First frame must be a Hello.
-    let hello: Hello = match socket.recv().await {
-        Some(Ok(Message::Text(t))) => match serde_json::from_str(&t) {
+    // First frame must be a Hello — within a bounded window, so a peer that
+    // connects and never handshakes can't hold the socket (and its slot) forever.
+    let hello: Hello = match tokio::time::timeout(HELLO_TIMEOUT, socket.recv()).await {
+        Ok(Some(Ok(Message::Text(t)))) => match serde_json::from_str(&t) {
             Ok(h) => h,
             Err(e) => {
                 let _ = socket
@@ -69,8 +84,9 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     let is_host = hello.is_host();
     let admission = hello.admission().to_string();
 
-    // Channel from the peer's writer half to this socket.
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Message>();
+    // Channel from the peer's writer half to this socket. Bounded so a peer that
+    // stops reading can't make us buffer frames without limit.
+    let (out_tx, mut out_rx) = mpsc::channel::<Message>(PEER_QUEUE_CAP);
 
     // Admission + registration, atomically under the room entry lock.
     //
@@ -134,6 +150,20 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     while let Some(Ok(msg)) = stream.next().await {
         match msg {
             Message::Text(_) | Message::Binary(_) => {
+                // Drop oversized frames: E2E payloads are small; anything past the
+                // cap is a bug or an OOM attempt. Skip it, keep the connection.
+                let size = match &msg {
+                    Message::Text(t) => t.len(),
+                    Message::Binary(b) => b.len(),
+                    _ => 0,
+                };
+                if size > MAX_FRAME_BYTES {
+                    eprintln!(
+                        "[relay] dropping oversized frame ({} bytes) in session '{}'",
+                        size, session
+                    );
+                    continue;
+                }
                 let peer = {
                     let room = state.rooms.get(&session);
                     room.and_then(|r| {
@@ -145,7 +175,12 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                     })
                 };
                 if let Some(peer) = peer {
-                    let _ = peer.send(msg);
+                    // `try_send` (not `send`) so a stalled peer applies backpressure
+                    // without blocking THIS reader; a full queue means the peer is
+                    // dead/too-slow, so we stop forwarding to it.
+                    if let Err(mpsc::error::TrySendError::Closed(_)) = peer.try_send(msg) {
+                        // peer gone — nothing to do; cleanup happens on its own task
+                    }
                 }
             }
             Message::Close(_) => break,

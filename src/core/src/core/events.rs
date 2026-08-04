@@ -55,6 +55,16 @@ pub enum AgentEvent {
         before_tokens: usize,
         after_tokens: usize,
     },
+    /// The estimated context usage crossed a graded warning threshold (e.g. 70 /
+    /// 85 / 95%). Emitted at most once per level per direction so the UI can warn
+    /// the user that context is filling up before an auto-compaction kicks in.
+    ContextWarning {
+        agent_id: String,
+        used_tokens: usize,
+        context_window: usize,
+        /// The crossed threshold as a percentage (70, 85, 95).
+        pct: u8,
+    },
     /// Emitted once per provider completion (finer than TurnEnd), carrying the
     /// exact token usage for that single model call, tagged with the model.
     Completion {

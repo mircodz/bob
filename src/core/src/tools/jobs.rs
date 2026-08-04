@@ -58,6 +58,10 @@ pub struct JobRegistry {
     jobs: Arc<Mutex<HashMap<String, BgJob>>>,
     order: Arc<Mutex<Vec<String>>>,
     counter: Arc<AtomicU64>,
+    /// Real background jobs (not detached root turns) that finished since the last
+    /// drain, as (id, description). The frontend drains this while the agent is
+    /// idle to wake it so it inspects the result instead of sitting there.
+    finished: Arc<Mutex<Vec<(String, String)>>>,
 }
 
 impl JobRegistry {
@@ -103,6 +107,7 @@ impl JobRegistry {
 
     /// Mark a job finished with its final result (or failure message).
     pub fn finish(&self, id: &str, status: JobStatus, result: String) {
+        let mut record: Option<(String, String)> = None;
         if let Some(j) = self.jobs.lock().unwrap().get_mut(id) {
             j.status = status;
             if !result.is_empty() {
@@ -113,7 +118,23 @@ impl JobRegistry {
             }
             j.result = Some(result);
             j.handle = None;
+            // Queue a wake for real background work only — a detached root turn
+            // ("turn") is closed out by the turn_done channel, and waking on it
+            // would re-drive the very turn that just ended.
+            if j.kind != "turn" {
+                record = Some((j.id.clone(), j.description.clone()));
+            }
         }
+        if let Some(r) = record {
+            self.finished.lock().unwrap().push(r);
+        }
+    }
+
+    /// Take the set of background jobs that finished since the last call, as
+    /// (id, description). Used by the frontend to wake an idle agent so it can
+    /// collect and act on the result. Draining clears the queue.
+    pub fn take_finished(&self) -> Vec<(String, String)> {
+        std::mem::take(&mut *self.finished.lock().unwrap())
     }
 
     /// Cancel a running job (aborts the future).
@@ -258,5 +279,34 @@ impl Tool for JobOutputTool {
             }
             None => Err(ToolError::not_found(format!("no such job {}", id))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finishing_a_bg_job_queues_a_wake() {
+        let reg = JobRegistry::new();
+        reg.register_tracking("job_1".into(), "bash", "run benchmarks".into());
+        reg.finish("job_1", JobStatus::Done, "ok".into());
+        let finished = reg.take_finished();
+        assert_eq!(
+            finished,
+            vec![("job_1".to_string(), "run benchmarks".to_string())]
+        );
+        // Draining clears the queue.
+        assert!(reg.take_finished().is_empty());
+    }
+
+    #[test]
+    fn finishing_a_detached_turn_does_not_wake() {
+        let reg = JobRegistry::new();
+        // A detached root turn has kind "turn"; its completion is handled by the
+        // turn_done channel, so it must NOT queue a self-retriggering wake.
+        reg.register_tracking("job_1".into(), "turn", "some prompt".into());
+        reg.finish("job_1", JobStatus::Done, "turn finished".into());
+        assert!(reg.take_finished().is_empty());
     }
 }

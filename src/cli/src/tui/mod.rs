@@ -315,6 +315,16 @@ enum BgOutcome {
     ModelList(Result<Vec<String>, String>),
     /// The `@file` candidate list finished gathering (git ls-files / walk).
     FileList(Vec<String>),
+    /// A `/compact` finished off the event loop (summarization is a network call,
+    /// so it must not run inline or it freezes the UI). Carries the live indicator
+    /// cell index to finalize, whether anything was compacted, and the before/after
+    /// token estimate.
+    Compacted {
+        cell: usize,
+        did: bool,
+        before: usize,
+        after: usize,
+    },
 }
 
 /// Run `fut` off the event loop and deliver its [`BgOutcome`] back to the UI.
@@ -569,12 +579,12 @@ pub async fn run(
                                     app.view.push_user(text);
                                     app.stick_to_bottom();
                                 } else {
-                                    app.toast = Some("couldn't steer — no running agent".into());
+                                    app.notify("couldn't steer — no running agent");
                                 }
                             }
                             KeyOutcome::SwitchModel(spec) => {
                                 if app.running {
-                                    app.toast = Some("finish the current turn first".into());
+                                    app.notify("finish the current turn first");
                                 } else {
                                     // A bare model id (no "provider:" prefix) uses
                                     // the current provider; a full spec switches both.
@@ -585,7 +595,7 @@ pub async fn run(
                                     };
                                     // Building a provider does network/auth work —
                                     // run it off the loop so the UI stays live.
-                                    app.toast = Some("switching model…".into());
+                                    app.notify("switching model…");
                                     spawn_bg(&app.bg_tx, async move {
                                         let id = full.split(':').next().unwrap_or("").to_string();
                                         BgOutcome::ProviderSwitched(
@@ -616,7 +626,7 @@ pub async fn run(
                                     ));
                                     app.stick_to_bottom();
                                 } else {
-                                    app.toast = Some("busy — try again after this turn".into());
+                                    app.notify("busy — try again after this turn");
                                 }
                             }
                             KeyOutcome::ListModels => {
@@ -625,11 +635,11 @@ pub async fn run(
                                 let prov = match agent.try_lock() {
                                     Ok(a) => a.provider(),
                                     Err(_) => {
-                                        app.toast = Some("busy — try again after this turn".into());
+                                        app.notify("busy — try again after this turn");
                                         continue 'outer;
                                     }
                                 };
-                                app.toast = Some("fetching models…".into());
+                                app.notify("fetching models…");
                                 spawn_bg(&app.bg_tx, async move {
                                     BgOutcome::ModelList(
                                         prov.list_models().await.map_err(|e| e.to_string()),
@@ -645,14 +655,40 @@ pub async fn run(
                                     drop(a);
                                     app.show_context(used, msgs);
                                 } else {
-                                    app.toast = Some("busy — try again after this turn".into());
+                                    app.notify("busy — try again after this turn");
+                                }
+                            }
+                            KeyOutcome::Compact => {
+                                if app.running {
+                                    app.view.push_notice(
+                                        "finish the current turn first".into(),
+                                    );
+                                    app.stick_to_bottom();
+                                } else {
+                                    // Summarization is a network round-trip; run it
+                                    // off the event loop so the UI stays responsive.
+                                    // Show a live "Compacting…" cell now; the result
+                                    // flips it to "Compacted" via BgOutcome::Compacted.
+                                    let cell = app.view.begin_compaction();
+                                    app.stick_to_bottom();
+                                    let agent = agent.clone();
+                                    spawn_bg(&app.bg_tx, async move {
+                                        let mut a = agent.lock().await;
+                                        let (did, before, after) = a.compact().await;
+                                        BgOutcome::Compacted {
+                                            cell,
+                                            did,
+                                            before,
+                                            after,
+                                        }
+                                    });
                                 }
                             }
                             KeyOutcome::ClearContext => {
                                 // Reset the conversation context: the agent forgets
                                 // all history, but we stay in the same session id.
                                 if app.running {
-                                    app.toast = Some("finish the current turn first".into());
+                                    app.notify("finish the current turn first");
                                 } else if let Ok(mut a) = agent.try_lock() {
                                     a.load_history(Vec::new());
                                     drop(a);
@@ -661,14 +697,14 @@ pub async fn run(
                                     app.view.push_notice("context cleared — the agent has forgotten the conversation.".into());
                                     app.stick_to_bottom();
                                 } else {
-                                    app.toast = Some("busy — try again after this turn".into());
+                                    app.notify("busy — try again after this turn");
                                 }
                             }
                             KeyOutcome::NewSession => {
                                 // Start a brand-new session: fresh history + a new id
                                 // scoped to this cwd. The old session stays saved.
                                 if app.running {
-                                    app.toast = Some("finish the current turn first".into());
+                                    app.notify("finish the current turn first");
                                 } else if let Ok(mut a) = agent.try_lock() {
                                     a.load_history(Vec::new());
                                     drop(a);
@@ -686,7 +722,7 @@ pub async fn run(
                                     app.view.push_notice(format!("started a fresh session ({}).", session.id));
                                     app.stick_to_bottom();
                                 } else {
-                                    app.toast = Some("busy — try again after this turn".into());
+                                    app.notify("busy — try again after this turn");
                                 }
                             }
                             KeyOutcome::None => {}
@@ -836,10 +872,10 @@ pub async fn run(
                 app.apply_bg(outcome, &agent);
             }
             _ = ticker.tick() => {
-                // Only the animated states (spinner/Working line, toast) need a
-                // periodic repaint. When fully idle, leave `dirty` false so the loop
-                // parks in sleep_until instead of repainting 10×/s for nothing.
-                if app.running || app.view.busy || app.toast.is_some() {
+                // Only the animated states (spinner/Working line) need a periodic
+                // repaint. When fully idle, leave `dirty` false so the loop parks in
+                // sleep_until instead of repainting 10×/s for nothing.
+                if app.running || app.view.busy {
                     app.spinner = app.spinner.wrapping_add(1);
                     dirty = true;
                 }
@@ -848,19 +884,41 @@ pub async fn run(
                 // history and acts on it — an idle agent is re-driven by a new turn
                 // rather than blocking.
                 if !app.running {
-                    let pending = {
-                        // try_lock: an in-flight turn holds this; we'll re-check on
-                        // the next tick. Never block the render loop.
-                        match agent.try_lock() {
-                            Ok(mut a) => a.has_pending_coordination(),
-                            Err(_) => false,
-                        }
-                    };
-                    if pending {
+                    // Job-completion wake: a background job (e.g. a benchmark run)
+                    // that finished while the agent was idle would otherwise just
+                    // sit there until the user nudged it. Inject a turn naming the
+                    // finished job(s) so the agent collects the result and continues.
+                    let finished = app.jobs.take_finished();
+                    if !finished.is_empty() {
+                        let list = finished
+                            .iter()
+                            .map(|(id, desc)| format!("{id} ({desc})"))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let prompt = format!(
+                            "Background job(s) finished: {list}. Use job_output to read the \
+                             result(s) and continue the task accordingly."
+                        );
+                        app.view.push_event(format!("Resumed — {list} finished"));
                         app.running = true;
                         app.turn_started = Some(std::time::Instant::now());
-                        spawn_turn(&agent, &app.turn_done_tx, String::new());
+                        spawn_turn(&agent, &app.turn_done_tx, prompt);
                         dirty = true;
+                    } else {
+                        let pending = {
+                            // try_lock: an in-flight turn holds this; we'll re-check
+                            // on the next tick. Never block the render loop.
+                            match agent.try_lock() {
+                                Ok(mut a) => a.has_pending_coordination(),
+                                Err(_) => false,
+                            }
+                        };
+                        if pending {
+                            app.running = true;
+                            app.turn_started = Some(std::time::Instant::now());
+                            spawn_turn(&agent, &app.turn_done_tx, String::new());
+                            dirty = true;
+                        }
                     }
                 }
             }
@@ -949,6 +1007,8 @@ enum KeyOutcome {
     ClearContext,
     /// Start a brand-new session (fresh history + new id), handled in the loop.
     NewSession,
+    /// Force a history compaction now (the `/compact` command).
+    Compact,
     Quit,
 }
 
@@ -972,7 +1032,6 @@ struct App {
     file_menu: Vec<String>,
     file_sel: usize,
     file_at: Option<usize>,
-    toast: Option<String>,
     /// Prompts submitted while a turn is running, sent in order once it frees.
     queue: std::collections::VecDeque<String>,
     /// Whether a turn is currently executing (drives the queue + input hint).
@@ -1049,6 +1108,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/copy", "copy the last message to the clipboard"),
     ("/usage", "show token usage (session + all-time)"),
     ("/context", "show context-window usage"),
+    ("/compact", "summarize & free up context now"),
     ("/model", "show the current model"),
     ("/models", "list & switch models"),
     (
@@ -1086,7 +1146,6 @@ impl App {
             file_menu: Vec::new(),
             file_sel: 0,
             file_at: None,
-            toast: None,
             queue: std::collections::VecDeque::new(),
             running: false,
             detached_job: None,
@@ -1123,6 +1182,13 @@ impl App {
         self.scrollback.stick_to_bottom();
     }
 
+    /// Surface a transient status message inline in the transcript (a dim notice)
+    /// and pin the view to the bottom so it's seen. Replaces the old corner toast.
+    fn notify(&mut self, text: impl Into<String>) {
+        self.view.push_notice(text.into());
+        self.stick_to_bottom();
+    }
+
     fn refresh_menu(&mut self) {
         let text = self.input.text();
         if text.starts_with('/') && !text.contains(' ') {
@@ -1157,19 +1223,17 @@ impl App {
                 if let Ok(mut a) = agent.try_lock() {
                     a.set_provider(provider);
                 } else {
-                    self.toast = Some("busy — try switching again".into());
+                    self.notify("busy — try switching again");
                     return;
                 }
                 self.provider_id = id;
                 self.model_label = model;
-                self.toast = None;
                 // Chain into the reasoning picker so model + effort are set together.
                 let cur = self.reasoning;
                 self.open_reasoning_picker(cur);
                 self.stick_to_bottom();
             }
             BgOutcome::ProviderSwitched(Err(e)) => {
-                self.toast = None;
                 self.view.push_notice(format!("error: {}", e));
                 self.stick_to_bottom();
             }
@@ -1188,7 +1252,6 @@ impl App {
                 } else {
                     models
                 };
-                self.toast = None;
                 if options.is_empty() {
                     self.view
                         .push_notice("provider returned no models; use `/models <spec>`".into());
@@ -1208,7 +1271,6 @@ impl App {
                 }
             }
             BgOutcome::ModelList(Err(e)) => {
-                self.toast = None;
                 self.view
                     .push_notice(format!("error listing models: {}", e));
                 self.stick_to_bottom();
@@ -1219,6 +1281,15 @@ impl App {
                 // Re-filter now that candidates are available (the user may have
                 // typed more since the gather started).
                 self.refresh_file_menu();
+            }
+            BgOutcome::Compacted {
+                cell,
+                did,
+                before,
+                after,
+            } => {
+                self.view.finish_compaction(cell, before, after, did);
+                self.stick_to_bottom();
             }
         }
     }
@@ -1407,7 +1478,7 @@ impl App {
                 let approved = answer.starts_with("Yes");
                 if is_plan && approved && self.permissions.mode() == Mode::Plan {
                     self.permissions.set_mode(Mode::Normal);
-                    self.toast = Some("plan approved · mode: normal".into());
+                    self.notify("plan approved · mode: normal");
                 }
                 let _ = resp.send(Some(answer));
                 KeyOutcome::None
@@ -1487,7 +1558,7 @@ impl App {
             return;
         }
         if self.teams.is_empty() {
-            self.toast = Some("no agents yet".into());
+            self.notify("no agents yet");
             return;
         }
         if let Some(id) = self.teams.display_order().first().cloned() {
@@ -1656,7 +1727,7 @@ impl App {
         if self.agent_team.send(&id, "user", &text) {
             self.teams.push_message(&id, "user", &text, Some(&id));
         } else {
-            self.toast = Some(format!("{} is not reachable", id));
+            self.notify(format!("{} is not reachable", id));
         }
     }
 
@@ -1810,6 +1881,19 @@ impl App {
                     self.refresh_menu();
                     return KeyOutcome::None;
                 }
+                KeyCode::Enter if !mods.contains(KeyModifiers::SHIFT) => {
+                    // Enter on the highlighted command fills it in and runs it — so
+                    // arrowing to `/compact` + Enter executes that command, not the
+                    // raw text the user half-typed (e.g. `/comp`).
+                    let pick = self.menu[self.menu_sel].0.to_string();
+                    self.input.set(&pick);
+                    self.input.submit();
+                    self.menu.clear();
+                    if let Some(out) = self.handle_command(&pick) {
+                        return out;
+                    }
+                    return KeyOutcome::None;
+                }
                 _ => {}
             }
         }
@@ -1927,6 +2011,7 @@ impl App {
                 }
             }
             "/context" => Some(KeyOutcome::ShowContext),
+            "/compact" => Some(KeyOutcome::Compact),
             "/memory" => {
                 self.show_memory();
                 Some(KeyOutcome::None)
@@ -2128,7 +2213,7 @@ impl App {
     /// not true root-level concurrency.
     fn detach_current_turn(&mut self) {
         if !self.running || self.detached_job.is_some() {
-            self.toast = Some("nothing to detach".into());
+            self.notify("nothing to detach");
             return;
         }
         let desc = self
@@ -2139,7 +2224,7 @@ impl App {
         self.jobs
             .register_tracking(id.clone(), "turn", truncate_mid(&desc, 60));
         self.detached_job = Some(id.clone());
-        self.toast = Some(format!("detached as {}", id));
+        self.notify(format!("detached as {}", id));
     }
 
     /// Esc: cooperatively interrupt the running turn. Sets the cancel flag (the
@@ -2150,7 +2235,7 @@ impl App {
             .store(true, std::sync::atomic::Ordering::Relaxed);
         self.queue.clear();
         self.view.push_notice("interrupting…".to_string());
-        self.toast = Some("interrupting…".into());
+        self.notify("interrupting…");
         self.stick_to_bottom();
     }
 
@@ -2165,9 +2250,9 @@ impl App {
         match text {
             Some(text) => {
                 clipboard::osc52_copy(&text);
-                self.toast = Some("copied last message".into());
+                self.notify("copied last message");
             }
-            None => self.toast = Some("nothing to copy".into()),
+            None => self.notify("nothing to copy"),
         }
     }
 }

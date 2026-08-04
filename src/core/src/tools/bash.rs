@@ -25,7 +25,10 @@ impl Tool for BashTool {
                 unless the user asks. Set `timeout` (seconds) to bound a command that might hang; \
                 it's killed and reported if it exceeds that. Set `run_in_background: true` for \
                 long-running work (a dev server, a watch build) you don't want to block on — it \
-                returns a job id immediately; poll it with job_status / job_output."
+                returns a job id immediately; poll it with job_status / job_output. Output is \
+                capped at ~30k bytes — if a command exceeds that, the head and tail are kept and \
+                the middle is elided, so pipe noisy commands through a filter (grep, tail, wc) to \
+                get the part you need."
                     .to_string(),
             input_schema: json!({
                 "type": "object",

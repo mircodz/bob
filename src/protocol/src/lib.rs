@@ -190,6 +190,12 @@ pub enum AgentEventDto {
         before_tokens: usize,
         after_tokens: usize,
     },
+    ContextWarning {
+        agent_id: String,
+        used_tokens: usize,
+        context_window: usize,
+        pct: u8,
+    },
     Completion {
         agent_id: String,
         model: String,
@@ -269,6 +275,17 @@ impl From<&AgentEvent> for AgentEventDto {
                 agent_id: agent_id.clone(),
                 before_tokens: *before_tokens,
                 after_tokens: *after_tokens,
+            },
+            AgentEvent::ContextWarning {
+                agent_id,
+                used_tokens,
+                context_window,
+                pct,
+            } => AgentEventDto::ContextWarning {
+                agent_id: agent_id.clone(),
+                used_tokens: *used_tokens,
+                context_window: *context_window,
+                pct: *pct,
             },
             AgentEvent::Completion {
                 agent_id,

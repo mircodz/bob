@@ -327,6 +327,7 @@ fn event_agent_id(event: &AgentEvent) -> Option<&str> {
         | AgentEvent::ToolCall { agent_id, .. }
         | AgentEvent::ToolResult { agent_id, .. }
         | AgentEvent::Compaction { agent_id, .. }
+        | AgentEvent::ContextWarning { agent_id, .. }
         | AgentEvent::TurnEnd { agent_id, .. }
         | AgentEvent::Completion { agent_id, .. }
         | AgentEvent::Error { agent_id, .. } => Some(agent_id.as_str()),

@@ -635,7 +635,7 @@ async fn run_remote(
             ephemeral: Identity::generate().secret(),
             pairing_secret: pairing.secret.clone(),
             peer_static: Some(pairing.static_key),
-            on_established: Box::new(|_| {}),
+            on_established: Box::new(|_| true),
         };
         return bob_remote::client::run(pairing.relay, pairing.session, params).await;
     }
@@ -668,11 +668,27 @@ async fn run_remote(
                 est.safety_number
             );
             println!("  confirm it matches the number shown on your phone.");
-            // Trust-on-first-use: remember this phone so future connects skip pairing.
-            if let Ok(mut book) = DeviceBook::load(&devices_path) {
-                if !book.is_trusted(&est.peer_static) {
-                    let name = format!("phone-{}", &session_for_cb[..8.min(session_for_cb.len())]);
-                    let _ = book.add(Device::new(name, &est.peer_static, now_stamp()));
+            // Trust-on-first-use, fail closed. The book must load; a load error
+            // means we can't verify trust, so we REJECT rather than admit blind.
+            let mut book = match DeviceBook::load(&devices_path) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("[host] cannot load device book ({e}); rejecting");
+                    return false;
+                }
+            };
+            if book.is_trusted(&est.peer_static) {
+                return true;
+            }
+            // Unknown key, but it presented a valid admission proof and completed
+            // the Noise handshake — that IS the first-use pairing act. Record it and
+            // admit; subsequent unknown keys go through this same gate.
+            let name = format!("phone-{}", &session_for_cb[..8.min(session_for_cb.len())]);
+            match book.add(Device::new(name, &est.peer_static, now_stamp())) {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("[host] cannot persist paired device ({e}); rejecting");
+                    false
                 }
             }
         }),

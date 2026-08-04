@@ -155,9 +155,6 @@ impl App {
             // Drop the stale roster hit-box so clicks don't select a hidden agent.
             self.roster_rect = None;
         }
-        if let Some(toast) = self.toast.clone() {
-            self.draw_toast(f, area, &toast);
-        }
     }
 
     /// Sticky todo checklist above the input: a header with the done/total count,
@@ -1011,26 +1008,6 @@ impl App {
         f.render_widget(
             Paragraph::new(lines).style(Style::default().bg(Palette::BG())),
             area,
-        );
-    }
-
-    fn draw_toast(&mut self, f: &mut ratatui::Frame, area: Rect, text: &str) {
-        let w = (text.len() as u16 + 4).clamp(10, area.width);
-        let toast = Rect {
-            x: area.x + area.width.saturating_sub(w).saturating_sub(1),
-            y: area.y + 1,
-            width: w,
-            height: 1,
-        };
-        f.render_widget(Clear, toast);
-        f.render_widget(
-            Paragraph::new(Span::styled(
-                format!(" {} ", text),
-                Style::default()
-                    .fg(Palette::TEXT())
-                    .bg(Palette::SELECTED_BG()),
-            )),
-            toast,
         );
     }
 }

@@ -29,9 +29,11 @@ impl Tool for ReadFileTool {
             name: "read_file".to_string(),
             description: "Read a file from disk. Returns the contents with 1-based line numbers \
                 (the numbers are display only — never include them in edits). Reads the whole \
-                file by default; pass offset/limit only for very large files. You MUST read a \
-                file before editing it. Prefer this over `cat`/`head`/`tail` via bash. When you \
-                need several files, issue multiple read calls in one step."
+                file by default; pass offset/limit only for very large files. Output is capped at \
+                2000 lines and each line at 2000 characters — when a file is longer the tail is \
+                elided with a note, so page through it with offset/limit if you need the rest. \
+                You MUST read a file before editing it. Prefer this over `cat`/`head`/`tail` via \
+                bash. When you need several files, issue multiple read calls in one step."
                 .to_string(),
             input_schema: json!({
                 "type": "object",

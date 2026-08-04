@@ -3,7 +3,9 @@
 
 use crate::agent::compaction::{maybe_compact, CompactionOptions};
 use crate::core::events::{AgentEvent, EventBus};
-use crate::core::types::{ContentBlock, GenerateOptions, Message, Role, StreamEvent, Usage};
+use crate::core::types::{
+    Completion, ContentBlock, GenerateOptions, Message, Role, StreamEvent, Usage,
+};
 use crate::providers::provider::Provider;
 use crate::tools::file_tracker::FileTracker;
 use crate::tools::registry::{ToolContext, ToolRegistry};
@@ -128,6 +130,10 @@ pub struct Agent {
     cancel: Arc<std::sync::atomic::AtomicBool>,
     /// Reasoning intensity requested for each generation (runtime-settable).
     reasoning: crate::core::types::ReasoningEffort,
+    /// Highest context-usage warning threshold already emitted this run, so a graded
+    /// warning fires once per level as usage climbs (and re-arms after a compaction
+    /// drops usage back down).
+    warned_pct: u8,
 }
 
 impl Agent {
@@ -142,6 +148,7 @@ impl Agent {
             todos: Arc::new(TodoStore::new()),
             cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             reasoning: crate::core::types::ReasoningEffort::default(),
+            warned_pct: 0,
         }
     }
 
@@ -326,6 +333,12 @@ impl Agent {
                     })
                     .sum::<usize>();
             let history = std::mem::take(&mut self.history);
+            // Graded pre-compaction warning: as estimated usage climbs past 70 / 85
+            // / 95% of the window, emit ONE warning per level so the user sees
+            // context filling up before an auto-compaction silently rewrites it.
+            let used = crate::agent::compaction::estimate_history_tokens(&history)
+                + system_overhead_tokens;
+            self.warn_context(used);
             let compaction = maybe_compact(
                 history,
                 &self.cfg.provider,
@@ -344,54 +357,98 @@ impl Agent {
                     before_tokens: compaction.before_tokens,
                     after_tokens: compaction.after_tokens,
                 });
+                // Usage just dropped; re-arm the graded warning to the new level so
+                // it can warn again as history rebuilds toward the window.
+                self.rearm_context_warning(compaction.after_tokens);
             }
 
-            // Stream the assistant turn, forwarding text deltas to the bus.
-            let opts = GenerateOptions {
-                system: self.cfg.system.clone(),
-                messages: self.history.clone(),
-                tools: self.cfg.tools.specs(),
-                cache: true,
-                reasoning: self.reasoning,
-                ..Default::default()
-            };
-            let mut rx = self.cfg.provider.stream(opts).await?;
+            // Stream the assistant turn, forwarding text deltas to the bus. This is
+            // wrapped in a small retry loop: a transient provider error (429 /
+            // overloaded / dropped stream) is retried with backoff, and a
+            // context-length rejection triggers a reactive compaction + one retry,
+            // so a single bad response doesn't abort the whole run.
+            const MAX_STREAM_ATTEMPTS: u32 = 4;
+            let mut completion: Option<Completion> = None;
+            let mut attempt = 0u32;
+            let mut recovered_overflow = false;
+            loop {
+                attempt += 1;
+                let opts = GenerateOptions {
+                    system: self.cfg.system.clone(),
+                    messages: self.history.clone(),
+                    tools: self.cfg.tools.specs(),
+                    cache: true,
+                    reasoning: self.reasoning,
+                    ..Default::default()
+                };
+                let mut rx = match self.cfg.provider.stream(opts).await {
+                    Ok(rx) => rx,
+                    Err(e) => {
+                        // Failure before the stream even opened (network/auth/length).
+                        if is_overflow_error(&e.to_string()) && !recovered_overflow {
+                            recovered_overflow = true;
+                            self.compact_now().await;
+                            continue;
+                        }
+                        if attempt < MAX_STREAM_ATTEMPTS && is_transient_error(&e.to_string()) {
+                            self.backoff(attempt).await;
+                            continue;
+                        }
+                        return Err(e);
+                    }
+                };
 
-            let mut completion = None;
-            let mut stream_error = None;
-            while let Some(evt) = rx.recv().await {
-                match evt {
-                    StreamEvent::TextDelta { text } => {
-                        self.cfg.bus.emit(AgentEvent::TextDelta {
-                            agent_id: self.id.clone(),
-                            text,
-                        });
+                let mut c = None;
+                let mut stream_error = None;
+                while let Some(evt) = rx.recv().await {
+                    match evt {
+                        StreamEvent::TextDelta { text } => {
+                            self.cfg.bus.emit(AgentEvent::TextDelta {
+                                agent_id: self.id.clone(),
+                                text,
+                            });
+                        }
+                        StreamEvent::MessageStop { completion: done } => {
+                            c = Some(done);
+                        }
+                        StreamEvent::Error { message } => {
+                            stream_error = Some(message);
+                            break;
+                        }
+                        _ => {}
                     }
-                    StreamEvent::MessageStop { completion: c } => {
-                        completion = Some(c);
-                    }
-                    StreamEvent::Error { message } => {
-                        stream_error = Some(message);
+                    if self.is_cancelled() {
                         break;
                     }
-                    _ => {}
                 }
-                // Stop consuming the stream promptly on interrupt. Dropping `rx`
-                // ends the provider's send side.
-                if self.is_cancelled() {
+
+                // Interrupted mid-stream before the model finished: stop cleanly.
+                if self.is_cancelled() && c.is_none() {
+                    final_text = "[interrupted]".to_string();
                     break;
                 }
+
+                if let Some(message) = stream_error {
+                    // A context-length rejection: compact reactively and retry once.
+                    if is_overflow_error(&message) && !recovered_overflow {
+                        recovered_overflow = true;
+                        self.compact_now().await;
+                        continue;
+                    }
+                    // A transient error: back off and retry, up to the cap.
+                    if attempt < MAX_STREAM_ATTEMPTS && is_transient_error(&message) {
+                        self.backoff(attempt).await;
+                        continue;
+                    }
+                    // Out of retries, or a genuinely fatal error.
+                    return Err(anyhow::anyhow!("{}", message));
+                }
+
+                completion = c;
+                break;
             }
-            // A real mid-stream API failure: surface it as an error so the caller
-            // can retry/report, rather than poisoning history with a fake turn.
-            if let Some(message) = stream_error {
-                anyhow::bail!("{}", message);
-            }
-            // Interrupted mid-stream before the model finished: stop cleanly. The
-            // history still ends on a valid boundary (no assistant message pushed
-            // yet), so the next request is well-formed.
+            // If the interrupt path set final_text, stop the turn.
             if self.is_cancelled() && completion.is_none() {
-                final_text = "[interrupted]".to_string();
                 break;
             }
             let completion =
@@ -514,9 +571,13 @@ impl Agent {
             self.full_history.push(msg);
         }
 
-        // If the turn loop ran to exhaustion without the model finishing, return
-        // a clear message rather than an empty string — otherwise a subagent that
-        // hits the cap looks like it silently returned nothing.
+        // If the turn loop ran to exhaustion without the model finishing, give it
+        // ONE final tool-less turn to wind down — summarize what it accomplished and
+        // what's left — instead of returning a bare "[stopped]" stub. This is what a
+        // parent agent (or the user) actually needs as a handoff.
+        if !finished && final_text.is_empty() && !self.is_cancelled() {
+            final_text = self.wind_down().await;
+        }
         if !finished && final_text.is_empty() {
             final_text = format!(
                 "[stopped after reaching the {}-turn limit without finishing]",
@@ -530,6 +591,156 @@ impl Agent {
         });
         Ok(final_text)
     }
+
+    /// Emit a graded context-usage warning if `used` tokens crosses the next
+    /// threshold (70 / 85 / 95% of the window) not yet warned this run. Fires at
+    /// most once per level as usage climbs.
+    fn warn_context(&mut self, used: usize) {
+        let window = self.cfg.context_window.max(1);
+        let pct = ((used * 100) / window) as u8;
+        for level in [95u8, 85, 70] {
+            if pct >= level && self.warned_pct < level {
+                self.warned_pct = level;
+                self.cfg.bus.emit(AgentEvent::ContextWarning {
+                    agent_id: self.id.clone(),
+                    used_tokens: used,
+                    context_window: window,
+                    pct: level,
+                });
+                break;
+            }
+        }
+    }
+
+    /// Reset the graded warning arm to the level `used` now sits in, so warnings
+    /// can fire again as history climbs back toward the window after a compaction.
+    fn rearm_context_warning(&mut self, used: usize) {
+        let window = self.cfg.context_window.max(1);
+        let pct = ((used * 100) / window) as u8;
+        self.warned_pct = [95u8, 85, 70]
+            .into_iter()
+            .find(|&level| pct >= level)
+            .unwrap_or(0);
+    }
+
+    /// Force a compaction of the conversation now (the `/compact` command). Public
+    /// so the frontend can summarize on demand rather than waiting for the
+    /// threshold. Returns `(did_compact, before_tokens, after_tokens)` for the
+    /// working history, and does NOT emit a Compaction event — the caller drives
+    /// its own in-chat indicator, so an event would duplicate it.
+    pub async fn compact(&mut self) -> (bool, usize, usize) {
+        let before = crate::agent::compaction::estimate_history_tokens(&self.history);
+        let len_before = self.history.len();
+        self.compact_inner(false).await;
+        let after = crate::agent::compaction::estimate_history_tokens(&self.history);
+        (self.history.len() < len_before, before, after)
+    }
+
+    /// Compact history NOW, emitting a Compaction event so the UI shows it happened.
+    /// Used by the automatic (threshold / overflow) paths.
+    async fn compact_now(&mut self) {
+        self.compact_inner(true).await;
+    }
+
+    /// Compact the working history. `emit` controls whether a Compaction event is
+    /// published (automatic paths emit; the manual `/compact` command does not,
+    /// since the frontend renders its own live indicator).
+    async fn compact_inner(&mut self, emit: bool) {
+        let history = std::mem::take(&mut self.history);
+        let compaction = maybe_compact(
+            history,
+            &self.cfg.provider,
+            &CompactionOptions {
+                context_window: self.cfg.context_window,
+                threshold: 0.0, // force compaction regardless of the estimate
+                keep_recent: self.cfg.keep_recent,
+                system_overhead_tokens: 0,
+            },
+        )
+        .await;
+        self.history = compaction.messages;
+        if emit && compaction.compacted {
+            self.cfg.bus.emit(AgentEvent::Compaction {
+                agent_id: self.id.clone(),
+                before_tokens: compaction.before_tokens,
+                after_tokens: compaction.after_tokens,
+            });
+        }
+    }
+
+    /// Sleep for an exponential backoff before retrying a transient failure.
+    async fn backoff(&self, attempt: u32) {
+        let secs = (0.5 * 2f64.powi(attempt as i32 - 1)).min(8.0);
+        tokio::time::sleep(std::time::Duration::from_secs_f64(secs)).await;
+    }
+
+    /// A final tool-less generation when the turn budget is exhausted: ask the
+    /// model to summarize what it did and what remains, so the caller gets a real
+    /// handoff instead of a stub. Best-effort — falls back to a stub on error.
+    async fn wind_down(&mut self) -> String {
+        let mut messages = self.history.clone();
+        messages.push(Message::user_text(
+            "You've reached your turn limit and can no longer call tools. In a few \
+             sentences, summarize what you accomplished, what remains unfinished, and \
+             your recommended next step. Do not attempt any more tools.",
+        ));
+        let opts = GenerateOptions {
+            system: self.cfg.system.clone(),
+            messages,
+            tools: Vec::new(), // no tools — force a text answer
+            cache: true,
+            reasoning: self.reasoning,
+            max_tokens: Some(1024),
+            ..Default::default()
+        };
+        match self.cfg.provider.generate(opts).await {
+            Ok(c) => {
+                let text = c.message.text().trim().to_string();
+                if text.is_empty() {
+                    format!(
+                        "[stopped after {} turns without finishing]",
+                        self.cfg.max_turns
+                    )
+                } else {
+                    format!("[turn limit reached] {text}")
+                }
+            }
+            Err(_) => format!(
+                "[stopped after reaching the {}-turn limit without finishing]",
+                self.cfg.max_turns
+            ),
+        }
+    }
+}
+
+/// Whether a provider error string indicates the request exceeded the model's
+/// context window (so a reactive compaction + retry is worth attempting).
+fn is_overflow_error(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("context length")
+        || m.contains("context_length")
+        || m.contains("maximum context")
+        || m.contains("too many tokens")
+        || m.contains("prompt is too long")
+        || m.contains("reduce the length")
+        || (m.contains("token") && m.contains("exceed"))
+}
+
+/// Whether a provider error looks transient (rate limit / overload / network) and
+/// worth retrying with backoff.
+fn is_transient_error(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("429")
+        || m.contains("rate limit")
+        || m.contains("overloaded")
+        || m.contains("529")
+        || m.contains("500")
+        || m.contains("502")
+        || m.contains("503")
+        || m.contains("timeout")
+        || m.contains("timed out")
+        || m.contains("connection")
+        || m.contains("stream ended")
 }
 
 /// Execute one tool call, emit its result event, and return the tool_result block.

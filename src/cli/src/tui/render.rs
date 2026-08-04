@@ -181,11 +181,41 @@ pub fn render_cell(cell: &Cell, width: usize, out: &mut Vec<Line<'static>>) {
             ]));
             out.push(Line::from(""));
         }
-        Cell::Compaction { before, after } => {
-            out.push(Line::from(Span::styled(
-                format!("  ⟲ compacted history: ~{} → ~{} tokens", before, after),
-                Style::default().fg(Palette::DIM()),
-            )));
+        Cell::Compaction {
+            before,
+            after,
+            done,
+        } => {
+            if *done {
+                out.push(Line::from(vec![
+                    Span::styled("• ", Style::default().fg(Palette::OK())),
+                    Span::styled(
+                        "Compacted",
+                        Style::default()
+                            .fg(Palette::TEXT())
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("  ~{} → ~{} tokens", before, after),
+                        Style::default().fg(Palette::DIM()),
+                    ),
+                ]));
+            } else {
+                out.push(Line::from(vec![
+                    Span::styled("• ", Style::default().fg(Palette::RUNNING())),
+                    Span::styled(
+                        "Compacting",
+                        Style::default()
+                            .fg(Palette::TEXT())
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        " summarizing conversation…",
+                        Style::default().fg(Palette::DIM()),
+                    ),
+                ]));
+            }
+            out.push(Line::from(""));
         }
         Cell::Notice(text) => {
             let color = if text.starts_with("error") {

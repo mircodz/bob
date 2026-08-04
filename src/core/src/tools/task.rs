@@ -62,7 +62,13 @@ impl Tool for TaskTool {
                 every subagent's final result. Set `background: true` to detach them as background \
                 jobs instead — this returns immediately with job ids you can later inspect with \
                 job_status and collect with job_output (use for long-running work you don't want \
-                to block on). Subagents cannot spawn further subagents."
+                to block on). Subagents cannot spawn further subagents. \
+                Delegate when work is parallelizable or context-heavy (searching a large codebase, \
+                researching several areas at once) — launch multiple in ONE call so they run \
+                concurrently. Do NOT delegate a quick read/grep/edit you can do directly, or work \
+                that needs your accumulated context: a subagent starts blank and sees only its \
+                prompt, so give it exact scope, the concrete deliverable, and the specific findings \
+                to report back — then verify its result rather than trusting it blindly."
                     .to_string(),
             input_schema: json!({
                 "type": "object",

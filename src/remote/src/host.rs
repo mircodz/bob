@@ -218,7 +218,15 @@ pub async fn run(
         "[host] secure channel established · safety number {:04}",
         est.safety_number
     );
-    (secure.on_established)(&est);
+    // Authorize the peer: the callback does trust-on-first-use bookkeeping and
+    // returns whether this device is allowed. An unauthorized key is rejected here,
+    // before any agent is assembled — the E2E channel proves who they are, but only
+    // a trusted identity gets a session.
+    if !(secure.on_established)(&est) {
+        eprintln!("[host] rejecting untrusted peer · closing connection");
+        let _ = ws_sink.close().await;
+        anyhow::bail!("peer not trusted");
+    }
     let mut opener = est.opener;
 
     // Outbound queue: everything the host sends funnels here, gets sealed, and is
@@ -425,7 +433,10 @@ pub async fn run(
                     text.len()
                 );
                 // New turn: reset the live buffer + subagent accumulator so
-                // they only hold this turn's events, and mark busy.
+                // they only hold this turn's events, and mark busy. Clear any
+                // leftover cancel from a PRIOR turn — otherwise a single Cancel
+                // would poison every turn that follows it.
+                cancel.store(false, std::sync::atomic::Ordering::Relaxed);
                 if let Ok(mut buf) = live_buffer.lock() {
                     buf.clear();
                 }
@@ -632,6 +643,7 @@ fn is_remote_event(e: &AgentEvent) -> bool {
         | AgentEvent::TextDelta { agent_id, .. }
         | AgentEvent::Message { agent_id, .. }
         | AgentEvent::Compaction { agent_id, .. }
+        | AgentEvent::ContextWarning { agent_id, .. }
         | AgentEvent::Error { agent_id, .. } => agent_id == "root",
         // Inter-agent coordination chatter stays internal — never sent to the phone.
         AgentEvent::AgentMessage { .. } => false,
