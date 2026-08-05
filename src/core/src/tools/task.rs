@@ -27,6 +27,8 @@ pub struct TaskTool {
     /// Shared language servers, so subagents get diagnostics/nav too. None if
     /// no lsp_servers are configured.
     pub lsp: Option<Arc<crate::lsp::LspManager>>,
+    /// The root's cancel flag, so a Cancel cascades into `task` children.
+    pub parent_cancel: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl TaskTool {
@@ -47,6 +49,7 @@ impl TaskTool {
             depth: 1,
             inbox: None,
             team: None,
+            parent_cancel: Some(self.parent_cancel.clone()),
         })
     }
 }
@@ -195,6 +198,8 @@ pub struct ExploreTool {
     pub cwd: String,
     pub jobs: JobRegistry,
     pub lsp: Option<Arc<crate::lsp::LspManager>>,
+    /// The root's cancel flag, so a Cancel cascades into the explore child.
+    pub parent_cancel: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[async_trait]
@@ -263,6 +268,7 @@ impl Tool for ExploreTool {
             depth: 1,
             inbox: None,
             team: None,
+            parent_cancel: Some(self.parent_cancel.clone()),
         });
         let (out, failed) = match child.run(&query).await {
             Ok(out) => (out, false),

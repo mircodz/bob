@@ -22,6 +22,7 @@ pub struct ResponsesProvider {
     model: String,
     base_url: String,
     client: reqwest::Client,
+    context_window: Option<usize>,
 }
 
 impl ResponsesProvider {
@@ -31,7 +32,14 @@ impl ResponsesProvider {
             model,
             base_url: base_url.trim_end_matches('/').to_string(),
             client: super::openai::http_client(),
+            context_window: None,
         }
+    }
+
+    /// Set an authoritative context window, overriding the id-based heuristic.
+    pub fn with_context_window(mut self, window: Option<usize>) -> Self {
+        self.context_window = window;
+        self
     }
 
     /// Translate our provider-agnostic messages into Responses `input` items,
@@ -100,6 +108,10 @@ impl Provider for ResponsesProvider {
     }
     fn model(&self) -> &str {
         &self.model
+    }
+    fn context_window(&self) -> usize {
+        self.context_window
+            .unwrap_or_else(|| crate::providers::provider::context_window_for(&self.model))
     }
 
     async fn generate(&self, opts: GenerateOptions) -> anyhow::Result<Completion> {

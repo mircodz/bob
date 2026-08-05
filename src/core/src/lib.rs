@@ -8,3 +8,4 @@ pub mod lsp;
 pub mod mcp;
 pub mod providers;
 pub mod tools;
+pub mod workflow;

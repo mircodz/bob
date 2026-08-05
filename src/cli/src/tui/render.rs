@@ -5,7 +5,7 @@ use super::highlight::highlight_line;
 use super::indent_line;
 use super::markdown::render_markdown;
 use super::theme::Palette;
-use super::view::{Cell, ToolStatus};
+use super::view::{Cell, ToolStatus, WfPhase, WfStatus};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
@@ -34,6 +34,7 @@ fn tool_display(name: &str, input: &Value) -> (String, String) {
         "todo_write" => ("Plan".into(), String::new()),
         "memory" => ("Memory".into(), arg("content")),
         "task" => ("Task".into(), String::new()),
+        "workflow" => ("Workflow".into(), arg("title")),
         "enter_plan" => ("Plan mode".into(), String::new()),
         "exit_plan" => ("Plan".into(), String::new()),
         "explore" => ("Explore".into(), arg("description")),
@@ -83,31 +84,43 @@ fn wrap_plain(text: &str, width: usize) -> Vec<String> {
 pub fn render_cell(cell: &Cell, width: usize, out: &mut Vec<Line<'static>>) {
     match cell {
         Cell::User(text) => {
-            // A full-width band with the input background: a blank padded row above
-            // and below, and the message wrapped to `width` with EACH row padded out
-            // so the bg fills edge to edge. Wrapping here (rather than letting an
-            // outer pass split an over-wide pre-padded line) keeps the band intact
-            // on long messages. Styled like the live prompt — a dim `› ` marker.
+            // A floating band: the colored (input-bg) block is inset from the
+            // transcript edges by MARGIN cols on each side, so base-bg shows in the
+            // gutter and the message reads like a chat bubble rather than a
+            // full-width strip. Inside the band there's a 1-col text inset + the
+            // dim `›` marker.
             use unicode_width::UnicodeWidthStr;
+            const MARGIN: usize = 2;
             let bg = Style::default().bg(Palette::INPUT_BG());
-            let pad_row = |w: usize| Line::from(Span::styled(" ".repeat(w), bg));
-            out.push(pad_row(width));
+            let gutter = || Span::raw(" ".repeat(MARGIN)); // base-bg on both sides
+            let band_w = width.saturating_sub(MARGIN * 2).max(1);
+            // A blank band row (gutter + colored fill + gutter).
+            let pad_row = || {
+                Line::from(vec![
+                    gutter(),
+                    Span::styled(" ".repeat(band_w), bg),
+                    gutter(),
+                ])
+            };
+            out.push(pad_row());
 
-            let prefix = "› ";
-            let indent = "  "; // continuation rows align under the marker
-            let content_w = width.saturating_sub(prefix.width()).max(1);
+            let prefix = " › "; // 1-col inset inside the band + the marker
+            let indent = "   ";
+            let content_w = band_w.saturating_sub(prefix.width() + 1).max(1);
             let rows = wrap_plain(text, content_w);
             for (i, row) in rows.iter().enumerate() {
                 let lead = if i == 0 { prefix } else { indent };
                 let used = lead.width() + row.width();
-                let trailing = width.saturating_sub(used);
+                let trailing = band_w.saturating_sub(used);
                 out.push(Line::from(vec![
+                    gutter(),
                     Span::styled(lead, bg.fg(Palette::DIM())),
                     Span::styled(row.clone(), bg.fg(Palette::TEXT())),
                     Span::styled(" ".repeat(trailing), bg),
+                    gutter(),
                 ]));
             }
-            out.push(pad_row(width));
+            out.push(pad_row());
             out.push(Line::from(""));
         }
         Cell::Assistant { text, .. } => {
@@ -249,7 +262,114 @@ pub fn render_cell(cell: &Cell, width: usize, out: &mut Vec<Line<'static>>) {
             ]));
             out.push(Line::from(""));
         }
+        Cell::Workflow {
+            title,
+            phases,
+            done,
+            ..
+        } => {
+            render_workflow(title, phases, *done, out);
+        }
     }
+}
+
+/// Small colored status dot for a workflow agent/phase — same glyph the subagent
+/// cells use (`•`), colored orange=running, green=done, red=failed.
+fn wf_dot(status: WfStatus) -> Span<'static> {
+    let color = match status {
+        WfStatus::Running => Palette::RUNNING(),
+        WfStatus::Done => Palette::OK(),
+        WfStatus::Failed => Palette::ERROR(),
+    };
+    Span::styled("•".to_string(), Style::default().fg(color))
+}
+
+/// Render a workflow run as a phase/agent tree. Running shows the full tree; when
+/// `done`, it collapses to a single summary line (title + agent count). Each agent
+/// row is one line, in the SAME order as the phases/agents vectors, so a click can
+/// be mapped back to an agent id by counting rows (see `workflow_row_agent`).
+fn render_workflow(title: &str, phases: &[WfPhase], done: bool, out: &mut Vec<Line<'static>>) {
+    let total_agents: usize = phases.iter().map(|p| p.agents.len()).sum();
+
+    if done {
+        // Collapsed: one green summary line.
+        out.push(Line::from(vec![
+            wf_dot(WfStatus::Done),
+            Span::styled(" Workflow ", Style::default().fg(Palette::DIM())),
+            Span::styled(
+                title.to_string(),
+                Style::default()
+                    .fg(Palette::TEXT())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(
+                    " · {} phase{} · {} agent{}",
+                    phases.len(),
+                    if phases.len() == 1 { "" } else { "s" },
+                    total_agents,
+                    if total_agents == 1 { "" } else { "s" },
+                ),
+                Style::default().fg(Palette::DIM()),
+            ),
+        ]));
+        out.push(Line::from(""));
+        return;
+    }
+
+    // Header: dot + "Workflow <title>" + running.
+    out.push(Line::from(vec![
+        wf_dot(WfStatus::Running),
+        Span::styled(" Workflow ", Style::default().fg(Palette::DIM())),
+        Span::styled(
+            title.to_string(),
+            Style::default()
+                .fg(Palette::TEXT())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" · running", Style::default().fg(Palette::DIM())),
+    ]));
+
+    // Three-level indent: workflow (col 0) → phase (col 2) → agents (col 4). Phases
+    // are group labels (no status dot); agents carry the colored dot + status.
+    for phase in phases {
+        let done_count = phase
+            .agents
+            .iter()
+            .filter(|a| a.status != WfStatus::Running)
+            .count();
+        out.push(Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(
+                phase.title.clone(),
+                Style::default()
+                    .fg(Palette::TEXT())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  {}/{}", done_count, phase.agents.len().max(phase.total)),
+                Style::default().fg(Palette::DIM()),
+            ),
+        ]));
+        for agent in &phase.agents {
+            let trailing = match agent.status {
+                WfStatus::Running if agent.tools == 1 => "  (1 tool)".to_string(),
+                WfStatus::Running => format!("  ({} tools)", agent.tools),
+                WfStatus::Done => "  done".to_string(),
+                WfStatus::Failed => "  failed".to_string(),
+            };
+            out.push(Line::from(vec![
+                Span::styled("    ", Style::default()),
+                wf_dot(agent.status),
+                Span::styled(
+                    format!(" {}", agent.label),
+                    Style::default().fg(Palette::TEXT()),
+                ),
+                Span::styled(trailing, Style::default().fg(Palette::DIM())),
+            ]));
+        }
+    }
+    out.push(Line::from(""));
 }
 
 fn render_tool(
@@ -261,12 +381,12 @@ fn render_tool(
     width: usize,
     out: &mut Vec<Line<'static>>,
 ) {
-    // Neither `spawn_agent` nor `todo_write` renders a tool cell in the
-    // transcript. `spawn_agent`'s visible artifact is the separate `Subagent`
-    // cell (the "• Spawned <name> agent" line, from the SubagentSpawn event);
-    // `todo_write` is shown by the sticky todo panel above the input. A tool line
-    // for either would just be noise.
-    if name == "spawn_agent" || name == "todo_write" {
+    // Neither `spawn_agent`, `todo_write`, nor `workflow` renders a tool cell in
+    // the transcript. `spawn_agent`'s visible artifact is the separate `Subagent`
+    // cell; `todo_write` is shown by the sticky todo panel; `workflow`'s is the live
+    // workflow tree cell (from its WorkflowPhase/Subagent events). A tool line for
+    // any of them would just be noise.
+    if name == "spawn_agent" || name == "todo_write" || name == "workflow" {
         return;
     }
     let (display, arg) = tool_display(name, input);

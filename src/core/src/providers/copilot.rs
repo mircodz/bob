@@ -94,15 +94,27 @@ pub async fn native_copilot(model: Option<String>) -> anyhow::Result<Arc<dyn Pro
         cached: Mutex::new(None),
     };
     // Prime the cache + discover the endpoint.
-    let (_tok, api_base) = source.ensure().await?;
-    let source: Arc<dyn TokenSource> = Arc::new(source);
+    let (tok, api_base) = source.ensure().await?;
     let model = model.unwrap_or_else(|| "gpt-4o".to_string());
 
+    // Ask the backend for this model's real limits so compaction sizes against the
+    // true input budget (Copilot advertises up to ~936k for Claude, not the 200k
+    // the id-based heuristic assumes). Best-effort: None → heuristic fallback.
+    let window = auth::fetch_model_limits(&tok, &api_base)
+        .await
+        .into_iter()
+        .find(|m| m.id == model)
+        .and_then(|m| m.max_prompt_tokens.or(m.max_context_window_tokens));
+
+    let source: Arc<dyn TokenSource> = Arc::new(source);
+
     if is_responses_model(&model) {
-        Ok(Arc::new(ResponsesProvider::with_auth(
-            model, api_base, source,
-        )))
+        Ok(Arc::new(
+            ResponsesProvider::with_auth(model, api_base, source).with_context_window(window),
+        ))
     } else {
-        Ok(Arc::new(OpenAiProvider::with_auth(model, api_base, source)))
+        Ok(Arc::new(
+            OpenAiProvider::with_auth(model, api_base, source).with_context_window(window),
+        ))
     }
 }

@@ -38,6 +38,9 @@ pub struct CoordDeps {
     pub jobs: JobRegistry,
     pub lsp: Option<Arc<crate::lsp::LspManager>>,
     pub team: AgentRegistry,
+    /// The root's cancel flag, passed to every spawned child so one Cancel
+    /// cascades through the whole team (including nested spawns).
+    pub parent_cancel: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// `spawn_agent`: start a named background subagent that is part of the team.
@@ -176,6 +179,7 @@ impl Tool for SpawnAgentTool {
             depth: child_depth,
             inbox: Some(inbox),
             team: Some(self.deps.team.clone()),
+            parent_cancel: Some(self.deps.parent_cancel.clone()),
         });
 
         // Run in the background. On completion, deliver the result back to the

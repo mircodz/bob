@@ -190,6 +190,16 @@ pub enum AgentEventDto {
         before_tokens: usize,
         after_tokens: usize,
     },
+    WorkflowPhase {
+        workflow_id: String,
+        title: String,
+        index: usize,
+        total: usize,
+    },
+    WorkflowLog {
+        workflow_id: String,
+        message: String,
+    },
     ContextWarning {
         agent_id: String,
         used_tokens: usize,
@@ -275,6 +285,24 @@ impl From<&AgentEvent> for AgentEventDto {
                 agent_id: agent_id.clone(),
                 before_tokens: *before_tokens,
                 after_tokens: *after_tokens,
+            },
+            AgentEvent::WorkflowPhase {
+                workflow_id,
+                title,
+                index,
+                total,
+            } => AgentEventDto::WorkflowPhase {
+                workflow_id: workflow_id.clone(),
+                title: title.clone(),
+                index: *index,
+                total: *total,
+            },
+            AgentEvent::WorkflowLog {
+                workflow_id,
+                message,
+            } => AgentEventDto::WorkflowLog {
+                workflow_id: workflow_id.clone(),
+                message: message.clone(),
             },
             AgentEvent::ContextWarning {
                 agent_id,

@@ -269,6 +269,13 @@ impl ToolRegistry {
                 cwd: ctx.cwd.clone(),
                 bash,
                 preview,
+                // Name the requester when it's a spawned/workflow team member, so a
+                // fan-out's prompts show WHO is asking. Root asks as itself → None.
+                agent: ctx
+                    .coord
+                    .as_ref()
+                    .map(|c| c.name.clone())
+                    .filter(|n| n != crate::agent::agent::ROOT_AGENT_ID),
             };
             if !perms.check(&req).await {
                 return Err(ToolError::permission_denied(format!(

@@ -452,6 +452,7 @@ pub async fn run(
                 let live_buffer = live_buffer.clone();
                 let busy = busy.clone();
                 let sub_accum = sub_accum.clone();
+                let cancel = cancel.clone();
                 tokio::spawn(async move {
                     let mut a = agent.lock().await;
                     let result = a.run(&text).await;
@@ -467,8 +468,13 @@ pub async fn run(
                     // re-drives root). We hold the agent lock throughout, so a new
                     // Prompt queues behind this — intended: the turn isn't "done"
                     // until its team is. Bounded so a stuck child can't spin forever.
+                    // A Cancel breaks the loop: the shared flag has already cascaded
+                    // into every child, so they wind down and we stop re-waking.
                     let mut wakes = 0;
-                    while wakes < 128 && a.has_outstanding_coordination() {
+                    while wakes < 128
+                        && !cancel.load(std::sync::atomic::Ordering::Relaxed)
+                        && a.has_outstanding_coordination()
+                    {
                         if a.has_pending_coordination() {
                             wakes += 1;
                             if let Err(e) = a.run("").await {
@@ -638,6 +644,8 @@ fn is_remote_event(e: &AgentEvent) -> bool {
         | AgentEvent::ToolCall { .. }
         | AgentEvent::ToolResult { .. }
         | AgentEvent::TurnEnd { .. }
+        | AgentEvent::WorkflowPhase { .. }
+        | AgentEvent::WorkflowLog { .. }
         | AgentEvent::Completion { .. } => true,
         AgentEvent::TurnStart { agent_id }
         | AgentEvent::TextDelta { agent_id, .. }

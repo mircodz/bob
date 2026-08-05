@@ -81,6 +81,21 @@ impl AgentTranscripts {
         running
     }
 
+    /// The ids of currently-RUNNING agents, in registration order (for the sidebar
+    /// AGENTS tree — finished agents are excluded).
+    pub fn running_ids(&self) -> Vec<String> {
+        self.order
+            .iter()
+            .filter(|id| {
+                matches!(
+                    self.threads.get(*id).map(|t| t.status),
+                    Some(ThreadStatus::Running)
+                )
+            })
+            .cloned()
+            .collect()
+    }
+
     /// Nesting depth of an agent (root's direct children = 0). Walks `parent_id`
     /// up the chain; capped to avoid a cycle hang.
     pub fn depth_of(&self, id: &str) -> usize {
@@ -333,7 +348,35 @@ fn event_agent_id(event: &AgentEvent) -> Option<&str> {
         | AgentEvent::Error { agent_id, .. } => Some(agent_id.as_str()),
         AgentEvent::SubagentSpawn { .. }
         | AgentEvent::SubagentDone { .. }
+        | AgentEvent::WorkflowPhase { .. }
+        | AgentEvent::WorkflowLog { .. }
         | AgentEvent::AgentMessage { .. } => None,
+    }
+}
+
+/// Full-screen workflow view state: a single scrollable pane showing a collapsible
+/// phase/agent tree. `sel` is a cursor into the flattened list of visible rows
+/// (phase headers + agents); the selected agent expands inline to show its detail.
+/// `None` on the App means the view is closed.
+pub struct WorkflowView {
+    pub run_id: String,
+    /// Cursor into the flattened row list (phase headers + agents), rebuilt each
+    /// draw. Enter on an agent expands its inline detail; on a phase toggles it.
+    pub selected: usize,
+    /// Phase indices the user has collapsed (their agents are hidden).
+    pub collapsed: std::collections::HashSet<usize>,
+    /// Vertical scroll offset of the tree pane, in rows.
+    pub scroll: u16,
+}
+
+impl Default for WorkflowView {
+    fn default() -> Self {
+        WorkflowView {
+            run_id: String::new(),
+            selected: 0,
+            collapsed: std::collections::HashSet::new(),
+            scroll: 0,
+        }
     }
 }
 

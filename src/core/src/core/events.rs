@@ -55,6 +55,19 @@ pub enum AgentEvent {
         before_tokens: usize,
         after_tokens: usize,
     },
+    /// A workflow run entered a new phase. `index`/`total` drive a progress bar; the
+    /// `workflow_id` groups this run's agents + phases into one live tree in the UI.
+    WorkflowPhase {
+        workflow_id: String,
+        title: String,
+        index: usize,
+        total: usize,
+    },
+    /// A free-form progress line from a workflow run (e.g. "6/7 reports written").
+    WorkflowLog {
+        workflow_id: String,
+        message: String,
+    },
     /// The estimated context usage crossed a graded warning threshold (e.g. 70 /
     /// 85 / 95%). Emitted at most once per level per direction so the UI can warn
     /// the user that context is filling up before an auto-compaction kicks in.
@@ -100,7 +113,14 @@ impl EventBus {
     }
 
     pub fn emit(&self, event: AgentEvent) {
-        let listeners = self.listeners.lock().unwrap();
+        // Clone the handles out of the lock BEFORE invoking any of them. A listener
+        // is free to touch the bus (subscribe, or emit a follow-on event) while it
+        // runs; holding the mutex across the callbacks would deadlock on the first
+        // such reentrant call and serialize unrelated emits behind slow listeners.
+        let listeners = {
+            let guard = self.listeners.lock().unwrap();
+            guard.clone()
+        };
         for l in listeners.iter() {
             l(&event);
         }

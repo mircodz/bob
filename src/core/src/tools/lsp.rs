@@ -454,3 +454,83 @@ fn uri_to_rel(uri: &str) -> String {
     let path = uri.strip_prefix("file://").unwrap_or(uri);
     rel(Path::new(path))
 }
+
+/// Best-effort post-edit diagnostics for a single file, formatted as a compact
+/// `<diagnostics>` block to append to an edit/write result — so the model sees a
+/// type/compile error it just introduced without having to remember a separate
+/// `lsp diagnostics` call.
+///
+/// This is a NON-BLOCKING enrichment: it waits at most `budget` for the server to
+/// publish, and returns `None` on timeout, no configured server, or no
+/// errors/warnings. The edit itself never depends on it — a slow or absent LSP
+/// just means the result is the diff alone, exactly as before.
+pub async fn post_edit_diagnostics(
+    lsp: &Option<Arc<LspManager>>,
+    cwd: &str,
+    path: &str,
+    budget: std::time::Duration,
+) -> Option<String> {
+    let manager = lsp.as_ref()?;
+    let file = resolve_path(cwd, path);
+    let client = manager.client_for(&file)?;
+
+    // Sync current on-disk text so the server diagnoses what we just wrote.
+    let text = std::fs::read_to_string(&file).ok()?;
+    client.sync_file(&file, &text).await;
+
+    // Poll within the budget, settling briefly after diagnostics appear. Many
+    // servers (rust-analyzer) publish an empty set first, then the real one.
+    let deadline = tokio::time::Instant::now() + budget;
+    let step = std::time::Duration::from_millis(100);
+    let mut last_len = usize::MAX;
+    loop {
+        tokio::time::sleep(step).await;
+        let now = client.diagnostics_for(&file);
+        if !now.is_empty() && now.len() == last_len {
+            break; // settled on a non-empty set
+        }
+        last_len = now.len();
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+    }
+
+    // Keep only errors (1) and warnings (2); those are the actionable ones.
+    let diags = client.diagnostics_for(&file);
+    let lines: Vec<&str> = text.lines().collect();
+    let mut body = String::new();
+    let mut shown = 0;
+    for d in &diags {
+        let sev = d["severity"].as_i64().unwrap_or(1);
+        if sev > 2 {
+            continue;
+        }
+        if shown >= 10 {
+            body.push_str("… and more\n");
+            break;
+        }
+        let sev_label = if sev == 1 { "ERROR" } else { "WARN" };
+        let line = d["range"]["start"]["line"].as_i64().unwrap_or(0);
+        let col = d["range"]["start"]["character"].as_i64().unwrap_or(0);
+        let msg = d["message"].as_str().unwrap_or("").replace('\n', " ");
+        body.push_str(&format!(
+            "{} {}:{}:{} {}\n",
+            sev_label,
+            rel(&file),
+            line + 1,
+            col + 1,
+            msg
+        ));
+        if let Some(src) = lines.get(line as usize) {
+            body.push_str(&format!("  {}\n", src));
+        }
+        shown += 1;
+    }
+    if shown == 0 {
+        return None;
+    }
+    Some(format!(
+        "\n\n<diagnostics>\n{}</diagnostics>",
+        body.trim_end()
+    ))
+}

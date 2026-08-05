@@ -1,5 +1,7 @@
 pub mod anthropic;
 pub mod copilot;
+#[cfg(test)]
+pub mod mock;
 pub mod openai;
 pub mod provider;
 pub mod responses;

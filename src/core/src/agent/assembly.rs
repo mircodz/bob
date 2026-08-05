@@ -6,8 +6,7 @@
 //! wiring once so the two frontends can't drift.
 
 use crate::agent::agent::{
-    Agent, AgentConfig, COMPACT_THRESHOLD, CONTEXT_WINDOW, DEFAULT_MAX_TURNS, KEEP_RECENT,
-    ROOT_AGENT_ID,
+    Agent, AgentConfig, COMPACT_THRESHOLD, DEFAULT_MAX_TURNS, KEEP_RECENT, ROOT_AGENT_ID,
 };
 use crate::agent::team::{mailbox, AgentRegistry};
 use crate::core::events::EventBus;
@@ -73,6 +72,12 @@ fn build_subagent_tools(p: &RootAgentParams) -> ToolRegistry {
 pub fn build_root_agent(p: RootAgentParams) -> Agent {
     let subagent_tools = build_subagent_tools(&p);
 
+    // One shared cancel flag: the root owns it, and its subagent-spawning tools
+    // hand it to every child as `parent_cancel`, so a single Cancel (Esc / remote
+    // Cancel) cascades from the root through the whole team. `cancel_handle()`
+    // returns this same flag, so the frontend's existing wiring keeps working.
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     // The root's tools are the subagent set (minus its coordination tools, which
     // we re-add explicitly below) plus the task + spawn tools it uses to delegate.
     let mut tools = ToolRegistry::new(Some(p.permissions.clone()));
@@ -95,6 +100,19 @@ pub fn build_root_agent(p: RootAgentParams) -> Agent {
         subagent_system: Some(p.system_prompt.clone()),
         jobs: p.jobs.clone(),
         lsp: p.lsp.clone(),
+        parent_cancel: cancel.clone(),
+    }));
+    // The `workflow` tool: the model composes a parameterized fan_out/map_reduce
+    // over many items. Root-only, like task; children can't spin up workflows.
+    tools.add(Arc::new(crate::tools::workflow_tool::WorkflowTool {
+        provider: p.provider.clone(),
+        subagent_tools: subagent_tools.clone(),
+        bus: p.bus.clone(),
+        cwd: p.cwd.clone(),
+        subagent_system: Some(p.system_prompt.clone()),
+        jobs: p.jobs.clone(),
+        lsp: p.lsp.clone(),
+        parent_cancel: cancel.clone(),
     }));
     tools.add(Arc::new(crate::tools::task::ExploreTool {
         provider: p.provider.clone(),
@@ -103,6 +121,7 @@ pub fn build_root_agent(p: RootAgentParams) -> Agent {
         cwd: p.cwd.clone(),
         jobs: p.jobs.clone(),
         lsp: p.lsp.clone(),
+        parent_cancel: cancel.clone(),
     }));
 
     // Coordination tools: spawn children from the same deps as `task`, and let the
@@ -117,6 +136,7 @@ pub fn build_root_agent(p: RootAgentParams) -> Agent {
         jobs: p.jobs.clone(),
         lsp: p.lsp.clone(),
         team: p.team.clone(),
+        parent_cancel: cancel.clone(),
     };
     tools.add(Arc::new(SpawnAgentTool { deps }));
     tools.add(Arc::new(SendMessageTool {
@@ -140,7 +160,7 @@ pub fn build_root_agent(p: RootAgentParams) -> Agent {
         cwd: p.cwd.clone(),
         max_turns: p.max_turns.unwrap_or(DEFAULT_MAX_TURNS),
         id: Some(ROOT_AGENT_ID.to_string()),
-        context_window: CONTEXT_WINDOW,
+        context_window: p.provider.context_window(),
         compact_threshold: COMPACT_THRESHOLD,
         keep_recent: KEEP_RECENT,
         jobs: p.jobs.clone(),
@@ -150,5 +170,7 @@ pub fn build_root_agent(p: RootAgentParams) -> Agent {
         team: Some(p.team.clone()),
         name: ROOT_AGENT_ID.to_string(),
         depth: 0,
+        parent_cancel: None,
+        cancel: Some(cancel),
     })
 }

@@ -17,6 +17,7 @@ const READ_ONLY: &[&str] = &[
     "todo_write",
     "memory",
     "task",
+    "workflow",
     "explore",
     "spawn_agent",
     "send_message",
@@ -26,6 +27,10 @@ const READ_ONLY: &[&str] = &[
     "web_search",
     "job_status",
     "job_output",
+    // Records the agent's own final answer into an in-memory sink (workflow
+    // structured output) — touches nothing on disk, so a prompt would be pure
+    // friction.
+    "structured_output",
     // Interaction tools handle their own user consent (or only change the
     // interaction mode), so a redundant permission prompt would just double-ask.
     "ask_user",
@@ -285,6 +290,7 @@ mod tests {
             cwd: ".".to_string(),
             bash: None,
             preview: None,
+            agent: None,
         }
     }
 
@@ -303,6 +309,16 @@ mod tests {
     }
 
     #[test]
+    fn structured_output_is_auto_allowed() {
+        // Recording the model's own answer into an in-memory sink mutates nothing —
+        // it must never prompt, or every workflow agent would stall on a dialog.
+        assert_eq!(
+            allow_read_only()(&req("structured_output")),
+            Some(Decision::Allow)
+        );
+    }
+
+    #[test]
     fn mutating_tools_are_not_auto_allowed() {
         let rule = allow_read_only();
         // These must fall through (None) so the engine can prompt/deny.
@@ -318,6 +334,7 @@ mod tests {
             cwd: ".".to_string(),
             bash: Some(crate::core::permissions::parse_bash(raw)),
             preview: None,
+            agent: None,
         }
     }
 

@@ -128,7 +128,18 @@ impl Tool for WriteFileTool {
         }
         std::fs::write(&full, content)?;
         ctx.files.record_write(&full.to_string_lossy());
-        Ok(format!("wrote {} bytes to {}", content.len(), path))
+        let mut result = format!("wrote {} bytes to {}", content.len(), path);
+        if let Some(diags) = crate::tools::lsp::post_edit_diagnostics(
+            &ctx.lsp,
+            &ctx.cwd,
+            path,
+            std::time::Duration::from_millis(700),
+        )
+        .await
+        {
+            result.push_str(&diags);
+        }
+        Ok(result)
     }
 
     fn preview(&self, input: &Value, ctx: &ToolContext) -> Option<String> {

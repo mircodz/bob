@@ -24,6 +24,10 @@ pub struct PermissionRequest {
     /// A side-effect-free preview of the action (e.g. an edit's diff), rendered
     /// in the prompt so the user sees what they're approving.
     pub preview: Option<String>,
+    /// The requesting agent's name when it's a team member (a workflow/spawned
+    /// agent), so the prompt can say WHO wants the permission during a fan-out.
+    /// `None` for the root agent and the fire-and-forget `task` children.
+    pub agent: Option<String>,
 }
 
 /// A single choice presented to the user when a decision is "ask". The `grant`
@@ -535,6 +539,7 @@ mod tests {
             cwd: ".".to_string(),
             bash: Some(parse_bash(raw)),
             preview: None,
+            agent: None,
         }
     }
 

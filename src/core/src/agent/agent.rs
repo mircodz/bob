@@ -22,7 +22,11 @@ pub const ROOT_AGENT_ID: &str = "root";
 
 /// Tuning knobs shared by EVERY agent (root + subagents), centralized so the
 /// frontends and the subagent-spawning tools can't silently disagree.
-pub const CONTEXT_WINDOW: usize = 200_000;
+///
+/// The context window is NOT here — it's model-specific and derived per provider
+/// via [`crate::providers::provider::Provider::context_window`]. A provider that
+/// can't tell falls back to [`crate::providers::provider::context_window_for`],
+/// which is the single source of model→window knowledge.
 pub const COMPACT_THRESHOLD: f64 = 0.8;
 pub const KEEP_RECENT: usize = 6;
 /// Turn budgets: the root gets a large budget; coordinated/`task` subagents a
@@ -50,12 +54,16 @@ pub struct SubagentSpec {
     /// fire-and-forget `task`/`explore` children.
     pub inbox: Option<crate::agent::team::AgentInbox>,
     pub team: Option<crate::agent::team::AgentRegistry>,
+    /// The spawner's cancel flag, so a Cancel on the root cascades into this child.
+    /// `None` only for the root itself.
+    pub parent_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// Build a child agent from a [`SubagentSpec`], filling the shared tuning
 /// constants. The one place subagents are constructed, so their configuration
 /// stays consistent.
 pub fn build_subagent(spec: SubagentSpec) -> Agent {
+    let context_window = spec.provider.context_window();
     Agent::new(AgentConfig {
         provider: spec.provider,
         tools: spec.tools,
@@ -64,7 +72,7 @@ pub fn build_subagent(spec: SubagentSpec) -> Agent {
         cwd: spec.cwd,
         max_turns: spec.max_turns,
         id: Some(spec.name.clone()),
-        context_window: CONTEXT_WINDOW,
+        context_window,
         compact_threshold: COMPACT_THRESHOLD,
         keep_recent: KEEP_RECENT,
         jobs: spec.jobs,
@@ -74,7 +82,20 @@ pub fn build_subagent(spec: SubagentSpec) -> Agent {
         team: spec.team,
         name: spec.name,
         depth: spec.depth,
+        parent_cancel: spec.parent_cancel,
+        cancel: None,
     })
+}
+
+/// Whether a turn should stop: the agent's OWN cancel flag is set, OR any ancestor
+/// flag it observes is set. Split out as a pure function so the cascade semantics
+/// (self OR parent) can be unit-tested without standing up a full provider.
+fn cancel_requested(
+    own: &std::sync::atomic::AtomicBool,
+    parent: Option<&Arc<std::sync::atomic::AtomicBool>>,
+) -> bool {
+    own.load(std::sync::atomic::Ordering::Relaxed)
+        || parent.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 fn next_agent_id() -> String {
@@ -111,6 +132,15 @@ pub struct AgentConfig {
     /// This agent's own name in the team + its spawn depth (root = 0).
     pub name: String,
     pub depth: usize,
+    /// An ancestor's cancel flag, observed (read-only) in addition to this agent's
+    /// own. Set for spawned children so a Cancel on the root cascades to the whole
+    /// tree — each agent still owns its own flag (cleared at its own turn start),
+    /// but `is_cancelled` also honors any ancestor's. `None` for the root.
+    pub parent_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// The agent's OWN cancel flag. Normally `None` (a fresh flag is created), but
+    /// the root injects one so it can hand the same flag to its subagent-spawning
+    /// tools as their `parent_cancel` — one Cancel then reaches root and every child.
+    pub cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 pub struct Agent {
@@ -139,6 +169,10 @@ pub struct Agent {
 impl Agent {
     pub fn new(cfg: AgentConfig) -> Self {
         let id = cfg.id.clone().unwrap_or_else(next_agent_id);
+        let cancel = cfg
+            .cancel
+            .clone()
+            .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
         Agent {
             id,
             cfg,
@@ -146,7 +180,7 @@ impl Agent {
             full_history: Vec::new(),
             files: Arc::new(FileTracker::new()),
             todos: Arc::new(TodoStore::new()),
-            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cancel,
             reasoning: crate::core::types::ReasoningEffort::default(),
             warned_pct: 0,
         }
@@ -214,7 +248,7 @@ impl Agent {
     }
 
     fn is_cancelled(&self) -> bool {
-        self.cancel.load(std::sync::atomic::Ordering::Relaxed)
+        cancel_requested(&self.cancel, self.cfg.parent_cancel.as_ref())
     }
 
     pub fn load_history(&mut self, messages: Vec<Message>) {
@@ -592,6 +626,60 @@ impl Agent {
         Ok(final_text)
     }
 
+    /// Run the agent on `prompt` but force its FINAL answer to be a single JSON
+    /// object matching `schema`, returned as a validated `serde_json::Value`. This
+    /// is the seam workflow orchestration uses: code gets data it can branch on
+    /// instead of prose it would have to parse.
+    ///
+    /// Mechanism: a one-off `structured_output` tool (whose advertised schema IS
+    /// `schema`) is added to the agent's registry for the duration of the call; the
+    /// prompt is suffixed with an instruction to finish by calling it; the normal
+    /// `run()` loop drives everything. The tool captures the validated payload into
+    /// a shared sink we read afterward. If the model finishes without calling it,
+    /// we nudge once and re-run; still nothing → `Err`. The registry is restored on
+    /// exit so the agent is unchanged for any later `run`.
+    pub async fn run_structured(
+        &mut self,
+        prompt: &str,
+        schema: serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        use crate::tools::structured::StructuredOutputTool;
+
+        let sink: crate::tools::structured::OutputSink = Arc::new(std::sync::Mutex::new(None));
+
+        // Snapshot the registry so we can restore it — run() reads self.cfg.tools
+        // directly, and adding the structured tool must not leak into later turns.
+        let original_tools = self.cfg.tools.clone();
+        self.cfg.tools.add(Arc::new(StructuredOutputTool::new(
+            schema.clone(),
+            sink.clone(),
+        )));
+
+        let instruction = "\n\nWhen you have everything you need, finish by calling the \
+            `structured_output` tool exactly once with your final answer as its arguments. \
+            That tool call IS your deliverable — do not also write a prose summary.";
+
+        // First attempt: the real prompt + the structured-output instruction.
+        let _ = self.run(&format!("{prompt}{instruction}")).await?;
+        let mut captured = sink.lock().unwrap().take();
+
+        // One corrective retry if the model didn't call the tool (empty-prompt wake
+        // turn — no new user message, just the nudge folded into history).
+        if captured.is_none() && !self.is_cancelled() {
+            let nudge = "You did not record a result. Call the `structured_output` tool now \
+                with your final answer matching its schema.";
+            let _ = self.run(nudge).await?;
+            captured = sink.lock().unwrap().take();
+        }
+
+        // Restore the registry regardless of outcome.
+        self.cfg.tools = original_tools;
+
+        captured.ok_or_else(|| {
+            anyhow::anyhow!("agent did not produce a structured result matching the schema")
+        })
+    }
+
     /// Emit a graded context-usage warning if `used` tokens crosses the next
     /// threshold (70 / 85 / 95% of the window) not yet warned this run. Fires at
     /// most once per level as usage climbs.
@@ -768,5 +856,108 @@ async fn run_one(
         tool_use_id: id,
         content,
         is_error: Some(is_error),
+    }
+}
+
+#[cfg(test)]
+mod cancel_tests {
+    use super::cancel_requested;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    #[test]
+    fn own_flag_cancels() {
+        let own = AtomicBool::new(false);
+        assert!(!cancel_requested(&own, None));
+        own.store(true, Ordering::Relaxed);
+        assert!(cancel_requested(&own, None));
+    }
+
+    #[test]
+    fn parent_flag_cascades_to_child() {
+        // A child's own flag is clear, but cancelling the parent (root) must make
+        // the child observe cancellation — the core of #5.
+        let parent = Arc::new(AtomicBool::new(false));
+        let child_own = AtomicBool::new(false);
+        assert!(!cancel_requested(&child_own, Some(&parent)));
+        parent.store(true, Ordering::Relaxed);
+        assert!(cancel_requested(&child_own, Some(&parent)));
+    }
+
+    #[test]
+    fn childs_own_run_start_clear_does_not_undo_parent_cancel() {
+        // A child clears its OWN flag at each turn start; that must not resurrect it
+        // once the parent has been cancelled (the "won't die" bug).
+        let parent = Arc::new(AtomicBool::new(true));
+        let child_own = AtomicBool::new(false); // freshly cleared at turn start
+        assert!(cancel_requested(&child_own, Some(&parent)));
+    }
+}
+
+#[cfg(test)]
+mod structured_tests {
+    use super::{Agent, AgentConfig, DEFAULT_MAX_TURNS};
+    use crate::core::events::EventBus;
+    use crate::providers::mock::{MockProvider, MockReply, MockRule};
+    use crate::providers::provider::Provider;
+    use crate::tools::registry::ToolRegistry;
+    use serde_json::json;
+    use std::sync::Arc;
+
+    /// Build a minimal root-ish agent over a given provider, with an empty tool set.
+    fn agent_with(provider: Arc<dyn Provider>) -> Agent {
+        Agent::new(AgentConfig {
+            provider,
+            tools: ToolRegistry::new(None),
+            bus: EventBus::new(),
+            system: None,
+            cwd: ".".to_string(),
+            max_turns: DEFAULT_MAX_TURNS,
+            id: Some("root".to_string()),
+            context_window: 200_000,
+            compact_threshold: 0.8,
+            keep_recent: 6,
+            jobs: crate::tools::jobs::JobRegistry::new(),
+            user_asker: None,
+            lsp: None,
+            inbox: None,
+            team: None,
+            name: "root".to_string(),
+            depth: 0,
+            parent_cancel: None,
+            cancel: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn structured_run_captures_the_tool_call() {
+        // The model's first move is to call structured_output with a valid object.
+        let schema = json!({
+            "type": "object",
+            "required": ["answer"],
+            "properties": { "answer": {"type": "string"} }
+        });
+        let provider = MockProvider::new(vec![MockRule {
+            needle: "structured_output".to_string(),
+            reply: MockReply::ToolCall {
+                name: "structured_output".to_string(),
+                input: json!({"answer": "42"}),
+            },
+        }]);
+        let mut agent = agent_with(Arc::new(provider));
+        let out = agent
+            .run_structured("what is the answer?", schema)
+            .await
+            .unwrap();
+        assert_eq!(out, json!({"answer": "42"}));
+    }
+
+    #[tokio::test]
+    async fn structured_run_errors_when_never_called() {
+        // The model just talks and never calls the tool — after the retry we get Err.
+        let schema = json!({ "type": "object", "required": ["answer"] });
+        let provider = MockProvider::new(vec![]).with_default(MockReply::Text("hi".into()));
+        let mut agent = agent_with(Arc::new(provider));
+        assert!(agent.run_structured("go", schema).await.is_err());
     }
 }

@@ -71,14 +71,24 @@ impl ScrollbackRenderer {
         self.scroll_up == 0
     }
 
-    /// Map a click at screen `row` to the transcript cell index under it, if any.
-    pub fn hit_test(&self, row: u16) -> Option<usize> {
+    /// Map a click at screen `row` to the transcript cell index under it, plus
+    /// which line WITHIN that cell was clicked (0 = the cell's first rendered line).
+    /// The offset lets a cell that renders multiple interactive rows (e.g. a
+    /// workflow tree) map a click to a specific row.
+    pub fn hit_test_offset(&self, row: u16) -> Option<(usize, usize)> {
         let rect = self.rect?;
         if row < rect.y || row >= rect.y + rect.height {
             return None;
         }
         let line_idx = self.start + (row - rect.y) as usize;
-        self.line_owner.get(line_idx).copied().flatten()
+        let cell = self.line_owner.get(line_idx).copied().flatten()?;
+        // Count how many preceding lines belong to the same cell → the offset.
+        let offset = self.line_owner[..line_idx]
+            .iter()
+            .rev()
+            .take_while(|o| **o == Some(cell))
+            .count();
+        Some((cell, offset))
     }
 
     /// Draw the transcript into `full`. `working` + `spinner` + `turn_elapsed_secs`

@@ -6,6 +6,15 @@ use bob_core::core::events::AgentEvent;
 use bob_core::core::types::{ContentBlock, Message, Role};
 use serde_json::Value;
 
+/// Current unix time in whole seconds (for workflow-agent timing). Best-effort:
+/// a clock error yields 0, which just means a 0s duration.
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ToolStatus {
     Running,
@@ -54,6 +63,73 @@ pub enum Cell {
     /// A message delivered to/from an agent (shown only in the team drawer's
     /// per-agent threads). `from` is the sender ("root", "user", or an agent name).
     AgentMsg { from: String, text: String },
+    /// A live workflow run: its phases, each with the agents that ran in it. Built
+    /// from the workflow's own event stream (WorkflowPhase + the run's
+    /// SubagentSpawn/Done) so the run reads as one navigable tree instead of a flat
+    /// list of lines. Clicking an agent row opens that agent's transcript in the
+    /// team drawer.
+    Workflow {
+        /// The workflow run id (matches the `parent_id` on its agents' spawns).
+        id: String,
+        title: String,
+        phases: Vec<WfPhase>,
+        done: bool,
+    },
+}
+
+/// One phase of a workflow run and the agents that ran under it.
+#[derive(Clone)]
+pub struct WfPhase {
+    pub title: String,
+    /// 0-based phase index and the declared total, for a "2/3" progress readout.
+    pub index: usize,
+    pub total: usize,
+    pub agents: Vec<WfAgent>,
+}
+
+/// One agent within a workflow phase — its id (for drill-in), display label, live
+/// status, and per-run metadata (tools, model, tokens, timing) so the workflow
+/// view can show a rich master-detail without re-deriving from the event stream.
+#[derive(Clone)]
+pub struct WfAgent {
+    pub agent_id: String,
+    pub label: String,
+    pub status: WfStatus,
+    pub tools: usize,
+    /// Model that answered (from the agent's `Completion` events), if seen yet.
+    pub model: Option<String>,
+    /// Total input tokens across this agent's completions.
+    pub tokens: u64,
+    /// Wall-clock spawn→done in whole seconds, filled when the agent finishes.
+    pub duration_secs: Option<u64>,
+    /// Monotonic-ish spawn stamp (unix secs) used to compute `duration_secs`. Not
+    /// rendered directly.
+    pub started_unix: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum WfStatus {
+    Running,
+    Done,
+    Failed,
+}
+
+impl WfStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            WfStatus::Running => "running",
+            WfStatus::Done => "done",
+            WfStatus::Failed => "failed",
+        }
+    }
+    fn from_str(s: &str) -> Self {
+        match s {
+            "failed" => WfStatus::Failed,
+            "running" => WfStatus::Running,
+            _ => WfStatus::Done,
+        }
+    }
 }
 
 impl Cell {
@@ -115,8 +191,59 @@ impl Cell {
                 from.hash(&mut h);
                 text.hash(&mut h);
             }
+            Cell::Workflow {
+                id,
+                title,
+                phases,
+                done,
+            } => {
+                id.hash(&mut h);
+                title.hash(&mut h);
+                done.hash(&mut h);
+                for p in phases {
+                    p.title.hash(&mut h);
+                    p.index.hash(&mut h);
+                    p.total.hash(&mut h);
+                    for a in &p.agents {
+                        a.agent_id.hash(&mut h);
+                        a.label.hash(&mut h);
+                        (a.status as u8).hash(&mut h);
+                        a.tools.hash(&mut h);
+                    }
+                }
+            }
         }
         h.finish()
+    }
+
+    /// For a `Cell::Workflow`, map a rendered-line `offset` (0 = the cell's first
+    /// line) to the agent id on that row, if the row is an agent row. Mirrors the
+    /// line emission order in `render::render_workflow` for the RUNNING (expanded)
+    /// layout: line 0 is the header, then per phase one branch line followed by one
+    /// line per agent. Returns None for the header/phase/blank rows, for a collapsed
+    /// (done) run, or for any non-workflow cell.
+    pub fn workflow_agent_at(&self, offset: usize) -> Option<&str> {
+        let Cell::Workflow { phases, done, .. } = self else {
+            return None;
+        };
+        if *done {
+            return None; // collapsed to a single summary line
+        }
+        // Row 0 = header. Walk phases accumulating rows.
+        let mut row = 1usize;
+        for phase in phases {
+            if offset == row {
+                return None; // the phase branch line
+            }
+            row += 1;
+            for agent in &phase.agents {
+                if offset == row {
+                    return Some(&agent.agent_id);
+                }
+                row += 1;
+            }
+        }
+        None
     }
 }
 
@@ -248,6 +375,10 @@ pub struct ViewModel {
     /// never mutates the view) leaves it untouched, so scrolling does no rebuild
     /// work regardless of transcript length.
     pub revision: u64,
+    /// The workflow-run id currently receiving events, so its phase/agent events
+    /// land in the right `Cell::Workflow` instead of flat lines. Set on the first
+    /// `WorkflowPhase`/`SubagentSpawn` of a run; cleared when the run ends.
+    active_workflow: Option<String>,
 }
 
 impl ViewModel {
@@ -308,6 +439,63 @@ impl ViewModel {
         self.revision += 1;
     }
 
+    /// Find a workflow run's cell by id (for the full-screen view). Returns the
+    /// (title, phases, done) so the view can render + navigate it.
+    pub fn workflow_by_id(&self, id: &str) -> Option<(&str, &[WfPhase], bool)> {
+        self.cells.iter().find_map(|c| match c {
+            Cell::Workflow {
+                id: wid,
+                title,
+                phases,
+                done,
+            } if wid == id => Some((title.as_str(), phases.as_slice(), *done)),
+            _ => None,
+        })
+    }
+
+    /// Extract the finished workflow trees for session persistence, in transcript
+    /// order (matches the order of their `[workflow result]` hand-off messages, so
+    /// hydrate can pair them up by position). Only `done` runs are persisted — a
+    /// run still in flight isn't saved (it'll re-run or be abandoned).
+    pub fn to_persisted_workflows(&self) -> Vec<bob_core::core::session::PersistedWorkflow> {
+        self.cells
+            .iter()
+            .filter_map(|c| match c {
+                Cell::Workflow {
+                    id,
+                    title,
+                    phases,
+                    done: true,
+                } => Some(bob_core::core::session::PersistedWorkflow {
+                    id: id.clone(),
+                    title: title.clone(),
+                    phases: phases
+                        .iter()
+                        .map(|p| bob_core::core::session::PersistedWfPhase {
+                            title: p.title.clone(),
+                            index: p.index,
+                            total: p.total,
+                            agents: p
+                                .agents
+                                .iter()
+                                .map(|a| bob_core::core::session::PersistedWfAgent {
+                                    agent_id: a.agent_id.clone(),
+                                    label: a.label.clone(),
+                                    status: a.status.as_str().to_string(),
+                                    tools: a.tools,
+                                    model: a.model.clone(),
+                                    tokens: a.tokens,
+                                    duration_secs: a.duration_secs,
+                                })
+                                .collect(),
+                        })
+                        .collect(),
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Toggle a tool cell's expanded/collapsed output at `idx`. Returns true if a
     /// tool cell was actually toggled. Going through this method (rather than poking
     /// `cells` directly) guarantees the render-cache revision is bumped, so the
@@ -323,8 +511,15 @@ impl ViewModel {
     }
 
     /// Rebuild the scrollback from a stored message history (on `--resume`).
-    /// Tool results are matched back to their tool_use cell by id.
-    pub fn hydrate(&mut self, messages: &[Message]) {
+    /// Tool results are matched back to their tool_use cell by id. `workflows` are
+    /// the persisted workflow trees, re-inserted in order at each `[workflow result]`
+    /// hand-off message so a resumed session shows past runs' trees.
+    pub fn hydrate(
+        &mut self,
+        messages: &[Message],
+        workflows: &[bob_core::core::session::PersistedWorkflow],
+    ) {
+        let mut wf_iter = workflows.iter();
         for m in messages {
             match m.role {
                 Role::User => {
@@ -342,6 +537,14 @@ impl ViewModel {
                     // — they're internal, not user turns. (Shared marker so this
                     // can't drift from the injector; see agent::team.)
                     if bob_core::agent::team::is_coord_message(&text) {
+                        continue;
+                    }
+                    // A workflow hand-off message: don't render the literal prompt;
+                    // instead re-insert the persisted workflow tree that preceded it.
+                    if bob_core::workflow::is_handoff(&text) {
+                        if let Some(pw) = wf_iter.next() {
+                            self.cells.push(persisted_workflow_to_cell(pw));
+                        }
                         continue;
                     }
                     // A user turn may carry tool_results (role=tool is stored as
@@ -364,6 +567,16 @@ impl ViewModel {
                                 });
                             }
                             ContentBlock::ToolUse { id, name, input } => {
+                                // A `workflow` tool call's visible artifact is the
+                                // live tree cell, not a tool line — so on resume,
+                                // re-insert the persisted tree here (paired in order),
+                                // exactly as the live path renders it.
+                                if name == "workflow" {
+                                    if let Some(pw) = wf_iter.next() {
+                                        self.cells.push(persisted_workflow_to_cell(pw));
+                                    }
+                                    continue;
+                                }
                                 self.cells.push(Cell::Tool {
                                     id: id.clone(),
                                     name: name.clone(),
@@ -454,6 +667,37 @@ impl ViewModel {
             .find(|c| matches!(c, Cell::Subagent { agent_id, .. } if agent_id == id))
     }
 
+    /// The `WfAgent` with the given id inside any live workflow cell, if present.
+    /// Workflow agents are keyed by their full id (e.g. "wf-demo.1-gather-1").
+    fn find_wf_agent(&mut self, id: &str) -> Option<&mut WfAgent> {
+        self.cells.iter_mut().rev().find_map(|c| match c {
+            Cell::Workflow { phases, .. } => phases
+                .iter_mut()
+                .flat_map(|p| p.agents.iter_mut())
+                .find(|a| a.agent_id == id),
+            _ => None,
+        })
+    }
+
+    /// The `Cell::Workflow` for the given run id, if present.
+    fn find_workflow(&mut self, id: &str) -> Option<&mut Cell> {
+        self.cells
+            .iter_mut()
+            .rev()
+            .find(|c| matches!(c, Cell::Workflow { id: wid, .. } if wid == id))
+    }
+
+    /// Whether `parent_id` names a live workflow run (its spawns group into the
+    /// tree). True for the active run or any existing workflow cell.
+    fn is_workflow_parent(&self, parent_id: &str) -> bool {
+        self.active_workflow.as_deref() == Some(parent_id)
+            || parent_id.starts_with("wf-")
+            || self
+                .cells
+                .iter()
+                .any(|c| matches!(c, Cell::Workflow { id, .. } if id == parent_id))
+    }
+
     /// Apply one agent event to the model.
     pub fn apply(&mut self, event: &AgentEvent) {
         // Any applied event may mutate cells (append, or update a tool/subagent
@@ -462,17 +706,35 @@ impl ViewModel {
         self.revision += 1;
         // Events from spawned subagents (agent_id like "task_1") only update the
         // count/done state of their Subagent cell — their inner chatter is never
-        // rendered as its own cells.
+        // rendered as its own cells. A workflow agent (id "wf-…") updates its row in
+        // the workflow tree instead.
         if let Some(id) = subagent_id(event) {
             match event {
                 AgentEvent::ToolCall { .. } => {
-                    if let Some(Cell::Subagent { tools, .. }) = self.find_subagent(id) {
+                    if let Some(a) = self.find_wf_agent(id) {
+                        a.tools += 1;
+                    } else if let Some(Cell::Subagent { tools, .. }) = self.find_subagent(id) {
                         *tools += 1;
                     }
                 }
                 AgentEvent::TurnEnd { .. } => {
-                    if let Some(Cell::Subagent { done, .. }) = self.find_subagent(id) {
+                    if let Some(a) = self.find_wf_agent(id) {
+                        // A workflow agent's completion is authoritatively marked by
+                        // SubagentDone (which carries failed); TurnEnd only nudges a
+                        // still-Running row toward done as a fallback.
+                        if a.status == WfStatus::Running {
+                            a.status = WfStatus::Done;
+                        }
+                    } else if let Some(Cell::Subagent { done, .. }) = self.find_subagent(id) {
                         *done = true;
+                    }
+                }
+                AgentEvent::Completion { model, usage, .. } => {
+                    // Capture the agent's model + accumulate its input tokens for the
+                    // workflow view's per-agent metadata.
+                    if let Some(a) = self.find_wf_agent(id) {
+                        a.model = Some(model.clone());
+                        a.tokens += usage.total_input();
                     }
                 }
                 _ => {}
@@ -483,6 +745,14 @@ impl ViewModel {
         match event {
             AgentEvent::TurnStart { .. } => {
                 self.busy = true;
+                // A root TurnStart while a workflow is active is the hand-off turn
+                // that runs AFTER the workflow finished — so mark the run done and
+                // stop routing further events into its tree.
+                if let Some(id) = self.active_workflow.take() {
+                    if let Some(Cell::Workflow { done, .. }) = self.find_workflow(&id) {
+                        *done = true;
+                    }
+                }
             }
             AgentEvent::SubagentSpawn {
                 agent_id,
@@ -490,17 +760,54 @@ impl ViewModel {
                 task,
                 ..
             } => {
-                self.cells.push(Cell::Subagent {
-                    agent_id: agent_id.clone(),
-                    parent_id: parent_id.clone(),
-                    task: task.clone(),
-                    tools: 0,
-                    done: false,
-                    failed: false,
-                });
+                if self.is_workflow_parent(parent_id) {
+                    // Attach the agent to the current phase of its workflow's tree
+                    // rather than pushing a standalone Subagent cell.
+                    self.active_workflow = Some(parent_id.clone());
+                    if let Some(Cell::Workflow { phases, .. }) = self.find_workflow(parent_id) {
+                        let agent = WfAgent {
+                            agent_id: agent_id.clone(),
+                            label: task.clone(),
+                            status: WfStatus::Running,
+                            tools: 0,
+                            model: None,
+                            tokens: 0,
+                            duration_secs: None,
+                            started_unix: unix_secs(),
+                        };
+                        // Land it in the last (current) phase; if a run somehow
+                        // spawned before any phase, create an implicit one.
+                        if let Some(last) = phases.last_mut() {
+                            last.agents.push(agent);
+                        } else {
+                            phases.push(WfPhase {
+                                title: String::new(),
+                                index: 0,
+                                total: 1,
+                                agents: vec![agent],
+                            });
+                        }
+                    }
+                } else {
+                    self.cells.push(Cell::Subagent {
+                        agent_id: agent_id.clone(),
+                        parent_id: parent_id.clone(),
+                        task: task.clone(),
+                        tools: 0,
+                        done: false,
+                        failed: false,
+                    });
+                }
             }
             AgentEvent::SubagentDone { agent_id, failed } => {
-                if let Some(Cell::Subagent {
+                if let Some(a) = self.find_wf_agent(agent_id) {
+                    a.status = if *failed {
+                        WfStatus::Failed
+                    } else {
+                        WfStatus::Done
+                    };
+                    a.duration_secs = Some(unix_secs().saturating_sub(a.started_unix));
+                } else if let Some(Cell::Subagent {
                     done, failed: f, ..
                 }) = self.find_subagent(agent_id)
                 {
@@ -531,9 +838,88 @@ impl ViewModel {
                 self.cells
                     .push(Cell::Event(format!("Sent a message to {}", to)));
             }
+            // A workflow phase boundary: ensure the run's Cell::Workflow exists and
+            // append this phase to its tree. Subsequent spawns attach to it.
+            AgentEvent::WorkflowPhase {
+                workflow_id,
+                title,
+                index,
+                total,
+            } => {
+                self.active_workflow = Some(workflow_id.clone());
+                if self.find_workflow(workflow_id).is_none() {
+                    // Derive a display title from the id ("wf-demo" → "demo").
+                    let display = workflow_id
+                        .strip_prefix("wf-")
+                        .unwrap_or(workflow_id)
+                        .to_string();
+                    self.cells.push(Cell::Workflow {
+                        id: workflow_id.clone(),
+                        title: display,
+                        phases: Vec::new(),
+                        done: false,
+                    });
+                }
+                if let Some(Cell::Workflow { phases, .. }) = self.find_workflow(workflow_id) {
+                    phases.push(WfPhase {
+                        title: title.clone(),
+                        index: *index,
+                        total: *total,
+                        agents: Vec::new(),
+                    });
+                }
+            }
+            // A freeform workflow log line stays a simple event line.
+            AgentEvent::WorkflowLog { message, .. } => {
+                self.cells.push(Cell::Event(message.clone()));
+            }
+            // A root ToolResult while a workflow is active is the `workflow` tool
+            // returning (it runs synchronously in the turn) — mark the run done so
+            // its tree collapses/finalizes without waiting for the next turn.
+            AgentEvent::ToolResult { .. } => {
+                if let Some(id) = self.active_workflow.take() {
+                    if let Some(Cell::Workflow { done, .. }) = self.find_workflow(&id) {
+                        *done = true;
+                    }
+                }
+                apply_content_event(&mut self.cells, event, false);
+            }
             // All other content events reduce via the shared helper (messages off).
             _ => apply_content_event(&mut self.cells, event, false),
         }
+    }
+}
+
+/// Rebuild a `Cell::Workflow` from its persisted form (always `done`, since only
+/// finished runs are persisted).
+fn persisted_workflow_to_cell(pw: &bob_core::core::session::PersistedWorkflow) -> Cell {
+    Cell::Workflow {
+        id: pw.id.clone(),
+        title: pw.title.clone(),
+        done: true,
+        phases: pw
+            .phases
+            .iter()
+            .map(|p| WfPhase {
+                title: p.title.clone(),
+                index: p.index,
+                total: p.total,
+                agents: p
+                    .agents
+                    .iter()
+                    .map(|a| WfAgent {
+                        agent_id: a.agent_id.clone(),
+                        label: a.label.clone(),
+                        status: WfStatus::from_str(&a.status),
+                        tools: a.tools,
+                        model: a.model.clone(),
+                        tokens: a.tokens,
+                        duration_secs: a.duration_secs,
+                        started_unix: 0,
+                    })
+                    .collect(),
+            })
+            .collect(),
     }
 }
 
@@ -555,11 +941,198 @@ fn subagent_id(event: &AgentEvent) -> Option<&str> {
         | AgentEvent::Error { agent_id, .. } => agent_id.as_str(),
         AgentEvent::SubagentSpawn { .. } => return None,
         AgentEvent::SubagentDone { .. } => return None,
+        AgentEvent::WorkflowPhase { .. } => return None,
+        AgentEvent::WorkflowLog { .. } => return None,
         AgentEvent::AgentMessage { .. } => return None,
     };
     if id != "root" {
         Some(id)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod workflow_view_tests {
+    use super::*;
+    use bob_core::core::events::AgentEvent;
+
+    fn phase(id: &str, title: &str, index: usize, total: usize) -> AgentEvent {
+        AgentEvent::WorkflowPhase {
+            workflow_id: id.into(),
+            title: title.into(),
+            index,
+            total,
+        }
+    }
+    fn spawn(parent: &str, agent: &str, task: &str) -> AgentEvent {
+        AgentEvent::SubagentSpawn {
+            parent_id: parent.into(),
+            agent_id: agent.into(),
+            task: task.into(),
+            prompt: String::new(),
+        }
+    }
+    fn done(agent: &str, failed: bool) -> AgentEvent {
+        AgentEvent::SubagentDone {
+            agent_id: agent.into(),
+            failed,
+        }
+    }
+
+    #[test]
+    fn builds_a_phase_grouped_tree() {
+        let mut vm = ViewModel::new();
+        vm.apply(&phase("wf-demo", "Gather", 0, 2));
+        vm.apply(&spawn("wf-demo", "wf-demo.1-a", "gather-1"));
+        vm.apply(&spawn("wf-demo", "wf-demo.2-b", "gather-2"));
+        vm.apply(&done("wf-demo.1-a", false));
+        vm.apply(&done("wf-demo.2-b", false));
+        vm.apply(&phase("wf-demo", "Synthesize", 1, 2));
+        vm.apply(&spawn("wf-demo", "wf-demo.3-s", "synthesize"));
+        vm.apply(&done("wf-demo.3-s", false));
+
+        // Exactly one workflow cell, two phases, agents attached to the right phase.
+        let wf = vm
+            .cells
+            .iter()
+            .find_map(|c| match c {
+                Cell::Workflow { phases, .. } => Some(phases),
+                _ => None,
+            })
+            .expect("a workflow cell");
+        assert_eq!(wf.len(), 2);
+        assert_eq!(wf[0].title, "Gather");
+        assert_eq!(wf[0].agents.len(), 2);
+        assert!(wf[0].agents.iter().all(|a| a.status == WfStatus::Done));
+        assert_eq!(wf[1].title, "Synthesize");
+        assert_eq!(wf[1].agents.len(), 1);
+        assert_eq!(wf[1].agents[0].agent_id, "wf-demo.3-s");
+    }
+
+    #[test]
+    fn failed_agent_marks_row_failed() {
+        let mut vm = ViewModel::new();
+        vm.apply(&phase("wf-x", "Only", 0, 1));
+        vm.apply(&spawn("wf-x", "wf-x.1-a", "a"));
+        vm.apply(&done("wf-x.1-a", true));
+        let a = vm.cells.iter().find_map(|c| match c {
+            Cell::Workflow { phases, .. } => phases[0].agents.first(),
+            _ => None,
+        });
+        assert_eq!(a.unwrap().status, WfStatus::Failed);
+    }
+
+    #[test]
+    fn non_workflow_spawn_still_makes_a_flat_subagent_cell() {
+        let mut vm = ViewModel::new();
+        // A normal task_* subagent (parent "root") must NOT be swallowed by the tree.
+        vm.apply(&spawn("root", "task_1", "review"));
+        assert!(vm
+            .cells
+            .iter()
+            .any(|c| matches!(c, Cell::Subagent { agent_id, .. } if agent_id == "task_1")));
+        assert!(!vm.cells.iter().any(|c| matches!(c, Cell::Workflow { .. })));
+    }
+
+    #[test]
+    fn click_offset_maps_to_agent_id() {
+        let mut vm = ViewModel::new();
+        vm.apply(&phase("wf-demo", "Gather", 0, 1));
+        vm.apply(&spawn("wf-demo", "wf-demo.1-a", "gather-1"));
+        let cell = vm
+            .cells
+            .iter()
+            .find(|c| matches!(c, Cell::Workflow { .. }))
+            .unwrap();
+        // Row 0 = header, row 1 = phase branch, row 2 = the agent.
+        assert_eq!(cell.workflow_agent_at(0), None);
+        assert_eq!(cell.workflow_agent_at(1), None);
+        assert_eq!(cell.workflow_agent_at(2), Some("wf-demo.1-a"));
+    }
+
+    #[test]
+    fn workflow_persists_and_rehydrates() {
+        // Build a finished run, extract it, then rehydrate from a message history
+        // whose hand-off turn should re-materialize the tree in place.
+        let mut vm = ViewModel::new();
+        vm.apply(&phase("wf-demo", "Gather", 0, 1));
+        vm.apply(&spawn("wf-demo", "wf-demo.1-a", "gather-1"));
+        vm.apply(&done("wf-demo.1-a", false));
+        // A root TurnStart marks the run done (the hand-off turn).
+        vm.apply(&AgentEvent::TurnStart {
+            agent_id: "root".into(),
+        });
+
+        let persisted = vm.to_persisted_workflows();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].phases[0].agents[0].status, "done");
+
+        // Rehydrate: a user turn, then the hand-off message, then the agent's reply.
+        let messages = vec![
+            Message::user_text("do the thing"),
+            Message::user_text(bob_core::workflow::handoff_prompt("demo", "{}")),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "summary".into(),
+                }],
+            },
+        ];
+        let mut restored = ViewModel::new();
+        restored.hydrate(&messages, &persisted);
+
+        // The hand-off text must NOT appear as a user cell; the tree must be back.
+        assert!(restored
+            .cells
+            .iter()
+            .any(|c| matches!(c, Cell::Workflow { done: true, .. })));
+        assert!(!restored
+            .cells
+            .iter()
+            .any(|c| matches!(c, Cell::User(t) if bob_core::workflow::is_handoff(t))));
+    }
+
+    #[test]
+    fn tool_path_workflow_persists_and_rehydrates() {
+        // The `workflow` TOOL path: the run is marked done by the root ToolResult,
+        // and on resume the tree re-inserts at the workflow tool_use in history.
+        let mut vm = ViewModel::new();
+        vm.apply(&phase("wf-hunt-1", "Round 1", 0, 1));
+        vm.apply(&spawn("wf-hunt-1", "wf-hunt-1.1-a", "find:r1"));
+        vm.apply(&done("wf-hunt-1.1-a", false));
+        // The root's ToolResult (the workflow tool returning) marks the run done.
+        vm.apply(&AgentEvent::ToolResult {
+            agent_id: "root".into(),
+            tool_use_id: "tu1".into(),
+            output: "{}".into(),
+            is_error: false,
+        });
+        let persisted = vm.to_persisted_workflows();
+        assert_eq!(persisted.len(), 1);
+
+        // History: a user turn, then an assistant turn whose tool_use is `workflow`.
+        let messages = vec![
+            Message::user_text("hunt for bugs"),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "tu1".into(),
+                    name: "workflow".into(),
+                    input: serde_json::json!({"shape": "loop"}),
+                }],
+            },
+        ];
+        let mut restored = ViewModel::new();
+        restored.hydrate(&messages, &persisted);
+        // The tree is back, and NO bare `workflow` tool cell was rendered.
+        assert!(restored
+            .cells
+            .iter()
+            .any(|c| matches!(c, Cell::Workflow { done: true, .. })));
+        assert!(!restored
+            .cells
+            .iter()
+            .any(|c| matches!(c, Cell::Tool { name, .. } if name == "workflow")));
     }
 }

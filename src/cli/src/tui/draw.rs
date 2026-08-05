@@ -4,6 +4,7 @@
 //! child module, they can access App's private fields directly.
 
 use super::theme::Palette;
+use super::widgets::{divider_col, inset};
 use super::{indent_line, render, team, truncate_mid, App};
 use bob_core::core::permissions::Mode;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -11,10 +12,13 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 
-/// Horizontal breathing room inside the input band, in columns per side. The
-/// height calc and the renderer BOTH inset the text by this, so wrapping agrees
-/// and the band grows to fit exactly (mismatched widths clipped long lines).
-const INPUT_PAD: u16 = 3;
+/// Horizontal breathing room INSIDE the input band (columns per side), on top of
+/// the band's own 2-col float. Kept at 1 so the input text aligns with the floating
+/// user-message bubble in the transcript (band inset 2 + this).
+const INPUT_PAD: u16 = 1;
+
+/// Width of the collapsible info sidebar (agents/LSP/MCP), in columns.
+const SIDEBAR_W: u16 = 44;
 
 impl App {
     /// Build the wrapped, prompt-prefixed display lines for the input box, given
@@ -30,12 +34,15 @@ impl App {
         let indent = || Span::styled("  ", Style::default());
 
         if self.input.text().is_empty() && !busy {
+            // A focused subagent conversation looks IDENTICAL to root — the sidebar
+            // bold is the only indicator of which agent you're in.
+            let placeholder = match &self.focused_agent {
+                Some(_) => "send a message...  (esc → main)",
+                None => "send a message...  (Ctrl+J or Shift+Enter for newline)",
+            };
             return vec![Line::from(vec![
                 marker(),
-                Span::styled(
-                    "send a message...  (Ctrl+J or Shift+Enter for newline)",
-                    Style::default().fg(Palette::FAINT()),
-                ),
+                Span::styled(placeholder, Style::default().fg(Palette::FAINT())),
             ])];
         }
 
@@ -63,7 +70,15 @@ impl App {
         // (1 pad row above + N text rows + 1 pad row below), capped so it can't
         // eat the whole screen. Use the SAME inset width the renderer uses, or the
         // height won't match the wrapped line count.
-        let text_width = area.width.saturating_sub(INPUT_PAD * 2) as usize;
+        // The band is inset 4 cols each side (see draw_input), so the usable text
+        // width is the content width minus that inset AND the internal INPUT_PAD.
+        // The content column is narrower when the sidebar is open.
+        let content_w = if self.sidebar_open {
+            area.width.saturating_sub(SIDEBAR_W)
+        } else {
+            area.width
+        };
+        let text_width = content_w.saturating_sub(8 + INPUT_PAD * 2) as usize;
         let wrapped = self
             .input_lines(text_width, self.running || self.view.busy)
             .len();
@@ -72,7 +87,7 @@ impl App {
 
         // The band above the input shows either a permission prompt or a user
         // question (they don't co-occur), sized to its content.
-        let prompt_height = if self.pending_perm.is_some() {
+        let prompt_height = if !self.perm_queue.is_empty() {
             // Count lines at the SAME padded width the renderer uses (2 cols each
             // side), +2 for the top padding row and a bottom breathing row.
             let inner_w = (area.width.saturating_sub(4)) as usize;
@@ -111,6 +126,20 @@ impl App {
             (self.queue.len() as u16 + 1).min(6)
         };
 
+        // When the info sidebar is open, carve a FULL-HEIGHT column off the right of
+        // the screen first (top → bottom), and lay everything else out in the left
+        // column. Collapsed → the content uses the whole width.
+        let (content_area, sidebar_area) = if self.sidebar_open {
+            let split = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Min(24), Constraint::Length(SIDEBAR_W)])
+                .split(area);
+            (split[0], Some(split[1]))
+        } else {
+            self.sidebar_rows = None;
+            (area, None)
+        };
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -122,10 +151,13 @@ impl App {
                 Constraint::Length(input_height),
                 Constraint::Length(1), // status bar below the input
             ])
-            .split(area);
+            .split(content_area);
 
         self.draw_scrollback(f, chunks[0]);
-        if self.pending_perm.is_some() {
+        if let Some(sb) = sidebar_area {
+            self.draw_sidebar(f, sb);
+        }
+        if !self.perm_queue.is_empty() {
             self.draw_permission(f, chunks[1]);
         } else if self.pending_query.is_some() {
             self.draw_query(f, chunks[1]);
@@ -139,21 +171,26 @@ impl App {
         if queue_height > 0 {
             self.draw_queue(f, chunks[4]);
         }
-        self.draw_input(f, chunks[5]);
+        let input_area = chunks[5];
+        self.draw_input(f, input_area);
         self.draw_status_bar(f, chunks[6]);
 
         if !self.menu.is_empty() {
-            self.draw_menu(f, chunks[5]);
+            self.draw_menu(f, input_area);
         }
         if !self.file_menu.is_empty() {
-            self.draw_file_menu(f, chunks[5]);
+            self.draw_file_menu(f, input_area);
         }
-        // The team drawer is a full overlay above everything else.
+        // The team drawer is a full overlay above everything else; the full-screen
+        // workflow view is another (they're mutually exclusive in practice).
         if self.team_drawer.is_some() {
             self.draw_team_drawer(f, area);
         } else {
             // Drop the stale roster hit-box so clicks don't select a hidden agent.
             self.roster_rect = None;
+        }
+        if self.workflow_view.is_some() {
+            self.draw_workflow_view(f, area);
         }
     }
 
@@ -315,7 +352,7 @@ impl App {
         };
         // Snapshot the fields we need so we can later take a mutable borrow of
         // `self.team_drawer` to write the clamped scroll back without a conflict.
-        let sel = drawer.selected;
+        let sel = drawer.list.selected;
         let hovered = drawer.hovered;
         let drawer_scroll = drawer.scroll;
         let compose_buf: Option<String> = drawer.composing.clone();
@@ -375,11 +412,8 @@ impl App {
         // Draw the faint divider down the middle column.
         {
             let dcol = body[1];
-            let divider: Vec<Line> = (0..dcol.height)
-                .map(|_| Line::from(Span::styled(" │", Style::default().fg(Palette::FAINT()))))
-                .collect();
             f.render_widget(
-                Paragraph::new(divider).style(Style::default().bg(Palette::BG())),
+                Paragraph::new(divider_col(dcol)).style(Style::default().bg(Palette::BG())),
                 dcol,
             );
         }
@@ -439,12 +473,7 @@ impl App {
         // the main scrollback. Inset the pane horizontally so content has breathing
         // room on both sides (and doesn't hug the divider), and so the full-width
         // user-message band wraps/pads to the SAME width it's rendered at.
-        let pane = Rect {
-            x: body[2].x + 1,
-            y: body[2].y,
-            width: body[2].width.saturating_sub(2),
-            height: body[2].height,
-        };
+        let pane = inset(body[2], 1);
         let pane_w = pane.width as usize;
         let mut transcript: Vec<Line> = vec![Line::from("")];
         if let Some(id) = order.get(sel) {
@@ -496,7 +525,278 @@ impl App {
         );
     }
 
+    /// Full-screen workflow view — a single scrollable pane with a collapsible
+    /// phase/agent tree. Phase headers (`▾ Map 4/4`) collapse/expand their agents;
+    /// the selected agent expands INLINE to show its Prompt / Activity / Outcome.
+    /// Chrome-free (no borders), full width so the detail reads well. ↑↓ move the
+    /// cursor, Enter toggles (collapse a phase / expand an agent), Esc closes.
+    fn draw_workflow_view(&mut self, f: &mut ratatui::Frame, area: Rect) {
+        use super::view::WfStatus;
+        let Some(vw) = self.workflow_view.as_ref() else {
+            return;
+        };
+        let sel = vw.selected;
+        let scroll = vw.scroll;
+        let collapsed = vw.collapsed.clone();
+        let Some((title, phases, done)) = self.view.workflow_by_id(&vw.run_id) else {
+            self.workflow_view = None;
+            self.wf_view_agents = None;
+            return;
+        };
+        let title = title.to_string();
+
+        f.render_widget(Clear, area);
+        f.render_widget(
+            Block::default().style(Style::default().bg(Palette::BG())),
+            area,
+        );
+        let outer = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2), // blank + one-line header
+                Constraint::Min(1),    // body
+                Constraint::Length(1), // hint
+            ])
+            .split(area);
+
+        // Header: everything on ONE line — title · N/N agents · time · status. The
+        // status reads "cancelled" when the shared cancel flag is set (an
+        // interrupted run whose agents are winding down).
+        let total_agents: usize = phases.iter().map(|p| p.agents.len()).sum();
+        let done_agents: usize = phases
+            .iter()
+            .flat_map(|p| &p.agents)
+            .filter(|a| a.status != WfStatus::Running)
+            .count();
+        let total_secs: u64 = phases
+            .iter()
+            .flat_map(|p| &p.agents)
+            .filter_map(|a| a.duration_secs)
+            .sum();
+        let cancelled = self.cancel.load(std::sync::atomic::Ordering::Relaxed);
+        let status = if cancelled {
+            "cancelled"
+        } else if done {
+            "done"
+        } else {
+            "running"
+        };
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled(
+                        format!("  {title}"),
+                        Style::default()
+                            .fg(Palette::TEXT())
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!(
+                            "    {done_agents}/{total_agents} agents · {} · {status}",
+                            super::fmt_duration(total_secs)
+                        ),
+                        Style::default().fg(Palette::DIM()),
+                    ),
+                ]),
+            ])
+            .style(Style::default().bg(Palette::BG())),
+            outer[0],
+        );
+
+        // Flatten the tree into selectable rows (phase headers + agents, honoring
+        // Split body: left = the collapsible tree, right = the selected agent's
+        // detail. A faint ` │` divider separates them (chrome-free, like the team
+        // drawer).
+        let body = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(42),
+                Constraint::Length(2),
+                Constraint::Min(20),
+            ])
+            .split(outer[1]);
+        let tree_area = Rect {
+            x: body[0].x + 1,
+            y: body[0].y,
+            width: body[0].width.saturating_sub(1),
+            height: body[0].height,
+        };
+        let tree_w = tree_area.width as usize;
+
+        // Flatten the tree into selectable rows (phase headers + agents, honoring
+        // collapse). The cursor `sel` indexes into this list.
+        let rows = workflow_rows(phases, &collapsed);
+
+        // Build one line per row.
+        let mut lines: Vec<Line> = Vec::new();
+        for (ri, row) in rows.iter().enumerate() {
+            let is_sel = ri == sel;
+            match row {
+                WfRow::Phase(pi) => {
+                    let p = &phases[*pi];
+                    let pstatus = phase_status(&p.agents);
+                    let done_n = p
+                        .agents
+                        .iter()
+                        .filter(|a| a.status != WfStatus::Running)
+                        .count();
+                    let caret = if collapsed.contains(pi) { "▸" } else { "▾" };
+                    let name_style = if is_sel {
+                        Style::default()
+                            .fg(Palette::TEXT())
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Palette::TEXT())
+                    };
+                    // "  ▾ • " chrome = 6 cols; reserve the count on the right.
+                    let count = format!("  {}/{}", done_n, p.agents.len());
+                    let avail = tree_w.saturating_sub(6 + count.chars().count()).max(4);
+                    let title = truncate_mid(&p.title, avail);
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("  {caret} "), Style::default().fg(Palette::DIM())),
+                        wf_dot(pstatus),
+                        Span::styled(format!(" {}", title), name_style),
+                        Span::styled(count, Style::default().fg(Palette::DIM())),
+                    ]));
+                }
+                WfRow::Agent(pi, ai) => {
+                    let a = &phases[*pi].agents[*ai];
+                    let is_last = *ai + 1 == phases[*pi].agents.len();
+                    let branch = if is_last { "└─" } else { "├─" };
+                    let label_style = if is_sel {
+                        Style::default()
+                            .fg(Palette::TEXT())
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Palette::TEXT())
+                    };
+                    // Duration only in the tree (model·tokens live in the detail pane).
+                    let dur = a
+                        .duration_secs
+                        .map(super::fmt_duration)
+                        .unwrap_or_else(|| format!("{} tools", a.tools));
+                    // Fixed left chrome: "    ├─ • " = 4 + 2 + 1 + 1 + 1 = 9 cols.
+                    const LEFT_CHROME: usize = 9;
+                    // Reserve room for the duration + a 2-col gap; truncate the label
+                    // to whatever's left so nothing overflows into the divider and the
+                    // duration always lands flush-right.
+                    let dur_w = dur.chars().count();
+                    let avail_label = tree_w.saturating_sub(LEFT_CHROME + dur_w + 2).max(4);
+                    let label = truncate_mid(&a.label, avail_label);
+                    let used = LEFT_CHROME + label.chars().count() + dur_w;
+                    let pad = tree_w.saturating_sub(used).max(1);
+                    // A still-running agent in a cancelled run is winding down → dim
+                    // grey dot (not the red "failed" it will momentarily report).
+                    let dot = if cancelled && a.status == WfStatus::Running {
+                        Span::styled("•".to_string(), Style::default().fg(Palette::FAINT()))
+                    } else {
+                        wf_dot(a.status)
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            format!("    {branch} "),
+                            Style::default().fg(Palette::FAINT()),
+                        ),
+                        dot,
+                        Span::styled(format!(" {}", label), label_style),
+                        Span::raw(" ".repeat(pad)),
+                        Span::styled(dur, Style::default().fg(Palette::DIM())),
+                    ]));
+                }
+            }
+        }
+
+        // Scroll + hit-test via the shared SelectList math (rows == lines here, so
+        // the cursor index maps 1:1 to a line). Seed it from the view's state, run
+        // the window, write the resolved scroll back.
+        let view_h = tree_area.height as usize;
+        let mut list = super::widgets::SelectList {
+            selected: sel,
+            scroll: scroll as usize,
+        };
+        let range = list.window(rows.len(), view_h);
+        let scroll = list.scroll;
+        if let Some(v) = self.workflow_view.as_mut() {
+            v.scroll = scroll as u16;
+        }
+
+        // Click hit-boxes: screen row → agent id (agent rows only).
+        let mut hit: Vec<(u16, String)> = Vec::new();
+        for ri in range.clone() {
+            let screen = tree_area.y + (ri - scroll) as u16;
+            if let WfRow::Agent(pi, ai) = rows[ri] {
+                hit.push((screen, phases[pi].agents[ai].agent_id.clone()));
+            }
+        }
+        self.wf_view_agents = Some(hit);
+
+        let visible: Vec<Line> = lines.into_iter().skip(scroll).collect();
+        f.render_widget(
+            Paragraph::new(visible).style(Style::default().bg(Palette::BG())),
+            tree_area,
+        );
+
+        // Divider — full height: spans the header rows down through the body (stops
+        // above the hint line), so the two columns read as one continuous split.
+        let dcol = Rect {
+            x: body[1].x,
+            y: area.y,
+            width: body[1].width,
+            height: outer[0].height + outer[1].height,
+        };
+        f.render_widget(
+            Paragraph::new(divider_col(dcol)).style(Style::default().bg(Palette::BG())),
+            dcol,
+        );
+
+        // Right pane: the selected agent's detail (Prompt / Activity / Outcome). A
+        // phase-header row shows a short phase summary instead.
+        // 1-col gap off the divider on the left, ~3 cols reserved on the right so
+        // wrapped text doesn't hug the terminal edge (the body lines carry their own
+        // 4-col indent, so we don't add more on the left).
+        let detail = Rect {
+            x: body[2].x + 1,
+            y: body[2].y,
+            width: body[2].width.saturating_sub(4),
+            height: body[2].height,
+        };
+        let dw = detail.width as usize;
+        let sel_agent = rows.get(sel).and_then(|r| match r {
+            WfRow::Agent(pi, ai) => phases[*pi].agents.get(*ai),
+            _ => None,
+        });
+        let mut dlines = detail_lines(self, sel_agent, dw);
+        // Body text (Prompt/Outcome) is indented 4 cols; wrap with a matching
+        // hanging indent so continuation rows stay aligned instead of hugging the
+        // divider.
+        let dlines: Vec<Line> = dlines
+            .drain(..)
+            .flat_map(|l| super::wrap_line_hanging(l, dw, 4))
+            .collect();
+        f.render_widget(
+            Paragraph::new(dlines).style(Style::default().bg(Palette::BG())),
+            detail,
+        );
+
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "  ↑↓ move · enter collapse phase · esc close",
+                Style::default().fg(Palette::FAINT()),
+            )))
+            .style(Style::default().bg(Palette::BG())),
+            outer[2],
+        );
+    }
+
     fn draw_scrollback(&mut self, f: &mut ratatui::Frame, full: Rect) {
+        // When focused on a subagent, the left pane shows THAT agent's transcript
+        // (rendered directly from its captured thread) instead of the root
+        // conversation. Selecting "main" clears focus and restores the root view.
+        if let Some(id) = self.focused_agent.clone() {
+            self.draw_focused_agent(f, full, &id);
+            return;
+        }
         let working = self.running || self.view.busy;
         let secs = self
             .turn_started
@@ -504,6 +804,114 @@ impl App {
             .unwrap_or(0);
         self.scrollback
             .render(f, full, &self.view, working, self.spinner, secs);
+    }
+
+    /// Render a focused agent's transcript in the main pane — laid out exactly like
+    /// the root conversation (same side padding, `render_cell`), so a subagent chat
+    /// is indistinguishable from root. The sidebar's bold row is the only indicator
+    /// of which agent you're in.
+    fn draw_focused_agent(&mut self, f: &mut ratatui::Frame, full: Rect, id: &str) {
+        let pane = inset(full, 2);
+        let w = pane.width as usize;
+        let mut lines: Vec<Line> = vec![Line::from("")];
+        if let Some(t) = self.teams.get(id) {
+            for cell in &t.cells {
+                render::render_cell(cell, w, &mut lines);
+            }
+        } else {
+            lines.push(Line::from(Span::styled(
+                "  (no transcript captured for this agent)",
+                Style::default().fg(Palette::FAINT()),
+            )));
+        }
+        // Wrap + pin to the bottom (show the latest activity).
+        let lines: Vec<Line> = lines
+            .into_iter()
+            .flat_map(|l| super::wrap_line(l, w))
+            .collect();
+        let view_h = pane.height as usize;
+        let skip = lines.len().saturating_sub(view_h);
+        let visible: Vec<Line> = lines.into_iter().skip(skip).collect();
+        f.render_widget(
+            Paragraph::new(visible).style(Style::default().bg(Palette::BG())),
+            pane,
+        );
+    }
+
+    /// The collapsible right info sidebar (lighter background). AGENTS section: a
+    /// tree with "main" (the root conversation) plus each running agent, indented by
+    /// spawn depth. The selected row is the focused conversation. Records screen-row
+    /// → agent-id hit-boxes so clicks select. (LSP/MCP sections come later.)
+    fn draw_sidebar(&mut self, f: &mut ratatui::Frame, area: Rect) {
+        // Lighter panel background to set the sidebar apart (opencode-style).
+        let bg = Style::default().bg(Palette::INPUT_BG());
+        f.render_widget(Clear, area);
+        f.render_widget(Block::default().style(bg), area);
+        let pane = inset(area, 1);
+        let w = pane.width as usize;
+
+        let running = self.teams.running_ids();
+        let mut lines: Vec<Line> = Vec::new();
+        let mut hit: Vec<(u16, String)> = Vec::new();
+
+        // Section header.
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("  AGENTS · {} running", running.len()),
+            bg.fg(Palette::DIM()),
+        )));
+
+        // Rows: index 0 = "main" (empty id), then the running agents.
+        let render_row = |lines: &mut Vec<Line>,
+                          hit: &mut Vec<(u16, String)>,
+                          idx: usize,
+                          id: &str,
+                          label: &str,
+                          depth: usize,
+                          meta: &str| {
+            let is_sel = idx == self.sidebar.selected;
+            let indent = "  ".repeat(depth);
+            // No chevron — the SELECTED (current) agent is just bold.
+            let name_style = if is_sel {
+                bg.fg(Palette::TEXT()).add_modifier(Modifier::BOLD)
+            } else {
+                bg.fg(Palette::TEXT())
+            };
+            let left = format!("  {indent}• {label}");
+            let pad = w.saturating_sub(left.chars().count() + meta.chars().count());
+            let row = pane.y + lines.len() as u16;
+            if row < pane.y + pane.height {
+                hit.push((row, id.to_string()));
+            }
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {indent}• "), bg.fg(Palette::RUNNING())),
+                Span::styled(label.to_string(), name_style),
+                Span::styled(" ".repeat(pad.max(1)), bg),
+                Span::styled(meta.to_string(), bg.fg(Palette::DIM())),
+            ]));
+        };
+
+        render_row(&mut lines, &mut hit, 0, "", "main", 0, "");
+        for (i, id) in running.iter().enumerate() {
+            let (label, meta) = self
+                .teams
+                .get(id)
+                .map(|t| (t.name.clone(), String::new()))
+                .unwrap_or_else(|| (id.clone(), String::new()));
+            let depth = self.teams.depth_of(id) + 1;
+            render_row(&mut lines, &mut hit, i + 1, id, &label, depth, &meta);
+        }
+
+        self.sidebar_rows = Some(hit);
+
+        // Footer hint.
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  ↑↓ select · esc main · ⌃g close",
+            bg.fg(Palette::FAINT()),
+        )));
+
+        f.render_widget(Paragraph::new(lines).style(bg), pane);
     }
 
     /// A one-line status bar below the input: cwd · branch · mode.
@@ -601,6 +1009,12 @@ impl App {
     }
 
     fn draw_input(&mut self, f: &mut ratatui::Frame, area: Rect) {
+        // Float the band to the SAME left edge as the transcript's user bubble:
+        // the scrollback insets everything by SIDE_PAD (2) and the user band adds
+        // its own MARGIN (2) on top, so its colored edge sits 4 cols in. Match that
+        // here (2 outer gutter + 2 band margin) so the input reads as the newest
+        // message in the same column as the conversation history.
+        let area = inset(area, 4);
         // Full-width band with a lighter background; no border. One blank row of
         // padding above (with status) and below; the middle grows with lines.
         let bg = Block::default().style(Style::default().bg(Palette::INPUT_BG()));
@@ -795,7 +1209,7 @@ impl App {
     /// Build all lines for the permission prompt: title, optional preview diff,
     /// numbered options, and the hint. Shared by height calc + render.
     fn permission_lines(&self, width: usize) -> Vec<Line<'static>> {
-        let Some(p) = &self.pending_perm else {
+        let Some(p) = self.perm_queue.front() else {
             return vec![];
         };
         let mut lines: Vec<Line> = Vec::new();
@@ -836,7 +1250,7 @@ impl App {
         }
 
         for (i, opt) in p.options.iter().enumerate() {
-            let selected = i == p.selected;
+            let selected = i == p.list.selected;
             let marker = if selected { "❯" } else { " " };
             let base = if opt.allow {
                 if opt.grant.is_some() {
@@ -861,15 +1275,21 @@ impl App {
                 Span::styled(opt.label.clone(), label_style),
             ]));
         }
+        // Base hint; when other prompts are waiting behind this one, show a counter
+        // so it's clear more approvals are queued (e.g. a workflow fan-out).
+        let mut hint = "↑↓ move · 1-9 pick · enter confirm · esc deny".to_string();
+        if self.perm_queue.len() > 1 {
+            hint.push_str(&format!("   ·   1 of {} pending", self.perm_queue.len()));
+        }
         lines.push(Line::from(Span::styled(
-            "↑↓ move · 1-9 pick · enter confirm · esc deny",
+            hint,
             Style::default().fg(Palette::FAINT()),
         )));
         lines
     }
 
     fn draw_permission(&mut self, f: &mut ratatui::Frame, area: Rect) {
-        if self.pending_perm.is_none() {
+        if self.perm_queue.is_empty() {
             return;
         }
         f.render_widget(Clear, area);
@@ -948,12 +1368,12 @@ impl App {
         const VISIBLE: usize = 10;
         let start = if total_rows <= VISIBLE {
             0
-        } else if q.selected < VISIBLE / 2 {
+        } else if q.list.selected < VISIBLE / 2 {
             0
-        } else if q.selected >= total_rows - VISIBLE / 2 {
+        } else if q.list.selected >= total_rows - VISIBLE / 2 {
             total_rows - VISIBLE
         } else {
-            q.selected - VISIBLE / 2
+            q.list.selected - VISIBLE / 2
         };
         let end = (start + VISIBLE).min(total_rows);
 
@@ -963,8 +1383,28 @@ impl App {
                 Style::default().fg(Palette::FAINT()),
             )));
         }
-        for (i, label, is_other) in &rows[start..end] {
-            let selected = *i == q.selected;
+        // Model-picker rows are "id\t<ctx label>"; align the id column across all
+        // rows so the context-window column lines up, and right-align the ctx
+        // labels so their units stack. id in the row color, window in dim accent.
+        let split_rows: Vec<Option<(&str, &str)>> =
+            rows.iter().map(|(_, l, _)| l.split_once('\t')).collect();
+        let id_col_w = split_rows
+            .iter()
+            .filter_map(|s| s.map(|(id, _)| id.chars().count()))
+            .max()
+            .unwrap_or(0);
+        let ctx_col_w = split_rows
+            .iter()
+            .filter_map(|s| s.map(|(_, ctx)| ctx.chars().count()))
+            .max()
+            .unwrap_or(0);
+
+        // Width of the widest 1-based index, so "5." and "10." both start the id
+        // column at the same offset (otherwise a 2-digit number shifts the row).
+        let num_w = format!("{}", total_rows).chars().count();
+
+        for (row_idx, (i, label, is_other)) in rows[start..end].iter().enumerate() {
+            let selected = *i == q.list.selected;
             let marker = if selected { "❯" } else { " " };
             let base = if *is_other {
                 Palette::DIM()
@@ -976,14 +1416,32 @@ impl App {
             } else {
                 Style::default().fg(base)
             };
-            lines.push(Line::from(vec![
+            let mut spans = vec![
                 Span::styled(
                     format!(" {} ", marker),
                     Style::default().fg(Palette::ACCENT()),
                 ),
-                Span::styled(format!("{}. ", i + 1), Style::default().fg(Palette::DIM())),
-                Span::styled(label.clone(), style),
-            ]));
+                Span::styled(
+                    format!("{:>width$}. ", i + 1, width = num_w),
+                    Style::default().fg(Palette::DIM()),
+                ),
+            ];
+            if let Some((id, ctx)) = split_rows[start + row_idx] {
+                let id_pad = id_col_w.saturating_sub(id.chars().count());
+                let ctx_pad = ctx_col_w.saturating_sub(ctx.chars().count());
+                spans.push(Span::styled(id.to_string(), style));
+                // Gap between columns + left-pad so ctx labels are right-aligned.
+                spans.push(Span::raw(" ".repeat(id_pad + 2 + ctx_pad)));
+                spans.push(Span::styled(
+                    ctx.to_string(),
+                    Style::default()
+                        .fg(Palette::ACCENT())
+                        .add_modifier(Modifier::DIM),
+                ));
+            } else {
+                spans.push(Span::styled(label.clone(), style));
+            }
+            lines.push(Line::from(spans));
         }
         if end < total_rows {
             lines.push(Line::from(Span::styled(
@@ -1010,4 +1468,191 @@ impl App {
             area,
         );
     }
+}
+
+// --- workflow-view helpers -------------------------------------------------
+
+/// A selectable row in the collapsible workflow tree: a phase header, or an agent
+/// (with its phase + agent indices). Shared by the draw + the key/click handlers so
+/// the cursor maps to the same rows both see.
+#[derive(Clone, Copy)]
+pub(super) enum WfRow {
+    Phase(usize),
+    Agent(usize, usize),
+}
+
+/// Flatten the phase/agent tree into an ordered list of selectable rows, honoring
+/// which phases are `collapsed` (their agents are hidden).
+pub(super) fn workflow_rows(
+    phases: &[super::view::WfPhase],
+    collapsed: &std::collections::HashSet<usize>,
+) -> Vec<WfRow> {
+    let mut rows = Vec::new();
+    for (pi, p) in phases.iter().enumerate() {
+        rows.push(WfRow::Phase(pi));
+        if !collapsed.contains(&pi) {
+            for ai in 0..p.agents.len() {
+                rows.push(WfRow::Agent(pi, ai));
+            }
+        }
+    }
+    rows
+}
+
+/// A small colored status dot for a workflow row (matches the inline tree).
+fn wf_dot(status: super::view::WfStatus) -> Span<'static> {
+    use super::view::WfStatus;
+    let color = match status {
+        WfStatus::Running => Palette::RUNNING(),
+        WfStatus::Done => Palette::OK(),
+        WfStatus::Failed => Palette::ERROR(),
+    };
+    Span::styled("•".to_string(), Style::default().fg(color))
+}
+
+/// Aggregate status of a phase from its agents: Failed if any failed, Running if
+/// any still running, else Done.
+fn phase_status(agents: &[super::view::WfAgent]) -> super::view::WfStatus {
+    use super::view::WfStatus;
+    if agents.iter().any(|a| a.status == WfStatus::Failed) {
+        WfStatus::Failed
+    } else if agents.is_empty() || agents.iter().any(|a| a.status == WfStatus::Running) {
+        WfStatus::Running
+    } else {
+        WfStatus::Done
+    }
+}
+
+/// The right-aligned metadata string for an agent row: model · tokens · duration,
+/// omitting parts not known yet.
+fn agent_meta(a: &super::view::WfAgent) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(m) = &a.model {
+        parts.push(m.clone());
+    }
+    if a.tokens > 0 {
+        parts.push(format!("{} tok", super::fmt_tokens(a.tokens)));
+    }
+    match a.status {
+        super::view::WfStatus::Running => parts.push(format!("{} tools", a.tools)),
+        _ => {
+            if let Some(d) = a.duration_secs {
+                parts.push(super::fmt_duration(d));
+            }
+        }
+    }
+    parts.join(" · ")
+}
+
+/// Build the Detail-pane lines for one workflow agent: a status/meta line, then its
+/// Prompt / Activity / Outcome distilled from its team-drawer transcript cells.
+fn detail_lines(
+    app: &App,
+    agent: Option<&super::view::WfAgent>,
+    _width: usize,
+) -> Vec<Line<'static>> {
+    use super::view::{Cell, WfStatus};
+    let mut out: Vec<Line> = vec![Line::from("")];
+    let Some(agent) = agent else {
+        out.push(Line::from(Span::styled(
+            "  (no agent selected)",
+            Style::default().fg(Palette::DIM()),
+        )));
+        return out;
+    };
+
+    // Header: label + status + meta.
+    let status_word = match agent.status {
+        WfStatus::Running => "running",
+        WfStatus::Done => "done",
+        WfStatus::Failed => "failed",
+    };
+    out.push(Line::from(Span::styled(
+        format!("  {}", agent.label),
+        Style::default()
+            .fg(Palette::TEXT())
+            .add_modifier(Modifier::BOLD),
+    )));
+    out.push(Line::from(vec![
+        Span::raw("  "),
+        wf_dot(agent.status),
+        Span::styled(
+            format!(" {} · {}", status_word, agent_meta(agent)),
+            Style::default().fg(Palette::DIM()),
+        ),
+    ]));
+
+    // The agent's transcript (Prompt/Activity/Outcome) lives in the team store.
+    let thread = app.teams.get(&agent.agent_id);
+    let Some(thread) = thread else {
+        out.push(Line::from(""));
+        out.push(Line::from(Span::styled(
+            "  (transcript not captured)",
+            Style::default().fg(Palette::FAINT()),
+        )));
+        return out;
+    };
+
+    let section = |out: &mut Vec<Line>, name: &str| {
+        out.push(Line::from(""));
+        out.push(Line::from(Span::styled(
+            format!("  {name}"),
+            Style::default()
+                .fg(Palette::ACCENT())
+                .add_modifier(Modifier::BOLD),
+        )));
+    };
+
+    // Prompt: the first User cell (the delegated instructions).
+    if let Some(Cell::User(text)) = thread.cells.iter().find(|c| matches!(c, Cell::User(_))) {
+        section(&mut out, "Prompt");
+        for l in text.lines().take(12) {
+            out.push(Line::from(Span::styled(
+                format!("    {l}"),
+                Style::default().fg(Palette::TEXT()),
+            )));
+        }
+    }
+
+    // Activity: the tool calls, as `Name(arg)`.
+    let tools: Vec<&Cell> = thread
+        .cells
+        .iter()
+        .filter(|c| matches!(c, Cell::Tool { .. }))
+        .collect();
+    if !tools.is_empty() {
+        section(&mut out, "Activity");
+        for c in tools {
+            if let Cell::Tool { name, input, .. } = c {
+                let arg = input
+                    .get("path")
+                    .or_else(|| input.get("pattern"))
+                    .or_else(|| input.get("command"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                out.push(Line::from(Span::styled(
+                    format!("    {name}({arg})"),
+                    Style::default().fg(Palette::DIM()),
+                )));
+            }
+        }
+    }
+
+    // Outcome: the last assistant cell (the agent's final answer / structured out).
+    if let Some(Cell::Assistant { text, .. }) = thread
+        .cells
+        .iter()
+        .rev()
+        .find(|c| matches!(c, Cell::Assistant { .. }))
+    {
+        section(&mut out, "Outcome");
+        for l in text.lines().take(20) {
+            out.push(Line::from(Span::styled(
+                format!("    {l}"),
+                Style::default().fg(Palette::TEXT()),
+            )));
+        }
+    }
+
+    out
 }

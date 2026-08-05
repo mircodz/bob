@@ -89,3 +89,60 @@ pub async fn fetch_copilot_token(github_token: &str) -> anyhow::Result<(String, 
 pub fn github_token() -> Option<String> {
     AuthStore::load().get("copilot").map(|c| c.token.clone())
 }
+
+/// One model's capability limits from the Copilot `/models` response. Fields are
+/// optional because embedding models (and future entries) omit them.
+#[derive(Debug, Clone, Default)]
+pub struct ModelLimits {
+    pub id: String,
+    /// Total context window (input + output) the backend advertises.
+    pub max_context_window_tokens: Option<usize>,
+    /// The input-token budget — what actually bounds our compaction. This is the
+    /// window MINUS the reserved output allowance, so it's the number to size the
+    /// history against.
+    pub max_prompt_tokens: Option<usize>,
+    pub max_output_tokens: Option<usize>,
+}
+
+/// Fetch per-model capability limits from the Copilot `/models` endpoint using a
+/// freshly-minted Copilot token. Best-effort: returns an empty vec on any
+/// failure so callers can fall back to the static id-based heuristic.
+pub async fn fetch_model_limits(copilot_token: &str, api_base: &str) -> Vec<ModelLimits> {
+    let client = reqwest::Client::new();
+    let res = client
+        .get(format!("{}/models", api_base.trim_end_matches('/')))
+        .header("authorization", format!("Bearer {}", copilot_token))
+        .header("user-agent", "bob")
+        .header("editor-version", "bob/1.0")
+        .header("copilot-integration-id", "vscode-chat")
+        .send()
+        .await;
+    let Ok(res) = res else {
+        return Vec::new();
+    };
+    if !res.status().is_success() {
+        return Vec::new();
+    }
+    let Ok(v) = res.json::<serde_json::Value>().await else {
+        return Vec::new();
+    };
+    v["data"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| {
+                    let id = m["id"].as_str()?.to_string();
+                    let limits = &m["capabilities"]["limits"];
+                    Some(ModelLimits {
+                        id,
+                        max_context_window_tokens: limits["max_context_window_tokens"]
+                            .as_u64()
+                            .map(|n| n as usize),
+                        max_prompt_tokens: limits["max_prompt_tokens"].as_u64().map(|n| n as usize),
+                        max_output_tokens: limits["max_output_tokens"].as_u64().map(|n| n as usize),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}

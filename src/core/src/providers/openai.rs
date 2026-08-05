@@ -51,6 +51,10 @@ pub struct OpenAiProvider {
     model: String,
     base_url: String,
     client: reqwest::Client,
+    /// Explicit context window (input-token budget) for the active model, when a
+    /// caller knows it from an authoritative source (e.g. the Copilot /models
+    /// limits). None → fall back to the id-based heuristic in `context_window_for`.
+    context_window: Option<usize>,
 }
 
 impl OpenAiProvider {
@@ -65,6 +69,7 @@ impl OpenAiProvider {
             model: model.unwrap_or_else(|| "gpt-4o".to_string()),
             base_url,
             client: http_client(),
+            context_window: None,
         }
     }
 
@@ -76,7 +81,16 @@ impl OpenAiProvider {
             model,
             base_url: base_url.trim_end_matches('/').to_string(),
             client: http_client(),
+            context_window: None,
         }
+    }
+
+    /// Set an authoritative context window (input-token budget), overriding the
+    /// id-based heuristic. Used by the Copilot provider once it has fetched the
+    /// model's real `max_prompt_tokens` limit.
+    pub fn with_context_window(mut self, window: Option<usize>) -> Self {
+        self.context_window = window;
+        self
     }
 
     fn build_body(&self, opts: &GenerateOptions, stream: bool) -> Value {
@@ -159,7 +173,10 @@ impl Provider for OpenAiProvider {
     fn model(&self) -> &str {
         &self.model
     }
-
+    fn context_window(&self) -> usize {
+        self.context_window
+            .unwrap_or_else(|| crate::providers::provider::context_window_for(&self.model))
+    }
     async fn generate(&self, opts: GenerateOptions) -> anyhow::Result<Completion> {
         let body = self.build_body(&opts, false);
         let res = crate::providers::provider::send_with_retry(self.request(body).await?, "openai")
@@ -330,6 +347,48 @@ impl Provider for OpenAiProvider {
         ids.sort();
         ids.dedup();
         Ok(ids)
+    }
+
+    async fn list_models_detailed(
+        &self,
+    ) -> anyhow::Result<Vec<crate::providers::provider::ModelEntry>> {
+        use crate::providers::provider::{context_window_for, ModelEntry};
+        let req = self.client.get(format!("{}/models", self.base_url));
+        let res = self.authed(req).await?.send().await?;
+        if !res.status().is_success() {
+            anyhow::bail!(
+                "models {}: {}",
+                res.status(),
+                res.text().await.unwrap_or_default()
+            );
+        }
+        let data: Value = res.json().await?;
+        let mut entries: Vec<ModelEntry> = data["data"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|m| {
+                        let id = m["id"].as_str()?.to_string();
+                        // Prefer the backend's real input budget; some backends
+                        // (OpenAI-proper) omit limits, so fall back to the
+                        // id-based heuristic.
+                        let limits = &m["capabilities"]["limits"];
+                        let window = limits["max_prompt_tokens"]
+                            .as_u64()
+                            .or_else(|| limits["max_context_window_tokens"].as_u64())
+                            .map(|n| n as usize)
+                            .unwrap_or_else(|| context_window_for(&id));
+                        Some(ModelEntry {
+                            id,
+                            context_window: Some(window),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        entries.sort_by(|a, b| a.id.cmp(&b.id));
+        entries.dedup_by(|a, b| a.id == b.id);
+        Ok(entries)
     }
 }
 

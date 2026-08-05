@@ -14,6 +14,7 @@ mod scrollback;
 mod team;
 mod theme;
 mod view;
+mod widgets;
 
 use bob_core::agent::agent::Agent;
 use bob_core::core::config::BobConfig;
@@ -103,7 +104,7 @@ struct PendingPerm {
     detail: String,
     preview: Option<String>,
     options: Vec<PermissionOption>,
-    selected: usize,
+    list: widgets::SelectList,
     resp: oneshot::Sender<Option<usize>>,
 }
 
@@ -159,7 +160,8 @@ enum QueryPurpose {
 /// free-text ("Other…") entry buffer.
 struct PendingQuery {
     query: bob_core::tools::registry::UserQuery,
-    selected: usize,
+    /// Selection cursor over the options (+ the "Other" row when allowed).
+    list: widgets::SelectList,
     /// When the user picks "Other", this holds the typed answer (Some = typing).
     other_text: Option<String>,
     purpose: QueryPurpose,
@@ -193,6 +195,12 @@ impl Asker for TuiAsker {
                 describe_input(&req.tool, &req.input),
                 req.preview.clone(),
             )
+        };
+        // When a spawned/workflow agent is the requester, name it so a fan-out's
+        // prompts make clear WHO wants the permission.
+        let title = match &req.agent {
+            Some(name) => format!("{title}  — for {name}"),
+            None => title,
         };
         let (resp_tx, resp_rx) = oneshot::channel();
         let prompt = PermPrompt {
@@ -250,6 +258,44 @@ fn fmt_tokens(n: u64) -> String {
     } else {
         n.to_string()
     }
+}
+
+/// Format a whole-second duration compactly: "12s", "1m23s", "45m".
+pub(super) fn fmt_duration(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        let (m, s) = (secs / 60, secs % 60);
+        if s == 0 {
+            format!("{m}m")
+        } else {
+            format!("{m}m{s:02}s")
+        }
+    } else {
+        format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+/// Compact context-window label for the model picker, e.g. 1_000_000 → "1M ctx",
+/// 400_000 → "400k ctx". Trailing ".0" is trimmed so 1M reads as "1M", not "1.0M".
+fn fmt_ctx_window(tokens: usize) -> String {
+    let n = tokens as f64;
+    let mag = if tokens >= 1_000_000 {
+        let v = n / 1_000_000.0;
+        format!("{}M", trim_dot(v))
+    } else if tokens >= 1_000 {
+        let v = n / 1_000.0;
+        format!("{}k", trim_dot(v))
+    } else {
+        tokens.to_string()
+    };
+    format!("{} ctx", mag)
+}
+
+/// Format a float with one decimal, dropping a trailing ".0" (1.0 → "1", 1.5 → "1.5").
+fn trim_dot(v: f64) -> String {
+    let s = format!("{:.1}", v);
+    s.trim_end_matches(".0").to_string()
 }
 
 /// Display path with $HOME collapsed to `~`.
@@ -489,6 +535,8 @@ pub async fn run(
     app.cwd_label = abbreviate_home(&cwd);
     app.branch = git_branch(&cwd);
     app.lsp = lsp.clone();
+    app.bus = bus.clone();
+    app.system_prompt = system_prompt.clone();
     app.todos = Some(todos);
     // Load user-defined slash commands from .bob/commands/*.md (global + project).
     app.custom_commands = bob_core::core::commands::load_custom_commands(&cwd);
@@ -501,9 +549,9 @@ pub async fn run(
     app.session_usage = bob_core::core::usage::total_of(&session.usage);
     app.global_usage = bob_core::core::usage::global_total();
     if !session.messages.is_empty() {
-        app.view.hydrate(&session.messages);
-        app.view.push_notice(format!(
-            "resumed session {} ({} msgs)",
+        app.view.hydrate(&session.messages, &session.workflows);
+        app.view.push_event(format!(
+            "Resumed session {} ({} msgs)",
             session.id,
             session.messages.len()
         ));
@@ -555,7 +603,18 @@ pub async fn run(
                         match app.on_key(key.code, key.modifiers) {
                             KeyOutcome::Quit => break 'outer Ok(()),
                             KeyOutcome::Submit(text) => {
-                                if app.running {
+                                if let Some(id) = app.focused_agent.clone() {
+                                    // Focused on a subagent: the message goes TO it
+                                    // (the send_message path + coordination wake), not
+                                    // to root. Echo it into the agent's thread so it
+                                    // shows in the swapped transcript immediately.
+                                    if app.agent_team.send(&id, "user", &text) {
+                                        app.teams.push_message(&id, "user", &text, Some(&id));
+                                    } else {
+                                        app.notify(format!("{id} is not reachable"));
+                                    }
+                                    app.stick_to_bottom();
+                                } else if app.running {
                                     // A turn is in flight — queue this as a pinned
                                     // chip above the input (NOT the transcript). It's
                                     // pushed to the transcript + dispatched when the
@@ -641,9 +700,21 @@ pub async fn run(
                                 };
                                 app.notify("fetching models…");
                                 spawn_bg(&app.bg_tx, async move {
-                                    BgOutcome::ModelList(
-                                        prov.list_models().await.map_err(|e| e.to_string()),
-                                    )
+                                    // Prefer the detailed listing (id + context
+                                    // window) so the picker can show each model's
+                                    // window; format as "id\t(N ctx)" labels.
+                                    let res = prov.list_models_detailed().await.map(|entries| {
+                                        entries
+                                            .into_iter()
+                                            .map(|e| match e.context_window {
+                                                Some(w) => {
+                                                    format!("{}\t{}", e.id, fmt_ctx_window(w))
+                                                }
+                                                None => e.id,
+                                            })
+                                            .collect::<Vec<_>>()
+                                    });
+                                    BgOutcome::ModelList(res.map_err(|e| e.to_string()))
                                 });
                             }
                             KeyOutcome::ShowContext => {
@@ -747,12 +818,23 @@ pub async fn run(
                             }
                         }
                         MouseEventKind::Down(MouseButton::Left) => {
+                            // In the workflow view, a click on an agent row drills in.
                             // In the drawer, a click on a roster row selects that
                             // agent. In the main view, a click on a tool cell
                             // expands/collapses its output; a click elsewhere sticks
                             // to the bottom.
-                            if app.team_drawer.is_some() {
+                            if app.workflow_view.is_some() {
+                                app.click_workflow_view(m.column, m.row);
+                            } else if app.team_drawer.is_some() {
                                 app.click_roster(m.column, m.row);
+                            } else if app.sidebar_open
+                                && app
+                                    .sidebar_rows
+                                    .as_ref()
+                                    .is_some_and(|r| r.iter().any(|(row, _)| *row == m.row))
+                            {
+                                // A click on a sidebar agent row focuses that agent.
+                                app.click_sidebar(m.column, m.row);
                             } else if !app.click_scrollback(m.column, m.row) {
                                 app.stick_to_bottom();
                             }
@@ -787,7 +869,13 @@ pub async fn run(
                     };
                     session.usage.push(entry.clone());
                     app.session_usage.add(usage);
-                    let _ = bob_core::core::usage::append_global(&entry);
+                    // Append to the global ledger OFF the event-loop thread: a
+                    // workflow fan-out fires a burst of Completion events, and doing
+                    // synchronous file IO here per event would stall rendering (look
+                    // like a freeze). spawn_blocking keeps the loop responsive.
+                    tokio::task::spawn_blocking(move || {
+                        let _ = bob_core::core::usage::append_global(&entry);
+                    });
                 }
                 // Route to the right transcript: the main view always sees the
                 // event (it updates the "• Spawned" cell for subagents and ignores
@@ -796,7 +884,7 @@ pub async fn run(
                 let showing = app
                     .team_drawer
                     .as_ref()
-                    .and_then(|d| app.teams.display_order().get(d.selected).cloned());
+                    .and_then(|d| app.teams.display_order().get(d.list.selected).cloned());
                 app.teams.apply(&evt, showing.as_deref());
                 app.view.apply(&evt);
                 // Follow new output only when already pinned to the bottom. If the
@@ -808,12 +896,14 @@ pub async fn run(
             }
             Some(prompt) = perm_rx.recv() => {
                 dirty = true;
-                app.pending_perm = Some(PendingPerm {
+                // Queue behind any prompt already showing (don't clobber it — that
+                // would drop its response channel and silently deny that agent).
+                app.perm_queue.push_back(PendingPerm {
                     title: prompt.title,
                     detail: prompt.detail,
                     preview: prompt.preview,
                     options: prompt.options,
-                    selected: 0,
+                    list: widgets::SelectList::new(),
                     resp: prompt.resp,
                 });
             }
@@ -821,7 +911,7 @@ pub async fn run(
                 dirty = true;
                 app.pending_query = Some(PendingQuery {
                     query: q.query,
-                    selected: 0,
+                    list: widgets::SelectList::new(),
                     other_text: None,
                     purpose: QueryPurpose::Tool(q.resp),
                 });
@@ -842,6 +932,7 @@ pub async fn run(
                     session.todos = todos.items();
                 }
                 session.agent_threads = app.teams.to_persisted();
+                session.workflows = app.view.to_persisted_workflows();
                 session.updated_at = now_stamp();
                 let _ = save_session(&session);
                 drop(a);
@@ -907,10 +998,18 @@ pub async fn run(
                     } else {
                         let pending = {
                             // try_lock: an in-flight turn holds this; we'll re-check
-                            // on the next tick. Never block the render loop.
-                            match agent.try_lock() {
-                                Ok(mut a) => a.has_pending_coordination(),
-                                Err(_) => false,
+                            // on the next tick. Never block the render loop. Don't
+                            // re-drive a wake while a cancel is in flight — a
+                            // cancelled team's children may still be reporting back,
+                            // and waking here would resurrect the turn the user just
+                            // stopped. The flag clears at the next real user prompt.
+                            if app.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                                false
+                            } else {
+                                match agent.try_lock() {
+                                    Ok(mut a) => a.has_pending_coordination(),
+                                    Err(_) => false,
+                                }
                             }
                         };
                         if pending {
@@ -937,6 +1036,7 @@ pub async fn run(
             session.todos = todos.items();
         }
         session.agent_threads = app.teams.to_persisted();
+        session.workflows = app.view.to_persisted_workflows();
         session.updated_at = now_stamp();
         let _ = save_session(&session);
     }
@@ -1016,7 +1116,12 @@ struct App {
     view: ViewModel,
     input: input::Input,
     spinner: usize,
-    pending_perm: Option<PendingPerm>,
+    /// Pending permission prompts, oldest first. The FRONT is the one shown; the
+    /// rest wait their turn (their response channels stay alive so their agents
+    /// stay blocked rather than being silently denied). Concurrent fan-outs — a
+    /// workflow or `task` spawning many agents — can each raise a prompt at once,
+    /// so they queue instead of clobbering one another.
+    perm_queue: std::collections::VecDeque<PendingPerm>,
     /// Filtered slash-command menu, when the input starts with '/'. Owned strings
     /// so built-in and user-defined (custom) commands can share one list.
     menu: Vec<(String, String)>,
@@ -1083,6 +1188,11 @@ struct App {
     teams: team::AgentTranscripts,
     /// Team drawer overlay state; `None` when closed.
     team_drawer: Option<team::TeamDrawer>,
+    /// Full-screen workflow view overlay; `None` when closed.
+    workflow_view: Option<team::WorkflowView>,
+    /// The workflow view's per-selectable-row (screen row, agent id), set each
+    /// draw, so key-nav and clicks map to an agent. `None` when the view is closed.
+    wf_view_agents: Option<Vec<(u16, String)>>,
     /// Screen rect of the drawer's agent roster (set each draw), so left-clicks can
     /// be hit-tested to select an agent. `None` when the drawer is closed.
     roster_rect: Option<Rect>,
@@ -1090,6 +1200,20 @@ struct App {
     show_todos: bool,
     /// Shared team roster, so the drawer can message agents (send_message path).
     agent_team: bob_core::agent::team::AgentRegistry,
+    /// Event bus + composed system prompt, kept so `/workflow` can build a
+    /// `WorkflowContext` (agents + progress events route through the same bus).
+    bus: EventBus,
+    system_prompt: String,
+    /// The collapsible right info sidebar. `open` = shown (Ctrl+G toggles it,
+    /// manual-open only). `sidebar.selected` indexes the AGENTS tree (0 = "main").
+    sidebar_open: bool,
+    sidebar: widgets::SelectList,
+    /// The agent whose conversation the LEFT transcript is currently showing, and
+    /// which the input box talks to. `None` = the root conversation ("main").
+    focused_agent: Option<String>,
+    /// Screen-row → agent id hit map for the sidebar's AGENTS rows (set each draw),
+    /// so clicks select an agent. "main" maps to an empty id.
+    sidebar_rows: Option<Vec<(u16, String)>>,
 }
 
 /// The turn `/init` submits: asks the agent to survey the project and write an
@@ -1137,7 +1261,7 @@ impl App {
             view: ViewModel::new(),
             input: input::Input::new(),
             spinner: 0,
-            pending_perm: None,
+            perm_queue: std::collections::VecDeque::new(),
             menu: Vec::new(),
             custom_commands: Vec::new(),
             menu_sel: 0,
@@ -1172,9 +1296,17 @@ impl App {
             scrollback: scrollback::ScrollbackRenderer::new(),
             teams: team::AgentTranscripts::new(),
             team_drawer: None,
+            workflow_view: None,
+            wf_view_agents: None,
             roster_rect: None,
             show_todos: true,
             agent_team,
+            bus: EventBus::new(),
+            system_prompt: String::new(),
+            sidebar_open: false,
+            sidebar: widgets::SelectList::new(),
+            focused_agent: None,
+            sidebar_rows: None,
         }
     }
 
@@ -1264,7 +1396,7 @@ impl App {
                             options,
                             allow_other: true,
                         },
-                        selected: 0,
+                        list: widgets::SelectList::new(),
                         other_text: None,
                         purpose: QueryPurpose::ModelPicker,
                     });
@@ -1412,15 +1544,11 @@ impl App {
 
         match code {
             KeyCode::Up | KeyCode::Char('k') => {
-                if q.selected > 0 {
-                    q.selected -= 1;
-                }
+                q.list.up();
                 self.preview_theme_if_picking();
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                if q.selected + 1 < n {
-                    q.selected += 1;
-                }
+                q.list.down(n);
                 self.preview_theme_if_picking();
             }
             KeyCode::Char(c @ '1'..='9') => {
@@ -1430,7 +1558,7 @@ impl App {
                 }
             }
             KeyCode::Enter => {
-                let idx = q.selected;
+                let idx = q.list.selected;
                 return self.pick_query_option(idx);
             }
             KeyCode::Esc => {
@@ -1483,7 +1611,11 @@ impl App {
                 let _ = resp.send(Some(answer));
                 KeyOutcome::None
             }
-            QueryPurpose::ModelPicker => KeyOutcome::SwitchModel(answer),
+            QueryPurpose::ModelPicker => {
+                // The picker label is "id\t(N ctx)"; the spec is just the id.
+                let id = answer.split('\t').next().unwrap_or(&answer).to_string();
+                KeyOutcome::SwitchModel(id)
+            }
             QueryPurpose::ReasoningPicker => KeyOutcome::SetReasoning(answer),
             QueryPurpose::ThemePicker { .. } => {
                 // `answer` is the chosen theme name. It's already live (applied on
@@ -1505,7 +1637,7 @@ impl App {
         if !matches!(q.purpose, QueryPurpose::ThemePicker { .. }) {
             return;
         }
-        if let Some(name) = q.query.options.get(q.selected) {
+        if let Some(name) = q.query.options.get(q.list.selected) {
             theme::set_theme(theme::Theme::by_name(name));
         }
     }
@@ -1523,7 +1655,10 @@ impl App {
                 options,
                 allow_other: false,
             },
-            selected,
+            list: widgets::SelectList {
+                selected,
+                scroll: 0,
+            },
             other_text: None,
             purpose: QueryPurpose::ThemePicker {
                 original: current.to_string(),
@@ -1545,7 +1680,7 @@ impl App {
                 options,
                 allow_other: false,
             },
-            selected: 0,
+            list: widgets::SelectList::new(),
             other_text: None,
             purpose: QueryPurpose::ReasoningPicker,
         });
@@ -1586,8 +1721,8 @@ impl App {
             return;
         }
         if let Some(drawer) = self.team_drawer.as_mut() {
-            if drawer.selected != idx {
-                drawer.selected = idx;
+            if drawer.list.selected != idx {
+                drawer.list.selected = idx;
                 drawer.scroll = 0;
             }
         }
@@ -1600,10 +1735,62 @@ impl App {
     /// `row`. Maps the row → cell via the scrollback's hit-test; only `Cell::Tool`
     /// cells toggle. Returns true if something toggled (so the caller marks dirty).
     fn click_scrollback(&mut self, _col: u16, row: u16) -> bool {
-        match self.scrollback.hit_test(row) {
-            Some(cell_idx) => self.view.toggle_tool_expanded(cell_idx),
-            None => false,
+        let Some((cell_idx, offset)) = self.scrollback.hit_test_offset(row) else {
+            return false;
+        };
+        // A click on a workflow cell: an agent row drills into that agent's
+        // transcript (team drawer); the header/phase rows open the full-screen
+        // workflow view. Anything else falls back to the tool-expand toggle.
+        if let Some(cell) = self.view.cells.get(cell_idx) {
+            if let view::Cell::Workflow { id, .. } = cell {
+                if let Some(agent_id) = cell.workflow_agent_at(offset) {
+                    let id = agent_id.to_string();
+                    return self.open_drawer_on(&id);
+                }
+                // Header or phase row → open the full-screen view for this run.
+                let run_id = id.clone();
+                self.open_workflow_view(run_id);
+                return true;
+            }
         }
+        self.view.toggle_tool_expanded(cell_idx)
+    }
+
+    /// Open the full-screen workflow view for `run_id`.
+    fn open_workflow_view(&mut self, run_id: String) {
+        self.workflow_view = Some(team::WorkflowView {
+            run_id,
+            ..Default::default()
+        });
+    }
+
+    /// Open the team drawer focused on `agent_id` (used when clicking a workflow
+    /// tree row). Selects that agent, marks it read, and opens the drawer if closed.
+    /// Returns true if the drawer state changed.
+    fn open_drawer_on(&mut self, agent_id: &str) -> bool {
+        let order = self.teams.display_order();
+        let Some(idx) = order.iter().position(|id| id == agent_id) else {
+            // The agent isn't in the transcript store (shouldn't happen for a live
+            // workflow agent) — nothing to open.
+            return false;
+        };
+        self.teams.mark_read(agent_id);
+        match self.team_drawer.as_mut() {
+            Some(drawer) => {
+                drawer.list.selected = idx;
+                drawer.scroll = 0;
+            }
+            None => {
+                self.team_drawer = Some(team::TeamDrawer {
+                    list: widgets::SelectList {
+                        selected: idx,
+                        scroll: 0,
+                    },
+                    ..Default::default()
+                });
+            }
+        }
+        true
     }
 
     /// `hovered` to the roster index under the cursor, or `None` when off-roster.
@@ -1625,8 +1812,104 @@ impl App {
         false
     }
 
-    /// Keys while the team drawer is open. ↑/↓ (or j/k) select an agent, PgUp/
-    /// PgDn scroll the transcript, `i` compose a message, Esc/Ctrl+T close.
+    /// Key handling for the collapsible workflow view. ↑↓ move the cursor over the
+    /// flattened phase/agent rows; Enter toggles (collapse a phase / expand an
+    /// agent's inline detail); Esc closes. PgUp/PgDn jump the cursor.
+    fn handle_workflow_view_key(&mut self, code: KeyCode) -> KeyOutcome {
+        use draw::{workflow_rows, WfRow};
+        // Rebuild the current row list so the cursor clamps to what's visible.
+        let rows = self
+            .workflow_view
+            .as_ref()
+            .and_then(|vw| {
+                self.view
+                    .workflow_by_id(&vw.run_id)
+                    .map(|(_, phases, _)| workflow_rows(phases, &vw.collapsed))
+                    .map(|r| (vw, r))
+            })
+            .map(|(_, r)| r);
+        let Some(rows) = rows else {
+            return KeyOutcome::None;
+        };
+        let n = rows.len();
+        let Some(vw) = self.workflow_view.as_mut() else {
+            return KeyOutcome::None;
+        };
+        if vw.selected >= n {
+            vw.selected = n.saturating_sub(1);
+        }
+        match code {
+            KeyCode::Esc => {
+                self.workflow_view = None;
+                self.wf_view_agents = None;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if vw.selected > 0 {
+                    vw.selected -= 1;
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if vw.selected + 1 < n {
+                    vw.selected += 1;
+                }
+            }
+            KeyCode::PageUp => vw.selected = vw.selected.saturating_sub(10),
+            KeyCode::PageDown => vw.selected = (vw.selected + 10).min(n.saturating_sub(1)),
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                // Enter toggles a phase's collapse. On an agent it's a no-op — the
+                // detail pane already shows the selected agent.
+                if let Some(WfRow::Phase(pi)) = rows.get(vw.selected) {
+                    if vw.collapsed.contains(pi) {
+                        vw.collapsed.remove(pi);
+                    } else {
+                        vw.collapsed.insert(*pi);
+                    }
+                }
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                // Expand a collapsed phase.
+                if let Some(WfRow::Phase(pi)) = rows.get(vw.selected) {
+                    vw.collapsed.remove(pi);
+                }
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                // Collapse the phase under (or containing) the cursor.
+                match rows.get(vw.selected) {
+                    Some(WfRow::Phase(pi)) | Some(WfRow::Agent(pi, _)) => {
+                        vw.collapsed.insert(*pi);
+                    }
+                    None => {}
+                }
+            }
+            _ => {}
+        }
+        KeyOutcome::None
+    }
+
+    /// A left-click in the workflow view selects the clicked agent row (its detail
+    /// then shows in the right pane).
+    fn click_workflow_view(&mut self, _col: u16, row: u16) {
+        use draw::{workflow_rows, WfRow};
+        let Some(agent_id) = self
+            .wf_view_agents
+            .as_ref()
+            .and_then(|rows| rows.iter().find(|(r, _)| *r == row).map(|(_, s)| s.clone()))
+        else {
+            return;
+        };
+        if let Some(vw) = self.workflow_view.as_ref() {
+            if let Some((_, phases, _)) = self.view.workflow_by_id(&vw.run_id) {
+                let rows = workflow_rows(phases, &vw.collapsed);
+                let idx = rows.iter().position(|r| {
+                    matches!(r, WfRow::Agent(pi, ai) if phases[*pi].agents[*ai].agent_id == agent_id)
+                });
+                if let (Some(idx), Some(vw)) = (idx, self.workflow_view.as_mut()) {
+                    vw.selected = idx;
+                }
+            }
+        }
+    }
+
     fn handle_drawer_key(&mut self, code: KeyCode) -> KeyOutcome {
         let count = self.teams.len();
         // Compose mode: keys edit/submit the message to the selected agent.
@@ -1650,15 +1933,15 @@ impl App {
                 drawer.composing = Some(String::new());
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                if drawer.selected > 0 {
-                    drawer.selected -= 1;
+                if drawer.list.selected > 0 {
+                    drawer.list.up();
                     drawer.scroll = 0;
                     selection_changed = true;
                 }
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                if drawer.selected + 1 < count {
-                    drawer.selected += 1;
+                if drawer.list.selected + 1 < count {
+                    drawer.list.down(count);
                     drawer.scroll = 0;
                     selection_changed = true;
                 }
@@ -1672,7 +1955,7 @@ impl App {
             _ => {}
         }
         if selection_changed {
-            let sel = drawer.selected;
+            let sel = drawer.list.selected;
             if let Some(id) = self.teams.display_order().get(sel).cloned() {
                 self.teams.mark_read(&id);
             }
@@ -1707,6 +1990,36 @@ impl App {
         KeyOutcome::None
     }
 
+    /// Set `focused_agent` from the current sidebar selection: index 0 = "main"
+    /// (root, `None`), otherwise the running agent at that position.
+    fn apply_sidebar_focus(&mut self) {
+        if self.sidebar.selected == 0 {
+            self.focused_agent = None;
+            return;
+        }
+        let running = self.teams.running_ids();
+        self.focused_agent = running.get(self.sidebar.selected - 1).cloned();
+    }
+
+    /// A click in the sidebar selects that agent row (and focuses it). An empty id
+    /// is the "main" row → back to the root conversation.
+    fn click_sidebar(&mut self, _col: u16, row: u16) {
+        let Some(id) = self
+            .sidebar_rows
+            .as_ref()
+            .and_then(|rows| rows.iter().find(|(r, _)| *r == row).map(|(_, s)| s.clone()))
+        else {
+            return;
+        };
+        if id.is_empty() {
+            self.sidebar.selected = 0;
+            self.focused_agent = None;
+        } else if let Some(idx) = self.teams.running_ids().iter().position(|r| *r == id) {
+            self.sidebar.selected = idx + 1;
+            self.focused_agent = Some(id);
+        }
+    }
+
     /// Deliver the composed message into the selected agent's inbox, mirroring the
     /// `send_message` tool, and echo it into that agent's thread immediately.
     fn send_drawer_message(&mut self) {
@@ -1715,7 +2028,7 @@ impl App {
         };
         let text = drawer.composing.take().unwrap_or_default();
         let text = text.trim().to_string();
-        let sel = drawer.selected;
+        let sel = drawer.list.selected;
         if text.is_empty() {
             return;
         }
@@ -1744,9 +2057,42 @@ impl App {
             self.toggle_team_drawer();
             return KeyOutcome::None;
         }
+        // 0a-bis) Ctrl+G toggles the info sidebar (agents tree). Manual open only.
+        if code == KeyCode::Char('g') && mods.contains(KeyModifiers::CONTROL) {
+            self.sidebar_open = !self.sidebar_open;
+            return KeyOutcome::None;
+        }
+        // 0a-ter) While the sidebar is open, ↑/↓ move its selection and Enter/Esc
+        // switch the focused conversation — but ONLY when the input is empty, so
+        // typing a message is unaffected. Esc always returns to main when focused.
+        if self.sidebar_open {
+            match code {
+                KeyCode::Up if self.input.text().is_empty() => {
+                    self.sidebar.up();
+                    self.apply_sidebar_focus();
+                    return KeyOutcome::None;
+                }
+                KeyCode::Down if self.input.text().is_empty() => {
+                    let n = 1 + self.teams.running_ids().len();
+                    self.sidebar.down(n);
+                    self.apply_sidebar_focus();
+                    return KeyOutcome::None;
+                }
+                KeyCode::Esc if self.focused_agent.is_some() => {
+                    self.focused_agent = None;
+                    self.sidebar.selected = 0;
+                    return KeyOutcome::None;
+                }
+                _ => {}
+            }
+        }
         // 0a') While the drawer is open it owns the keyboard.
         if self.team_drawer.is_some() {
             return self.handle_drawer_key(code);
+        }
+        // 0a'') The full-screen workflow view owns the keyboard while open.
+        if self.workflow_view.is_some() {
+            return self.handle_workflow_view_key(code);
         }
 
         // 0b) A pending user question (ask_user / exit_plan) takes priority.
@@ -1755,35 +2101,32 @@ impl App {
         }
 
         // 1) Permission prompt takes priority — a select, driven by arrows,
-        //    digits (1-9), Enter (confirm), or Esc/Ctrl+C (deny).
-        if let Some(p) = &mut self.pending_perm {
+        //    digits (1-9), Enter (confirm), or Esc/Ctrl+C (deny). The FRONT of the
+        //    queue is shown; answering it pops it and reveals the next.
+        if let Some(p) = self.perm_queue.front_mut() {
             let n = p.options.len();
             match code {
                 KeyCode::Up | KeyCode::Char('k') => {
-                    if p.selected > 0 {
-                        p.selected -= 1;
-                    }
+                    p.list.up();
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    if p.selected + 1 < n {
-                        p.selected += 1;
-                    }
+                    p.list.down(n);
                 }
                 KeyCode::Char(c @ '1'..='9') => {
                     let idx = (c as usize) - ('1' as usize);
                     if idx < n {
-                        let p = self.pending_perm.take().unwrap();
+                        let p = self.perm_queue.pop_front().unwrap();
                         let _ = p.resp.send(Some(idx));
                     }
                 }
                 KeyCode::Enter => {
-                    let sel = p.selected;
-                    let p = self.pending_perm.take().unwrap();
+                    let sel = p.list.selected;
+                    let p = self.perm_queue.pop_front().unwrap();
                     let _ = p.resp.send(Some(sel));
                 }
                 KeyCode::Esc => {
                     // Esc denies (send None → treated as deny).
-                    let _ = self.pending_perm.take().unwrap().resp.send(None);
+                    let _ = self.perm_queue.pop_front().unwrap().resp.send(None);
                 }
                 _ => {}
             }
@@ -2261,14 +2604,25 @@ impl App {
 /// spans at boundaries and preserving each span's style. Over-long single
 /// tokens are hard-broken.
 pub(super) fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
+    wrap_line_hanging(line, width, 0)
+}
+
+/// Like [`wrap_line`], but continuation rows are prefixed with `indent` spaces so
+/// wrapped body text stays aligned under its first row instead of falling back to
+/// column 0. Used by panes that render indented sections (the workflow detail).
+pub(super) fn wrap_line_hanging(
+    line: Line<'static>,
+    width: usize,
+    indent: usize,
+) -> Vec<Line<'static>> {
     if width == 0 || line.width() <= width {
         return vec![line];
     }
     use unicode_width::UnicodeWidthChar;
+    let indent = indent.min(width.saturating_sub(1));
+    let cont_lead = || Span::raw(" ".repeat(indent));
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut cur: Vec<Span<'static>> = Vec::new();
-    // Track DISPLAY columns, not char count: a CJK ideograph or emoji occupies two
-    // terminal cells, so counting chars wraps wide text one column short and clips.
     let mut col = 0usize;
 
     for span in line.spans {
@@ -2276,14 +2630,16 @@ pub(super) fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>>
         let mut chunk = String::new();
         for ch in span.content.chars() {
             let w = ch.width().unwrap_or(0);
-            // Break BEFORE a glyph that would overflow the row (using its real
-            // width, so a 2-cell glyph at column width-1 moves to the next row).
             if col + w > width && col > 0 {
                 if !chunk.is_empty() {
                     cur.push(Span::styled(std::mem::take(&mut chunk), style));
                 }
                 out.push(Line::from(std::mem::take(&mut cur)));
-                col = 0;
+                // Start the continuation row with the hanging indent.
+                if indent > 0 {
+                    cur.push(cont_lead());
+                }
+                col = indent;
             }
             chunk.push(ch);
             col += w;
@@ -2312,4 +2668,25 @@ pub(super) fn indent_line(line: Line<'static>) -> Line<'static> {
     let mut spans = vec![Span::raw("   ")];
     spans.extend(line.spans);
     Line::from(spans)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{fmt_ctx_window, trim_dot};
+
+    #[test]
+    fn ctx_window_labels() {
+        assert_eq!(fmt_ctx_window(1_000_000), "1M ctx");
+        assert_eq!(fmt_ctx_window(936_000), "936k ctx");
+        assert_eq!(fmt_ctx_window(400_000), "400k ctx");
+        assert_eq!(fmt_ctx_window(1_050_000), "1.1M ctx");
+        assert_eq!(fmt_ctx_window(128_000), "128k ctx");
+        assert_eq!(fmt_ctx_window(512), "512 ctx");
+    }
+
+    #[test]
+    fn trim_dot_drops_trailing_zero() {
+        assert_eq!(trim_dot(1.0), "1");
+        assert_eq!(trim_dot(1.5), "1.5");
+    }
 }

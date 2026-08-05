@@ -40,6 +40,45 @@ pub struct Session {
     /// Per-agent drawer transcripts (the team drawer), so they survive a resume.
     #[serde(default)]
     pub agent_threads: Vec<PersistedThread>,
+    /// Workflow runs (the `/workflow` tree cells in the main transcript). Stored
+    /// separately because they're built from live events, not the message history,
+    /// so they'd otherwise vanish on resume. Anchored to their hand-off message.
+    #[serde(default)]
+    pub workflows: Vec<PersistedWorkflow>,
+}
+
+/// A persisted workflow run: its id/title and phases + agents. On resume the tree
+/// is re-inserted just before its `[workflow result]` hand-off message; runs are
+/// matched to hand-off messages in order, so no explicit index is stored. `done`
+/// is implied — a persisted run is always finished.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PersistedWorkflow {
+    pub id: String,
+    pub title: String,
+    pub phases: Vec<PersistedWfPhase>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PersistedWfPhase {
+    pub title: String,
+    pub index: usize,
+    pub total: usize,
+    pub agents: Vec<PersistedWfAgent>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PersistedWfAgent {
+    pub agent_id: String,
+    pub label: String,
+    /// "running" | "done" | "failed".
+    pub status: String,
+    pub tools: usize,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub tokens: u64,
+    #[serde(default)]
+    pub duration_secs: Option<u64>,
 }
 
 /// One spawned agent's persisted transcript for the team drawer.
@@ -156,6 +195,7 @@ pub fn new_session(provider: &str, id: String, now: String, cwd: String) -> Sess
         subagent_runs: vec![],
         todos: vec![],
         agent_threads: vec![],
+        workflows: vec![],
     }
 }
 

@@ -11,10 +11,12 @@ pub mod lsp_actions;
 pub mod memory;
 pub mod registry;
 pub mod search;
+pub mod structured;
 pub mod task;
 pub mod todo;
 pub mod todo_write;
 pub mod web;
+pub mod workflow_tool;
 
 use crate::tools::bash::BashTool;
 use crate::tools::builtin::{ListDirTool, ReadFileTool, WriteFileTool};
