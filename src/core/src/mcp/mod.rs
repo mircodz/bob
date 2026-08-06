@@ -1,94 +1,53 @@
-//! Minimal MCP (Model Context Protocol) client over stdio. No SDK — MCP is just
-//! newline-delimited JSON-RPC 2.0 over a subprocess's stdin/stdout. We spawn the
-//! server, perform the initialize handshake, list its tools, and expose each as
-//! a native `Tool` (namespaced `<server>.<tool>`) so the agent can't tell them
-//! apart from built-ins.
+//! Minimal MCP (Model Context Protocol) client. MCP is JSON-RPC 2.0 exchanged
+//! either over a spawned subprocess's stdin/stdout (stdio transport) or over
+//! HTTP POST with SSE/JSON responses (streamable-HTTP transport). We perform the
+//! initialize handshake, list the server's tools, and expose each as a native
+//! `Tool` (namespaced `<server>_<tool>`) so the agent can't tell them apart from
+//! built-ins.
+
+mod http;
+mod stdio;
 
 use crate::core::config::McpServerConfig;
 use crate::core::types::ToolSpec;
 use crate::tools::registry::{Tool, ToolContext, ToolError, ToolResult};
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use std::collections::HashMap;
-use std::process::Stdio;
-use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin};
-use tokio::sync::oneshot;
+use std::sync::Arc;
 
-/// A live connection to one MCP server. Cloneable handle; the actual process +
-/// pending-request map live behind Arcs so wrapped tools can call back in.
-#[derive(Clone)]
-pub struct McpClient {
-    inner: Arc<McpInner>,
+/// A transport carries JSON-RPC requests/notifications to one MCP server.
+#[async_trait]
+pub(crate) trait Transport: Send + Sync {
+    /// Send a request and await its `result` (mapping a JSON-RPC error to Err).
+    async fn request(&self, method: &str, params: Value) -> anyhow::Result<Value>;
+    /// Fire-and-forget notification (no response expected).
+    async fn notify(&self, method: &str, params: Value);
 }
 
-struct McpInner {
+/// A live connection to one MCP server, over whichever transport it uses.
+#[derive(Clone)]
+pub struct McpClient {
     name: String,
-    stdin: tokio::sync::Mutex<ChildStdin>,
-    pending: Mutex<HashMap<i64, oneshot::Sender<Value>>>,
-    next_id: AtomicI64,
-    // Keep the child alive for the life of the client.
-    _child: tokio::sync::Mutex<Child>,
+    transport: Arc<dyn Transport>,
 }
 
 impl McpClient {
-    /// Spawn the server, run the initialize handshake, and return the client.
+    /// Connect to the server (spawning it for stdio, or opening an HTTP session),
+    /// run the initialize handshake, and return the client.
     pub async fn connect(cfg: &McpServerConfig) -> anyhow::Result<McpClient> {
-        let mut command = tokio::process::Command::new(&cfg.command);
-        command
-            .args(&cfg.args)
-            .envs(&cfg.env)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-
-        let mut child = command
-            .spawn()
-            .map_err(|e| anyhow::anyhow!("failed to start MCP server '{}': {}", cfg.name, e))?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("no stdin"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("no stdout"))?;
-
-        let inner = Arc::new(McpInner {
+        let transport: Arc<dyn Transport> = if cfg.is_http() {
+            Arc::new(http::HttpTransport::connect(cfg).await?)
+        } else {
+            Arc::new(stdio::StdioTransport::connect(cfg).await?)
+        };
+        let client = McpClient {
             name: cfg.name.clone(),
-            stdin: tokio::sync::Mutex::new(stdin),
-            pending: Mutex::new(HashMap::new()),
-            next_id: AtomicI64::new(1),
-            _child: tokio::sync::Mutex::new(child),
-        });
-
-        // Background reader: match each JSON-RPC response to its pending sender.
-        {
-            let inner = inner.clone();
-            tokio::spawn(async move {
-                let mut lines = BufReader::new(stdout).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    if line.trim().is_empty() {
-                        continue;
-                    }
-                    if let Ok(msg) = serde_json::from_str::<Value>(&line) {
-                        if let Some(id) = msg.get("id").and_then(|v| v.as_i64()) {
-                            if let Some(tx) = inner.pending.lock().unwrap().remove(&id) {
-                                let _ = tx.send(msg);
-                            }
-                        }
-                        // Notifications (no id) are ignored.
-                    }
-                }
-            });
-        }
-
-        let client = McpClient { inner };
+            transport,
+        };
 
         // initialize handshake.
         client
+            .transport
             .request(
                 "initialize",
                 json!({
@@ -99,14 +58,17 @@ impl McpClient {
             )
             .await?;
         // notifications/initialized (fire-and-forget).
-        client.notify("notifications/initialized", json!({})).await;
+        client
+            .transport
+            .notify("notifications/initialized", json!({}))
+            .await;
 
         Ok(client)
     }
 
     /// List the server's tools and wrap each as a native namespaced Tool.
     pub async fn list_tools(&self) -> anyhow::Result<Vec<Arc<dyn Tool>>> {
-        let result = self.request("tools/list", json!({})).await?;
+        let result = self.transport.request("tools/list", json!({})).await?;
         let tools = result
             .get("tools")
             .and_then(|t| t.as_array())
@@ -120,7 +82,7 @@ impl McpClient {
                 continue;
             }
             let spec = ToolSpec {
-                name: format!("{}.{}", self.inner.name, raw_name),
+                name: format!("{}_{}", self.name, raw_name),
                 description: t["description"].as_str().unwrap_or("").to_string(),
                 input_schema: t
                     .get("inputSchema")
@@ -139,6 +101,7 @@ impl McpClient {
     /// Call a tool on the server, returning its text content joined.
     async fn call_tool(&self, name: &str, args: Value) -> anyhow::Result<String> {
         let result = self
+            .transport
             .request("tools/call", json!({ "name": name, "arguments": args }))
             .await?;
         // result.content is an array of {type, text|...}.
@@ -164,46 +127,6 @@ impl McpClient {
         } else {
             Ok(text)
         }
-    }
-
-    /// Send a JSON-RPC request and await its response `result` (or error).
-    async fn request(&self, method: &str, params: Value) -> anyhow::Result<Value> {
-        let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = oneshot::channel();
-        self.inner.pending.lock().unwrap().insert(id, tx);
-
-        let msg = json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": params
-        });
-        self.write_line(&msg).await?;
-
-        // Await the matching response (with a generous timeout).
-        let resp = tokio::time::timeout(std::time::Duration::from_secs(30), rx)
-            .await
-            .map_err(|_| anyhow::anyhow!("MCP request '{}' timed out", method))?
-            .map_err(|_| anyhow::anyhow!("MCP connection closed"))?;
-
-        if let Some(err) = resp.get("error") {
-            anyhow::bail!("MCP error: {}", err);
-        }
-        Ok(resp.get("result").cloned().unwrap_or(Value::Null))
-    }
-
-    async fn notify(&self, method: &str, params: Value) {
-        let msg = json!({ "jsonrpc": "2.0", "method": method, "params": params });
-        let _ = self.write_line(&msg).await;
-    }
-
-    async fn write_line(&self, msg: &Value) -> anyhow::Result<()> {
-        let mut line = serde_json::to_string(msg)?;
-        line.push('\n');
-        let mut stdin = self.inner.stdin.lock().await;
-        stdin.write_all(line.as_bytes()).await?;
-        stdin.flush().await?;
-        Ok(())
     }
 }
 

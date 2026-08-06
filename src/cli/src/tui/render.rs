@@ -4,6 +4,7 @@ use super::diffview::{diff_header, render_diff};
 use super::highlight::highlight_line;
 use super::indent_line;
 use super::markdown::render_markdown;
+pub(super) use super::markdown::render_markdown as render_markdown_snippet;
 use super::theme::Palette;
 use super::view::{Cell, ToolStatus, WfPhase, WfStatus};
 use ratatui::style::{Modifier, Style};
@@ -64,18 +65,24 @@ fn wrap_plain(text: &str, width: usize) -> Vec<String> {
     use unicode_width::UnicodeWidthChar;
     let width = width.max(1);
     let mut rows: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    let mut col = 0usize;
-    for ch in text.chars() {
-        let w = ch.width().unwrap_or(0);
-        if col + w > width && col > 0 {
-            rows.push(std::mem::take(&mut cur));
-            col = 0;
+    // Split on explicit newlines FIRST, then width-wrap each segment. A `\n` has
+    // zero display width, so folding it into a row would leave the row string
+    // wider than the visible line — the band's trailing-pad math then under-fills
+    // and the background stops mid-row (visible on multi-line subagent prompts).
+    for segment in text.split('\n') {
+        let mut cur = String::new();
+        let mut col = 0usize;
+        for ch in segment.chars() {
+            let w = ch.width().unwrap_or(0);
+            if col + w > width && col > 0 {
+                rows.push(std::mem::take(&mut cur));
+                col = 0;
+            }
+            cur.push(ch);
+            col += w;
         }
-        cur.push(ch);
-        col += w;
+        rows.push(cur);
     }
-    rows.push(cur);
     rows
 }
 
@@ -90,7 +97,7 @@ pub fn render_cell(cell: &Cell, width: usize, out: &mut Vec<Line<'static>>) {
             // full-width strip. Inside the band there's a 1-col text inset + the
             // dim `›` marker.
             use unicode_width::UnicodeWidthStr;
-            const MARGIN: usize = 2;
+            const MARGIN: usize = super::widgets::BAND_MARGIN as usize;
             let bg = Style::default().bg(Palette::INPUT_BG());
             let gutter = || Span::raw(" ".repeat(MARGIN)); // base-bg on both sides
             let band_w = width.saturating_sub(MARGIN * 2).max(1);
@@ -149,16 +156,14 @@ pub fn render_cell(cell: &Cell, width: usize, out: &mut Vec<Line<'static>>) {
         }
         Cell::Subagent {
             agent_id,
-            parent_id,
+            parent_id: _,
             task,
             tools,
             done,
             failed,
         } => {
-            let _ = parent_id;
-            // One line per subagent: a status dot — orange while running, green on
-            // success, red on failure — + "Spawned <name> agent", then the tool
-            // count while running, or "finished" / "failed" when done.
+            // One line per subagent: a status dot (running/done/failed) + "Spawned
+            // <name> agent", then the live tool count or the terminal state.
             let dot_color = if *failed {
                 Palette::ERROR()
             } else if *done {
@@ -275,7 +280,7 @@ pub fn render_cell(cell: &Cell, width: usize, out: &mut Vec<Line<'static>>) {
 
 /// Small colored status dot for a workflow agent/phase — same glyph the subagent
 /// cells use (`•`), colored orange=running, green=done, red=failed.
-fn wf_dot(status: WfStatus) -> Span<'static> {
+pub(super) fn wf_dot(status: WfStatus) -> Span<'static> {
     let color = match status {
         WfStatus::Running => Palette::RUNNING(),
         WfStatus::Done => Palette::OK(),
@@ -292,7 +297,6 @@ fn render_workflow(title: &str, phases: &[WfPhase], done: bool, out: &mut Vec<Li
     let total_agents: usize = phases.iter().map(|p| p.agents.len()).sum();
 
     if done {
-        // Collapsed: one green summary line.
         out.push(Line::from(vec![
             wf_dot(WfStatus::Done),
             Span::styled(" Workflow ", Style::default().fg(Palette::DIM())),
@@ -317,7 +321,6 @@ fn render_workflow(title: &str, phases: &[WfPhase], done: bool, out: &mut Vec<Li
         return;
     }
 
-    // Header: dot + "Workflow <title>" + running.
     out.push(Line::from(vec![
         wf_dot(WfStatus::Running),
         Span::styled(" Workflow ", Style::default().fg(Palette::DIM())),
@@ -407,7 +410,6 @@ fn render_tool(
     ];
     if !arg.is_empty() {
         if name == "bash" {
-            // Syntax-highlight the shell command.
             header.push(Span::raw(" "));
             for s in highlight_line(&truncate(&arg, 100), "sh") {
                 header.push(s);
@@ -485,8 +487,21 @@ fn render_tool(
     // own 2-col hanging indent plus our lead (`  │ ` or `    `, 4 cols).
     let lead: &str = if gutter { "  │ " } else { "    " };
     let content_w = width.saturating_sub(2 + lead.chars().count()).max(8);
-    for line in body.iter().take(limit) {
+    // Cap the number of VISUAL rows we emit, not just logical lines: a single very
+    // long line (e.g. a minified JSON blob or a one-line coverage report) wraps
+    // into many rows, so limiting by logical line alone lets one line fill the
+    // screen. We count wrapped rows and stop at `limit`, then report how many
+    // logical lines never got shown.
+    let mut rows_used = 0usize;
+    let mut shown_lines = 0usize;
+    for line in body.iter() {
+        if rows_used >= limit {
+            break;
+        }
         for (r, row) in wrap_plain(line, content_w).into_iter().enumerate() {
+            if rows_used >= limit {
+                break;
+            }
             // Continuation rows align under the text (keep the gutter bar for bash,
             // blank the marker so only the bar shows), so wrapped output stays tidy.
             let this_lead = if r == 0 {
@@ -500,9 +515,11 @@ fn render_tool(
                 Span::styled(this_lead, Style::default().fg(Palette::FAINT())),
                 Span::styled(row, Style::default().fg(color)),
             ]));
+            rows_used += 1;
         }
+        shown_lines += 1;
     }
-    let extra = total.saturating_sub(limit);
+    let extra = total.saturating_sub(shown_lines);
     if extra > 0 {
         out.push(Line::from(Span::styled(
             format!("{lead}... {extra} more lines (click to expand)"),
@@ -528,9 +545,80 @@ fn parse_diff_output(output: &str) -> Option<(String, String, String)> {
     Some((header, lang, body))
 }
 
-/// Render a small markdown snippet (used for the permission preview diff). The
-/// snippet is typically a header line plus a ```diff / ```lang fence, so this
-/// just delegates to the markdown pre-renderer.
-pub fn render_markdown_like(md: &str) -> Vec<Line<'static>> {
-    render_markdown(md)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn wrap_plain_breaks_on_embedded_newlines() {
+        // A multi-line prompt (as a subagent task is) must split at each `\n`, so
+        // every visible row is a separate string the band can pad to full width.
+        // Regression: `\n` (zero display width) used to fold into a row, leaving the
+        // band background clipped after the first segment on wrap.
+        let rows = wrap_plain("line one\nline two", 40);
+        assert_eq!(rows, vec!["line one".to_string(), "line two".to_string()]);
+
+        // Width-wrapping still applies WITHIN each newline-delimited segment.
+        let rows = wrap_plain("aaaa\nbbbbbb", 3);
+        assert_eq!(
+            rows,
+            vec![
+                "aaa".to_string(),
+                "a".to_string(),
+                "bbb".to_string(),
+                "bbb".to_string()
+            ]
+        );
+
+        // A trailing newline yields an empty final row (a blank band line), not a
+        // dropped one.
+        assert_eq!(wrap_plain("x\n", 10), vec!["x".to_string(), "".to_string()]);
+    }
+
+    #[test]
+    fn tool_display_maps_names_and_args() {
+        assert_eq!(
+            tool_display("write_file", &json!({"path": "a.py"})),
+            ("Write".into(), "a.py".into())
+        );
+        assert_eq!(
+            tool_display("multi_edit", &json!({"path": "b.rs"})),
+            ("Edit".into(), "b.rs".into())
+        );
+        assert_eq!(
+            tool_display("web_search", &json!({"query": "cats"})),
+            ("Search".into(), "cats".into())
+        );
+        // A missing arg key yields an empty string, not a panic.
+        assert_eq!(
+            tool_display("grep", &json!({})),
+            ("Grep".into(), "".into())
+        );
+        // Unknown tools pass through their raw name with no arg.
+        assert_eq!(
+            tool_display("mystery_tool", &json!({})),
+            ("mystery_tool".into(), "".into())
+        );
+    }
+
+    #[test]
+    fn truncate_appends_ellipsis_and_flattens_newlines() {
+        assert_eq!(truncate("hello", 10), "hello");
+        assert_eq!(truncate("hello world", 5), "hello...");
+        // Newlines collapse to spaces so a cell stays one line.
+        assert_eq!(truncate("a\nb", 10), "a b");
+    }
+
+    #[test]
+    fn parse_diff_output_splits_fence() {
+        let out = "edited foo.rs (+2/-1)\n```diff foo.rs\n+added\n-removed\n```";
+        let (header, lang, body) = parse_diff_output(out).unwrap();
+        assert_eq!(header, "edited foo.rs (+2/-1)");
+        assert_eq!(lang, "foo.rs");
+        assert_eq!(body, "+added\n-removed");
+        // No fence → None.
+        assert!(parse_diff_output("plain output, no diff").is_none());
+    }
 }
+

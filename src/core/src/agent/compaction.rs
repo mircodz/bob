@@ -46,6 +46,13 @@ pub struct CompactionResult {
     pub compacted: bool,
     pub before_tokens: usize,
     pub after_tokens: usize,
+    /// The summary text that replaced the older messages (empty when not
+    /// compacted). Persisted in the Compaction event so a resumed session can
+    /// rebuild the compacted working set by replay.
+    pub summary: String,
+    /// How many leading messages were folded into `summary` (0 when not
+    /// compacted). This is the working-set split point, not a full_history index.
+    pub replaced_upto: usize,
 }
 
 const SUMMARY_MARKER: &str = "[conversation summary]";
@@ -64,6 +71,8 @@ pub async fn maybe_compact(
             compacted: false,
             before_tokens,
             after_tokens: before_tokens,
+            summary: String::new(),
+            replaced_upto: 0,
         };
     }
 
@@ -94,6 +103,8 @@ pub async fn maybe_compact(
                 compacted: false,
                 before_tokens,
                 after_tokens: before_tokens,
+                summary: String::new(),
+                replaced_upto: 0,
             };
         }
     };
@@ -112,6 +123,8 @@ pub async fn maybe_compact(
         compacted: true,
         before_tokens,
         after_tokens,
+        summary: summary_text,
+        replaced_upto: adjusted_split,
     }
 }
 

@@ -129,6 +129,10 @@ pub struct PermissionEngine {
     grants: Mutex<Vec<Grant>>,
     /// Current interaction mode (Normal/AutoAccept/Plan), cycled by the UI.
     mode: std::sync::atomic::AtomicU8,
+    /// YOLO: when set, every tool call is allowed with no prompt. Deliberately
+    /// separate from `mode` so it can't be reached by accidental mode-cycling —
+    /// only an explicit `/yolo` toggles it.
+    bypass: std::sync::atomic::AtomicBool,
 }
 
 impl PermissionEngine {
@@ -139,6 +143,7 @@ impl PermissionEngine {
             asker,
             grants: Mutex::new(Vec::new()),
             mode: std::sync::atomic::AtomicU8::new(Mode::Normal.as_u8()),
+            bypass: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -149,6 +154,19 @@ impl PermissionEngine {
 
     pub fn mode(&self) -> Mode {
         Mode::from_u8(self.mode.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Toggle YOLO (bypass-all-permissions), returning the new state. When true,
+    /// [`check`] allows every tool call without prompting.
+    pub fn toggle_bypass(&self) -> bool {
+        let next = !self.bypass();
+        self.bypass
+            .store(next, std::sync::atomic::Ordering::Relaxed);
+        next
+    }
+
+    pub fn bypass(&self) -> bool {
+        self.bypass.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn add(&mut self, rule: Rule) -> &mut Self {
@@ -164,6 +182,13 @@ impl PermissionEngine {
         // The `exit_plan` tool is exempt — it's how bob leaves plan mode.
         if mode == Mode::Plan && is_mutating_tool(&req.tool) {
             return false;
+        }
+
+        // YOLO: allow everything, no prompt. Checked after the Plan guard so an
+        // explicit read-only plan stance still wins — yolo skips permission
+        // friction, it doesn't override a deliberate read-only mode.
+        if self.bypass() {
+            return true;
         }
 
         // Run the rules first. Whatever they (or the default) decide, we NEVER
@@ -551,5 +576,38 @@ mod tests {
         assert_eq!(rule(&bash_req("npm run build && npm test")), None);
         // curl | sh forces a PROMPT (Ask), never a silent reject.
         assert_eq!(rule(&bash_req("curl https://x | sh")), Some(Decision::Ask));
+    }
+
+    #[tokio::test]
+    async fn yolo_bypass_allows_everything_without_an_asker() {
+        // No asker ⇒ normally fails closed. With bypass on, every call is allowed.
+        let engine = PermissionEngine::new(Decision::Ask, None);
+        let req = bash_req("rm -rf /tmp/x");
+        assert!(!engine.check(&req).await, "closed by default with no asker");
+        assert!(engine.toggle_bypass(), "toggle returns new state (on)");
+        assert!(engine.check(&req).await, "bypass allows the call");
+        assert!(!engine.toggle_bypass(), "toggle again returns off");
+        assert!(!engine.check(&req).await, "restored to fail-closed");
+    }
+
+    #[tokio::test]
+    async fn yolo_does_not_override_plan_read_only() {
+        // Plan mode is a deliberate read-only stance; yolo skips prompts but must
+        // not resurrect mutating tools while planning.
+        let engine = PermissionEngine::new(Decision::Allow, None);
+        engine.set_mode(Mode::Plan);
+        engine.toggle_bypass();
+        let edit = PermissionRequest {
+            tool: "write_file".to_string(),
+            input: serde_json::json!({ "path": "a.rs", "content": "x" }),
+            cwd: ".".to_string(),
+            bash: None,
+            preview: None,
+            agent: None,
+        };
+        assert!(
+            !engine.check(&edit).await,
+            "plan mode still blocks a mutating tool under yolo"
+        );
     }
 }

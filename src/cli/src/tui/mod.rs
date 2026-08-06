@@ -53,10 +53,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use view::ViewModel;
 
-/// Build a "shimmer" version of `text`: a bright band sweeps across the glyphs
-/// as a working indicator. `tick` advances the wave (one step per
-/// animation frame). Each character's brightness is a function of its distance
-/// from the moving crest, interpolated between a dim base and a bright peak.
+/// Build a "shimmer" version of `text`: a bright band sweeps across the glyphs as
+/// a working indicator. `tick` advances the wave; each glyph's brightness is its
+/// distance from the moving crest, lerped between a dim base and a bright peak.
 pub(super) fn shimmer_spans(text: &str, tick: usize) -> Vec<Span<'static>> {
     // Base (dim) and peak (bright) endpoints of the gradient.
     const BASE: (f32, f32, f32) = (0x66 as f32, 0x66 as f32, 0x66 as f32);
@@ -417,6 +416,19 @@ pub async fn run(
         }));
     }
 
+    // Shadow-write every event to the append-only log (Stage 1). A dedicated
+    // writer thread owns the DB connection, so this listener only enqueues and
+    // never blocks the agent's async task on a SQLite write. The blob save at
+    // turn-end is still authoritative until replay-on-load lands (Stage 2).
+    let event_log = Arc::new(bob_core::core::session::EventLogWriter::spawn());
+    {
+        let event_log = event_log.clone();
+        let session_id = session.id.clone();
+        bus.on(Arc::new(move |e: &AgentEvent| {
+            event_log.append(&session_id, e);
+        }));
+    }
+
     // Permission asker → UI channel.
     let (perm_tx, mut perm_rx) = mpsc::unbounded_channel::<PermPrompt>();
     let asker = Arc::new(TuiAsker { tx: perm_tx });
@@ -485,7 +497,16 @@ pub async fn run(
             max_turns: config.max_turns,
         });
     if !session.messages.is_empty() {
-        agent.load_history(session.messages.clone());
+        // Seed the agent from the event log when it's authoritative (blob fallback
+        // via the shared guard), matching what the view replays below.
+        let events = bob_core::core::session::load_events(&session.id)
+            .ok()
+            .flatten();
+        let history = bob_core::core::session::reconstructed_history(
+            events.as_deref(),
+            &session.messages,
+        );
+        agent.load_history(history);
     }
     // Grab the cancel handle before moving the agent behind the mutex, so the UI
     // can interrupt a running turn without needing to lock the (busy) agent.
@@ -495,6 +516,11 @@ pub async fn run(
     if !session.todos.is_empty() {
         todos.set(session.todos.clone());
     }
+    // Apply the saved reasoning effort (config `reasoning`), so a level chosen in a
+    // prior session is in force from the first turn. Empty/unknown → Off.
+    let startup_reasoning = bob_core::core::types::ReasoningEffort::parse(&config.reasoning)
+        .unwrap_or(bob_core::core::types::ReasoningEffort::Off);
+    agent.set_reasoning(startup_reasoning);
     let agent = Arc::new(Mutex::new(agent));
 
     // --- terminal setup ---
@@ -532,6 +558,8 @@ pub async fn run(
     );
     app.provider_id = provider_spec.split(':').next().unwrap_or("").to_string();
     app.model_label = provider.model().to_string();
+    // Reflect the saved reasoning effort in the status bar from launch.
+    app.reasoning = startup_reasoning;
     app.cwd_label = abbreviate_home(&cwd);
     app.branch = git_branch(&cwd);
     app.lsp = lsp.clone();
@@ -549,7 +577,32 @@ pub async fn run(
     app.session_usage = bob_core::core::usage::total_of(&session.usage);
     app.global_usage = bob_core::core::usage::global_total();
     if !session.messages.is_empty() {
-        app.view.hydrate(&session.messages, &session.workflows);
+        // Prefer replay from the event log (the emerging single source of truth):
+        // feed each logged event through the SAME view + team reducers the live
+        // loop uses, so a resumed transcript is built identically to a live one —
+        // including notices and other cells that never existed in the message
+        // history. GUARD: only trust replay if the reconstructed root history is at
+        // least as long as the blob's — a truncated/corrupt log must never render
+        // LESS than we safely have. Otherwise fall back to blob hydration.
+        let replayed = match bob_core::core::session::load_events(&session.id) {
+            Ok(Some(events)) => {
+                let rebuilt = bob_core::core::session::root_history_from_events(&events);
+                if rebuilt.len() >= session.messages.len() {
+                    for evt in &events {
+                        app.teams.apply(evt, None);
+                        app.view.apply(evt);
+                    }
+                    app.view.reset_after_replay();
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        };
+        if !replayed {
+            app.view.hydrate(&session.messages, &session.workflows);
+        }
         app.view.push_event(format!(
             "Resumed session {} ({} msgs)",
             session.id,
@@ -621,7 +674,9 @@ pub async fn run(
                                     // turn ends. Alt+Enter steers instead of queueing.
                                     app.queue.push_back(text);
                                 } else {
-                                    app.view.push_user(text.clone());
+                                    // The user line is rendered from the UserPrompt
+                                    // event that run() emits — no direct push here, so
+                                    // the live path and replay build it identically.
                                     app.stick_to_bottom();
                                     app.running = true;
                                     app.current_prompt = Some(text.clone());
@@ -678,6 +733,14 @@ pub async fn run(
                                 if let Ok(mut a) = agent.try_lock() {
                                     a.set_reasoning(effort);
                                     app.reasoning = effort;
+                                    // Remember for next launch (best-effort).
+                                    if let Err(e) = bob_core::core::config::set_default_reasoning(
+                                        effort.label(),
+                                    ) {
+                                        app.notify(format!(
+                                            "reasoning set, but couldn't save default: {e}"
+                                        ));
+                                    }
                                     app.view.push_event(format!(
                                         "Model changed to {} {}",
                                         app.model_label,
@@ -764,6 +827,14 @@ pub async fn run(
                                     a.load_history(Vec::new());
                                     drop(a);
                                     session.messages.clear();
+                                    session.updated_at = now_stamp();
+                                    // Force-save the shrink so it lands past the
+                                    // anti-clobber guard AND resets the on-disk
+                                    // message_count — otherwise the next (shorter)
+                                    // end-of-turn save would be silently dropped.
+                                    if let Err(e) = bob_core::core::session::save_session_force(&session) {
+                                        app.notify(&format!("couldn't save cleared context: {e}"));
+                                    }
                                     app.view.clear();
                                     app.view.push_notice("context cleared — the agent has forgotten the conversation.".into());
                                     app.stick_to_bottom();
@@ -807,14 +878,14 @@ pub async fn run(
                             if let Some(d) = app.team_drawer.as_mut() {
                                 d.scroll = d.scroll.saturating_sub(1);
                             } else {
-                                app.scrollback.scroll_up(1);
+                                app.active_scrollback().scroll_up(1);
                             }
                         }
                         MouseEventKind::ScrollDown => {
                             if let Some(d) = app.team_drawer.as_mut() {
                                 d.scroll = d.scroll.saturating_add(1);
                             } else {
-                                app.scrollback.scroll_down(1);
+                                app.active_scrollback().scroll_down(1);
                             }
                         }
                         MouseEventKind::Down(MouseButton::Left) => {
@@ -934,7 +1005,9 @@ pub async fn run(
                 session.agent_threads = app.teams.to_persisted();
                 session.workflows = app.view.to_persisted_workflows();
                 session.updated_at = now_stamp();
-                let _ = save_session(&session);
+                if let Err(e) = save_session(&session) {
+                    app.view.push_notice(format!("warning: couldn't save session: {e}"));
+                }
                 drop(a);
                 // If this turn had been detached (Ctrl+B), close out its job.
                 if let Some(job_id) = app.detached_job.take() {
@@ -946,7 +1019,8 @@ pub async fn run(
                 // being sent.
                 match app.queue.pop_front() {
                     Some(next) => {
-                        app.view.push_user(next.clone());
+                        // The user line comes from run()'s UserPrompt event, same as
+                        // a fresh submit — no direct push (would duplicate it).
                         app.stick_to_bottom();
                         app.current_prompt = Some(next.clone());
                         app.turn_started = Some(std::time::Instant::now());
@@ -1028,9 +1102,32 @@ pub async fn run(
     // quit (Quit/​/exit/Ctrl+C) or a stream error would otherwise drop everything
     // since the last completed turn. Snapshot the agent's full history + state now.
     {
-        let a = agent.lock().await;
-        session.messages = a.messages().to_vec();
-        drop(a);
+        // If a turn is still running, its task holds the agent lock across the whole
+        // `run()` — a plain `lock().await` here would block until the turn finishes
+        // (and a busy multi-tool turn can run for minutes), which looked like a
+        // freeze on quit. Signal cancel first so `run()` breaks out cooperatively
+        // and releases the lock; bound the wait with a timeout so a wedged turn
+        // can't hold exit hostage — we still persist whatever history we can read.
+        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        let locked = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            agent.lock(),
+        )
+        .await;
+        match locked {
+            Ok(a) => {
+                session.messages = a.messages().to_vec();
+                drop(a);
+            }
+            Err(_) => {
+                // Turn didn't yield in time; fall back to the last-saved messages
+                // rather than hang. The event log below still has the full stream.
+                eprintln!(
+                    "bob: warning: turn didn't stop in time on quit; \
+                     saved history may be one turn stale"
+                );
+            }
+        }
         session.grants = permissions.export_grants();
         if let Some(todos) = &app.todos {
             session.todos = todos.items();
@@ -1038,7 +1135,13 @@ pub async fn run(
         session.agent_threads = app.teams.to_persisted();
         session.workflows = app.view.to_persisted_workflows();
         session.updated_at = now_stamp();
-        let _ = save_session(&session);
+        // Terminal is being torn down here, so there's no view to notice into —
+        // log to stderr so a final-save failure isn't completely silent.
+        if let Err(e) = save_session(&session) {
+            eprintln!("bob: warning: couldn't save session on exit: {e}");
+        }
+        // Ensure every shadow-written event is durable before we exit.
+        event_log.flush();
     }
 
     // Terminal restore is handled by `_guard` (Drop) — covers the normal return,
@@ -1184,6 +1287,11 @@ struct App {
     theme_name: String,
     /// The main transcript viewport: render caches, scroll position, click map.
     scrollback: scrollback::ScrollbackRenderer,
+    /// A second scrollback renderer used when viewing a focused subagent's
+    /// transcript, so it gets the SAME padding, wrapping, caching, and scroll
+    /// behavior as the root conversation (one renderer, two transcripts). Reset
+    /// when the focused agent changes.
+    focused_scrollback: scrollback::ScrollbackRenderer,
     /// Per-agent transcripts for the team drawer (fed by subagent events).
     teams: team::AgentTranscripts,
     /// Team drawer overlay state; `None` when closed.
@@ -1196,6 +1304,9 @@ struct App {
     /// Screen rect of the drawer's agent roster (set each draw), so left-clicks can
     /// be hit-tested to select an agent. `None` when the drawer is closed.
     roster_rect: Option<Rect>,
+    /// First roster index visible after windowing (the drawer roster scrolls when
+    /// the team is taller than the pane), so click/hover hit-tests add this offset.
+    roster_scroll: usize,
     /// Whether the sticky todo panel is shown (toggled with Ctrl+L).
     show_todos: bool,
     /// Shared team roster, so the drawer can message agents (send_message path).
@@ -1206,6 +1317,9 @@ struct App {
     system_prompt: String,
     /// The collapsible right info sidebar. `open` = shown (Ctrl+G toggles it,
     /// manual-open only). `sidebar.selected` indexes the AGENTS tree (0 = "main").
+    /// The sidebar is full-height and lists only running agents, so it isn't
+    /// windowed — `sidebar.scroll` is unused until a scrolling section (LSP/MCP)
+    /// lands.
     sidebar_open: bool,
     sidebar: widgets::SelectList,
     /// The agent whose conversation the LEFT transcript is currently showing, and
@@ -1233,6 +1347,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/usage", "show token usage (session + all-time)"),
     ("/context", "show context-window usage"),
     ("/compact", "summarize & free up context now"),
+    ("/yolo", "toggle bypassing ALL permission prompts (dangerous)"),
     ("/model", "show the current model"),
     ("/models", "list & switch models"),
     (
@@ -1294,11 +1409,13 @@ impl App {
             todos: None,
             theme_name: "dark".to_string(),
             scrollback: scrollback::ScrollbackRenderer::new(),
+            focused_scrollback: scrollback::ScrollbackRenderer::new(),
             teams: team::AgentTranscripts::new(),
             team_drawer: None,
             workflow_view: None,
             wf_view_agents: None,
             roster_rect: None,
+            roster_scroll: 0,
             show_todos: true,
             agent_team,
             bus: EventBus::new(),
@@ -1360,6 +1477,14 @@ impl App {
                 }
                 self.provider_id = id;
                 self.model_label = model;
+                // Remember this choice for the next launch. Best-effort: a config
+                // write failure shouldn't abort the (already-applied) switch.
+                if let Err(e) = bob_core::core::config::set_default_model(
+                    &self.provider_id,
+                    &self.model_label,
+                ) {
+                    self.notify(format!("switched, but couldn't save default: {e}"));
+                }
                 // Chain into the reasoning picker so model + effort are set together.
                 let cur = self.reasoning;
                 self.open_reasoning_picker(cur);
@@ -1715,7 +1840,7 @@ impl App {
         if row <= rect.y {
             return; // header/blank line
         }
-        let idx = (row - rect.y - 1) as usize;
+        let idx = (row - rect.y - 1) as usize + self.roster_scroll;
         let order = self.teams.display_order();
         if idx >= order.len() {
             return;
@@ -1796,11 +1921,12 @@ impl App {
     /// `hovered` to the roster index under the cursor, or `None` when off-roster.
     /// Returns true if the hover state changed (so the caller can mark dirty).
     fn hover_roster(&mut self, col: u16, row: u16) -> bool {
+        let scroll = self.roster_scroll;
         let new_hover = self.roster_rect.and_then(|rect| {
             if col < rect.x || col >= rect.x + rect.width || row <= rect.y {
                 return None;
             }
-            let idx = (row - rect.y - 1) as usize;
+            let idx = (row - rect.y - 1) as usize + scroll;
             (idx < self.teams.display_order().len()).then_some(idx)
         });
         if let Some(drawer) = self.team_drawer.as_mut() {
@@ -1835,30 +1961,20 @@ impl App {
         let Some(vw) = self.workflow_view.as_mut() else {
             return KeyOutcome::None;
         };
-        if vw.selected >= n {
-            vw.selected = n.saturating_sub(1);
-        }
+        vw.list.clamp(n);
         match code {
             KeyCode::Esc => {
                 self.workflow_view = None;
                 self.wf_view_agents = None;
             }
-            KeyCode::Up | KeyCode::Char('k') => {
-                if vw.selected > 0 {
-                    vw.selected -= 1;
-                }
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if vw.selected + 1 < n {
-                    vw.selected += 1;
-                }
-            }
-            KeyCode::PageUp => vw.selected = vw.selected.saturating_sub(10),
-            KeyCode::PageDown => vw.selected = (vw.selected + 10).min(n.saturating_sub(1)),
+            KeyCode::Up | KeyCode::Char('k') => vw.list.up(),
+            KeyCode::Down | KeyCode::Char('j') => vw.list.down(n),
+            KeyCode::PageUp => vw.list.page_up(10),
+            KeyCode::PageDown => vw.list.page_down(10, n),
             KeyCode::Enter | KeyCode::Char(' ') => {
                 // Enter toggles a phase's collapse. On an agent it's a no-op — the
                 // detail pane already shows the selected agent.
-                if let Some(WfRow::Phase(pi)) = rows.get(vw.selected) {
+                if let Some(WfRow::Phase(pi)) = rows.get(vw.list.selected) {
                     if vw.collapsed.contains(pi) {
                         vw.collapsed.remove(pi);
                     } else {
@@ -1868,13 +1984,13 @@ impl App {
             }
             KeyCode::Right | KeyCode::Char('l') => {
                 // Expand a collapsed phase.
-                if let Some(WfRow::Phase(pi)) = rows.get(vw.selected) {
+                if let Some(WfRow::Phase(pi)) = rows.get(vw.list.selected) {
                     vw.collapsed.remove(pi);
                 }
             }
             KeyCode::Left | KeyCode::Char('h') => {
                 // Collapse the phase under (or containing) the cursor.
-                match rows.get(vw.selected) {
+                match rows.get(vw.list.selected) {
                     Some(WfRow::Phase(pi)) | Some(WfRow::Agent(pi, _)) => {
                         vw.collapsed.insert(*pi);
                     }
@@ -1904,7 +2020,7 @@ impl App {
                     matches!(r, WfRow::Agent(pi, ai) if phases[*pi].agents[*ai].agent_id == agent_id)
                 });
                 if let (Some(idx), Some(vw)) = (idx, self.workflow_view.as_mut()) {
-                    vw.selected = idx;
+                    vw.list.selected = idx;
                 }
             }
         }
@@ -1994,11 +2110,33 @@ impl App {
     /// (root, `None`), otherwise the running agent at that position.
     fn apply_sidebar_focus(&mut self) {
         if self.sidebar.selected == 0 {
-            self.focused_agent = None;
+            self.set_focused_agent(None);
             return;
         }
         let running = self.teams.running_ids();
-        self.focused_agent = running.get(self.sidebar.selected - 1).cloned();
+        let id = running.get(self.sidebar.selected - 1).cloned();
+        self.set_focused_agent(id);
+    }
+
+    /// The scrollback renderer for whatever transcript is currently on screen —
+    /// the focused subagent's when one is selected, else the root conversation.
+    /// So scroll input drives the view the user is actually looking at.
+    fn active_scrollback(&mut self) -> &mut scrollback::ScrollbackRenderer {
+        if self.focused_agent.is_some() {
+            &mut self.focused_scrollback
+        } else {
+            &mut self.scrollback
+        }
+    }
+
+    /// Switch the focused agent, resetting the shared focused-scrollback so the new
+    /// transcript opens pinned to the bottom instead of inheriting the previous
+    /// agent's scroll offset.
+    fn set_focused_agent(&mut self, id: Option<String>) {
+        if self.focused_agent != id {
+            self.focused_scrollback = scrollback::ScrollbackRenderer::new();
+        }
+        self.focused_agent = id;
     }
 
     /// A click in the sidebar selects that agent row (and focuses it). An empty id
@@ -2013,10 +2151,10 @@ impl App {
         };
         if id.is_empty() {
             self.sidebar.selected = 0;
-            self.focused_agent = None;
+            self.set_focused_agent(None);
         } else if let Some(idx) = self.teams.running_ids().iter().position(|r| *r == id) {
             self.sidebar.selected = idx + 1;
-            self.focused_agent = Some(id);
+            self.set_focused_agent(Some(id));
         }
     }
 
@@ -2045,26 +2183,26 @@ impl App {
     }
 
     fn on_key(&mut self, code: KeyCode, mods: KeyModifiers) -> KeyOutcome {
-        // 0) Shift+Tab cycles the interaction mode (normal → auto-accept → plan).
+        // Shift+Tab cycles the interaction mode (normal → auto-accept → plan).
         if code == KeyCode::BackTab {
             let next = self.permissions.mode().next();
             self.permissions.set_mode(next);
             return KeyOutcome::None;
         }
 
-        // 0a) Ctrl+T toggles the team drawer (only meaningful once agents exist).
+        // Ctrl+T toggles the team drawer (only meaningful once agents exist).
         if code == KeyCode::Char('t') && mods.contains(KeyModifiers::CONTROL) {
             self.toggle_team_drawer();
             return KeyOutcome::None;
         }
-        // 0a-bis) Ctrl+G toggles the info sidebar (agents tree). Manual open only.
+        // Ctrl+G toggles the info sidebar (agents tree). Manual open only.
         if code == KeyCode::Char('g') && mods.contains(KeyModifiers::CONTROL) {
             self.sidebar_open = !self.sidebar_open;
             return KeyOutcome::None;
         }
-        // 0a-ter) While the sidebar is open, ↑/↓ move its selection and Enter/Esc
-        // switch the focused conversation — but ONLY when the input is empty, so
-        // typing a message is unaffected. Esc always returns to main when focused.
+        // With the sidebar open, ↑/↓ move its selection and Enter/Esc switch the
+        // focused conversation — but ONLY when the input is empty, so typing is
+        // unaffected. Esc always returns to main when focused.
         if self.sidebar_open {
             match code {
                 KeyCode::Up if self.input.text().is_empty() => {
@@ -2079,7 +2217,7 @@ impl App {
                     return KeyOutcome::None;
                 }
                 KeyCode::Esc if self.focused_agent.is_some() => {
-                    self.focused_agent = None;
+                    self.set_focused_agent(None);
                     self.sidebar.selected = 0;
                     return KeyOutcome::None;
                 }
@@ -2100,9 +2238,9 @@ impl App {
             return self.handle_query_key(code);
         }
 
-        // 1) Permission prompt takes priority — a select, driven by arrows,
-        //    digits (1-9), Enter (confirm), or Esc/Ctrl+C (deny). The FRONT of the
-        //    queue is shown; answering it pops it and reveals the next.
+        // Permission prompt takes priority — a select driven by arrows, digits
+        // (1-9), Enter (confirm), or Esc/Ctrl+C (deny). The FRONT of the queue is
+        // shown; answering it pops it and reveals the next.
         if let Some(p) = self.perm_queue.front_mut() {
             let n = p.options.len();
             match code {
@@ -2133,7 +2271,7 @@ impl App {
             return KeyOutcome::None;
         }
 
-        // 2) Global shortcuts.
+        // Global shortcuts.
         match (code, mods) {
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => return KeyOutcome::Quit,
             (KeyCode::Char('o'), KeyModifiers::CONTROL) => {
@@ -2158,11 +2296,11 @@ impl App {
                 return KeyOutcome::None;
             }
             (KeyCode::PageUp, _) => {
-                self.scrollback.scroll_up(10);
+                self.active_scrollback().scroll_up(10);
                 return KeyOutcome::None;
             }
             (KeyCode::PageDown, _) => {
-                self.scrollback.scroll_down(10);
+                self.active_scrollback().scroll_down(10);
                 return KeyOutcome::None;
             }
             _ => {}
@@ -2303,6 +2441,17 @@ impl App {
             "/exit" => Some(KeyOutcome::Quit),
             "/clear" => Some(KeyOutcome::ClearContext),
             "/new" => Some(KeyOutcome::NewSession),
+            "/yolo" => {
+                let on = self.permissions.toggle_bypass();
+                if on {
+                    self.notify(
+                        "YOLO on — every tool call runs with NO permission prompt. /yolo to stop.",
+                    );
+                } else {
+                    self.notify("YOLO off — permission prompts restored.");
+                }
+                Some(KeyOutcome::None)
+            }
             "/copy" => {
                 self.copy_last();
                 Some(KeyOutcome::None)
@@ -2672,7 +2821,10 @@ pub(super) fn indent_line(line: Line<'static>) -> Line<'static> {
 
 #[cfg(test)]
 mod tests {
-    use super::{fmt_ctx_window, trim_dot};
+    use super::{
+        fmt_ctx_window, fmt_duration, fmt_tokens, trim_dot, truncate_mid, wrap_line,
+    };
+    use ratatui::text::{Line, Span};
 
     #[test]
     fn ctx_window_labels() {
@@ -2688,5 +2840,50 @@ mod tests {
     fn trim_dot_drops_trailing_zero() {
         assert_eq!(trim_dot(1.0), "1");
         assert_eq!(trim_dot(1.5), "1.5");
+    }
+
+    #[test]
+    fn fmt_duration_units() {
+        assert_eq!(fmt_duration(0), "0s");
+        assert_eq!(fmt_duration(59), "59s");
+        assert_eq!(fmt_duration(60), "1m");
+        assert_eq!(fmt_duration(83), "1m23s"); // seconds zero-padded
+        assert_eq!(fmt_duration(605), "10m05s");
+        assert_eq!(fmt_duration(3600), "1h0m");
+        assert_eq!(fmt_duration(3661), "1h1m");
+    }
+
+    #[test]
+    fn fmt_tokens_scales() {
+        assert_eq!(fmt_tokens(0), "0");
+        assert_eq!(fmt_tokens(999), "999");
+        assert_eq!(fmt_tokens(1_000), "1.0k");
+        assert_eq!(fmt_tokens(1_234), "1.2k");
+        assert_eq!(fmt_tokens(1_000_000), "1.0M");
+    }
+
+    #[test]
+    fn truncate_mid_head_and_ellipsis() {
+        // Under the cap → unchanged.
+        assert_eq!(truncate_mid("hi", 8), "hi");
+        // max < 4 → never truncates (no room for "x...").
+        assert_eq!(truncate_mid("abcdef", 3), "abcdef");
+        // Keeps max-1 chars + "..." (counts chars, not bytes).
+        assert_eq!(truncate_mid("hello world", 8), "hello w...");
+        assert_eq!(truncate_mid("héllo wörld", 6), "héllo...");
+    }
+
+    #[test]
+    fn wrap_line_splits_on_display_width() {
+        let line = Line::from(vec![Span::raw("aaaa")]);
+        let wrapped = wrap_line(line, 2);
+        let text: Vec<String> = wrapped
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(text, vec!["aa".to_string(), "aa".to_string()]);
+        // width 0 is a no-op (can't wrap into nothing).
+        let line = Line::from(vec![Span::raw("abc")]);
+        assert_eq!(wrap_line(line, 0).len(), 1);
     }
 }

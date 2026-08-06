@@ -3,10 +3,28 @@
 //! a frontend subscribes to this stream and renders it however it likes.
 
 use crate::core::types::{Message, Usage};
+use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
-#[derive(Clone, Debug)]
+/// Every observable agent action, serializable so it can be appended to the
+/// per-session event log (see [`crate::core::session`]) and replayed on resume.
+///
+/// Serialized internally-tagged (`{"kind":"ToolCall", ...}`) with NO
+/// `deny_unknown_fields`, so a newer bob can add fields to an existing variant
+/// and an older bob ignores them. Unrecognized *variants* decode to
+/// [`AgentEvent::Unknown`] (via `#[serde(other)]`) and replay as a no-op — the
+/// log is thus forward-compatible across versions.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind")]
 pub enum AgentEvent {
+    /// A user turn was submitted to this agent. Emitted by [`Agent::run`] the
+    /// instant the prompt is pushed to history, so the transcript's user line is
+    /// part of the event stream (and thus the replay log) rather than a UI-only
+    /// side effect. Empty coordination "wake" turns emit nothing.
+    UserPrompt {
+        agent_id: String,
+        text: String,
+    },
     TurnStart {
         agent_id: String,
     },
@@ -54,6 +72,17 @@ pub enum AgentEvent {
         agent_id: String,
         before_tokens: usize,
         after_tokens: usize,
+        /// The summary text that replaced the older messages. Carried in the log
+        /// so replay can rebuild the agent's compacted working set, not just the
+        /// full-history view. Token counts alone are insufficient to reconstruct
+        /// it. Defaults empty for events written before this field existed.
+        #[serde(default)]
+        summary: String,
+        /// The `full_history` index up to which older messages were folded into
+        /// `summary`. On replay the working set drops `working[..replaced_upto]`
+        /// and prepends the synthetic summary message.
+        #[serde(default)]
+        replaced_upto: usize,
     },
     /// A workflow run entered a new phase. `index`/`total` drive a progress bar; the
     /// `workflow_id` groups this run's agents + phases into one live tree in the UI.
@@ -93,6 +122,37 @@ pub enum AgentEvent {
         agent_id: String,
         message: String,
     },
+    /// A variant written by a newer bob that this build doesn't recognize.
+    /// Decoded here (never constructed locally) so replaying a forward-version
+    /// log is a no-op rather than a hard deserialize error.
+    #[serde(other)]
+    Unknown,
+}
+
+impl AgentEvent {
+    /// The variant tag, stored in the log's `kind` column for cheap filtering
+    /// and debugging without parsing the JSON payload.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            AgentEvent::UserPrompt { .. } => "UserPrompt",
+            AgentEvent::TurnStart { .. } => "TurnStart",
+            AgentEvent::TextDelta { .. } => "TextDelta",
+            AgentEvent::Message { .. } => "Message",
+            AgentEvent::ToolCall { .. } => "ToolCall",
+            AgentEvent::ToolResult { .. } => "ToolResult",
+            AgentEvent::SubagentSpawn { .. } => "SubagentSpawn",
+            AgentEvent::SubagentDone { .. } => "SubagentDone",
+            AgentEvent::AgentMessage { .. } => "AgentMessage",
+            AgentEvent::Compaction { .. } => "Compaction",
+            AgentEvent::WorkflowPhase { .. } => "WorkflowPhase",
+            AgentEvent::WorkflowLog { .. } => "WorkflowLog",
+            AgentEvent::ContextWarning { .. } => "ContextWarning",
+            AgentEvent::Completion { .. } => "Completion",
+            AgentEvent::TurnEnd { .. } => "TurnEnd",
+            AgentEvent::Error { .. } => "Error",
+            AgentEvent::Unknown => "Unknown",
+        }
+    }
 }
 
 pub type EventListener = Arc<dyn Fn(&AgentEvent) + Send + Sync>;

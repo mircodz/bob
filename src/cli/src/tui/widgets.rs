@@ -1,23 +1,33 @@
 //! Shared TUI building blocks. bob's TUI is immediate-mode over ratatui — every
-//! `draw_*` builds `Line`s and blits a `Paragraph`. Several overlays (team drawer,
-//! workflow view, agents sidebar, the pickers) re-implemented the same handful of
-//! primitives by hand: insetting a rect, a scrolling list with a selection cursor +
-//! click hit-testing, a faint vertical divider, and right-aligning a metadata
-//! column. Those hand-rolled copies drifted (inconsistent padding, off-by-one
-//! scroll/pad math), so they live here once.
+//! `draw_*` builds `Line`s and blits a `Paragraph`. Overlays (team drawer, workflow
+//! view, agents sidebar, pickers) once hand-rolled the same primitives — insetting
+//! a rect, a scrolling selection list, a faint vertical divider — and the copies
+//! drifted. They live here once now.
 //!
-//! This is deliberately a small set of HELPERS, not a widget framework — it stays
+//! Deliberately a small set of HELPERS, not a widget framework: it stays
 //! immediate-mode and composes with ratatui rather than wrapping it.
 
-// Some helpers are the shared vocabulary for overlays and aren't all wired into a
-// caller yet (they'll be used by the LSP/MCP sidebar sections + a future command
-// palette). Keep the module free of per-item dead-code warnings.
+// `row_at` is the click-hit companion to `window` — kept as part of the SelectList
+// API for symmetry (overlays currently hand-roll the screen-row→index map against
+// their own recorded rects). Suppress the lone dead-code warning rather than split
+// the type's vocabulary.
 #![allow(dead_code)]
 
 use super::theme::Palette;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
+
+/// The shared horizontal layout budget, in columns. The whole scrollback is inset
+/// by [`SIDE_PAD`] on each side; a floating "band" (a user message or the input
+/// box) sits inside that with an extra [`BAND_MARGIN`], so its colored edge lands
+/// at [`BAND_INSET`] (`SIDE_PAD + BAND_MARGIN`) columns from the screen edge. Every
+/// panel stacked above the input aligns its left edge to `BAND_INSET` so the whole
+/// column reads as one conversation. These live here (not per-file) so the input,
+/// the transcript, and the overlays can't drift apart.
+pub const SIDE_PAD: u16 = 2;
+pub const BAND_MARGIN: u16 = 2;
+pub const BAND_INSET: u16 = SIDE_PAD + BAND_MARGIN;
 
 /// Shrink a rect by `n` columns on each side and 0 rows (a horizontal inset). The
 /// most common breathing-room adjustment before rendering into a pane.
@@ -43,31 +53,12 @@ pub fn divider_col(area: Rect) -> Vec<Line<'static>> {
         .collect()
 }
 
-/// Right-align `meta` after `left_spans` within `width` display columns: returns
-/// `left_spans` + a padding spacer + `meta`, so the metadata column lands flush
-/// right. `left_w` is the display width already consumed by `left_spans` (the
-/// caller knows it; spans don't carry a cheap width). A minimum 1-col gap is kept.
-pub fn right_align(
-    mut left_spans: Vec<Span<'static>>,
-    left_w: usize,
-    meta: Span<'static>,
-    meta_w: usize,
-    width: usize,
-) -> Line<'static> {
-    let pad = width.saturating_sub(left_w + meta_w).max(1);
-    left_spans.push(Span::raw(" ".repeat(pad)));
-    left_spans.push(meta);
-    Line::from(left_spans)
-}
-
 /// A scrolling single-selection list. Owns the cursor + scroll offset and the
-/// window math so every overlay's roster/tree/picker shares one implementation
-/// (previously each hand-rolled ↑↓ clamping, scroll-to-keep-visible, and a
-/// screen-row → index hit map, and each got a subtle case wrong).
+/// window math so every overlay's roster/tree/picker shares one implementation.
 ///
-/// The list is content-agnostic: the caller supplies `len` (how many rows) and,
-/// at render time, a closure that builds each row's `Line`. `SelectList` returns
-/// the visible slice + a row→index hit map for clicks.
+/// Content-agnostic: the caller supplies `len` and builds each row's `Line` at
+/// render time. `window()` returns the visible index range; `row_at()` maps a
+/// click back to an index.
 #[derive(Default)]
 pub struct SelectList {
     /// Selected row index (clamped to `0..len`).
@@ -213,5 +204,84 @@ mod tests {
         assert_eq!(s.selected, 2);
         s.clamp(0);
         assert_eq!(s.selected, 0);
+    }
+
+    #[test]
+    fn clamp_leaves_in_range_selection() {
+        let mut s = SelectList::new();
+        s.selected = 3;
+        s.clamp(10); // already in range → unchanged
+        assert_eq!(s.selected, 3);
+    }
+
+    #[test]
+    fn page_up_down_jump_and_clamp() {
+        let mut s = SelectList::new();
+        s.page_down(10, 100);
+        assert_eq!(s.selected, 10);
+        s.page_down(10, 100);
+        assert_eq!(s.selected, 20);
+        s.page_up(5);
+        assert_eq!(s.selected, 15);
+        // Clamp at the ends.
+        s.page_down(1000, 100);
+        assert_eq!(s.selected, 99);
+        s.page_up(1000);
+        assert_eq!(s.selected, 0);
+        // Empty list → stays at 0, no panic.
+        let mut e = SelectList::new();
+        e.page_down(5, 0);
+        assert_eq!(e.selected, 0);
+    }
+
+    #[test]
+    fn window_edge_cases() {
+        let mut s = SelectList::new();
+        // Zero view height or empty list → empty range, scroll reset.
+        s.scroll = 4;
+        assert_eq!(s.window(10, 0), 0..0);
+        assert_eq!(s.scroll, 0);
+        s.scroll = 4;
+        assert_eq!(s.window(0, 5), 0..0);
+        assert_eq!(s.scroll, 0);
+        // Fewer items than the viewport → no scroll, full range.
+        s.selected = 2;
+        assert_eq!(s.window(3, 10), 0..3);
+        assert_eq!(s.scroll, 0);
+    }
+
+    #[test]
+    fn row_at_ignores_clicks_above_pane() {
+        let mut s = SelectList::new();
+        s.selected = 0;
+        let range = s.window(10, 4); // scroll 0, range 0..4
+        // A row above the pane top maps to nothing.
+        assert_eq!(s.row_at(&range, 20, 19), None);
+        // The pane's top row is the first index.
+        assert_eq!(s.row_at(&range, 20, 20), Some(0));
+    }
+
+    #[test]
+    fn divider_col_matches_height() {
+        assert_eq!(
+            divider_col(Rect {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 3,
+            })
+            .len(),
+            3
+        );
+        assert_eq!(
+            divider_col(Rect {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 0,
+            })
+            .len(),
+            0
+        );
     }
 }

@@ -1,4 +1,5 @@
 pub mod anthropic;
+pub mod codec;
 pub mod copilot;
 #[cfg(test)]
 pub mod mock;

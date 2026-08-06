@@ -234,11 +234,7 @@ impl Provider for ResponsesProvider {
                             ));
                         }
                         for (idx, (id, name, args)) in &tools {
-                            let input = if args.is_empty() {
-                                json!({})
-                            } else {
-                                serde_json::from_str(args).unwrap_or(json!({}))
-                            };
+                            let input = crate::providers::codec::parse_tool_input(args);
                             ordered.push((
                                 *idx,
                                 ContentBlock::ToolUse {
@@ -310,7 +306,12 @@ fn to_input_items(m: &Message) -> Vec<Value> {
                             "output": content,
                         }));
                     }
-                    _ => {}
+                    // A user turn never carries these; nothing to emit. Exhaustive
+                    // so a new variant can't silently vanish from the user path.
+                    ContentBlock::ToolUse { .. }
+                    | ContentBlock::Thinking { .. }
+                    | ContentBlock::RedactedThinking { .. }
+                    | ContentBlock::ReasoningItem { .. } => {}
                 }
             }
             if !parts.is_empty() {
@@ -331,7 +332,12 @@ fn to_input_items(m: &Message) -> Vec<Value> {
                     "call_id": tool_use_id,
                     "output": content,
                 })),
-                _ => None,
+                // A Tool message only carries tool_results.
+                ContentBlock::Text { .. }
+                | ContentBlock::ToolUse { .. }
+                | ContentBlock::Thinking { .. }
+                | ContentBlock::RedactedThinking { .. }
+                | ContentBlock::ReasoningItem { .. } => None,
             })
             .collect(),
         Role::Assistant => {

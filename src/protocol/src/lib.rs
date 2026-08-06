@@ -224,6 +224,13 @@ pub enum AgentEventDto {
 impl From<&AgentEvent> for AgentEventDto {
     fn from(e: &AgentEvent) -> Self {
         match e {
+            // The phone echoes the user's own submitted input locally, so a
+            // UserPrompt is mapped to a user Message but filtered out before it's
+            // sent (see host::is_remote_event) to avoid a double line.
+            AgentEvent::UserPrompt { agent_id, text } => AgentEventDto::Message {
+                agent_id: agent_id.clone(),
+                message: Message::user_text(text.clone()),
+            },
             AgentEvent::TurnStart { agent_id } => AgentEventDto::TurnStart {
                 agent_id: agent_id.clone(),
             },
@@ -281,6 +288,7 @@ impl From<&AgentEvent> for AgentEventDto {
                 agent_id,
                 before_tokens,
                 after_tokens,
+                ..
             } => AgentEventDto::Compaction {
                 agent_id: agent_id.clone(),
                 before_tokens: *before_tokens,
@@ -331,6 +339,12 @@ impl From<&AgentEvent> for AgentEventDto {
             AgentEvent::Error { agent_id, message } => AgentEventDto::Error {
                 agent_id: agent_id.clone(),
                 message: message.clone(),
+            },
+            // Only arises from replaying a log written by a newer bob; a live event
+            // is never Unknown. Surface it as a benign error rather than dropping it.
+            AgentEvent::Unknown => AgentEventDto::Error {
+                agent_id: String::new(),
+                message: "unknown event".to_string(),
             },
         }
     }

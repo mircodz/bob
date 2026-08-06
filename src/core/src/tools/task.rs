@@ -14,7 +14,18 @@ use crate::tools::jobs::{JobRegistry, JobStatus};
 use crate::tools::registry::{Tool, ToolContext, ToolError, ToolRegistry, ToolResult};
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+/// Process-wide monotonic counter for subagent ids. Per-batch `task_{i+1}` ids
+/// collided across successive `task` calls — the team drawer keys threads by id,
+/// so batch B's `task_1` silently overwrote batch A's finished `task_1` thread
+/// (spawned agents "didn't show up"). A global counter makes every spawn unique.
+static SUBAGENT_SEQ: AtomicU64 = AtomicU64::new(1);
+
+fn next_subagent_id() -> String {
+    format!("task_{}", SUBAGENT_SEQ.fetch_add(1, Ordering::Relaxed))
+}
 
 pub struct TaskTool {
     pub provider: Arc<dyn Provider>,
@@ -33,12 +44,19 @@ pub struct TaskTool {
 
 impl TaskTool {
     /// Build a subagent for one task and return the future that runs it.
-    fn make_child(&self, id: String, cwd: String) -> Agent {
+    /// `read_only` confines the child to the read-only tool subset (no
+    /// write/edit/bash) — for audit/analysis delegation that must not mutate.
+    fn make_child(&self, id: String, cwd: String, read_only: bool) -> Agent {
         // The simple `task` tool stays fire-and-forget: its children are not team
         // members (no inbox/registry). Coordinated agents come from `spawn_agent`.
+        let tools = if read_only {
+            self.subagent_tools.read_only_subset()
+        } else {
+            self.subagent_tools.clone()
+        };
         build_subagent(SubagentSpec {
             provider: self.provider.clone(),
-            tools: self.subagent_tools.clone(),
+            tools,
             bus: self.bus.clone(),
             system: self.subagent_system.clone(),
             cwd,
@@ -71,7 +89,9 @@ impl Tool for TaskTool {
                 concurrently. Do NOT delegate a quick read/grep/edit you can do directly, or work \
                 that needs your accumulated context: a subagent starts blank and sees only its \
                 prompt, so give it exact scope, the concrete deliverable, and the specific findings \
-                to report back — then verify its result rather than trusting it blindly."
+                to report back — then verify its result rather than trusting it blindly. \
+                For read/analysis/audit work that must not modify anything, set \
+                `read_only: true` so the subagent gets only read/search tools (no write/edit/bash)."
                     .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -87,7 +107,8 @@ impl Tool for TaskTool {
                             "required": ["description", "prompt"]
                         }
                     },
-                    "background": { "type": "boolean", "description": "Run detached as background jobs (default false)." }
+                    "background": { "type": "boolean", "description": "Run detached as background jobs (default false)." },
+                    "read_only": { "type": "boolean", "description": "Confine every subagent to read-only tools (reads/searches, no write/edit/bash). Use for audits/analysis that must not mutate files (default false)." }
                 },
                 "required": ["tasks"]
             }),
@@ -100,6 +121,7 @@ impl Tool for TaskTool {
             _ => return Err(ToolError::invalid_input("no tasks provided")),
         };
         let background = input["background"].as_bool().unwrap_or(false);
+        let read_only = input["read_only"].as_bool().unwrap_or(false);
         let base_cwd = if self.cwd.is_empty() {
             ctx.cwd.clone()
         } else {
@@ -113,7 +135,7 @@ impl Tool for TaskTool {
                 let description = t["description"].as_str().unwrap_or("").to_string();
                 let prompt = t["prompt"].as_str().unwrap_or("").to_string();
                 let job_id = ctx.jobs.next_id();
-                let child = self.make_child(job_id.clone(), base_cwd.clone());
+                let child = self.make_child(job_id.clone(), base_cwd.clone(), read_only);
                 let jobs = ctx.jobs.clone();
                 let jid = job_id.clone();
                 let handle = tokio::spawn(async move {
@@ -136,10 +158,10 @@ impl Tool for TaskTool {
 
         // Inline (blocking) — run all subagents concurrently and join.
         let mut handles = Vec::new();
-        for (i, t) in tasks.into_iter().enumerate() {
+        for t in tasks.into_iter() {
             let description = t["description"].as_str().unwrap_or("").to_string();
             let prompt = t["prompt"].as_str().unwrap_or("").to_string();
-            let id = format!("task_{}", i + 1);
+            let id = next_subagent_id();
             self.bus
                 .emit(crate::core::events::AgentEvent::SubagentSpawn {
                     parent_id: ROOT_AGENT_ID.to_string(),
@@ -147,7 +169,7 @@ impl Tool for TaskTool {
                     task: description.clone(),
                     prompt: prompt.clone(),
                 });
-            let child = self.make_child(id.clone(), base_cwd.clone());
+            let child = self.make_child(id.clone(), base_cwd.clone(), read_only);
             let bus = self.bus.clone();
             handles.push(tokio::spawn(async move {
                 let mut child = child;
@@ -280,5 +302,25 @@ impl Tool for ExploreTool {
                 failed,
             });
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_subagent_id;
+    use std::collections::HashSet;
+
+    // Regression: subagent ids used to be `task_{i+1}` numbered per-batch, so a
+    // second `task` call reused `task_1..` and the team drawer (which keys threads
+    // by id) silently overwrote the first batch's finished threads — spawned
+    // agents "didn't show up". Ids must be globally unique across calls.
+    #[test]
+    fn subagent_ids_are_unique_across_batches() {
+        let mut seen = HashSet::new();
+        // Two "batches" of four, as two separate `task` calls would produce.
+        for _ in 0..8 {
+            let id = next_subagent_id();
+            assert!(seen.insert(id.clone()), "duplicate subagent id: {id}");
+        }
     }
 }

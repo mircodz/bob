@@ -2,6 +2,7 @@
 //! provider-agnostic types to/from the Messages API, with prompt caching.
 
 use crate::core::types::*;
+use crate::providers::codec::BlockWire;
 use crate::providers::provider::Provider;
 use crate::providers::sse::parse_sse;
 use async_trait::async_trait;
@@ -362,12 +363,7 @@ fn finalize(
 ) -> Completion {
     for (i, b) in blocks.iter_mut().enumerate() {
         if let Some(ContentBlock::ToolUse { input, .. }) = b {
-            let raw = &tool_json[i];
-            *input = if raw.is_empty() {
-                json!({})
-            } else {
-                serde_json::from_str(raw).unwrap_or(json!({}))
-            };
+            *input = crate::providers::codec::parse_tool_input(&tool_json[i]);
         }
     }
     let content: Vec<ContentBlock> = blocks.iter().flatten().cloned().collect();
@@ -390,12 +386,7 @@ fn merge_into(target: &mut Value, extra: &Value) {
 }
 
 fn map_stop_reason(reason: &str) -> StopReason {
-    match reason {
-        "tool_use" => StopReason::ToolUse,
-        "max_tokens" => StopReason::MaxTokens,
-        "stop_sequence" => StopReason::StopSequence,
-        _ => StopReason::EndTurn,
-    }
+    crate::providers::codec::map_stop_reason(reason)
 }
 
 fn to_api_message(m: &Message) -> Value {
@@ -412,37 +403,46 @@ fn to_api_message(m: &Message) -> Value {
     let content: Vec<Value> = m
         .content
         .iter()
-        .filter_map(|b| match b {
-            ContentBlock::Text { text } => Some(json!({ "type": "text", "text": text })),
-            ContentBlock::ToolUse { id, name, input } => {
-                Some(json!({ "type": "tool_use", "id": id, "name": name, "input": input }))
-            }
-            ContentBlock::ToolResult {
-                tool_use_id,
-                content,
-                is_error,
-            } => Some(json!({
-                "type": "tool_result",
-                "tool_use_id": tool_use_id,
-                "content": content,
-                "is_error": is_error,
-            })),
-            ContentBlock::Thinking {
-                thinking,
-                signature,
-            } => Some(json!({
-                "type": "thinking",
-                "thinking": thinking,
-                "signature": signature,
-            })),
-            ContentBlock::RedactedThinking { data } => {
-                Some(json!({ "type": "redacted_thinking", "data": data }))
-            }
-            // OpenAI Responses-specific; never sent to Anthropic — drop it.
-            ContentBlock::ReasoningItem { .. } => None,
-        })
+        .filter_map(|b| block_to_wire(b).into_value())
         .collect();
     json!({ "role": role, "content": content })
+}
+
+/// Translate one content block to Anthropic's wire form. EXHAUSTIVE match: every
+/// `ContentBlock` variant is either emitted or explicitly skipped — a new variant
+/// is a compile error here, never a silent drop.
+fn block_to_wire(b: &ContentBlock) -> BlockWire {
+    match b {
+        ContentBlock::Text { text } => {
+            BlockWire::Emit(json!({ "type": "text", "text": text }))
+        }
+        ContentBlock::ToolUse { id, name, input } => {
+            BlockWire::Emit(json!({ "type": "tool_use", "id": id, "name": name, "input": input }))
+        }
+        ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+        } => BlockWire::Emit(json!({
+            "type": "tool_result",
+            "tool_use_id": tool_use_id,
+            "content": content,
+            "is_error": is_error,
+        })),
+        ContentBlock::Thinking {
+            thinking,
+            signature,
+        } => BlockWire::Emit(json!({
+            "type": "thinking",
+            "thinking": thinking,
+            "signature": signature,
+        })),
+        ContentBlock::RedactedThinking { data } => {
+            BlockWire::Emit(json!({ "type": "redacted_thinking", "data": data }))
+        }
+        // OpenAI Responses-specific; Anthropic has no representation — drop it.
+        ContentBlock::ReasoningItem { .. } => BlockWire::Skip,
+    }
 }
 
 fn from_api_message(data: &Value) -> Message {
@@ -548,5 +548,16 @@ mod tests {
         let blocks = v["content"].as_array().unwrap();
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0]["type"], "text");
+    }
+
+    #[test]
+    fn every_content_block_is_classified_not_dropped() {
+        use crate::providers::codec::conformance::all_content_blocks;
+        // block_to_wire is an exhaustive match: every ContentBlock is Emit or a
+        // deliberate Skip (ReasoningItem). A new variant without an arm is a
+        // compile error — silent drops can't regress.
+        for b in all_content_blocks() {
+            let _ = block_to_wire(&b);
+        }
     }
 }

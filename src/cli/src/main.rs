@@ -108,18 +108,32 @@ enum ConfigAction {
 
 #[derive(Subcommand)]
 enum McpAction {
-    /// Add a stdio MCP server. Put the command after `--`.
+    /// Add an MCP server. For stdio, put the command after `--`. For a remote
+    /// HTTP server, pass `--url` instead.
     ///
     /// e.g.  bob mcp add filesystem -- npx -y @modelcontextprotocol/server-filesystem /path
+    ///       bob mcp add github --url https://api.githubcopilot.com/mcp/
     Add {
         /// A name for the server (namespaces its tools as <name>.<tool>).
         name: String,
-        /// Repeatable env var, KEY=VALUE.
+        /// Remote HTTP server URL. If set, this is an HTTP (not stdio) server.
+        #[arg(long)]
+        url: Option<String>,
+        /// Repeatable env var, KEY=VALUE (stdio only).
         #[arg(short, long = "env", value_name = "KEY=VALUE")]
         env: Vec<String>,
-        /// The command and its args (everything after `--`).
-        #[arg(last = true, required = true)]
+        /// The command and its args (everything after `--`) for a stdio server.
+        #[arg(last = true)]
         command: Vec<String>,
+    },
+    /// Authorize a remote HTTP MCP server. Uses OAuth (opens a browser) by
+    /// default, or stores a static token if you pass --token.
+    Login {
+        name: String,
+        /// Use this bearer token directly (e.g. a GitHub Personal Access Token)
+        /// instead of the OAuth browser flow.
+        #[arg(long)]
+        token: Option<String>,
     },
     /// List configured MCP servers.
     List,
@@ -247,7 +261,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Logout { provider }) => return run_logout(&provider),
         Some(Command::Auth) => return show_auth(),
         Some(Command::Config { action }) => return run_config(action),
-        Some(Command::Mcp { action }) => return run_mcp(action),
+        Some(Command::Mcp { action }) => return run_mcp(action).await,
         Some(Command::Lsp { action }) => return run_lsp(action),
         Some(Command::Remote {
             relay,
@@ -463,16 +477,38 @@ fn show_config() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_mcp(action: McpAction) -> anyhow::Result<()> {
+async fn run_mcp(action: McpAction) -> anyhow::Result<()> {
     use bob_core::core::config::{
         add_mcp_server, list_mcp_servers, remove_mcp_server, McpServerConfig,
     };
     match action {
-        McpAction::Add { name, env, command } => {
+        McpAction::Add {
+            name,
+            url,
+            env,
+            command,
+        } => {
+            if let Some(url) = url {
+                let replaced = add_mcp_server(McpServerConfig {
+                    name: name.clone(),
+                    command: String::new(),
+                    args: vec![],
+                    env: std::collections::HashMap::new(),
+                    url: Some(url),
+                    oauth: None,
+                })?;
+                println!(
+                    "\x1b[32m{}\x1b[0m HTTP MCP server '{}' in ~/.bob/config.toml",
+                    if replaced { "updated" } else { "added" },
+                    name
+                );
+                println!("  authorize it with:  \x1b[36mbob mcp login {}\x1b[0m", name);
+                return Ok(());
+            }
             let mut parts = command.into_iter();
             let cmd = parts
                 .next()
-                .ok_or_else(|| anyhow::anyhow!("no command given (put it after `--`)"))?;
+                .ok_or_else(|| anyhow::anyhow!("no command given (put it after `--`, or pass --url for an HTTP server)"))?;
             let args: Vec<String> = parts.collect();
             let mut env_map = std::collections::HashMap::new();
             for pair in env {
@@ -488,12 +524,53 @@ fn run_mcp(action: McpAction) -> anyhow::Result<()> {
                 command: cmd,
                 args,
                 env: env_map,
+                url: None,
+                oauth: None,
             })?;
             println!(
                 "\x1b[32m{}\x1b[0m MCP server '{}' in ~/.bob/config.toml",
                 if replaced { "updated" } else { "added" },
                 name
             );
+            Ok(())
+        }
+        McpAction::Login { name, token } => {
+            let servers = list_mcp_servers()?;
+            let server = servers
+                .iter()
+                .find(|s| s.name == name)
+                .ok_or_else(|| anyhow::anyhow!("no MCP server named '{}'", name))?;
+            if server.url.is_none() {
+                anyhow::bail!("'{}' is a stdio server; login is only for HTTP servers", name);
+            }
+
+            // Static-token path (e.g. a GitHub Personal Access Token).
+            if let Some(token) = token {
+                bob_core::auth::mcp::store_static_token(&name, &token)?;
+                println!("\x1b[32mstored token\x1b[0m for MCP server '{}'", name);
+                return Ok(());
+            }
+
+            let url = server.url.clone().unwrap();
+            // Discover OAuth config if we don't already have it, and persist it.
+            let oauth = match &server.oauth {
+                Some(o) => o.clone(),
+                None => {
+                    println!("discovering OAuth configuration for '{}'…", name);
+                    let discovered = bob_core::auth::mcp::discover(&name, &url).await?;
+                    let mut updated = server.clone();
+                    updated.oauth = Some(discovered.clone());
+                    add_mcp_server(updated)?;
+                    discovered
+                }
+            };
+
+            let handle = bob_core::auth::mcp::begin_login(&name, &oauth);
+            println!("\nTo authorize bob with the '{}' MCP server:", name);
+            println!("  open  \x1b[36m{}\x1b[0m", handle.url);
+            println!("waiting for you to approve in the browser…");
+            bob_core::auth::mcp::finish_login(handle).await?;
+            println!("\x1b[32mauthorized\x1b[0m MCP server '{}'", name);
             Ok(())
         }
         McpAction::List => {
@@ -505,20 +582,37 @@ fn run_mcp(action: McpAction) -> anyhow::Result<()> {
             }
             println!("MCP servers (~/.bob/config.toml):");
             for s in servers {
-                let args = if s.args.is_empty() {
-                    String::new()
+                if let Some(url) = &s.url {
+                    let auth = if s.oauth.is_some() {
+                        " (oauth)"
+                    } else {
+                        ""
+                    };
+                    println!(
+                        "  \x1b[1m{}\x1b[0m  \x1b[90mhttp {}{}\x1b[0m",
+                        s.name, url, auth
+                    );
                 } else {
-                    format!(" {}", s.args.join(" "))
-                };
-                println!(
-                    "  \x1b[1m{}\x1b[0m  \x1b[90m{}{}\x1b[0m",
-                    s.name, s.command, args
-                );
+                    let args = if s.args.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" {}", s.args.join(" "))
+                    };
+                    println!(
+                        "  \x1b[1m{}\x1b[0m  \x1b[90m{}{}\x1b[0m",
+                        s.name, s.command, args
+                    );
+                }
             }
             Ok(())
         }
         McpAction::Remove { name } => {
             if remove_mcp_server(&name)? {
+                // Also clear any stored OAuth credentials for this server.
+                let mut store = bob_core::auth::AuthStore::load();
+                if store.remove(&format!("mcp:{}", name)) {
+                    let _ = store.save();
+                }
                 println!("\x1b[32mremoved\x1b[0m MCP server '{}'", name);
             } else {
                 println!("no MCP server named '{}'", name);

@@ -19,6 +19,29 @@ pub struct AgentThread {
     pub cells: Vec<Cell>,
     /// Content cells appended since the drawer last showed this thread.
     pub unread: usize,
+    /// Bumped on every transcript mutation, so a shared scrollback renderer can
+    /// invalidate its per-cell cache exactly like the root `ViewModel.revision`.
+    /// (Cells can change in place — a tool cell flips status without changing
+    /// `cells.len()` — so a length check alone would miss updates.)
+    pub revision: u64,
+}
+
+impl AgentThread {
+    /// The label shown in the drawer roster. `spawn_agent` children carry a
+    /// semantic handle (e.g. "researcher") as their id, so `name` is meaningful.
+    /// `task` children get an opaque auto-id (`task_7`); for those we prefer the
+    /// human `task` description ("review src/core") the model supplied at spawn.
+    pub fn display_label(&self) -> &str {
+        let looks_auto = self
+            .name
+            .strip_prefix("task_")
+            .is_some_and(|n| n.chars().all(|c| c.is_ascii_digit()));
+        if looks_auto && !self.task.trim().is_empty() {
+            &self.task
+        } else {
+            &self.name
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -37,6 +60,7 @@ impl AgentThread {
             status: ThreadStatus::Running,
             cells: Vec::new(),
             unread: 0,
+            revision: 0,
         }
     }
 }
@@ -154,6 +178,7 @@ impl AgentTranscripts {
         // prompt of the conversation.
         if !already && !prompt.trim().is_empty() {
             t.cells.push(Cell::User(prompt.to_string()));
+            t.revision += 1;
         }
     }
 
@@ -165,6 +190,7 @@ impl AgentTranscripts {
         } else {
             ThreadStatus::Done
         };
+        t.revision += 1;
     }
 
     /// Append a message line to an agent's thread (chat to/from it). `showing` is
@@ -176,6 +202,7 @@ impl AgentTranscripts {
             from: from.to_string(),
             text: text.to_string(),
         });
+        t.revision += 1;
         if !is_showing {
             t.unread += 1;
         }
@@ -216,6 +243,9 @@ impl AgentTranscripts {
                         before = t.cells.len();
                         apply_content_event(&mut t.cells, event, true);
                         after = t.cells.len();
+                        // A content event may mutate a cell in place (tool status)
+                        // without growing `cells`, so bump unconditionally.
+                        t.revision += 1;
                     }
                     if !is_showing && after > before {
                         if let Some(t) = self.threads.get_mut(id) {
@@ -264,6 +294,7 @@ impl AgentTranscripts {
                 status,
                 cells: pt.cells.iter().map(cell_from_persisted).collect(),
                 unread: 0,
+                revision: 0,
             };
             out.order.push(pt.id.clone());
             out.threads.insert(pt.id.clone(), thread);
@@ -337,6 +368,7 @@ fn cell_from_persisted(pc: &PersistedCell) -> Cell {
 fn event_agent_id(event: &AgentEvent) -> Option<&str> {
     match event {
         AgentEvent::TurnStart { agent_id }
+        | AgentEvent::UserPrompt { agent_id, .. }
         | AgentEvent::TextDelta { agent_id, .. }
         | AgentEvent::Message { agent_id, .. }
         | AgentEvent::ToolCall { agent_id, .. }
@@ -351,6 +383,7 @@ fn event_agent_id(event: &AgentEvent) -> Option<&str> {
         | AgentEvent::WorkflowPhase { .. }
         | AgentEvent::WorkflowLog { .. }
         | AgentEvent::AgentMessage { .. } => None,
+        AgentEvent::Unknown => None,
     }
 }
 
@@ -360,22 +393,19 @@ fn event_agent_id(event: &AgentEvent) -> Option<&str> {
 /// `None` on the App means the view is closed.
 pub struct WorkflowView {
     pub run_id: String,
-    /// Cursor into the flattened row list (phase headers + agents), rebuilt each
-    /// draw. Enter on an agent expands its inline detail; on a phase toggles it.
-    pub selected: usize,
+    /// Cursor + scroll into the flattened row list (phase headers + agents), rebuilt
+    /// each draw. Enter on an agent expands its inline detail; on a phase toggles it.
+    pub list: super::widgets::SelectList,
     /// Phase indices the user has collapsed (their agents are hidden).
     pub collapsed: std::collections::HashSet<usize>,
-    /// Vertical scroll offset of the tree pane, in rows.
-    pub scroll: u16,
 }
 
 impl Default for WorkflowView {
     fn default() -> Self {
         WorkflowView {
             run_id: String::new(),
-            selected: 0,
+            list: super::widgets::SelectList::new(),
             collapsed: std::collections::HashSet::new(),
-            scroll: 0,
         }
     }
 }
@@ -383,7 +413,10 @@ impl Default for WorkflowView {
 /// Drawer UI state: which agent is selected, scroll offset, and (when chatting)
 /// the compose buffer. `None` on the App means the drawer is closed.
 pub struct TeamDrawer {
-    pub selected: usize,
+    /// Roster selection cursor + scroll (the roster windows when the team is taller
+    /// than the pane). Distinct from `TeamDrawer::scroll` below, which is the
+    /// *detail-pane* transcript scroll.
+    pub list: super::widgets::SelectList,
     pub scroll: u16,
     /// Roster index the mouse is currently hovering (for a hover highlight), or
     /// `None` when the cursor isn't over a roster row.
@@ -395,7 +428,7 @@ pub struct TeamDrawer {
 impl Default for TeamDrawer {
     fn default() -> Self {
         TeamDrawer {
-            selected: 0,
+            list: super::widgets::SelectList::new(),
             scroll: 0,
             hovered: None,
             composing: None,
@@ -510,6 +543,20 @@ mod tests {
     }
 
     #[test]
+    fn display_label_prefers_description_for_auto_ids() {
+        let mut t = AgentTranscripts::new();
+        // `task` child: opaque id + human description → drawer shows the description.
+        t.on_spawn("task_7", "root", "review src/core", "audit it");
+        assert_eq!(t.get("task_7").unwrap().display_label(), "review src/core");
+        // `spawn_agent` child: semantic handle as id → keep the handle.
+        t.on_spawn("researcher", "root", "dig into perf", "profile it");
+        assert_eq!(t.get("researcher").unwrap().display_label(), "researcher");
+        // Auto-id with no description → fall back to the id, never blank.
+        t.on_spawn("task_9", "root", "", "");
+        assert_eq!(t.get("task_9").unwrap().display_label(), "task_9");
+    }
+
+    #[test]
     fn completion_event_is_noop_content() {
         let mut t = AgentTranscripts::new();
         t.on_spawn("a", "root", "task", "");
@@ -522,5 +569,40 @@ mod tests {
             None,
         );
         assert_eq!(t.get("a").unwrap().cells.len(), 0);
+    }
+
+    #[test]
+    fn depth_of_walks_parent_chain() {
+        let mut t = AgentTranscripts::new();
+        t.on_spawn("a", "root", "", ""); // root child → depth 0
+        t.on_spawn("ab", "a", "", ""); // grandchild → 1
+        t.on_spawn("abc", "ab", "", ""); // great-grandchild → 2
+        assert_eq!(t.depth_of("a"), 0);
+        assert_eq!(t.depth_of("ab"), 1);
+        assert_eq!(t.depth_of("abc"), 2);
+        // Unknown id → 0.
+        assert_eq!(t.depth_of("missing"), 0);
+    }
+
+    #[test]
+    fn depth_of_survives_a_cycle() {
+        // A self-referential / cyclic parent must not hang (depth is capped).
+        let mut t = AgentTranscripts::new();
+        t.on_spawn("a", "b", "", "");
+        t.on_spawn("b", "a", "", "");
+        // Terminates and returns a bounded value.
+        assert!(t.depth_of("a") <= 16);
+    }
+
+    #[test]
+    fn display_order_runs_before_finished() {
+        let mut t = AgentTranscripts::new();
+        t.on_spawn("a", "root", "", "");
+        t.on_spawn("b", "root", "", "");
+        t.on_spawn("c", "root", "", "");
+        t.on_done("a", false); // a finishes
+        // Running (b, c, in spawn order) first, then finished (a) at the bottom.
+        assert_eq!(t.display_order(), vec!["b", "c", "a"]);
+        assert_eq!(t.running_ids(), vec!["b", "c"]);
     }
 }

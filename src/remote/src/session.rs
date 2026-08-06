@@ -43,6 +43,18 @@ pub fn load(id: &str) -> Option<Session> {
     load_session(id).ok().flatten()
 }
 
+/// The message history to seed the agent + greet the controller with, preferring
+/// the event log (the single source of truth) over the stored blob. Falls back to
+/// the blob when the log is absent (legacy sessions) or reconstructs FEWER
+/// messages than the blob — a truncated/corrupt log must never lose history.
+/// Mirrors the TUI's replay-with-guard on resume.
+pub fn history_for(session: &Session) -> Vec<Message> {
+    let events = bob_core::core::session::load_events(&session.id)
+        .ok()
+        .flatten();
+    bob_core::core::session::reconstructed_history(events.as_deref(), &session.messages)
+}
+
 /// Persist a session's current messages under its id, bumping updated_at.
 pub fn persist(session: &mut Session, messages: Vec<Message>) {
     session.messages = messages;

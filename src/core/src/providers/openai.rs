@@ -304,11 +304,7 @@ impl Provider for OpenAiProvider {
                 content.push(ContentBlock::Text { text });
             }
             for (_, (id, name, args)) in tool_acc {
-                let input = if args.is_empty() {
-                    json!({})
-                } else {
-                    serde_json::from_str(&args).unwrap_or(json!({}))
-                };
+                let input = crate::providers::codec::parse_tool_input(&args);
                 content.push(ContentBlock::ToolUse { id, name, input });
             }
             let completion = Completion {
@@ -410,24 +406,24 @@ pub(crate) fn chat_supports_reasoning(model: &str) -> bool {
 }
 
 fn map_finish(reason: &str) -> StopReason {
-    match reason {
-        "tool_calls" | "function_call" => StopReason::ToolUse,
-        "length" => StopReason::MaxTokens,
-        _ => StopReason::EndTurn,
-    }
+    crate::providers::codec::map_stop_reason(reason)
 }
 
 /// One of our messages may become several OpenAI messages (tool results split).
+///
+/// Every `ContentBlock` is classified by [`classify_block`] with an EXHAUSTIVE
+/// match, so a block this format can't represent is skipped *on purpose* (with a
+/// stated reason) rather than silently dropped by a `_ => None` — the bug this
+/// replaced. A new `ContentBlock` variant won't compile until it's handled.
 fn to_api_messages(m: &Message) -> Vec<Value> {
     if m.role == Role::Tool {
         return m
             .content
             .iter()
-            .filter_map(|b| match b {
-                ContentBlock::ToolResult {
+            .filter_map(|b| match classify_block(b) {
+                OpenAiBlock::ToolResult {
                     tool_use_id,
                     content,
-                    ..
                 } => Some(json!({
                     "role": "tool",
                     "tool_call_id": tool_use_id,
@@ -438,28 +434,18 @@ fn to_api_messages(m: &Message) -> Vec<Value> {
             .collect();
     }
 
-    let text: String = m
-        .content
-        .iter()
-        .filter_map(|b| match b {
-            ContentBlock::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("");
-
-    let tool_calls: Vec<Value> = m
-        .content
-        .iter()
-        .filter_map(|b| match b {
-            ContentBlock::ToolUse { id, name, input } => Some(json!({
-                "id": id,
-                "type": "function",
-                "function": { "name": name, "arguments": input.to_string() },
-            })),
-            _ => None,
-        })
-        .collect();
+    let mut text = String::new();
+    let mut tool_calls: Vec<Value> = Vec::new();
+    for b in &m.content {
+        match classify_block(b) {
+            OpenAiBlock::Text(t) => text.push_str(&t),
+            OpenAiBlock::ToolCall(v) => tool_calls.push(v),
+            // A tool_result on a non-Tool message, or a reasoning/thinking block:
+            // chat/completions has no field for these, so they're intentionally
+            // not sent. (Thinking is Anthropic-only; ReasoningItem is Responses-only.)
+            OpenAiBlock::ToolResult { .. } | OpenAiBlock::SkipUnsupported => {}
+        }
+    }
 
     let role = match m.role {
         Role::Assistant => "assistant",
@@ -477,6 +463,41 @@ fn to_api_messages(m: &Message) -> Vec<Value> {
     vec![msg]
 }
 
+/// The chat/completions role a `ContentBlock` maps to. Exhaustive by construction:
+/// the match in [`classify_block`] must cover every `ContentBlock` variant, so a
+/// newly added variant is a compile error here — never a silent drop.
+enum OpenAiBlock {
+    Text(String),
+    ToolCall(Value),
+    ToolResult { tool_use_id: String, content: String },
+    /// Deliberately unsupported by chat/completions (thinking / reasoning items).
+    SkipUnsupported,
+}
+
+fn classify_block(b: &ContentBlock) -> OpenAiBlock {
+    match b {
+        ContentBlock::Text { text } => OpenAiBlock::Text(text.clone()),
+        ContentBlock::ToolUse { id, name, input } => OpenAiBlock::ToolCall(json!({
+            "id": id,
+            "type": "function",
+            "function": { "name": name, "arguments": input.to_string() },
+        })),
+        ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            ..
+        } => OpenAiBlock::ToolResult {
+            tool_use_id: tool_use_id.clone(),
+            content: content.clone(),
+        },
+        // No chat/completions representation — thinking is Anthropic's, reasoning
+        // items are the Responses API's. Omitted deliberately, not by accident.
+        ContentBlock::Thinking { .. }
+        | ContentBlock::RedactedThinking { .. }
+        | ContentBlock::ReasoningItem { .. } => OpenAiBlock::SkipUnsupported,
+    }
+}
+
 fn from_api_message(msg: &Value) -> Message {
     let mut content: Vec<ContentBlock> = Vec::new();
     if let Some(c) = msg["content"].as_str() {
@@ -492,11 +513,7 @@ fn from_api_message(msg: &Value) -> Message {
             content.push(ContentBlock::ToolUse {
                 id: tc["id"].as_str().unwrap_or("").to_string(),
                 name: tc["function"]["name"].as_str().unwrap_or("").to_string(),
-                input: if args.is_empty() {
-                    json!({})
-                } else {
-                    serde_json::from_str(args).unwrap_or(json!({}))
-                },
+                input: crate::providers::codec::parse_tool_input(args),
             });
         }
     }
@@ -519,5 +536,61 @@ mod tests {
         assert!(!chat_supports_reasoning("gpt-4o"));
         assert!(!chat_supports_reasoning("claude-sonnet-4-5"));
         assert!(!chat_supports_reasoning("gpt-3.5-turbo"));
+    }
+
+    #[test]
+    fn text_and_tool_use_survive_conversion() {
+        use super::*;
+        // The regression that motivated the codec seam: text + tool_use in one
+        // assistant message must BOTH appear on the wire (previously two separate
+        // filter_maps, now one exhaustive classify_block).
+        let m = Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Text {
+                    text: "let me look".into(),
+                },
+                ContentBlock::ToolUse {
+                    id: "t1".into(),
+                    name: "read_file".into(),
+                    input: json!({"path": "a.rs"}),
+                },
+            ],
+        };
+        let out = to_api_messages(&m);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["content"], json!("let me look"));
+        assert_eq!(out[0]["tool_calls"][0]["function"]["name"], json!("read_file"));
+    }
+
+    #[test]
+    fn tool_result_message_maps_to_tool_role() {
+        use super::*;
+        let m = Message {
+            role: Role::Tool,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "t1".into(),
+                content: "42".into(),
+                is_error: Some(false),
+            }],
+        };
+        let out = to_api_messages(&m);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["role"], json!("tool"));
+        assert_eq!(out[0]["tool_call_id"], json!("t1"));
+        assert_eq!(out[0]["content"], json!("42"));
+    }
+
+    #[test]
+    fn every_content_block_is_classified_not_dropped() {
+        use super::*;
+        use crate::providers::codec::conformance::all_content_blocks;
+        // The anti-silent-drop guarantee: classify_block covers EVERY ContentBlock
+        // variant. Unsupported ones (thinking/reasoning) are SkipUnsupported by
+        // intent — never an accidental fall-through. If a new variant is added
+        // without a classify_block arm, this file won't compile.
+        for b in all_content_blocks() {
+            let _ = classify_block(&b); // exhaustive match — compile-time proof
+        }
     }
 }

@@ -4,7 +4,7 @@
 //! child module, they can access App's private fields directly.
 
 use super::theme::Palette;
-use super::widgets::{divider_col, inset};
+use super::widgets::{divider_col, inset, BAND_INSET};
 use super::{indent_line, render, team, truncate_mid, App};
 use bob_core::core::permissions::Mode;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -20,14 +20,20 @@ const INPUT_PAD: u16 = 1;
 /// Width of the collapsible info sidebar (agents/LSP/MCP), in columns.
 const SIDEBAR_W: u16 = 44;
 
+/// Team-drawer roster column width, and the name budget inside it once the
+/// `"  • "` dot chrome (~8 cols) is subtracted. Nesting eats 2 cols per depth.
+const ROSTER_W: u16 = 24;
+const ROSTER_NAME_W: usize = 16;
+
 impl App {
     /// Build the wrapped, prompt-prefixed display lines for the input box, given
     /// the usable text width. Used for BOTH the height calc and rendering so they
     /// never disagree. The first row carries a `›` marker, wrapped/continuation
     /// rows a 2-space indent, so text stays aligned under the marker.
     fn input_lines(&self, width: usize, busy: bool) -> Vec<Line<'static>> {
-        // The prompt marker + its continuation indent are both 2 columns wide, so
-        // content wraps at `width - 2` and every visual row aligns.
+        // Marker convention: `›` (DIM) = a text-input/prompt line; `❯` (WARN) = the
+        // selected row of a list/menu. Don't cross them.
+        // Marker + continuation indent are both 2 cols, so content wraps at width-2.
         const PREFIX: usize = 2;
         let text_color = Style::default().fg(Palette::TEXT());
         let marker = || Span::styled("› ", Style::default().fg(Palette::DIM()));
@@ -66,19 +72,15 @@ impl App {
             Block::default().style(Style::default().bg(Palette::BG())),
             area,
         );
-        // The input band grows with the number of *wrapped* text lines
-        // (1 pad row above + N text rows + 1 pad row below), capped so it can't
-        // eat the whole screen. Use the SAME inset width the renderer uses, or the
-        // height won't match the wrapped line count.
-        // The band is inset 4 cols each side (see draw_input), so the usable text
-        // width is the content width minus that inset AND the internal INPUT_PAD.
-        // The content column is narrower when the sidebar is open.
+        // Input band height = 1 pad + wrapped text rows + 1 pad, capped. Compute the
+        // wrap width with the SAME inset the renderer uses (BAND_INSET + INPUT_PAD),
+        // or the height won't match the line count. Narrower when the sidebar is open.
         let content_w = if self.sidebar_open {
             area.width.saturating_sub(SIDEBAR_W)
         } else {
             area.width
         };
-        let text_width = content_w.saturating_sub(8 + INPUT_PAD * 2) as usize;
+        let text_width = content_w.saturating_sub(BAND_INSET * 2 + INPUT_PAD * 2) as usize;
         let wrapped = self
             .input_lines(text_width, self.running || self.view.busy)
             .len();
@@ -88,12 +90,13 @@ impl App {
         // The band above the input shows either a permission prompt or a user
         // question (they don't co-occur), sized to its content.
         let prompt_height = if !self.perm_queue.is_empty() {
-            // Count lines at the SAME padded width the renderer uses (2 cols each
+            // Count lines at the SAME padded width the renderer uses (BAND_INSET each
             // side), +2 for the top padding row and a bottom breathing row.
-            let inner_w = (area.width.saturating_sub(4)) as usize;
+            let inner_w = area.width.saturating_sub(BAND_INSET * 2) as usize;
             (self.permission_lines(inner_w).len() as u16 + 2).min(24)
         } else if self.pending_query.is_some() {
-            (self.query_lines(area.width as usize).len() as u16 + 1).min(24)
+            let inner_w = area.width.saturating_sub(BAND_INSET * 2) as usize;
+            (self.query_lines(inner_w).len() as u16 + 1).min(24)
         } else {
             0
         };
@@ -205,6 +208,11 @@ impl App {
     ) {
         use bob_core::tools::todo::TodoStatus;
         f.render_widget(Clear, area);
+        f.render_widget(
+            Block::default().style(Style::default().bg(Palette::BG())),
+            area,
+        );
+        let area = inset(area, BAND_INSET);
         let done = items
             .iter()
             .filter(|i| i.status == TodoStatus::Completed)
@@ -225,7 +233,7 @@ impl App {
         let mut lines: Vec<Line> = vec![
             Line::from(""),
             Line::from(Span::styled(
-                format!("  {}", header),
+                header,
                 Style::default().fg(Palette::DIM()),
             )),
         ];
@@ -258,7 +266,7 @@ impl App {
                 item.label().to_string()
             };
             lines.push(Line::from(vec![
-                Span::styled(format!("  {} ", glyph), Style::default().fg(glyph_color)),
+                Span::styled(format!("{} ", glyph), Style::default().fg(glyph_color)),
                 Span::styled(text, text_style),
             ]));
         }
@@ -277,12 +285,17 @@ impl App {
     ) {
         use bob_core::tools::jobs::JobStatus;
         f.render_widget(Clear, area);
+        f.render_widget(
+            Block::default().style(Style::default().bg(Palette::BG())),
+            area,
+        );
+        let area = inset(area, BAND_INSET);
         let running = jobs
             .iter()
             .filter(|(_, _, _, s)| *s == JobStatus::Running)
             .count();
         let mut lines: Vec<Line> = vec![Line::from(Span::styled(
-            format!(" background jobs · {} running ", running),
+            format!("background jobs · {} running", running),
             Style::default()
                 .fg(Palette::ACCENT())
                 .add_modifier(Modifier::BOLD),
@@ -295,7 +308,7 @@ impl App {
                 JobStatus::Cancelled => ("•", Palette::FAINT()),
             };
             lines.push(Line::from(vec![
-                Span::styled(format!("  {} ", glyph), Style::default().fg(color)),
+                Span::styled(format!("{} ", glyph), Style::default().fg(color)),
                 Span::styled(format!("{} ", id), Style::default().fg(Palette::DIM())),
                 Span::styled(
                     format!("[{}] ", kind),
@@ -318,8 +331,13 @@ impl App {
     /// last chip can be popped back for editing with Backspace on an empty prompt.
     fn draw_queue(&self, f: &mut ratatui::Frame, area: Rect) {
         f.render_widget(Clear, area);
+        f.render_widget(
+            Block::default().style(Style::default().bg(Palette::BG())),
+            area,
+        );
+        let area = inset(area, BAND_INSET);
         let mut lines: Vec<Line> = vec![Line::from(Span::styled(
-            format!(" queued · {} · sent after this turn ", self.queue.len()),
+            format!("queued · {} · sent after this turn", self.queue.len()),
             Style::default()
                 .fg(Palette::ACCENT())
                 .add_modifier(Modifier::BOLD),
@@ -330,11 +348,11 @@ impl App {
             .take(area.height.saturating_sub(1) as usize)
         {
             lines.push(Line::from(vec![
-                Span::styled("  › ", Style::default().fg(Palette::DIM())),
+                Span::styled("› ", Style::default().fg(Palette::DIM())),
                 Span::styled(
                     truncate_mid(
                         &msg.replace('\n', " "),
-                        area.width.saturating_sub(4) as usize,
+                        area.width.saturating_sub(2) as usize,
                     ),
                     Style::default().fg(Palette::TEXT()),
                 ),
@@ -357,10 +375,8 @@ impl App {
         let drawer_scroll = drawer.scroll;
         let compose_buf: Option<String> = drawer.composing.clone();
         let composing = compose_buf.is_some();
-        // A distinct popup background sets the drawer apart from the main log.
-        // Minimal, chrome-free overlay matching the rest of the TUI: base
-        // background, dim prose, one colored status dot per agent, the selected
-        // agent bold, separation by whitespace (no boxes/borders/dividers/bars).
+        // Chrome-free overlay: base background, one status dot per agent, selected
+        // agent bold, whitespace separation (no boxes/borders/bars).
         f.render_widget(Clear, area);
         f.render_widget(
             Block::default().style(Style::default().bg(Palette::BG())),
@@ -401,7 +417,7 @@ impl App {
         let body = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Length(24),
+                Constraint::Length(ROSTER_W),
                 Constraint::Length(2), // divider column (│ + a space of breathing room)
                 Constraint::Min(10),
             ])
@@ -419,8 +435,29 @@ impl App {
         }
 
         // Left: agent roster (running first, finished at the bottom & dimmed).
+        // Window it so a large team scrolls to keep the selection visible instead of
+        // overflowing the pane. One leading blank line, so the roster body is
+        // `height - 1` rows; the resolved scroll is written back for the click map.
+        let roster_h = (body[0].height as usize).saturating_sub(1);
+        let range = {
+            let mut list = super::widgets::SelectList {
+                selected: sel,
+                scroll: self
+                    .team_drawer
+                    .as_ref()
+                    .map(|d| d.list.scroll)
+                    .unwrap_or(0),
+            };
+            let r = list.window(order.len(), roster_h);
+            if let Some(d) = self.team_drawer.as_mut() {
+                d.list.scroll = list.scroll;
+            }
+            r
+        };
+        self.roster_scroll = range.start;
         let mut roster: Vec<Line> = vec![Line::from("")];
-        for (i, id) in order.iter().enumerate() {
+        for i in range.clone() {
+            let id = &order[i];
             let Some(t) = self.teams.get(id) else {
                 continue;
             };
@@ -452,7 +489,7 @@ impl App {
             let mut spans = vec![
                 Span::styled(format!("  {}• ", indent), Style::default().fg(dot_color)),
                 Span::styled(
-                    truncate_mid(&t.name, 16usize.saturating_sub(depth * 2)),
+                    truncate_mid(t.display_label(), ROSTER_NAME_W.saturating_sub(depth * 2)),
                     name_style,
                 ),
             ];
@@ -510,7 +547,7 @@ impl App {
         let hint = if composing {
             let buf = compose_buf.as_deref().unwrap_or("");
             Line::from(vec![
-                Span::styled("  › ", Style::default().fg(Palette::ACCENT())),
+                Span::styled("› ", Style::default().fg(Palette::DIM())),
                 Span::styled(buf.to_string(), Style::default().fg(Palette::TEXT())),
             ])
         } else {
@@ -535,8 +572,8 @@ impl App {
         let Some(vw) = self.workflow_view.as_ref() else {
             return;
         };
-        let sel = vw.selected;
-        let scroll = vw.scroll;
+        let sel = vw.list.selected;
+        let scroll = vw.list.scroll;
         let collapsed = vw.collapsed.clone();
         let Some((title, phases, done)) = self.view.workflow_by_id(&vw.run_id) else {
             self.workflow_view = None;
@@ -655,7 +692,7 @@ impl App {
                     let title = truncate_mid(&p.title, avail);
                     lines.push(Line::from(vec![
                         Span::styled(format!("  {caret} "), Style::default().fg(Palette::DIM())),
-                        wf_dot(pstatus),
+                        render::wf_dot(pstatus),
                         Span::styled(format!(" {}", title), name_style),
                         Span::styled(count, Style::default().fg(Palette::DIM())),
                     ]));
@@ -691,7 +728,7 @@ impl App {
                     let dot = if cancelled && a.status == WfStatus::Running {
                         Span::styled("•".to_string(), Style::default().fg(Palette::FAINT()))
                     } else {
-                        wf_dot(a.status)
+                        render::wf_dot(a.status)
                     };
                     lines.push(Line::from(vec![
                         Span::styled(
@@ -713,12 +750,12 @@ impl App {
         let view_h = tree_area.height as usize;
         let mut list = super::widgets::SelectList {
             selected: sel,
-            scroll: scroll as usize,
+            scroll,
         };
         let range = list.window(rows.len(), view_h);
         let scroll = list.scroll;
         if let Some(v) = self.workflow_view.as_mut() {
-            v.scroll = scroll as u16;
+            v.list.scroll = scroll;
         }
 
         // Click hit-boxes: screen row → agent id (agent rows only).
@@ -802,8 +839,15 @@ impl App {
             .turn_started
             .map(|t| t.elapsed().as_secs())
             .unwrap_or(0);
-        self.scrollback
-            .render(f, full, &self.view, working, self.spinner, secs);
+        self.scrollback.render(
+            f,
+            full,
+            &self.view.cells,
+            self.view.revision,
+            working,
+            self.spinner,
+            secs,
+        );
     }
 
     /// Render a focused agent's transcript in the main pane — laid out exactly like
@@ -811,31 +855,21 @@ impl App {
     /// is indistinguishable from root. The sidebar's bold row is the only indicator
     /// of which agent you're in.
     fn draw_focused_agent(&mut self, f: &mut ratatui::Frame, full: Rect, id: &str) {
-        let pane = inset(full, 2);
-        let w = pane.width as usize;
-        let mut lines: Vec<Line> = vec![Line::from("")];
-        if let Some(t) = self.teams.get(id) {
-            for cell in &t.cells {
-                render::render_cell(cell, w, &mut lines);
-            }
-        } else {
-            lines.push(Line::from(Span::styled(
-                "  (no transcript captured for this agent)",
-                Style::default().fg(Palette::FAINT()),
-            )));
-        }
-        // Wrap + pin to the bottom (show the latest activity).
-        let lines: Vec<Line> = lines
-            .into_iter()
-            .flat_map(|l| super::wrap_line(l, w))
-            .collect();
-        let view_h = pane.height as usize;
-        let skip = lines.len().saturating_sub(view_h);
-        let visible: Vec<Line> = lines.into_iter().skip(skip).collect();
-        f.render_widget(
-            Paragraph::new(visible).style(Style::default().bg(Palette::BG())),
-            pane,
-        );
+        // Render the subagent transcript through the SAME ScrollbackRenderer the
+        // root conversation uses, so padding, wrapping, caching, and scrolling are
+        // identical by construction (not a hand-rolled copy that drifts). An empty
+        // slice + a bump-on-miss revision cleanly handles the no-transcript case.
+        let (cells, revision): (&[super::view::Cell], u64) = match self.teams.get(id) {
+            Some(t) => (&t.cells, t.revision),
+            None => (&[], 0),
+        };
+        let working = self.running || self.view.busy;
+        let secs = self
+            .turn_started
+            .map(|t| t.elapsed().as_secs())
+            .unwrap_or(0);
+        self.focused_scrollback
+            .render(f, full, cells, revision, working, self.spinner, secs);
     }
 
     /// The collapsible right info sidebar (lighter background). AGENTS section: a
@@ -935,12 +969,17 @@ impl App {
                 Style::default().fg(Palette::LINK()),
             ));
         }
-        // interaction mode (color-coded; normal is dim, others pop)
-        let mode = self.permissions.mode();
-        let (mode_text, mode_color) = match mode {
-            Mode::Normal => ("normal", Palette::DIM()),
-            Mode::AutoAccept => ("auto-accept", Palette::OK()),
-            Mode::Plan => ("plan", Palette::WARN()),
+        // interaction mode (color-coded; normal is dim, others pop). YOLO
+        // overrides the label with a loud red badge — a bypass-all state must be
+        // impossible to miss.
+        let (mode_text, mode_color) = if self.permissions.bypass() {
+            ("YOLO", Palette::ERROR())
+        } else {
+            match self.permissions.mode() {
+                Mode::Normal => ("normal", Palette::DIM()),
+                Mode::AutoAccept => ("auto-accept", Palette::OK()),
+                Mode::Plan => ("plan", Palette::WARN()),
+            }
         };
         spans.push(sep());
         spans.push(Span::styled(mode_text, Style::default().fg(mode_color)));
@@ -1009,29 +1048,19 @@ impl App {
     }
 
     fn draw_input(&mut self, f: &mut ratatui::Frame, area: Rect) {
-        // Float the band to the SAME left edge as the transcript's user bubble:
-        // the scrollback insets everything by SIDE_PAD (2) and the user band adds
-        // its own MARGIN (2) on top, so its colored edge sits 4 cols in. Match that
-        // here (2 outer gutter + 2 band margin) so the input reads as the newest
-        // message in the same column as the conversation history.
-        let area = inset(area, 4);
+        // Float the band to the SAME left edge as the transcript's user bubble and
+        // every panel above the input: BAND_INSET (SIDE_PAD + BAND_MARGIN) columns
+        // in. The input reads as the newest message in the conversation's column.
+        let area = inset(area, BAND_INSET);
         // Full-width band with a lighter background; no border. One blank row of
         // padding above (with status) and below; the middle grows with lines.
         let bg = Block::default().style(Style::default().bg(Palette::INPUT_BG()));
         f.render_widget(bg, area);
 
         let busy = self.running || self.view.busy;
-        // Status sits on the top padding row, right-aligned. While a turn runs, hint
-        // that Enter queues and Alt+Enter steers — the queued chips themselves show
-        // in their own panel above.
-        let status_line = if busy {
-            Line::from(Span::styled(
-                "enter queues · alt+enter steers ",
-                Style::default().fg(Palette::FAINT()),
-            ))
-        } else {
-            Line::from("")
-        };
+        // The top padding row stays blank — the queued-input chips in their own
+        // panel above already convey that Enter queues / Alt+Enter steers.
+        let status_line = Line::from("");
         // Horizontal breathing room inside the input band.
         let status_area = Rect {
             x: area.x,
@@ -1055,10 +1084,9 @@ impl App {
             height: text_rows,
         };
 
-        // Wrapped, prompt-prefixed lines (same builder + width as the height calc).
-        // Show the tail if the content is taller than the visible rows. Each line
-        // is padded to the full text width so the input background fills edge to
-        // edge (an unpadded line leaves the tail of the row the terminal's bg).
+        // Show the tail when content exceeds the visible rows. Each line is padded
+        // to the full text width so the band background fills edge-to-edge (an
+        // unpadded row leaves its tail the terminal's own bg).
         let all = self.input_lines(text_area.width as usize, busy);
         let total_rows = all.len();
         let mut visible: Vec<Line> = if all.len() > text_rows as usize {
@@ -1235,7 +1263,7 @@ impl App {
         // Preview: render the ```diff / ```lang block the tool produced. Capped
         // so a huge edit doesn't push the options off-screen.
         if let Some(preview) = &p.preview {
-            let rendered = render::render_markdown_like(preview);
+            let rendered = render::render_markdown_snippet(preview);
             let cap = 14usize;
             for l in rendered.iter().take(cap) {
                 lines.push(indent_line(l.clone()));
@@ -1300,11 +1328,12 @@ impl App {
             Block::default().style(Style::default().bg(Palette::BG())),
             area,
         );
-        const PAD_X: u16 = 2;
+        // Align the prompt's left edge to the shared band column (BAND_INSET), the
+        // same edge as the input box + user bubbles, with a blank top row.
         let inner = Rect {
-            x: area.x + PAD_X,
+            x: area.x + BAND_INSET,
             y: area.y + 1,
-            width: area.width.saturating_sub(PAD_X * 2),
+            width: area.width.saturating_sub(BAND_INSET * 2),
             height: area.height.saturating_sub(1),
         };
         let lines = self.permission_lines(inner.width as usize);
@@ -1329,7 +1358,7 @@ impl App {
                 .add_modifier(Modifier::BOLD),
         )));
         if !q.query.detail.is_empty() {
-            for l in render::render_markdown_like(&q.query.detail)
+            for l in render::render_markdown_snippet(&q.query.detail)
                 .into_iter()
                 .take(12)
             {
@@ -1341,7 +1370,7 @@ impl App {
         // Free-text entry mode.
         if let Some(buf) = &q.other_text {
             lines.push(Line::from(vec![
-                Span::styled(" > ", Style::default().fg(Palette::ACCENT())),
+                Span::styled("› ", Style::default().fg(Palette::DIM())),
                 Span::styled(buf.clone(), Style::default().fg(Palette::TEXT())),
                 Span::styled("_", Style::default().fg(Palette::FAINT())),
             ]));
@@ -1365,17 +1394,17 @@ impl App {
             rows.push((n_opts, "Other…".to_string(), true));
         }
 
+        // Window the rows around the selection with the shared SelectList math
+        // (keep-visible), so a long list (e.g. 39 models) stays on screen and never
+        // hides the selected row behind the input. A local list seeded from the
+        // stored cursor + scroll keeps the offset stable across redraws.
         const VISIBLE: usize = 10;
-        let start = if total_rows <= VISIBLE {
-            0
-        } else if q.list.selected < VISIBLE / 2 {
-            0
-        } else if q.list.selected >= total_rows - VISIBLE / 2 {
-            total_rows - VISIBLE
-        } else {
-            q.list.selected - VISIBLE / 2
+        let mut list = super::widgets::SelectList {
+            selected: q.list.selected,
+            scroll: q.list.scroll,
         };
-        let end = (start + VISIBLE).min(total_rows);
+        let range = list.window(total_rows, VISIBLE);
+        let (start, end) = (range.start, range.end);
 
         if start > 0 {
             lines.push(Line::from(Span::styled(
@@ -1462,10 +1491,16 @@ impl App {
             return;
         }
         f.render_widget(Clear, area);
-        let lines = self.query_lines(area.width as usize);
+        f.render_widget(
+            Block::default().style(Style::default().bg(Palette::BG())),
+            area,
+        );
+        // Align the query to the shared band column, like the permission prompt.
+        let inner = inset(area, BAND_INSET);
+        let lines = self.query_lines(inner.width as usize);
         f.render_widget(
             Paragraph::new(lines).style(Style::default().bg(Palette::BG())),
-            area,
+            inner,
         );
     }
 }
@@ -1497,17 +1532,6 @@ pub(super) fn workflow_rows(
         }
     }
     rows
-}
-
-/// A small colored status dot for a workflow row (matches the inline tree).
-fn wf_dot(status: super::view::WfStatus) -> Span<'static> {
-    use super::view::WfStatus;
-    let color = match status {
-        WfStatus::Running => Palette::RUNNING(),
-        WfStatus::Done => Palette::OK(),
-        WfStatus::Failed => Palette::ERROR(),
-    };
-    Span::styled("•".to_string(), Style::default().fg(color))
 }
 
 /// Aggregate status of a phase from its agents: Failed if any failed, Running if
@@ -1575,7 +1599,7 @@ fn detail_lines(
     )));
     out.push(Line::from(vec![
         Span::raw("  "),
-        wf_dot(agent.status),
+        render::wf_dot(agent.status),
         Span::styled(
             format!(" {} · {}", status_word, agent_meta(agent)),
             Style::default().fg(Palette::DIM()),

@@ -304,6 +304,13 @@ impl Agent {
             let m = Message::user_text(prompt);
             self.history.push(m.clone());
             self.full_history.push(m);
+            // Emit the user turn so it's part of the event stream (and the replay
+            // log), not just a UI-side push. The frontend renders the user line
+            // from this event.
+            self.cfg.bus.emit(AgentEvent::UserPrompt {
+                agent_id: self.id.clone(),
+                text: prompt.to_string(),
+            });
         }
         self.cfg.bus.emit(AgentEvent::TurnStart {
             agent_id: self.id.clone(),
@@ -390,6 +397,8 @@ impl Agent {
                     agent_id: self.id.clone(),
                     before_tokens: compaction.before_tokens,
                     after_tokens: compaction.after_tokens,
+                    summary: compaction.summary.clone(),
+                    replaced_upto: compaction.replaced_upto,
                 });
                 // Usage just dropped; re-arm the graded warning to the new level so
                 // it can warn again as history rebuilds toward the window.
@@ -752,6 +761,8 @@ impl Agent {
                 agent_id: self.id.clone(),
                 before_tokens: compaction.before_tokens,
                 after_tokens: compaction.after_tokens,
+                summary: compaction.summary.clone(),
+                replaced_upto: compaction.replaced_upto,
             });
         }
     }
@@ -842,10 +853,20 @@ async fn run_one(
     name: String,
     input: serde_json::Value,
 ) -> ContentBlock {
-    let (content, is_error) = match tools.execute(&name, input, ctx).await {
-        Ok(output) => (output, false),
-        Err(e) => (e.wire(), true),
-    };
+    // If the streamed/returned tool arguments failed to parse as JSON, the codec
+    // tagged them with a sentinel rather than silently substituting `{}` (which
+    // used to make the tool fail downstream with a misleading "missing field"
+    // error the model couldn't diagnose). Surface the real cause so it retries
+    // with well-formed arguments.
+    let (content, is_error) =
+        if let Some(explain) = crate::providers::codec::tool_input_parse_error(&input) {
+            (explain, true)
+        } else {
+            match tools.execute(&name, input, ctx).await {
+                Ok(output) => (output, false),
+                Err(e) => (e.wire(), true),
+            }
+        };
     bus.emit(AgentEvent::ToolResult {
         agent_id: agent_id.to_string(),
         tool_use_id: id.clone(),

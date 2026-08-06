@@ -391,6 +391,20 @@ impl ViewModel {
         self.revision += 1;
     }
 
+    /// Settle transient state after replaying a session's event log on resume.
+    /// Replay reruns the live reducers, which may leave `busy` true or a workflow
+    /// still "active" (its terminating event isn't always in the log). A resumed
+    /// session is idle, and any workflow that was mid-run is treated as finished.
+    pub fn reset_after_replay(&mut self) {
+        self.busy = false;
+        if let Some(id) = self.active_workflow.take() {
+            if let Some(Cell::Workflow { done, .. }) = self.find_workflow(&id) {
+                *done = true;
+            }
+        }
+        self.revision += 1;
+    }
+
     pub fn push_notice(&mut self, text: String) {
         self.cells.push(Cell::Notice(text));
         self.revision += 1;
@@ -743,6 +757,9 @@ impl ViewModel {
         }
 
         match event {
+            AgentEvent::UserPrompt { text, .. } => {
+                self.push_user(text.clone());
+            }
             AgentEvent::TurnStart { .. } => {
                 self.busy = true;
                 // A root TurnStart while a workflow is active is the hand-off turn
@@ -930,6 +947,7 @@ fn persisted_workflow_to_cell(pw: &bob_core::core::session::PersistedWorkflow) -
 fn subagent_id(event: &AgentEvent) -> Option<&str> {
     let id = match event {
         AgentEvent::TurnStart { agent_id }
+        | AgentEvent::UserPrompt { agent_id, .. }
         | AgentEvent::TextDelta { agent_id, .. }
         | AgentEvent::Message { agent_id, .. }
         | AgentEvent::ToolCall { agent_id, .. }
@@ -944,6 +962,7 @@ fn subagent_id(event: &AgentEvent) -> Option<&str> {
         AgentEvent::WorkflowPhase { .. } => return None,
         AgentEvent::WorkflowLog { .. } => return None,
         AgentEvent::AgentMessage { .. } => return None,
+        AgentEvent::Unknown => return None,
     };
     if id != "root" {
         Some(id)
@@ -1033,6 +1052,71 @@ mod workflow_view_tests {
             .iter()
             .any(|c| matches!(c, Cell::Subagent { agent_id, .. } if agent_id == "task_1")));
         assert!(!vm.cells.iter().any(|c| matches!(c, Cell::Workflow { .. })));
+    }
+
+    #[test]
+    fn replaying_events_rebuilds_the_transcript() {
+        // Stage 2 invariant: replaying a session's event log through the SAME
+        // apply() the live loop uses reconstructs the transcript — including the
+        // user turn (now a UserPrompt event) and a notice cell that never existed
+        // in the message history. This is what makes "if it was drawn, it was
+        // saved" hold on resume.
+        let log = vec![
+            AgentEvent::UserPrompt {
+                agent_id: "root".into(),
+                text: "fix the bug".into(),
+            },
+            AgentEvent::TurnStart {
+                agent_id: "root".into(),
+            },
+            AgentEvent::TextDelta {
+                agent_id: "root".into(),
+                text: "on it".into(),
+            },
+            AgentEvent::ToolCall {
+                agent_id: "root".into(),
+                tool_use_id: "t1".into(),
+                name: "read_file".into(),
+                input: serde_json::json!({"path": "a.rs"}),
+            },
+            AgentEvent::ToolResult {
+                agent_id: "root".into(),
+                tool_use_id: "t1".into(),
+                output: "fn main() {}".into(),
+                is_error: false,
+            },
+            AgentEvent::Error {
+                agent_id: "root".into(),
+                message: "flaky network".into(),
+            },
+            AgentEvent::TurnEnd {
+                agent_id: "root".into(),
+                usage: Default::default(),
+            },
+        ];
+        let mut vm = ViewModel::new();
+        for e in &log {
+            vm.apply(e);
+        }
+        vm.reset_after_replay();
+
+        assert!(matches!(&vm.cells[0], Cell::User(t) if t == "fix the bug"));
+        assert!(vm
+            .cells
+            .iter()
+            .any(|c| matches!(c, Cell::Assistant { text, .. } if text == "on it")));
+        assert!(vm.cells.iter().any(
+            |c| matches!(c, Cell::Tool { name, status: ToolStatus::Ok, output: Some(o), .. }
+                if name == "read_file" && o == "fn main() {}")
+        ));
+        // The error notice — a view-only cell absent from any message history —
+        // survives because it's replayed from the event, not reconstructed.
+        assert!(vm
+            .cells
+            .iter()
+            .any(|c| matches!(c, Cell::Notice(t) if t.contains("flaky network"))));
+        // A resumed session is idle.
+        assert!(!vm.busy);
     }
 
     #[test]

@@ -8,6 +8,7 @@
 
 pub mod anthropic;
 pub mod copilot;
+pub mod mcp;
 pub mod openai;
 
 use serde::{Deserialize, Serialize};

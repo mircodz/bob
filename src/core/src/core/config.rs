@@ -20,11 +20,39 @@ pub struct PermissionsConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct McpServerConfig {
     pub name: String,
+    /// The command to spawn for a stdio server. Empty for HTTP servers.
+    #[serde(default)]
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
     #[serde(default)]
     pub env: std::collections::HashMap<String, String>,
+    /// If set, this is a remote HTTP (streamable-HTTP) server reached at this URL
+    /// rather than a spawned stdio subprocess.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// OAuth configuration for an HTTP server that requires authorization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<McpOAuthConfig>,
+}
+
+impl McpServerConfig {
+    /// True when this entry describes a remote HTTP server.
+    pub fn is_http(&self) -> bool {
+        self.url.is_some()
+    }
+}
+
+/// OAuth 2.0 (authorization-code + PKCE) parameters for a remote MCP server.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct McpOAuthConfig {
+    pub authorize_url: String,
+    pub token_url: String,
+    pub client_id: String,
+    #[serde(default)]
+    pub scope: String,
+    /// Localhost port for the OAuth redirect callback.
+    pub callback_port: u16,
 }
 
 /// A language server bob should manage for this project. Unlike MCP servers
@@ -60,6 +88,10 @@ pub struct BobConfig {
     /// use the provider's default (or the colon form in `provider`).
     #[serde(default)]
     pub model: String,
+    /// Reasoning effort label: off | low | medium | high | max. Empty/unset = off.
+    /// Persisted when changed in-session so it survives a restart.
+    #[serde(default)]
+    pub reasoning: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system: Option<String>,
     #[serde(default)]
@@ -79,6 +111,7 @@ impl Default for BobConfig {
         BobConfig {
             provider: "anthropic".to_string(),
             model: String::new(),
+            reasoning: String::new(),
             system: None,
             max_turns: Some(20),
             theme: None,
@@ -107,6 +140,7 @@ impl Default for BobConfig {
 struct PartialConfig {
     provider: Option<String>,
     model: Option<String>,
+    reasoning: Option<String>,
     system: Option<String>,
     max_turns: Option<u32>,
     theme: Option<String>,
@@ -129,6 +163,7 @@ fn merge(base: BobConfig, over: PartialConfig) -> BobConfig {
     BobConfig {
         provider: over.provider.unwrap_or(base.provider),
         model: over.model.unwrap_or(base.model),
+        reasoning: over.reasoning.unwrap_or(base.reasoning),
         system: over.system.or(base.system),
         max_turns: over.max_turns.or(base.max_turns),
         theme: over.theme.or(base.theme),
@@ -190,6 +225,9 @@ pub fn default_config_toml() -> String {
 provider = "{provider}"
 # Model within the provider (e.g. "claude-sonnet-4-5", "gpt-5"). Empty = default.
 model = "{model}"
+# Reasoning effort: off | low | medium | high | max. Updated when you change it
+# in-session (/reasoning). Empty = off.
+reasoning = "{reasoning}"
 
 # Color theme: dark | light | catppuccin | catppuccin-macchiato | catppuccin-frappe
 #            | catppuccin-latte | github-dark | github-light | solarized-dark
@@ -223,6 +261,7 @@ deny = [{deny}]
 "#,
         provider = "",
         model = "",
+        reasoning = "",
         max_turns = d.max_turns.unwrap_or(20),
         perm_default = d.permissions.default,
         allow_bash = quote(&d.permissions.allow_bash),
@@ -290,7 +329,9 @@ fn set_mcp_servers(
     for s in servers {
         let mut t = Table::new();
         t["name"] = value(&s.name);
-        t["command"] = value(&s.command);
+        if !s.command.is_empty() {
+            t["command"] = value(&s.command);
+        }
         if !s.args.is_empty() {
             let mut arr = Array::new();
             for a in &s.args {
@@ -304,6 +345,20 @@ fn set_mcp_servers(
                 env[k] = value(v.as_str());
             }
             t["env"] = Item::Table(env);
+        }
+        if let Some(url) = &s.url {
+            t["url"] = value(url.as_str());
+        }
+        if let Some(o) = &s.oauth {
+            let mut ot = Table::new();
+            ot["authorize_url"] = value(o.authorize_url.as_str());
+            ot["token_url"] = value(o.token_url.as_str());
+            ot["client_id"] = value(o.client_id.as_str());
+            if !o.scope.is_empty() {
+                ot["scope"] = value(o.scope.as_str());
+            }
+            ot["callback_port"] = value(o.callback_port as i64);
+            t["oauth"] = Item::Table(ot);
         }
         tables.push(t);
     }
@@ -322,6 +377,38 @@ pub fn add_mcp_server(server: McpServerConfig) -> anyhow::Result<bool> {
     set_mcp_servers(&mut doc, &servers)?;
     write_config_doc(&doc)?;
     Ok(replaced)
+}
+
+/// Persist the default provider + model to the global config, so a model switched
+/// in-session (`/model`, the picker) is remembered on the next launch. Writes the
+/// top-level `provider` and `model` keys via `toml_edit`, preserving comments and
+/// unrelated settings. An empty `model` clears the key (falls back to the
+/// provider's default).
+pub fn set_default_model(provider: &str, model: &str) -> anyhow::Result<()> {
+    use toml_edit::value;
+    let mut doc = read_config_doc()?;
+    doc["provider"] = value(provider);
+    if model.is_empty() {
+        doc.as_table_mut().remove("model");
+    } else {
+        doc["model"] = value(model);
+    }
+    write_config_doc(&doc)
+}
+
+/// Persist the default reasoning-effort label to the global config, so a level
+/// chosen in-session (`/reasoning`, the picker) is remembered next launch. An
+/// empty or "off" label clears the key (falls back to Off). Preserves comments
+/// and unrelated settings.
+pub fn set_default_reasoning(label: &str) -> anyhow::Result<()> {
+    use toml_edit::value;
+    let mut doc = read_config_doc()?;
+    if label.is_empty() || label == "off" {
+        doc.as_table_mut().remove("reasoning");
+    } else {
+        doc["reasoning"] = value(label);
+    }
+    write_config_doc(&doc)
 }
 
 /// Remove an MCP server by name. Returns true if one was removed.
@@ -465,6 +552,24 @@ mod tests {
     }
 
     #[test]
+    fn default_template_parses_and_carries_reasoning() {
+        // The generated ~/.bob/config.toml must be valid and round-trip the
+        // reasoning key so a persisted level survives a fresh install + edit.
+        let toml_str = default_config_toml();
+        let p: PartialConfig = toml::from_str(&toml_str).expect("default template is valid TOML");
+        assert!(p.reasoning.is_some(), "template exposes the reasoning key");
+        // Merged onto defaults it stays empty (= Off) until the user sets it.
+        let cfg = merge(BobConfig::default(), p);
+        assert_eq!(cfg.reasoning, "");
+    }
+
+    #[test]
+    fn reasoning_field_deserializes() {
+        let p: PartialConfig = toml::from_str(r#"reasoning = "high""#).unwrap();
+        assert_eq!(p.reasoning.as_deref(), Some("high"));
+    }
+
+    #[test]
     fn set_mcp_servers_preserves_comments() {
         // A hand-written doc with a comment and an unrelated key.
         let mut doc = "# keep me\nprovider = \"anthropic\"\n"
@@ -475,6 +580,8 @@ mod tests {
             command: "npx".into(),
             args: vec!["-y".into(), "server".into()],
             env: std::collections::HashMap::new(),
+            url: None,
+            oauth: None,
         }];
         set_mcp_servers(&mut doc, &servers).unwrap();
         let out = doc.to_string();
@@ -492,6 +599,47 @@ mod tests {
         let parsed: OnlyMcp = toml::from_str(&out).unwrap();
         assert_eq!(parsed.mcp_servers.len(), 1);
         assert_eq!(parsed.mcp_servers[0].name, "fs");
+    }
+
+    #[test]
+    fn set_mcp_servers_roundtrips_http_with_oauth() {
+        let mut doc = "provider = \"anthropic\"\n"
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        let servers = vec![McpServerConfig {
+            name: "github".into(),
+            command: String::new(),
+            args: vec![],
+            env: std::collections::HashMap::new(),
+            url: Some("https://api.githubcopilot.com/mcp/".into()),
+            oauth: Some(McpOAuthConfig {
+                authorize_url: "https://example.com/authorize".into(),
+                token_url: "https://example.com/token".into(),
+                client_id: "abc123".into(),
+                scope: "repo".into(),
+                callback_port: 54546,
+            }),
+        }];
+        set_mcp_servers(&mut doc, &servers).unwrap();
+        let out = doc.to_string();
+        // No `command` key should be emitted for an HTTP server.
+        assert!(!out.contains("command ="), "http server has no command");
+        assert!(out.contains("url = \"https://api.githubcopilot.com/mcp/\""));
+        assert!(out.contains("client_id = \"abc123\""));
+
+        #[derive(Deserialize, Default)]
+        struct OnlyMcp {
+            #[serde(default)]
+            mcp_servers: Vec<McpServerConfig>,
+        }
+        let parsed: OnlyMcp = toml::from_str(&out).unwrap();
+        assert_eq!(parsed.mcp_servers.len(), 1);
+        let s = &parsed.mcp_servers[0];
+        assert!(s.is_http());
+        assert_eq!(s.command, "");
+        let o = s.oauth.as_ref().unwrap();
+        assert_eq!(o.client_id, "abc123");
+        assert_eq!(o.callback_port, 54546);
     }
 
     #[test]

@@ -17,7 +17,6 @@ pub struct Theme {
     pub dim: Color,
     pub faint: Color,
     pub accent: Color,
-    pub user: Color,
     pub ok: Color,
     pub error: Color,
     pub warn: Color,
@@ -54,7 +53,6 @@ impl Theme {
             dim: rgb(0x8a, 0x8f, 0x98),
             faint: rgb(0x55, 0x5a, 0x63),
             accent: rgb(0x51, 0xaf, 0xef),
-            user: rgb(0x56, 0xc8, 0xd8),
             ok: rgb(0x8c, 0xc2, 0x65),
             error: rgb(0xf7, 0x6b, 0x6b),
             warn: rgb(0xef, 0xbd, 0x5d),
@@ -87,7 +85,6 @@ impl Theme {
             dim: rgb(0x6a, 0x73, 0x7d),
             faint: rgb(0x9d, 0xa5, 0xb4),
             accent: rgb(0x1f, 0x6f, 0xb2),
-            user: rgb(0x0b, 0x5c, 0xad),
             ok: rgb(0x2e, 0x7d, 0x32),
             error: rgb(0xc1, 0x2f, 0x2f),
             warn: rgb(0x9a, 0x63, 0x00),
@@ -119,7 +116,6 @@ impl Theme {
             dim: rgb(0xa6, 0xad, 0xc8),
             faint: rgb(0x6c, 0x70, 0x86),
             accent: rgb(0x89, 0xb4, 0xfa),
-            user: rgb(0x89, 0xdc, 0xeb),
             ok: rgb(0xa6, 0xe3, 0xa1),
             error: rgb(0xf3, 0x8b, 0xa8),
             warn: rgb(0xf9, 0xe2, 0xaf),
@@ -151,7 +147,6 @@ impl Theme {
             dim: rgb(0xa5, 0xad, 0xcb),
             faint: rgb(0x6e, 0x73, 0x8d),
             accent: rgb(0x8a, 0xad, 0xf4),
-            user: rgb(0x91, 0xd7, 0xe3),
             ok: rgb(0xa6, 0xda, 0x95),
             error: rgb(0xed, 0x87, 0x96),
             warn: rgb(0xee, 0xd4, 0x9f),
@@ -183,7 +178,6 @@ impl Theme {
             dim: rgb(0xa5, 0xad, 0xce),
             faint: rgb(0x73, 0x79, 0x94),
             accent: rgb(0x8c, 0xaa, 0xee),
-            user: rgb(0x99, 0xd1, 0xdb),
             ok: rgb(0xa6, 0xd1, 0x89),
             error: rgb(0xe7, 0x82, 0x84),
             warn: rgb(0xe5, 0xc8, 0x90),
@@ -215,7 +209,6 @@ impl Theme {
             dim: rgb(0x6c, 0x6f, 0x85),
             faint: rgb(0x9c, 0xa0, 0xb0),
             accent: rgb(0x1e, 0x66, 0xf5),
-            user: rgb(0x04, 0xa5, 0xe5),
             ok: rgb(0x40, 0xa0, 0x2b),
             error: rgb(0xd2, 0x0f, 0x39),
             warn: rgb(0xdf, 0x8e, 0x1d),
@@ -260,7 +253,6 @@ impl Theme {
             dim: base04,
             faint: base03,
             accent: base0d,
-            user: base0c,
             ok: base0b,
             error: base08,
             warn: base0a,
@@ -303,7 +295,6 @@ impl Theme {
             dim: base1,
             faint: base1,
             accent: blue,
-            user: cyan,
             ok: green,
             error: red,
             warn: yellow,
@@ -346,7 +337,6 @@ impl Theme {
             dim: base01,
             faint: base01,
             accent: blue,
-            user: cyan,
             ok: green,
             error: red,
             warn: yellow,
@@ -378,7 +368,6 @@ impl Theme {
             dim: rgb(0x8b, 0x94, 0x9e),
             faint: rgb(0x6e, 0x76, 0x81),
             accent: rgb(0x58, 0xa6, 0xff),
-            user: rgb(0x79, 0xc0, 0xff),
             ok: rgb(0x3f, 0xb9, 0x50),
             error: rgb(0xf8, 0x51, 0x49),
             warn: rgb(0xd2, 0x9c, 0x22),
@@ -410,7 +399,6 @@ impl Theme {
             dim: rgb(0x57, 0x60, 0x6a),
             faint: rgb(0x8c, 0x95, 0x9f),
             accent: rgb(0x09, 0x69, 0xda),
-            user: rgb(0x02, 0x55, 0xac),
             ok: rgb(0x1a, 0x7f, 0x37),
             error: rgb(0xcf, 0x22, 0x2e),
             warn: rgb(0x9a, 0x66, 0x00),
@@ -509,9 +497,6 @@ impl Palette {
     }
     pub fn ACCENT() -> Color {
         active().accent
-    }
-    pub fn USER() -> Color {
-        active().user
     }
     pub fn OK() -> Color {
         active().ok

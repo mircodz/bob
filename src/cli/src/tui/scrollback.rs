@@ -1,12 +1,11 @@
 //! The scrollback viewport: owns the render caches, scroll position, and the
-//! click hit-test map for the main transcript. Grouping this state (previously a
-//! sprawl of loose `App` fields with a tight mutual invariant) means the caches,
-//! the flattened line list, and the click map are always rebuilt together and can
-//! never fall out of sync.
+//! click hit-test map for the main transcript. Grouping this state keeps the
+//! caches, the flattened line list, and the click map rebuilt together so they
+//! can't fall out of sync.
 
 use super::render;
 use super::theme::{self, Palette};
-use super::view::{self, ViewModel};
+use super::view;
 use super::{shimmer_spans, wrap_line};
 use ratatui::layout::Rect;
 use ratatui::style::Style;
@@ -15,8 +14,9 @@ use ratatui::widgets::Paragraph;
 use std::hash::{Hash, Hasher};
 
 /// Horizontal inset applied to the whole scrollback (both sides), so content and
-/// the full-width user band get even breathing room.
-const SIDE_PAD: u16 = 2;
+/// the full-width user band get even breathing room. Shared with the input band +
+/// the overlays via [`super::widgets::SIDE_PAD`].
+use super::widgets::SIDE_PAD;
 /// Columns reserved for a non-user cell's hanging indent (left) and the matching
 /// right margin, so wrapped body text doesn't hug either edge.
 const HANGING_INDENT: usize = 2;
@@ -97,7 +97,8 @@ impl ScrollbackRenderer {
         &mut self,
         f: &mut ratatui::Frame,
         full: Rect,
-        view: &ViewModel,
+        cells: &[view::Cell],
+        revision: u64,
         working: bool,
         spinner: usize,
         turn_elapsed_secs: u64,
@@ -113,16 +114,15 @@ impl ScrollbackRenderer {
         let width_full = area.width as usize;
         let width = area.width.max(1) as usize;
         let theme_gen = theme::generation();
-        let cells = &view.cells;
         if self.render_cache.len() != cells.len() {
             self.render_cache.resize(cells.len(), (0, Vec::new()));
         }
 
-        // Cheap rebuild trigger: the view's revision (bumped only on real cell
+        // Cheap rebuild trigger: the transcript's revision (bumped only on real cell
         // changes) + width/theme + the working-line tick. A pure scroll leaves all
         // of these unchanged, so we skip the rebuild — O(1) per scroll frame.
         let mut sig_hasher = std::collections::hash_map::DefaultHasher::new();
-        view.revision.hash(&mut sig_hasher);
+        revision.hash(&mut sig_hasher);
         width_full.hash(&mut sig_hasher);
         theme_gen.hash(&mut sig_hasher);
         working.hash(&mut sig_hasher);

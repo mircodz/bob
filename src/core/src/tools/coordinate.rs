@@ -62,19 +62,25 @@ impl Tool for SpawnAgentTool {
                 for error-handling gaps; report each as file:line + the problem + a fix`). A vague \
                 prompt like \"review the code for style\" yields a useless meta-answer about \
                 methodology — be concrete or the agent will waste the turn. \
-                \n\nIMPORTANT: the result is NOT returned by this call — it arrives LATER as a \
-                message (`[message from <name>]: finished: …`). Do NOT use job_status/job_output for \
+                \n\nIMPORTANT: the result is NOT returned by this call — this call only \
+                CONFIRMS the spawn. The agent's real output arrives LATER as a separate \
+                message (`[message from <name>]: finished: …`); that message IS its result — \
+                read it, don't re-spawn or assume the agent returned nothing. An empty return \
+                from THIS call is normal and expected. Do NOT use job_status/job_output for \
                 spawned agents. When you spawn several, WAIT for ALL of them to report back, then \
                 write ONE synthesized summary for the user (grouped/cross-referenced) — do not dump \
                 a separate paragraph per agent as each trickles in. Use `task` instead for simple \
-                independent fan-out you don't need to coordinate with."
+                independent fan-out you don't need to coordinate with. \
+                \n\nFor read-only investigation/audit work, set `read_only: true` so the agent \
+                gets only read/search tools (no write/edit/bash)."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "name": { "type": "string", "description": "Short handle for the agent (e.g. \"researcher\")." },
                     "description": { "type": "string", "description": "A 3-5 word summary of what this agent does (e.g. \"review src/core\"), shown in the UI. NOT the full task." },
-                    "task": { "type": "string", "description": "Complete, self-contained instructions: exact files/scope + the concrete deliverable + demand for specific findings. The agent has none of your context." }
+                    "task": { "type": "string", "description": "Complete, self-contained instructions: exact files/scope + the concrete deliverable + demand for specific findings. The agent has none of your context." },
+                    "read_only": { "type": "boolean", "description": "Confine the agent to read-only tools (reads/searches, no write/edit/bash). Use for audits/analysis that must not mutate files (default false)." }
                 },
                 "required": ["name", "task"]
             }),
@@ -150,7 +156,11 @@ impl Tool for SpawnAgentTool {
         // spawn time (rather than baking them into subagent_tools up front) to
         // avoid a self-referential cycle — SpawnAgentTool would otherwise need to
         // contain a copy of itself.
-        let mut child_tools = self.deps.subagent_tools.clone();
+        let mut child_tools = if input["read_only"].as_bool().unwrap_or(false) {
+            self.deps.subagent_tools.read_only_subset()
+        } else {
+            self.deps.subagent_tools.clone()
+        };
         child_tools.add(Arc::new(SpawnAgentTool {
             deps: self.deps.clone(),
         }));

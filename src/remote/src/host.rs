@@ -272,6 +272,25 @@ pub async fn run(
     // bind them to the most recent `task` tool_call seen this turn.
     let sub_accum: Arc<std::sync::Mutex<SubAccum>> =
         Arc::new(std::sync::Mutex::new(SubAccum::default()));
+
+    // Shadow-write every event to the append-only log, exactly as the TUI does, so
+    // a remote-driven conversation builds the same event history a resumed TUI can
+    // replay. The bus listener is synchronous and can't touch the async
+    // `active_session` mutex, so the current session id is mirrored in a cheap
+    // sync cell updated whenever the active session is swapped (load/new).
+    let event_log = Arc::new(bob_core::core::session::EventLogWriter::spawn());
+    let log_session_id: Arc<std::sync::Mutex<String>> =
+        Arc::new(std::sync::Mutex::new(String::new()));
+    {
+        let event_log = event_log.clone();
+        let log_session_id = log_session_id.clone();
+        bus.on(Arc::new(move |e: &AgentEvent| {
+            let id = log_session_id.lock().map(|g| g.clone()).unwrap_or_default();
+            if !id.is_empty() {
+                event_log.append(&id, e);
+            }
+        }));
+    }
     {
         // Bridge every root-level event to a HostFrame::Event, and buffer it.
         let out = out.clone();
@@ -353,12 +372,17 @@ pub async fn run(
     let active_session = Arc::new(Mutex::new(session::latest_or_new(&provider_spec)));
     {
         let s = active_session.lock().await;
+        // Point the event log at this session so bus events are appended under it.
+        if let Ok(mut id) = log_session_id.lock() {
+            *id = s.id.clone();
+        }
         if !s.messages.is_empty() {
-            agent.load_history(s.messages.clone());
+            let history = session::history_for(&s);
+            agent.load_history(history.clone());
             eprintln!(
                 "[host] resumed session {} ({} messages)",
                 s.id,
-                s.messages.len()
+                history.len()
             );
         }
     }
@@ -387,7 +411,7 @@ pub async fn run(
     {
         let s = active_session.lock().await;
         out.send(HostFrame::History {
-            messages: s.messages.clone(),
+            messages: session::history_for(&s),
             session_id: s.id.clone(),
             subagent_runs: s.subagent_runs.clone(),
         });
@@ -453,6 +477,7 @@ pub async fn run(
                 let busy = busy.clone();
                 let sub_accum = sub_accum.clone();
                 let cancel = cancel.clone();
+                let event_log = event_log.clone();
                 tokio::spawn(async move {
                     let mut a = agent.lock().await;
                     let result = a.run(&text).await;
@@ -499,6 +524,13 @@ pub async fn run(
                         let mut s = active_session.lock().await;
                         s.subagent_runs.extend(new_runs);
                         session::persist(&mut s, messages);
+                    }
+                    // Make this turn's shadow-written events durable alongside the
+                    // blob save above. flush() blocks on the writer draining, so do
+                    // it off the async worker.
+                    {
+                        let event_log = event_log.clone();
+                        let _ = tokio::task::spawn_blocking(move || event_log.flush()).await;
                     }
                     // The turn's events are now captured in persisted messages,
                     // so drop the live buffer and clear busy. (A reconnect that
@@ -568,10 +600,12 @@ pub async fn run(
             ControlFrame::LoadSession { id } => {
                 match session::load(&id) {
                     Some(s) => {
-                        // Swap the agent's history and the active session.
+                        // Reconstruct history from the event log (blob fallback),
+                        // then swap the agent's history and the active session.
+                        let history = session::history_for(&s);
                         {
                             let mut a = agent.lock().await;
-                            a.load_history(s.messages.clone());
+                            a.load_history(history.clone());
                         }
                         // Drop buffered/accumulated events from the previous
                         // session so a resync can't replay them under this one.
@@ -585,11 +619,15 @@ pub async fn run(
                             let mut active = active_session.lock().await;
                             *active = s;
                             (
-                                active.messages.clone(),
+                                history,
                                 active.id.clone(),
                                 active.subagent_runs.clone(),
                             )
                         };
+                        // Redirect the event log to the newly-active session.
+                        if let Ok(mut id) = log_session_id.lock() {
+                            *id = sid.clone();
+                        }
                         eprintln!("[host] loaded session {sid} ({} messages)", messages.len());
                         out.send(HostFrame::History {
                             messages,
@@ -616,6 +654,10 @@ pub async fn run(
                 }
                 let sid = fresh.id.clone();
                 *active_session.lock().await = fresh;
+                // Redirect the event log to the new session.
+                if let Ok(mut id) = log_session_id.lock() {
+                    *id = sid.clone();
+                }
                 eprintln!("[host] started new session {sid}");
                 out.send(HostFrame::History {
                     messages: Vec::new(),
@@ -655,5 +697,9 @@ fn is_remote_event(e: &AgentEvent) -> bool {
         | AgentEvent::Error { agent_id, .. } => agent_id == "root",
         // Inter-agent coordination chatter stays internal — never sent to the phone.
         AgentEvent::AgentMessage { .. } => false,
+        // The phone echoes its own submitted input locally; forwarding would double it.
+        AgentEvent::UserPrompt { .. } => false,
+        // Only from replaying a newer-version log; nothing to forward live.
+        AgentEvent::Unknown => false,
     }
 }
