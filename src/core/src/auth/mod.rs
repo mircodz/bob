@@ -70,6 +70,23 @@ impl AuthProvider for AnthropicOAuth {
     }
 }
 
+/// A caller-supplied credential passed programmatically to a provider (the SDK's
+/// `.credential(...)`), as opposed to the ambient env-var / on-disk-login
+/// resolution a provider falls back to when none is given.
+///
+/// This is deliberately a small, TYPED enum rather than a single opaque token:
+/// each provider authenticates differently (Anthropic `x-api-key`, OpenAI
+/// `Bearer`, Copilot device-flow), so the credential names its scheme and each
+/// provider's constructor honors only the variant(s) it understands. Interactive
+/// schemes (subscription OAuth, device-flow) are intentionally NOT here — those
+/// require a login flow, not a value you can paste into code.
+#[derive(Clone, Debug)]
+pub enum ProviderAuth {
+    /// A raw API key. The provider applies its own header (Anthropic sends it as
+    /// `x-api-key`; the OpenAI family sends it as a `Bearer` token).
+    ApiKey(String),
+}
+
 /// One provider's stored credentials. Flexible bag so different auth schemes fit
 /// (an OAuth token here, a refresh token there). `extra` holds provider-specific
 /// fields (e.g. Copilot's cached short-lived token + its expiry).

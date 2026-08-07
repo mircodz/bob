@@ -1,17 +1,15 @@
 //! The bob-sdk "hello world": build an agent in a few lines and run one turn.
 //! This doubles as a regression guard on the public builder surface.
 //!
-//! Run with: `cargo run -p bob-sdk --example minimal`
-//! (Requires a configured provider — e.g. `ANTHROPIC_API_KEY` set, or
-//! `bob login anthropic`.)
+//! Run with: `ANTHROPIC_API_KEY=sk-... cargo run -p bob-sdk --example minimal`
 
 use bob_sdk::prelude::*;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut agent = Agent::builder()
-        .model("copilot/claude-sonnet-4-5")
-        .cwd(".")
+        .model("anthropic/claude-sonnet-4-5-20250929")
+        .credential(ProviderAuth::ApiKey(std::env::var("ANTHROPIC_API_KEY")?))
         .build()
         .await?;
 

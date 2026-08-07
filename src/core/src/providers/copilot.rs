@@ -84,12 +84,22 @@ fn is_responses_model(model: &str) -> bool {
 }
 
 /// Registry constructor for the "copilot" provider (uniform
-/// `async fn create(model) -> Result<Arc<dyn Provider>>` shape shared by every
-/// provider family). Builds the native Copilot provider, or an error if not
-/// logged in: discovers the correct API base by minting a token up front, and
-/// routes newer models to the Responses API (`/responses`) while classic models
-/// use /chat/completions.
-pub async fn create(model: Option<String>) -> anyhow::Result<Arc<dyn Provider>> {
+/// `async fn create(model, auth)` shape shared by every provider family). Builds
+/// the native Copilot provider, or an error if not logged in.
+///
+/// Copilot authenticates only via its device-flow login (`bob login copilot`), so
+/// a programmatic `ProviderAuth` is rejected explicitly rather than silently
+/// ignored — there's no API-key path here.
+pub async fn create(
+    model: Option<String>,
+    auth: Option<crate::auth::ProviderAuth>,
+) -> anyhow::Result<Arc<dyn Provider>> {
+    if auth.is_some() {
+        anyhow::bail!(
+            "the copilot provider authenticates via `bob login copilot`; it does not accept a \
+             programmatic API key"
+        );
+    }
     let github_token = auth::github_token()
         .ok_or_else(|| anyhow::anyhow!("not logged in to Copilot — run `bob login copilot`"))?;
     let source = CopilotAuth {

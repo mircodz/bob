@@ -14,10 +14,24 @@ const API_VERSION: &str = "2023-06-01";
 const OAUTH_BETA: &str = "oauth-2025-04-20";
 
 /// Registry constructor: build the Anthropic provider as a `dyn Provider`. Uniform
-/// `async fn create(model) -> Result<Arc<dyn Provider>>` shape shared by every
-/// provider family so the registry match in `mod.rs` is symmetric.
-pub async fn create(model: Option<String>) -> anyhow::Result<std::sync::Arc<dyn Provider>> {
-    Ok(std::sync::Arc::new(AnthropicProvider::new(model)?))
+/// `async fn create(model, auth)` shape shared by every provider family so the
+/// registry match in `mod.rs` is symmetric. A caller-supplied `ProviderAuth::ApiKey`
+/// is applied as the `x-api-key` header; `None` falls back to on-disk OAuth login
+/// or the `ANTHROPIC_API_KEY` env var.
+pub async fn create(
+    model: Option<String>,
+    auth: Option<crate::auth::ProviderAuth>,
+) -> anyhow::Result<std::sync::Arc<dyn Provider>> {
+    let model = model.unwrap_or_else(|| "claude-sonnet-4-5-20250929".to_string());
+    if let Some(crate::auth::ProviderAuth::ApiKey(key)) = auth {
+        return Ok(std::sync::Arc::new(AnthropicProvider {
+            auth: AuthMode::ApiKey(key),
+            model,
+            base_url: API_URL.to_string(),
+            client: reqwest::Client::new(),
+        }));
+    }
+    Ok(std::sync::Arc::new(AnthropicProvider::new(Some(model))?))
 }
 
 /// How this provider authenticates.

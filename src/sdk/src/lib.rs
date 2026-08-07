@@ -32,10 +32,11 @@ use bob_core::agent::agent::Agent as CoreAgent;
 use bob_core::agent::assembly::{build_root_agent, RootAgentParams};
 use bob_core::agent::prompt::build_system_prompt;
 use bob_core::agent::team::AgentRegistry;
+use bob_core::auth::ProviderAuth;
 use bob_core::core::events::EventBus;
 use bob_core::core::permissions::{Asker, Decision, PermissionEngine};
 use bob_core::core::store::{MemoryStore, SessionStore};
-use bob_core::providers::create_provider;
+use bob_core::providers::create_provider_with_auth;
 use bob_core::tools::jobs::JobRegistry;
 use bob_core::tools::registry::{UserAsker, UserQuery};
 
@@ -43,6 +44,7 @@ use bob_core::tools::registry::{UserAsker, UserQuery};
 /// `use bob_sdk::prelude::*;` is enough to get going.
 pub mod prelude {
     pub use crate::{Agent, AgentBuilder};
+    pub use bob_core::auth::ProviderAuth;
     pub use bob_core::core::permissions::{Asker, Decision};
     pub use bob_core::core::store::{MemoryStore, SessionStore, SqliteStore};
     pub use bob_types::{ContentBlock, Message, ReasoningEffort, Role};
@@ -77,6 +79,7 @@ pub struct AgentBuilder {
     permission_default: Decision,
     asker: Option<Arc<dyn Asker>>,
     user_asker: Option<Arc<dyn UserAsker>>,
+    credential: Option<ProviderAuth>,
     store: Option<Arc<dyn SessionStore>>,
     resume: Resume,
     max_turns: Option<u32>,
@@ -94,6 +97,7 @@ impl Default for AgentBuilder {
             permission_default: Decision::Ask,
             asker: None,
             user_asker: None,
+            credential: None,
             store: None,
             resume: Resume::Fresh,
             max_turns: None,
@@ -107,6 +111,15 @@ impl AgentBuilder {
     /// it's not set.
     pub fn model(mut self, spec: impl Into<String>) -> Self {
         self.model = Some(spec.into());
+        self
+    }
+
+    /// A programmatic credential for the chosen provider (e.g.
+    /// `ProviderAuth::ApiKey("sk-…")`). When unset, the provider resolves auth from
+    /// the ambient environment (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY`) or an
+    /// on-disk `bob login`. Each provider honors only the auth schemes it supports.
+    pub fn credential(mut self, credential: ProviderAuth) -> Self {
+        self.credential = Some(credential);
         self
     }
 
@@ -173,7 +186,7 @@ impl AgentBuilder {
         let model = self
             .model
             .ok_or_else(|| anyhow::anyhow!("no model set — call `.model(\"provider/model\")`"))?;
-        let provider = create_provider(&model).await?;
+        let provider = create_provider_with_auth(&model, self.credential).await?;
         let bus = EventBus::new();
         let jobs = JobRegistry::new();
         let team = AgentRegistry::new();
@@ -261,6 +274,7 @@ mod tests {
         let _b = Agent::builder()
             .model("anthropic/claude-opus-4.8")
             .cwd("/tmp/project")
+            .credential(ProviderAuth::ApiKey("sk-ant-test".into()))
             .permission_default(Decision::Allow)
             .max_turns(10)
             .resume_latest();
@@ -270,5 +284,7 @@ mod tests {
         assert!(matches!(d.permission_default, Decision::Ask));
         // No default model: the caller must choose one explicitly.
         assert!(d.model.is_none());
+        // No default credential: auth resolves from env / login unless set.
+        assert!(d.credential.is_none());
     }
 }

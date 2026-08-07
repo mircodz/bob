@@ -29,13 +29,27 @@ impl TokenSource for OpenAiOauth {
 }
 
 /// Registry constructor for the "openai" provider. Uniform
-/// `async fn create(model) -> Result<Arc<dyn Provider>>` shape shared by every
-/// provider family. Routes:
+/// `async fn create(model, auth)` shape shared by every provider family. A
+/// caller-supplied `ProviderAuth::ApiKey` is used as a `Bearer` token against the
+/// standard `/chat/completions` endpoint. With no explicit auth it routes:
 ///   - Logged in with ChatGPT (OAuth) → the **Responses API** against the Codex
 ///     backend (chatgpt.com/backend-api/codex), which speaks only /responses.
 ///   - Otherwise → the classic /chat/completions provider with an API key.
-pub async fn create(model: Option<String>) -> anyhow::Result<Arc<dyn Provider>> {
+pub async fn create(
+    model: Option<String>,
+    auth: Option<crate::auth::ProviderAuth>,
+) -> anyhow::Result<Arc<dyn Provider>> {
     use crate::providers::responses::ResponsesProvider;
+    if let Some(crate::auth::ProviderAuth::ApiKey(key)) = auth {
+        let base = std::env::var("OPENAI_BASE_URL")
+            .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
+        let source: Arc<dyn TokenSource> = Arc::new(crate::auth::StaticKey(key));
+        return Ok(Arc::new(OpenAiProvider::with_auth(
+            model.unwrap_or_else(|| "gpt-4o".to_string()),
+            base,
+            source,
+        )));
+    }
     if crate::auth::openai::is_logged_in() {
         let source: Arc<dyn TokenSource> = Arc::new(OpenAiOauth);
         Ok(Arc::new(ResponsesProvider::with_auth(
