@@ -1,0 +1,12 @@
+[package]
+name = "bob-types"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "bob_types"
+path = "src/lib.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
