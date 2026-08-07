@@ -255,7 +255,7 @@ mod tests {
         let mut s = SelectList::new();
         s.selected = 0;
         let range = s.window(10, 4); // scroll 0, range 0..4
-        // A row above the pane top maps to nothing.
+                                     // A row above the pane top maps to nothing.
         assert_eq!(s.row_at(&range, 20, 19), None);
         // The pane's top row is the first index.
         assert_eq!(s.row_at(&range, 20, 20), Some(0));

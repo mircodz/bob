@@ -502,13 +502,18 @@ async fn run_mcp(action: McpAction) -> anyhow::Result<()> {
                     if replaced { "updated" } else { "added" },
                     name
                 );
-                println!("  authorize it with:  \x1b[36mbob mcp login {}\x1b[0m", name);
+                println!(
+                    "  authorize it with:  \x1b[36mbob mcp login {}\x1b[0m",
+                    name
+                );
                 return Ok(());
             }
             let mut parts = command.into_iter();
-            let cmd = parts
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("no command given (put it after `--`, or pass --url for an HTTP server)"))?;
+            let cmd = parts.next().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no command given (put it after `--`, or pass --url for an HTTP server)"
+                )
+            })?;
             let args: Vec<String> = parts.collect();
             let mut env_map = std::collections::HashMap::new();
             for pair in env {
@@ -541,7 +546,10 @@ async fn run_mcp(action: McpAction) -> anyhow::Result<()> {
                 .find(|s| s.name == name)
                 .ok_or_else(|| anyhow::anyhow!("no MCP server named '{}'", name))?;
             if server.url.is_none() {
-                anyhow::bail!("'{}' is a stdio server; login is only for HTTP servers", name);
+                anyhow::bail!(
+                    "'{}' is a stdio server; login is only for HTTP servers",
+                    name
+                );
             }
 
             // Static-token path (e.g. a GitHub Personal Access Token).
@@ -583,11 +591,7 @@ async fn run_mcp(action: McpAction) -> anyhow::Result<()> {
             println!("MCP servers (~/.bob/config.toml):");
             for s in servers {
                 if let Some(url) = &s.url {
-                    let auth = if s.oauth.is_some() {
-                        " (oauth)"
-                    } else {
-                        ""
-                    };
+                    let auth = if s.oauth.is_some() { " (oauth)" } else { "" };
                     println!(
                         "  \x1b[1m{}\x1b[0m  \x1b[90mhttp {}{}\x1b[0m",
                         s.name, url, auth

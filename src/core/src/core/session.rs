@@ -407,10 +407,7 @@ pub fn root_history_from_events(events: &[AgentEvent]) -> Vec<Message> {
 
     // Flush any buffered tool_results as a single Role::Tool message. Called before
     // appending a non-result message so ordering matches the live turn loop.
-    fn flush(
-        msgs: &mut Vec<Message>,
-        pending: &mut Vec<crate::core::types::ContentBlock>,
-    ) {
+    fn flush(msgs: &mut Vec<Message>, pending: &mut Vec<crate::core::types::ContentBlock>) {
         if !pending.is_empty() {
             msgs.push(Message {
                 role: Role::Tool,
@@ -427,9 +424,9 @@ pub fn root_history_from_events(events: &[AgentEvent]) -> Vec<Message> {
             }
             AgentEvent::AgentMessage { to, from, text } if to == "root" => {
                 flush(&mut msgs, &mut pending_results);
-                msgs.push(Message::user_text(crate::agent::team::format_coord_message(
-                    from, text,
-                )));
+                msgs.push(Message::user_text(
+                    crate::agent::team::format_coord_message(from, text),
+                ));
             }
             AgentEvent::Message { agent_id, message } if agent_id == "root" => {
                 flush(&mut msgs, &mut pending_results);
@@ -764,7 +761,9 @@ mod tests {
     // Build a session with `n` user messages under a fixed id.
     fn sized(id: &str, n: usize) -> Session {
         let mut s = new_session("anthropic", id.into(), "t".into(), String::new());
-        s.messages = (0..n).map(|i| Message::user_text(format!("m{i}"))).collect();
+        s.messages = (0..n)
+            .map(|i| Message::user_text(format!("m{i}")))
+            .collect();
         s
     }
 

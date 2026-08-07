@@ -232,10 +232,7 @@ impl App {
         );
         let mut lines: Vec<Line> = vec![
             Line::from(""),
-            Line::from(Span::styled(
-                header,
-                Style::default().fg(Palette::DIM()),
-            )),
+            Line::from(Span::styled(header, Style::default().fg(Palette::DIM()))),
         ];
         for item in items.iter().take(area.height.saturating_sub(3) as usize) {
             let (glyph, glyph_color, text_style) = match item.status {

@@ -1130,11 +1130,7 @@ pub async fn run(
         // and releases the lock; bound the wait with a timeout so a wedged turn
         // can't hold exit hostage — we still persist whatever history we can read.
         cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-        let locked = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            agent.lock(),
-        )
-        .await;
+        let locked = tokio::time::timeout(std::time::Duration::from_secs(5), agent.lock()).await;
         match locked {
             Ok(a) => {
                 session.messages = a.messages().to_vec();
@@ -1368,7 +1364,10 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/usage", "show token usage (session + all-time)"),
     ("/context", "show context-window usage"),
     ("/compact", "summarize & free up context now"),
-    ("/yolo", "toggle bypassing ALL permission prompts (dangerous)"),
+    (
+        "/yolo",
+        "toggle bypassing ALL permission prompts (dangerous)",
+    ),
     ("/model", "show the current model"),
     ("/models", "list & switch models"),
     (
@@ -1500,10 +1499,9 @@ impl App {
                 self.model_label = model;
                 // Remember this choice for the next launch. Best-effort: a config
                 // write failure shouldn't abort the (already-applied) switch.
-                if let Err(e) = bob_core::core::config::set_default_model(
-                    &self.provider_id,
-                    &self.model_label,
-                ) {
+                if let Err(e) =
+                    bob_core::core::config::set_default_model(&self.provider_id, &self.model_label)
+                {
                     self.notify(format!("switched, but couldn't save default: {e}"));
                 }
                 // Chain into the reasoning picker so model + effort are set together.
@@ -1570,7 +1568,8 @@ impl App {
                 self.stick_to_bottom();
             }
             BgOutcome::SessionSaveFailed(e) => {
-                self.view.push_notice(format!("warning: couldn't save session: {e}"));
+                self.view
+                    .push_notice(format!("warning: couldn't save session: {e}"));
             }
         }
     }
@@ -2845,9 +2844,7 @@ pub(super) fn indent_line(line: Line<'static>) -> Line<'static> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        fmt_ctx_window, fmt_duration, fmt_tokens, trim_dot, truncate_mid, wrap_line,
-    };
+    use super::{fmt_ctx_window, fmt_duration, fmt_tokens, trim_dot, truncate_mid, wrap_line};
     use ratatui::text::{Line, Span};
 
     #[test]

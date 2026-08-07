@@ -618,11 +618,7 @@ pub async fn run(
                         let (messages, sid, runs) = {
                             let mut active = active_session.lock().await;
                             *active = s;
-                            (
-                                history,
-                                active.id.clone(),
-                                active.subagent_runs.clone(),
-                            )
+                            (history, active.id.clone(), active.subagent_runs.clone())
                         };
                         // Redirect the event log to the newly-active session.
                         if let Ok(mut id) = log_session_id.lock() {

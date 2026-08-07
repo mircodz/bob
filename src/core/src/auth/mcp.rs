@@ -47,9 +47,19 @@ pub async fn discover(server: &str, url: &str) -> anyhow::Result<McpOAuthConfig>
         .unwrap_or_else(|| well_known(url, "oauth-protected-resource"));
 
     // 2. Protected-resource metadata → authorization server(s).
-    let prm: Value = client.get(&prm_url).send().await?.json().await.map_err(|e| {
-        anyhow::anyhow!("failed to read protected-resource metadata at {}: {}", prm_url, e)
-    })?;
+    let prm: Value = client
+        .get(&prm_url)
+        .send()
+        .await?
+        .json()
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "failed to read protected-resource metadata at {}: {}",
+                prm_url,
+                e
+            )
+        })?;
     let as_base = prm["authorization_servers"]
         .as_array()
         .and_then(|a| a.first())
@@ -59,9 +69,19 @@ pub async fn discover(server: &str, url: &str) -> anyhow::Result<McpOAuthConfig>
 
     // 3. Authorization-server metadata (RFC 8414).
     let asm_url = well_known(&as_base, "oauth-authorization-server");
-    let asm: Value = client.get(&asm_url).send().await?.json().await.map_err(|e| {
-        anyhow::anyhow!("failed to read authorization-server metadata at {}: {}", asm_url, e)
-    })?;
+    let asm: Value = client
+        .get(&asm_url)
+        .send()
+        .await?
+        .json()
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "failed to read authorization-server metadata at {}: {}",
+                asm_url,
+                e
+            )
+        })?;
     let authorize_url = asm["authorization_endpoint"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("no authorization_endpoint in AS metadata"))?
@@ -229,7 +249,13 @@ pub async fn access_token(server: &str, oauth: &McpOAuthConfig) -> anyhow::Resul
     let store = AuthStore::load();
     let cred = store
         .get(&key)
-        .ok_or_else(|| anyhow::anyhow!("not logged in to MCP server '{}'; run `bob mcp login {}`", server, server))?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "not logged in to MCP server '{}'; run `bob mcp login {}`",
+                server,
+                server
+            )
+        })?
         .clone();
 
     // If we have a non-expired token, use it. 60s of slack for clock skew.

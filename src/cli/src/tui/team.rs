@@ -601,7 +601,7 @@ mod tests {
         t.on_spawn("b", "root", "", "");
         t.on_spawn("c", "root", "", "");
         t.on_done("a", false); // a finishes
-        // Running (b, c, in spawn order) first, then finished (a) at the bottom.
+                               // Running (b, c, in spawn order) first, then finished (a) at the bottom.
         assert_eq!(t.display_order(), vec!["b", "c", "a"]);
         assert_eq!(t.running_ids(), vec!["b", "c"]);
     }

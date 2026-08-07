@@ -591,10 +591,7 @@ mod tests {
             ("Search".into(), "cats".into())
         );
         // A missing arg key yields an empty string, not a panic.
-        assert_eq!(
-            tool_display("grep", &json!({})),
-            ("Grep".into(), "".into())
-        );
+        assert_eq!(tool_display("grep", &json!({})), ("Grep".into(), "".into()));
         // Unknown tools pass through their raw name with no arg.
         assert_eq!(
             tool_display("mystery_tool", &json!({})),
@@ -621,4 +618,3 @@ mod tests {
         assert!(parse_diff_output("plain output, no diff").is_none());
     }
 }
-
