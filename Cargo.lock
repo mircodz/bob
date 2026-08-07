@@ -322,6 +322,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "bob-sdk"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bob-core",
+ "bob-types",
+ "tokio",
+]
+
+[[package]]
 name = "bob-secure"
 version = "0.0.1"
 dependencies = [

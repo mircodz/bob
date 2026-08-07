@@ -1,0 +1,20 @@
+[package]
+name = "bob-sdk"
+version.workspace = true
+edition.workspace = true
+description = "Ergonomic builder-style SDK over bob-core: spin up an agent in a few lines."
+
+[lib]
+name = "bob_sdk"
+path = "src/lib.rs"
+
+[dependencies]
+bob-core = { path = "../core" }
+bob-types.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+
+[[example]]
+name = "minimal"
+path = "examples/minimal.rs"
