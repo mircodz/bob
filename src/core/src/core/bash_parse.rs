@@ -316,8 +316,8 @@ mod tests {
 
     #[test]
     fn malformed_input_fails_closed() {
-        // Unterminated substitution / quote → Err, so the caller won't auto-allow.
-        assert!(analyze("echo $(").is_err());
-        assert!(analyze("echo 'unterminated").is_err());
+        // Unterminated substitution / quote → None, so the caller won't auto-allow.
+        assert!(analyze("echo $(").is_none());
+        assert!(analyze("echo 'unterminated").is_none());
     }
 }

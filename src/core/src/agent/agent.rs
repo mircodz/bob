@@ -1099,3 +1099,136 @@ mod structured_tests {
         );
     }
 }
+
+/// End-to-end agent-loop tests: a real turn that calls a tool, feeds the result
+/// back, and finishes — driven entirely by MockProvider + a fake tool, asserting
+/// the loop terminates and the transcript/events are what a frontend would render.
+#[cfg(test)]
+mod e2e_tests {
+    use super::{Agent, AgentConfig, DEFAULT_MAX_TURNS};
+    use crate::core::events::{AgentEvent, EventBus};
+    use crate::core::types::{Role, ToolSpec};
+    use crate::providers::mock::{MockProvider, MockReply, MockRule};
+    use crate::tools::registry::{Tool, ToolContext, ToolRegistry, ToolResult};
+    use async_trait::async_trait;
+    use serde_json::{json, Value};
+    use std::sync::{Arc, Mutex};
+
+    /// A trivial tool that records the input it was called with and echoes a fixed
+    /// result — enough to exercise the full tool-call → tool-result → text turn.
+    struct EchoTool {
+        seen: Arc<Mutex<Vec<Value>>>,
+    }
+
+    #[async_trait]
+    impl Tool for EchoTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "echo".to_string(),
+                description: "echo back".to_string(),
+                input_schema: json!({"type": "object"}),
+            }
+        }
+        async fn execute(&self, input: Value, _ctx: &ToolContext) -> ToolResult {
+            self.seen.lock().unwrap().push(input.clone());
+            Ok(format!("echoed: {}", input["msg"].as_str().unwrap_or("")))
+        }
+        fn is_read_only(&self) -> bool {
+            true
+        }
+    }
+
+    fn agent_with_echo(
+        provider: Arc<dyn crate::providers::provider::Provider>,
+        bus: EventBus,
+    ) -> (Agent, Arc<Mutex<Vec<Value>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut tools = ToolRegistry::new(None);
+        tools.add(Arc::new(EchoTool { seen: seen.clone() }));
+        let agent = Agent::new(AgentConfig {
+            provider,
+            tools,
+            bus,
+            system: None,
+            cwd: ".".to_string(),
+            max_turns: DEFAULT_MAX_TURNS,
+            id: Some("root".to_string()),
+            context_window: 200_000,
+            compact_threshold: 0.8,
+            keep_recent: 6,
+            jobs: crate::tools::jobs::JobRegistry::new(),
+            user_asker: None,
+            lsp: None,
+            inbox: None,
+            team: None,
+            name: "root".to_string(),
+            depth: 0,
+            parent_cancel: None,
+            cancel: None,
+        });
+        (agent, seen)
+    }
+
+    #[tokio::test]
+    async fn full_turn_calls_a_tool_then_finishes() {
+        // The model calls `echo` once (keyed off the user prompt), then — seeing the
+        // tool result — replies with final text. This is the canonical agent loop.
+        // The model calls `echo` once (keyed off the user prompt), then — once the
+        // tool result comes back (a Tool-role message whose `.text()` is empty, so
+        // the "please echo" rule no longer matches) — falls through to the default
+        // reply with final text.
+        let provider = MockProvider::new(vec![MockRule {
+            needle: "please echo".to_string(),
+            reply: MockReply::ToolCall {
+                name: "echo".to_string(),
+                input: json!({"msg": "hello"}),
+            },
+        }])
+        .with_default(MockReply::Text("all done".to_string()));
+
+        // Capture the event stream a frontend would render.
+        let bus = EventBus::new();
+        let kinds = Arc::new(Mutex::new(Vec::<String>::new()));
+        {
+            let kinds = kinds.clone();
+            bus.on(Arc::new(move |e: &AgentEvent| {
+                kinds.lock().unwrap().push(e.kind().to_string());
+            }));
+        }
+
+        let (mut agent, seen) = agent_with_echo(Arc::new(provider), bus);
+        let out = agent.run("please echo").await.unwrap();
+
+        // The final assistant text is returned.
+        assert_eq!(out, "all done");
+        // The tool actually ran, with the model's input.
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0]["msg"], "hello");
+
+        // History ends coherently: user → assistant(tool_use) → tool(result) →
+        // assistant(text). The last message is the final assistant turn.
+        let msgs = agent.messages();
+        assert_eq!(msgs.first().unwrap().role, Role::User);
+        assert_eq!(msgs.last().unwrap().role, Role::Assistant);
+        assert_eq!(msgs.last().unwrap().text(), "all done");
+
+        // The event stream carried the turn: a tool call, a tool result, and a
+        // final message — the signals the TUI/remote render from.
+        let kinds = kinds.lock().unwrap();
+        assert!(kinds.iter().any(|k| k == "ToolCall"), "kinds: {kinds:?}");
+        assert!(kinds.iter().any(|k| k == "ToolResult"), "kinds: {kinds:?}");
+        assert!(kinds.iter().any(|k| k == "TurnEnd"), "kinds: {kinds:?}");
+    }
+
+    #[tokio::test]
+    async fn plain_text_turn_returns_immediately() {
+        // No tool call: the model answers directly and the loop ends in one turn.
+        let provider = MockProvider::new(vec![]).with_default(MockReply::Text("hi there".into()));
+        let (mut agent, _seen) = agent_with_echo(Arc::new(provider), EventBus::new());
+        let out = agent.run("hello").await.unwrap();
+        assert_eq!(out, "hi there");
+        // user + assistant only.
+        assert_eq!(agent.messages().len(), 2);
+    }
+}
