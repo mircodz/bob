@@ -26,7 +26,7 @@ use bob_core::core::policies::{
     allow_bash_commands, allow_code_action_list, allow_read_only, allow_tools, deny_tools,
     flag_dangerous_bash,
 };
-use bob_core::core::session::{save_session, Session};
+use bob_core::core::session::Session;
 use bob_core::providers::create_provider;
 use bob_core::providers::provider::Provider;
 
@@ -422,12 +422,17 @@ pub async fn run(
     // writer thread owns the DB connection, so this listener only enqueues and
     // never blocks the agent's async task on a SQLite write. The blob save at
     // turn-end is still authoritative until replay-on-load lands (Stage 2).
-    let event_log = Arc::new(bob_core::core::session::EventLogWriter::spawn());
+    // The session store (default: the shared SQLite DB). Owns the background
+    // event-log writer thread; a single instance serializes all event appends and
+    // is the seam the SDK builder will accept. Non-blocking append keeps the
+    // agent's async task off the SQLite write path.
+    let store: Arc<dyn bob_core::core::store::SessionStore> =
+        Arc::new(bob_core::core::store::SqliteStore::default());
     {
-        let event_log = event_log.clone();
+        let store = store.clone();
         let session_id = session.id.clone();
         bus.on(Arc::new(move |e: &AgentEvent| {
-            event_log.append(&session_id, e);
+            store.append_event(&session_id, e);
         }));
     }
 
@@ -501,13 +506,7 @@ pub async fn run(
     if !session.messages.is_empty() {
         // Seed the agent from the event log when it's authoritative (blob fallback
         // via the shared guard), matching what the view replays below.
-        let events = bob_core::core::session::load_events(&session.id)
-            .ok()
-            .flatten();
-        let history = bob_core::core::session::reconstructed_history(
-            events.as_deref(),
-            &session.messages,
-        );
+        let history = store.history_for(&session);
         agent.load_history(history);
     }
     // Grab the cancel handle before moving the agent behind the mutex, so the UI
@@ -586,8 +585,8 @@ pub async fn run(
         // history. GUARD: only trust replay if the reconstructed root history is at
         // least as long as the blob's — a truncated/corrupt log must never render
         // LESS than we safely have. Otherwise fall back to blob hydration.
-        let replayed = match bob_core::core::session::load_events(&session.id) {
-            Ok(Some(events)) => {
+        let replayed = match store.load_events(&session.id) {
+            Some(events) => {
                 let rebuilt = bob_core::core::session::root_history_from_events(&events);
                 if rebuilt.len() >= session.messages.len() {
                     for evt in &events {
@@ -1016,8 +1015,10 @@ pub async fn run(
                 {
                     let snapshot = session.clone();
                     let tx = app.bg_tx.clone();
+                    let store = store.clone();
                     tokio::spawn(async move {
-                        let res = tokio::task::spawn_blocking(move || save_session(&snapshot)).await;
+                        let res =
+                            tokio::task::spawn_blocking(move || store.save(&snapshot)).await;
                         let err = match res {
                             Ok(Ok(())) => None,
                             Ok(Err(e)) => Some(e.to_string()),
@@ -1157,11 +1158,11 @@ pub async fn run(
         session.updated_at = now_stamp();
         // Terminal is being torn down here, so there's no view to notice into —
         // log to stderr so a final-save failure isn't completely silent.
-        if let Err(e) = save_session(&session) {
+        if let Err(e) = store.save(&session) {
             eprintln!("bob: warning: couldn't save session on exit: {e}");
         }
         // Ensure every shadow-written event is durable before we exit.
-        event_log.flush();
+        store.flush();
     }
 
     // Terminal restore is handled by `_guard` (Drop) — covers the normal return,
