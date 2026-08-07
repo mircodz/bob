@@ -105,9 +105,7 @@ impl MockProvider {
 
     fn completion_for(&self, reply: MockReply) -> Completion {
         let (content, stop_reason, output_tokens) = match reply {
-            MockReply::Text(text) => {
-                (vec![ContentBlock::Text { text }], StopReason::EndTurn, 5)
-            }
+            MockReply::Text(text) => (vec![ContentBlock::Text { text }], StopReason::EndTurn, 5),
             MockReply::ToolCall { name, input } => (
                 vec![ContentBlock::ToolUse {
                     id: format!("mock_{}", self.calls.load(Ordering::Relaxed)),

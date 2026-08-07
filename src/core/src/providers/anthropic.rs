@@ -13,6 +13,13 @@ const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const API_VERSION: &str = "2023-06-01";
 const OAUTH_BETA: &str = "oauth-2025-04-20";
 
+/// Registry constructor: build the Anthropic provider as a `dyn Provider`. Uniform
+/// `async fn create(model) -> Result<Arc<dyn Provider>>` shape shared by every
+/// provider family so the registry match in `mod.rs` is symmetric.
+pub async fn create(model: Option<String>) -> anyhow::Result<std::sync::Arc<dyn Provider>> {
+    Ok(std::sync::Arc::new(AnthropicProvider::new(model)?))
+}
+
 /// How this provider authenticates.
 enum AuthMode {
     /// Console API key (x-api-key header) — pay per token.
@@ -417,9 +424,7 @@ fn to_api_message(m: &Message) -> Value {
 /// is a compile error here, never a silent drop.
 fn block_to_wire(b: &ContentBlock) -> BlockWire {
     match b {
-        ContentBlock::Text { text } => {
-            BlockWire::Emit(json!({ "type": "text", "text": text }))
-        }
+        ContentBlock::Text { text } => BlockWire::Emit(json!({ "type": "text", "text": text })),
         ContentBlock::ToolUse { id, name, input } => {
             BlockWire::Emit(json!({ "type": "tool_use", "id": id, "name": name, "input": input }))
         }

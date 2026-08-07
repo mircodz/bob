@@ -117,9 +117,7 @@ pub(crate) mod conformance {
     /// exhaustiveness check below.
     pub fn all_content_blocks() -> Vec<ContentBlock> {
         let blocks = vec![
-            ContentBlock::Text {
-                text: "hi".into(),
-            },
+            ContentBlock::Text { text: "hi".into() },
             ContentBlock::ToolUse {
                 id: "t1".into(),
                 name: "read_file".into(),
@@ -134,9 +132,7 @@ pub(crate) mod conformance {
                 thinking: "hmm".into(),
                 signature: "sig".into(),
             },
-            ContentBlock::RedactedThinking {
-                data: "xxx".into(),
-            },
+            ContentBlock::RedactedThinking { data: "xxx".into() },
             ContentBlock::ReasoningItem {
                 item: json!({"id": "r1"}),
             },

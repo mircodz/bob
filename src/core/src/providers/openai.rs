@@ -18,6 +18,36 @@ use tokio::sync::mpsc;
 /// to change while the whole workspace converges on one auth trait.
 pub use crate::auth::AuthProvider as TokenSource;
 
+/// The ChatGPT-subscription (Codex) OAuth token source.
+struct OpenAiOauth;
+
+#[async_trait]
+impl TokenSource for OpenAiOauth {
+    async fn token(&self) -> anyhow::Result<String> {
+        crate::auth::openai::access_token().await
+    }
+}
+
+/// Registry constructor for the "openai" provider. Uniform
+/// `async fn create(model) -> Result<Arc<dyn Provider>>` shape shared by every
+/// provider family. Routes:
+///   - Logged in with ChatGPT (OAuth) → the **Responses API** against the Codex
+///     backend (chatgpt.com/backend-api/codex), which speaks only /responses.
+///   - Otherwise → the classic /chat/completions provider with an API key.
+pub async fn create(model: Option<String>) -> anyhow::Result<Arc<dyn Provider>> {
+    use crate::providers::responses::ResponsesProvider;
+    if crate::auth::openai::is_logged_in() {
+        let source: Arc<dyn TokenSource> = Arc::new(OpenAiOauth);
+        Ok(Arc::new(ResponsesProvider::with_auth(
+            model.unwrap_or_else(|| "gpt-5".to_string()),
+            "https://chatgpt.com/backend-api/codex".to_string(),
+            source,
+        )))
+    } else {
+        Ok(Arc::new(OpenAiProvider::new(model, None)))
+    }
+}
+
 /// Shared HTTP client with sane timeouts. A connect timeout prevents hanging on
 /// an unreachable endpoint; we deliberately do NOT set an overall read timeout,
 /// since legitimate streamed generations can run for minutes.
@@ -462,7 +492,10 @@ fn to_api_messages(m: &Message) -> Vec<Value> {
 enum OpenAiBlock {
     Text(String),
     ToolCall(Value),
-    ToolResult { tool_use_id: String, content: String },
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+    },
     /// Deliberately unsupported by chat/completions (thinking / reasoning items).
     SkipUnsupported,
 }
@@ -553,7 +586,10 @@ mod tests {
         let out = to_api_messages(&m);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["content"], json!("let me look"));
-        assert_eq!(out[0]["tool_calls"][0]["function"]["name"], json!("read_file"));
+        assert_eq!(
+            out[0]["tool_calls"][0]["function"]["name"],
+            json!("read_file")
+        );
     }
 
     #[test]
