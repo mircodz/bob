@@ -7,15 +7,13 @@
 use crate::agent::agent::{
     build_subagent, Agent, SubagentSpec, EXPLORE_MAX_TURNS, ROOT_AGENT_ID, SUBAGENT_MAX_TURNS,
 };
-use crate::core::events::EventBus;
+use crate::agent::env::AgentEnv;
 use crate::core::types::ToolSpec;
-use crate::providers::provider::Provider;
-use crate::tools::jobs::{JobRegistry, JobStatus};
-use crate::tools::registry::{Tool, ToolContext, ToolError, ToolRegistry, ToolResult};
+use crate::tools::jobs::JobStatus;
+use crate::tools::registry::{Tool, ToolContext, ToolError, ToolResult};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 
 /// Process-wide monotonic counter for subagent ids. Per-batch `task_{i+1}` ids
 /// collided across successive `task` calls — the team drawer keys threads by id,
@@ -28,18 +26,7 @@ fn next_subagent_id() -> String {
 }
 
 pub struct TaskTool {
-    pub provider: Arc<dyn Provider>,
-    pub subagent_tools: ToolRegistry,
-    pub bus: EventBus,
-    pub cwd: String,
-    pub subagent_system: Option<String>,
-    /// Shared job registry (same instance the root agent + UI use).
-    pub jobs: JobRegistry,
-    /// Shared language servers, so subagents get diagnostics/nav too. None if
-    /// no lsp_servers are configured.
-    pub lsp: Option<Arc<crate::lsp::LspManager>>,
-    /// The root's cancel flag, so a Cancel cascades into `task` children.
-    pub parent_cancel: Arc<std::sync::atomic::AtomicBool>,
+    pub env: AgentEnv,
 }
 
 impl TaskTool {
@@ -50,24 +37,24 @@ impl TaskTool {
         // The simple `task` tool stays fire-and-forget: its children are not team
         // members (no inbox/registry). Coordinated agents come from `spawn_agent`.
         let tools = if read_only {
-            self.subagent_tools.read_only_subset()
+            self.env.subagent_tools.read_only_subset()
         } else {
-            self.subagent_tools.clone()
+            self.env.subagent_tools.clone()
         };
         build_subagent(SubagentSpec {
-            provider: self.provider.clone(),
+            provider: self.env.provider.clone(),
             tools,
-            bus: self.bus.clone(),
-            system: self.subagent_system.clone(),
+            bus: self.env.bus.clone(),
+            system: self.env.subagent_system.clone(),
             cwd,
-            jobs: self.jobs.clone(),
-            lsp: self.lsp.clone(),
+            jobs: self.env.jobs.clone(),
+            lsp: self.env.lsp.clone(),
             name: id,
             max_turns: SUBAGENT_MAX_TURNS,
             depth: 1,
             inbox: None,
             team: None,
-            parent_cancel: Some(self.parent_cancel.clone()),
+            parent_cancel: Some(self.env.parent_cancel.clone()),
         })
     }
 }
@@ -122,10 +109,10 @@ impl Tool for TaskTool {
         };
         let background = input["background"].as_bool().unwrap_or(false);
         let read_only = input["read_only"].as_bool().unwrap_or(false);
-        let base_cwd = if self.cwd.is_empty() {
+        let base_cwd = if self.env.cwd.is_empty() {
             ctx.cwd.clone()
         } else {
-            self.cwd.clone()
+            self.env.cwd.clone()
         };
 
         if background {
@@ -162,7 +149,8 @@ impl Tool for TaskTool {
             let description = t["description"].as_str().unwrap_or("").to_string();
             let prompt = t["prompt"].as_str().unwrap_or("").to_string();
             let id = next_subagent_id();
-            self.bus
+            self.env
+                .bus
                 .emit(crate::core::events::AgentEvent::SubagentSpawn {
                     parent_id: ROOT_AGENT_ID.to_string(),
                     agent_id: id.clone(),
@@ -170,7 +158,7 @@ impl Tool for TaskTool {
                     prompt: prompt.clone(),
                 });
             let child = self.make_child(id.clone(), base_cwd.clone(), read_only);
-            let bus = self.bus.clone();
+            let bus = self.env.bus.clone();
             handles.push(tokio::spawn(async move {
                 let mut child = child;
                 let (result, failed) = match child.run(&prompt).await {
@@ -213,15 +201,7 @@ const EXPLORE_SYSTEM: &str = "You are a fast, read-only code explorer. You have 
 /// for "where is X / how does Y work / which files touch Z" questions — it has a
 /// curated read-only toolset and returns a synthesized answer.
 pub struct ExploreTool {
-    pub provider: Arc<dyn Provider>,
-    /// The full subagent toolset; explore uses only its read-only subset.
-    pub subagent_tools: ToolRegistry,
-    pub bus: EventBus,
-    pub cwd: String,
-    pub jobs: JobRegistry,
-    pub lsp: Option<Arc<crate::lsp::LspManager>>,
-    /// The root's cancel flag, so a Cancel cascades into the explore child.
-    pub parent_cancel: Arc<std::sync::atomic::AtomicBool>,
+    pub env: AgentEnv,
 }
 
 #[async_trait]
@@ -260,15 +240,16 @@ impl Tool for ExploreTool {
             .filter(|s| !s.is_empty())
             .unwrap_or("explore")
             .to_string();
-        let cwd = if self.cwd.is_empty() {
+        let cwd = if self.env.cwd.is_empty() {
             ctx.cwd.clone()
         } else {
-            self.cwd.clone()
+            self.env.cwd.clone()
         };
 
         // Announce as a subagent so it appears in the transcript + team drawer.
         let id = "explore".to_string();
-        self.bus
+        self.env
+            .bus
             .emit(crate::core::events::AgentEvent::SubagentSpawn {
                 parent_id: ROOT_AGENT_ID.to_string(),
                 agent_id: id.clone(),
@@ -278,25 +259,26 @@ impl Tool for ExploreTool {
 
         // A read-only child: only reads/searches, its own focused prompt.
         let mut child = build_subagent(SubagentSpec {
-            provider: self.provider.clone(),
-            tools: self.subagent_tools.read_only_subset(),
-            bus: self.bus.clone(),
+            provider: self.env.provider.clone(),
+            tools: self.env.subagent_tools.read_only_subset(),
+            bus: self.env.bus.clone(),
             system: Some(EXPLORE_SYSTEM.to_string()),
             cwd,
-            jobs: self.jobs.clone(),
-            lsp: self.lsp.clone(),
+            jobs: self.env.jobs.clone(),
+            lsp: self.env.lsp.clone(),
             name: id.clone(),
             max_turns: EXPLORE_MAX_TURNS,
             depth: 1,
             inbox: None,
             team: None,
-            parent_cancel: Some(self.parent_cancel.clone()),
+            parent_cancel: Some(self.env.parent_cancel.clone()),
         });
         let (out, failed) = match child.run(&query).await {
             Ok(out) => (out, false),
             Err(e) => (format!("error: {}", e), true),
         };
-        self.bus
+        self.env
+            .bus
             .emit(crate::core::events::AgentEvent::SubagentDone {
                 agent_id: id,
                 failed,

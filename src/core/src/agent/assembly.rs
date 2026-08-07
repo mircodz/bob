@@ -92,7 +92,10 @@ pub fn build_root_agent(p: RootAgentParams) -> Agent {
         tools.add(Arc::new(RenameSymbolTool::new(lsp.clone())));
         tools.add(Arc::new(CodeActionTool::new(lsp.clone())));
     }
-    tools.add(Arc::new(TaskTool {
+    // The shared dependency bundle every delegation tool needs to spawn children.
+    // Built once, cloned into each tool — instead of respelling the same eight
+    // fields four times.
+    let env = crate::agent::env::AgentEnv {
         provider: p.provider.clone(),
         subagent_tools: subagent_tools.clone(),
         bus: p.bus.clone(),
@@ -101,42 +104,23 @@ pub fn build_root_agent(p: RootAgentParams) -> Agent {
         jobs: p.jobs.clone(),
         lsp: p.lsp.clone(),
         parent_cancel: cancel.clone(),
-    }));
+    };
+    tools.add(Arc::new(TaskTool { env: env.clone() }));
     // The `workflow` tool: the model composes a parameterized fan_out/map_reduce
     // over many items. Root-only, like task; children can't spin up workflows.
     tools.add(Arc::new(crate::tools::workflow_tool::WorkflowTool {
-        provider: p.provider.clone(),
-        subagent_tools: subagent_tools.clone(),
-        bus: p.bus.clone(),
-        cwd: p.cwd.clone(),
-        subagent_system: Some(p.system_prompt.clone()),
-        jobs: p.jobs.clone(),
-        lsp: p.lsp.clone(),
-        parent_cancel: cancel.clone(),
+        env: env.clone(),
     }));
     tools.add(Arc::new(crate::tools::task::ExploreTool {
-        provider: p.provider.clone(),
-        subagent_tools: subagent_tools.clone(),
-        bus: p.bus.clone(),
-        cwd: p.cwd.clone(),
-        jobs: p.jobs.clone(),
-        lsp: p.lsp.clone(),
-        parent_cancel: cancel.clone(),
+        env: env.clone(),
     }));
 
-    // Coordination tools: spawn children from the same deps as `task`, and let the
-    // root message + inspect the team. Children get send/list via subagent_tools;
-    // spawn_agent enforces the nesting-depth and running-agent caps at runtime.
+    // Coordination tools: spawn children from the same env as `task`, plus the
+    // team roster. Children get send/list via subagent_tools; spawn_agent enforces
+    // the nesting-depth and running-agent caps at runtime.
     let deps = CoordDeps {
-        provider: p.provider.clone(),
-        subagent_tools: subagent_tools.clone(),
-        bus: p.bus.clone(),
-        cwd: p.cwd.clone(),
-        subagent_system: Some(p.system_prompt.clone()),
-        jobs: p.jobs.clone(),
-        lsp: p.lsp.clone(),
+        env,
         team: p.team.clone(),
-        parent_cancel: cancel.clone(),
     };
     tools.add(Arc::new(SpawnAgentTool { deps }));
     tools.add(Arc::new(SendMessageTool {

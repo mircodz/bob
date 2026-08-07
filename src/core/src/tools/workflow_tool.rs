@@ -8,33 +8,22 @@
 //! This is the safe, no-sandbox path to the "dynamic workflows" idea: the model
 //! parameterizes a known-good harness rather than writing arbitrary code.
 
-use crate::core::events::EventBus;
+use crate::agent::env::AgentEnv;
 use crate::core::types::ToolSpec;
-use crate::providers::provider::Provider;
-use crate::tools::jobs::JobRegistry;
-use crate::tools::registry::{Tool, ToolContext, ToolError, ToolRegistry, ToolResult};
+use crate::tools::registry::{Tool, ToolContext, ToolError, ToolResult};
 use crate::workflow::params::{self, WorkflowParams};
 use crate::workflow::WorkflowContext;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 
 /// Monotonic counter so each `workflow` tool run gets a distinct render id.
 static WORKFLOW_RUN_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// The `workflow` tool. Holds the same subagent-building deps as `TaskTool` so it
-/// can spin up a `WorkflowContext` and run a parameterized workflow.
+/// The `workflow` tool. Holds the same subagent-building [`AgentEnv`] as `TaskTool`
+/// so it can spin up a `WorkflowContext` and run a parameterized workflow.
 pub struct WorkflowTool {
-    pub provider: Arc<dyn Provider>,
-    pub subagent_tools: ToolRegistry,
-    pub bus: EventBus,
-    pub cwd: String,
-    pub subagent_system: Option<String>,
-    pub jobs: JobRegistry,
-    pub lsp: Option<Arc<crate::lsp::LspManager>>,
-    /// The root's cancel flag, so a Cancel cascades into the workflow's agents.
-    pub parent_cancel: Arc<std::sync::atomic::AtomicBool>,
+    pub env: AgentEnv,
 }
 
 #[async_trait]
@@ -118,10 +107,10 @@ impl Tool for WorkflowTool {
     async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
         use crate::workflow::params::Shape;
 
-        let cwd = if self.cwd.is_empty() {
+        let cwd = if self.env.cwd.is_empty() {
             ctx.cwd.clone()
         } else {
-            self.cwd.clone()
+            self.env.cwd.clone()
         };
         // A distinct, recognizable id so the TUI groups this run's events into one
         // workflow tree (the "wf-" prefix is how the view detects workflow agents).
@@ -147,14 +136,14 @@ impl Tool for WorkflowTool {
         let make_ctx = || {
             WorkflowContext::new(
                 run_id.clone(),
-                self.provider.clone(),
-                self.bus.clone(),
+                self.env.provider.clone(),
+                self.env.bus.clone(),
                 cwd.clone(),
-                self.subagent_tools.clone(),
-                self.subagent_system.clone(),
-                self.lsp.clone(),
-                self.jobs.clone(),
-                self.parent_cancel.clone(),
+                self.env.subagent_tools.clone(),
+                self.env.subagent_system.clone(),
+                self.env.lsp.clone(),
+                self.env.jobs.clone(),
+                self.env.parent_cancel.clone(),
                 0, // default concurrency cap
             )
         };

@@ -16,12 +16,10 @@
 //! blocking primitive that could deadlock.
 
 use crate::agent::agent::{build_subagent, SubagentSpec, SUBAGENT_MAX_TURNS};
+use crate::agent::env::AgentEnv;
 use crate::agent::team::{mailbox, AgentRegistry, AgentStatus};
-use crate::core::events::EventBus;
 use crate::core::types::ToolSpec;
-use crate::providers::provider::Provider;
-use crate::tools::jobs::JobRegistry;
-use crate::tools::registry::{Tool, ToolContext, ToolError, ToolRegistry, ToolResult};
+use crate::tools::registry::{Tool, ToolContext, ToolError, ToolResult};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -30,17 +28,11 @@ use std::sync::Arc;
 /// pieces `TaskTool` uses to assemble a subagent, plus the team registry.
 #[derive(Clone)]
 pub struct CoordDeps {
-    pub provider: Arc<dyn Provider>,
-    pub subagent_tools: ToolRegistry,
-    pub bus: EventBus,
-    pub cwd: String,
-    pub subagent_system: Option<String>,
-    pub jobs: JobRegistry,
-    pub lsp: Option<Arc<crate::lsp::LspManager>>,
+    /// The shared subagent-spawning environment (provider, tools, bus, cwd,
+    /// system, jobs, lsp, cancel) — the same bundle `task`/`workflow`/`explore`
+    /// hold.
+    pub env: AgentEnv,
     pub team: AgentRegistry,
-    /// The root's cancel flag, passed to every spawned child so one Cancel
-    /// cascades through the whole team (including nested spawns).
-    pub parent_cancel: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// `spawn_agent`: start a named background subagent that is part of the team.
@@ -143,6 +135,7 @@ impl Tool for SpawnAgentTool {
             .unwrap_or(&task)
             .to_string();
         self.deps
+            .env
             .bus
             .emit(crate::core::events::AgentEvent::SubagentSpawn {
                 parent_id: coord.name.clone(),
@@ -157,9 +150,9 @@ impl Tool for SpawnAgentTool {
         // avoid a self-referential cycle — SpawnAgentTool would otherwise need to
         // contain a copy of itself.
         let mut child_tools = if input["read_only"].as_bool().unwrap_or(false) {
-            self.deps.subagent_tools.read_only_subset()
+            self.deps.env.subagent_tools.read_only_subset()
         } else {
-            self.deps.subagent_tools.clone()
+            self.deps.env.subagent_tools.clone()
         };
         child_tools.add(Arc::new(SpawnAgentTool {
             deps: self.deps.clone(),
@@ -173,23 +166,23 @@ impl Tool for SpawnAgentTool {
 
         // Assemble the child agent, itself a team member (so it can coordinate).
         let child = build_subagent(SubagentSpec {
-            provider: self.deps.provider.clone(),
+            provider: self.deps.env.provider.clone(),
             tools: child_tools,
-            bus: self.deps.bus.clone(),
-            system: self.deps.subagent_system.clone(),
-            cwd: if self.deps.cwd.is_empty() {
+            bus: self.deps.env.bus.clone(),
+            system: self.deps.env.subagent_system.clone(),
+            cwd: if self.deps.env.cwd.is_empty() {
                 ctx.cwd.clone()
             } else {
-                self.deps.cwd.clone()
+                self.deps.env.cwd.clone()
             },
-            jobs: self.deps.jobs.clone(),
-            lsp: self.deps.lsp.clone(),
+            jobs: self.deps.env.jobs.clone(),
+            lsp: self.deps.env.lsp.clone(),
             name: name.clone(),
             max_turns: SUBAGENT_MAX_TURNS,
             depth: child_depth,
             inbox: Some(inbox),
             team: Some(self.deps.team.clone()),
-            parent_cancel: Some(self.deps.parent_cancel.clone()),
+            parent_cancel: Some(self.deps.env.parent_cancel.clone()),
         });
 
         // Run in the background. On completion, deliver the result back to the
@@ -197,7 +190,7 @@ impl Tool for SpawnAgentTool {
         let team = coord.team.clone();
         let spawner = coord.name.clone();
         let child_name = name.clone();
-        let bus = self.deps.bus.clone();
+        let bus = self.deps.env.bus.clone();
         tokio::spawn(async move {
             let mut child = child;
             let (status, result) = match child.run(&task).await {
