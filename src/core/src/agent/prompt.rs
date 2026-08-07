@@ -234,7 +234,7 @@ fn today_iso() -> String {
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as i64; // [0, 146096]
+    let doe = z - era * 146_097; // [0, 146096]
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
     let y = yoe + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
@@ -249,7 +249,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 ///   1. the user-global `~/.bob/AGENTS.md` (personal conventions across projects),
 ///   2. AGENTS.md / CLAUDE.md found by walking from the repo root DOWN to the cwd
 ///      (so a monorepo's root conventions and a subdir's local ones both apply).
-/// Returns None if nothing was found.
+///      Returns None if nothing was found.
 fn project_context(cwd: &Path) -> Option<String> {
     let mut blocks: Vec<String> = Vec::new();
 

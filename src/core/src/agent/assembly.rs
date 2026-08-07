@@ -1,9 +1,9 @@
 //! Assembling the root agent + its full tool surface. Both frontends (the TUI and
 //! the remote host) need the exact same wiring: build the tool registries (builtins
 //! + MCP + LSP + coordination), compose the `task`/`spawn_agent`/`send_message`/
-//! `list_agents` tools around a shared team, and register the root as a team member
-//! with its own mailbox so children can report back to it. This module owns that
-//! wiring once so the two frontends can't drift.
+//!   `list_agents` tools around a shared team, and register the root as a team member
+//!   with its own mailbox so children can report back to it. This module owns that
+//!   wiring once so the two frontends can't drift.
 
 use crate::agent::agent::{
     Agent, AgentConfig, COMPACT_THRESHOLD, DEFAULT_MAX_TURNS, KEEP_RECENT, ROOT_AGENT_ID,

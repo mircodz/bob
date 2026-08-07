@@ -34,7 +34,7 @@ use bob_core::agent::prompt::build_system_prompt;
 use bob_core::agent::team::AgentRegistry;
 use bob_core::core::events::EventBus;
 use bob_core::core::permissions::{Asker, Decision, PermissionEngine};
-use bob_core::core::store::{SessionStore, SqliteStore};
+use bob_core::core::store::{MemoryStore, SessionStore};
 use bob_core::providers::create_provider;
 use bob_core::tools::jobs::JobRegistry;
 use bob_core::tools::registry::{UserAsker, UserQuery};
@@ -44,7 +44,7 @@ use bob_core::tools::registry::{UserAsker, UserQuery};
 pub mod prelude {
     pub use crate::{Agent, AgentBuilder};
     pub use bob_core::core::permissions::{Asker, Decision};
-    pub use bob_core::core::store::{SessionStore, SqliteStore};
+    pub use bob_core::core::store::{MemoryStore, SessionStore, SqliteStore};
     pub use bob_types::{ContentBlock, Message, ReasoningEffort, Role};
 }
 
@@ -71,7 +71,7 @@ enum Resume {
 
 /// Fluent builder for an [`Agent`]. Construct with [`Agent::builder`].
 pub struct AgentBuilder {
-    model: String,
+    model: Option<String>,
     cwd: String,
     system_override: Option<String>,
     permission_default: Decision,
@@ -85,8 +85,9 @@ pub struct AgentBuilder {
 impl Default for AgentBuilder {
     fn default() -> Self {
         AgentBuilder {
-            // A sensible default model; override with `.model(...)`.
-            model: "anthropic".to_string(),
+            // No default model — the caller MUST pick one (`.model(...)`), so bob
+            // never silently talks to a model the user didn't choose.
+            model: None,
             cwd: ".".to_string(),
             system_override: None,
             // Fail-closed-ish default: without an asker, `Ask`/`Deny` decline.
@@ -102,9 +103,10 @@ impl Default for AgentBuilder {
 
 impl AgentBuilder {
     /// The `provider/model` (or legacy `provider:model`, or bare `provider`) to
-    /// run — resolved through the provider registry.
+    /// run — resolved through the provider registry. Required; `build()` errors if
+    /// it's not set.
     pub fn model(mut self, spec: impl Into<String>) -> Self {
-        self.model = spec.into();
+        self.model = Some(spec.into());
         self
     }
 
@@ -168,13 +170,18 @@ impl AgentBuilder {
     /// Build the agent: resolve the provider, assemble tools + permissions, compose
     /// the prompt, and seed history from the chosen session.
     pub async fn build(self) -> anyhow::Result<Agent> {
-        let provider = create_provider(&self.model).await?;
+        let model = self
+            .model
+            .ok_or_else(|| anyhow::anyhow!("no model set — call `.model(\"provider/model\")`"))?;
+        let provider = create_provider(&model).await?;
         let bus = EventBus::new();
         let jobs = JobRegistry::new();
         let team = AgentRegistry::new();
+        // Default to a non-persistent in-memory store: an SDK embedder shouldn't
+        // silently write to `~/.bob`. Opt into persistence with `.store(...)`.
         let store: Arc<dyn SessionStore> = self
             .store
-            .unwrap_or_else(|| Arc::new(SqliteStore::default()));
+            .unwrap_or_else(|| Arc::new(MemoryStore::default()));
 
         let permissions = Arc::new(PermissionEngine::new(self.permission_default, self.asker));
 
@@ -261,5 +268,7 @@ mod tests {
         let d = AgentBuilder::default();
         assert_eq!(d.cwd, ".");
         assert!(matches!(d.permission_default, Decision::Ask));
+        // No default model: the caller must choose one explicitly.
+        assert!(d.model.is_none());
     }
 }

@@ -2,7 +2,7 @@
 //!   1. GitHub OAuth token — obtained once via device flow, stored long-term.
 //!   2. Copilot API token — short-lived (~30 min), fetched from the GitHub token
 //!      on demand and cached until it nears expiry.
-//! The Copilot chat API itself is OpenAI-compatible at api.githubcopilot.com.
+//!      The Copilot chat API itself is OpenAI-compatible at api.githubcopilot.com.
 
 use super::{
     poll_for_token, request_device_code, AuthStore, Credential, DeviceCode, DeviceFlowConfig,

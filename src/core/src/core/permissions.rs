@@ -498,7 +498,7 @@ impl ParsedCommand {
 /// allow-rules abstain and the engine falls back to prompting the user.
 pub fn parse_bash(raw: &str) -> ParsedCommand {
     match crate::core::bash_parse::analyze(raw) {
-        Ok(analysis) => ParsedCommand {
+        Some(analysis) => ParsedCommand {
             commands: analysis.commands,
             pipes_to_shell: analysis.pipes_to_shell,
             // A construct we couldn't fully model (arithmetic-eval, coprocess, …)
@@ -506,7 +506,7 @@ pub fn parse_bash(raw: &str) -> ParsedCommand {
             analyzable: !analysis.has_dynamic,
             raw: raw.to_string(),
         },
-        Err(()) => ParsedCommand {
+        None => ParsedCommand {
             commands: Vec::new(),
             pipes_to_shell: false,
             analyzable: false,

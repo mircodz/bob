@@ -834,7 +834,7 @@ pub async fn run(
                                     // message_count — otherwise the next (shorter)
                                     // end-of-turn save would be silently dropped.
                                     if let Err(e) = bob_core::core::session::save_session_force(&session) {
-                                        app.notify(&format!("couldn't save cleared context: {e}"));
+                                        app.notify(format!("couldn't save cleared context: {e}"));
                                     }
                                     app.view.clear();
                                     app.view.push_notice("context cleared — the agent has forgotten the conversation.".into());

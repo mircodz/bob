@@ -2,14 +2,14 @@
 //! Reverse-engineered from the open-source Codex CLI
 //! (codex-rs/login/src/device_code_auth.rs + server.rs). Three steps:
 //!   1. POST {issuer}/api/accounts/deviceauth/usercode  {client_id}
-//!        → { device_auth_id, user_code, interval }
+//!      → { device_auth_id, user_code, interval }
 //!      Show the user {issuer}/codex/device + the user_code.
 //!   2. Poll POST {issuer}/api/accounts/deviceauth/token {device_auth_id, user_code}
-//!        (403/404 = pending) → { authorization_code, code_challenge, code_verifier }
+//!      (403/404 = pending) → { authorization_code, code_challenge, code_verifier }
 //!   3. POST {issuer}/oauth/token  (form-encoded, grant_type=authorization_code,
 //!      code, redirect_uri={issuer}/deviceauth/callback, client_id, code_verifier)
-//!        → { id_token, access_token, refresh_token }
-//! Refresh uses grant_type=refresh_token at the same /oauth/token endpoint.
+//!      → { id_token, access_token, refresh_token }
+//!      Refresh uses grant_type=refresh_token at the same /oauth/token endpoint.
 
 use super::{now, store_tokens, urlencode, AuthStore};
 

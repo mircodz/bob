@@ -8,10 +8,10 @@
 //! plain parameters otherwise:
 //!   - `fan_out`    : one agent per item, return all results.
 //!   - `map_reduce` : fan_out, then one reduce agent (fanout-and-synthesize;
-//!                    classify-and-act and generate-and-filter are special cases).
+//!     classify-and-act and generate-and-filter are special cases).
 //!   - `loop`       : re-run a finder each round until a round turns up nothing new
-//!                    (loop-until-done — the model can't express cross-round control
-//!                    flow, so it lives here).
+//!     (loop-until-done — the model can't express cross-round control
+//!     flow, so it lives here).
 //!
 //! `{item}` in a prompt is substituted with each item's text.
 

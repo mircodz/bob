@@ -10,7 +10,7 @@ use bob_sdk::prelude::*;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut agent = Agent::builder()
-        .model("anthropic/claude-sonnet-4-5-20250929")
+        .model("copilot/claude-sonnet-4-5")
         .cwd(".")
         .build()
         .await?;

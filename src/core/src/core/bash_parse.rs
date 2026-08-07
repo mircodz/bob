@@ -43,40 +43,40 @@ fn base_name(cmd: &str) -> &str {
     cmd.rsplit('/').next().unwrap_or(cmd)
 }
 
-/// Parse + analyze a bash command line. Returns `Err(())` when the input can't be
+/// Parse + analyze a bash command line. Returns `None` when the input can't be
 /// parsed (malformed, or a construct brush rejects) — the caller treats that as
 /// "un-analyzable → never auto-allow".
-pub fn analyze(raw: &str) -> Result<Analysis, ()> {
+pub fn analyze(raw: &str) -> Option<Analysis> {
     let mut a = Analysis::default();
     walk_program(raw, &mut a, 0)?;
-    Ok(a)
+    Some(a)
 }
 
 /// Recursion cap so a pathological nest of substitutions can't blow the stack.
 const MAX_DEPTH: usize = 24;
 
-fn walk_program(raw: &str, a: &mut Analysis, depth: usize) -> Result<(), ()> {
+fn walk_program(raw: &str, a: &mut Analysis, depth: usize) -> Option<()> {
     if depth > MAX_DEPTH {
-        return Err(());
+        return None;
     }
     let opts = brush_parser::ParserOptions::default();
     let mut parser =
         brush_parser::Parser::new(std::io::Cursor::new(raw.as_bytes().to_vec()), &opts);
-    let program = parser.parse_program().map_err(|_| ())?;
+    let program = parser.parse_program().ok()?;
     for cc in &program.complete_commands {
         walk_compound_list(cc, a, depth)?;
     }
-    Ok(())
+    Some(())
 }
 
-fn walk_compound_list(list: &ast::CompoundList, a: &mut Analysis, depth: usize) -> Result<(), ()> {
+fn walk_compound_list(list: &ast::CompoundList, a: &mut Analysis, depth: usize) -> Option<()> {
     for item in &list.0 {
         walk_and_or(&item.0, a, depth)?;
     }
-    Ok(())
+    Some(())
 }
 
-fn walk_and_or(list: &ast::AndOrList, a: &mut Analysis, depth: usize) -> Result<(), ()> {
+fn walk_and_or(list: &ast::AndOrList, a: &mut Analysis, depth: usize) -> Option<()> {
     walk_pipeline(&list.first, a, depth)?;
     for ao in &list.additional {
         let p = match ao {
@@ -84,10 +84,10 @@ fn walk_and_or(list: &ast::AndOrList, a: &mut Analysis, depth: usize) -> Result<
         };
         walk_pipeline(p, a, depth)?;
     }
-    Ok(())
+    Some(())
 }
 
-fn walk_pipeline(p: &ast::Pipeline, a: &mut Analysis, depth: usize) -> Result<(), ()> {
+fn walk_pipeline(p: &ast::Pipeline, a: &mut Analysis, depth: usize) -> Option<()> {
     for (i, cmd) in p.seq.iter().enumerate() {
         // A real pipe into a shell interpreter is `… | sh`.
         if i > 0 {
@@ -101,10 +101,10 @@ fn walk_pipeline(p: &ast::Pipeline, a: &mut Analysis, depth: usize) -> Result<()
         }
         walk_command(cmd, a, depth)?;
     }
-    Ok(())
+    Some(())
 }
 
-fn walk_command(cmd: &ast::Command, a: &mut Analysis, depth: usize) -> Result<(), ()> {
+fn walk_command(cmd: &ast::Command, a: &mut Analysis, depth: usize) -> Option<()> {
     match cmd {
         ast::Command::Simple(sc) => walk_simple(sc, a, depth),
         ast::Command::Compound(cc, _redirects) => walk_compound(cc, a, depth),
@@ -112,11 +112,11 @@ fn walk_command(cmd: &ast::Command, a: &mut Analysis, depth: usize) -> Result<()
         // allowlist can't be fooled by hiding `rm` in a function some later command
         // calls. `FunctionBody(CompoundCommand, …)`.
         ast::Command::Function(f) => walk_compound(&f.body.0, a, depth),
-        ast::Command::ExtendedTest(_, _) => Ok(()), // `[[ … ]]`: no command execution
+        ast::Command::ExtendedTest(_, _) => Some(()), // `[[ … ]]`: no command execution
     }
 }
 
-fn walk_compound(cc: &ast::CompoundCommand, a: &mut Analysis, depth: usize) -> Result<(), ()> {
+fn walk_compound(cc: &ast::CompoundCommand, a: &mut Analysis, depth: usize) -> Option<()> {
     match cc {
         ast::CompoundCommand::Subshell(s) => walk_compound_list(&s.list, a, depth),
         ast::CompoundCommand::BraceGroup(b) => walk_compound_list(&b.list, a, depth),
@@ -137,7 +137,7 @@ fn walk_compound(cc: &ast::CompoundCommand, a: &mut Analysis, depth: usize) -> R
                     walk_compound_list(&elif.body, a, depth)?;
                 }
             }
-            Ok(())
+            Some(())
         }
         ast::CompoundCommand::CaseClause(c) => {
             for case in &c.cases {
@@ -145,19 +145,19 @@ fn walk_compound(cc: &ast::CompoundCommand, a: &mut Analysis, depth: usize) -> R
                     walk_compound_list(cmds, a, depth)?;
                 }
             }
-            Ok(())
+            Some(())
         }
         ast::CompoundCommand::ArithmeticForClause(f) => walk_compound_list(&f.body.list, a, depth),
         // Arithmetic / coprocess: no simple-command args we can allowlist. Treat as
         // dynamic so they never auto-allow through this path.
         ast::CompoundCommand::Arithmetic(_) | ast::CompoundCommand::Coprocess(_) => {
             a.has_dynamic = true;
-            Ok(())
+            Some(())
         }
     }
 }
 
-fn walk_simple(sc: &ast::SimpleCommand, a: &mut Analysis, depth: usize) -> Result<(), ()> {
+fn walk_simple(sc: &ast::SimpleCommand, a: &mut Analysis, depth: usize) -> Option<()> {
     // Build the argv from the command name + suffix words, and recurse into any
     // command substitutions found in ANY of its words (name, prefix, suffix).
     let mut argv: Argv = Vec::new();
@@ -178,7 +178,7 @@ fn walk_simple(sc: &ast::SimpleCommand, a: &mut Analysis, depth: usize) -> Resul
     if !argv.is_empty() {
         a.commands.push(argv);
     }
-    Ok(())
+    Some(())
 }
 
 fn walk_prefix_suffix_item(
@@ -186,7 +186,7 @@ fn walk_prefix_suffix_item(
     argv: &mut Argv,
     a: &mut Analysis,
     depth: usize,
-) -> Result<(), ()> {
+) -> Option<()> {
     match item {
         ast::CommandPrefixOrSuffixItem::Word(w) => {
             argv.push(w.value.clone());
@@ -202,7 +202,7 @@ fn walk_prefix_suffix_item(
         }
         ast::CommandPrefixOrSuffixItem::IoRedirect(_) => {}
     }
-    Ok(())
+    Some(())
 }
 
 /// The literal command name of a simple command, if it has a plain word name.
@@ -213,24 +213,24 @@ fn simple_command_name(sc: &ast::SimpleCommand) -> Option<String> {
 /// Scan a raw word for command substitutions (`$( … )`, backticks) and recurse
 /// into each — brush leaves these as unparsed strings, so this is where hidden
 /// commands like `echo $(rm -rf ~)` get surfaced.
-fn walk_word(raw: &str, a: &mut Analysis, depth: usize) -> Result<(), ()> {
+fn walk_word(raw: &str, a: &mut Analysis, depth: usize) -> Option<()> {
     // Fast path: no expansion markers → nothing to recurse into.
     if !raw.contains('$') && !raw.contains('`') {
-        return Ok(());
+        return Some(());
     }
     let opts = brush_parser::ParserOptions::default();
-    let pieces = brush_parser::word::parse(raw, &opts).map_err(|_| ())?;
+    let pieces = brush_parser::word::parse(raw, &opts).ok()?;
     for piece in &pieces {
         collect_substitutions(&piece.piece, a, depth)?;
     }
-    Ok(())
+    Some(())
 }
 
 fn collect_substitutions(
     piece: &brush_parser::word::WordPiece,
     a: &mut Analysis,
     depth: usize,
-) -> Result<(), ()> {
+) -> Option<()> {
     use brush_parser::word::WordPiece;
     match piece {
         WordPiece::CommandSubstitution(s) | WordPiece::BackquotedCommandSubstitution(s) => {
@@ -247,7 +247,7 @@ fn collect_substitutions(
         WordPiece::ArithmeticExpression(_) => a.has_dynamic = true,
         _ => {}
     }
-    Ok(())
+    Some(())
 }
 
 #[cfg(test)]

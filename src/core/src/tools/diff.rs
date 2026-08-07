@@ -101,8 +101,8 @@ pub fn compact_diff(lines: &[DiffLine], context: usize) -> Vec<DiffLine> {
         if l.op != DiffOp::Context {
             let lo = idx.saturating_sub(context);
             let hi = (idx + context).min(lines.len().saturating_sub(1));
-            for k in lo..=hi {
-                keep[k] = true;
+            for k in keep.iter_mut().take(hi + 1).skip(lo) {
+                *k = true;
             }
         }
     }

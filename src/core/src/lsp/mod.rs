@@ -35,13 +35,9 @@ pub enum Health {
     Failed(String),
 }
 
-/// Diagnostics for one file, plus the doc version they correspond to.
+/// Diagnostics for one file.
 #[derive(Clone, Default)]
 struct FileDiagnostics {
-    /// Doc version the server reported these against (0 if unversioned). Kept so
-    /// the diagnostics tool can tell stale pushes from fresh ones after an edit.
-    #[allow(dead_code)]
-    version: i64,
     diagnostics: Vec<Value>,
 }
 
@@ -343,18 +339,15 @@ fn spawn_reader(inner: Arc<LspInner>, stdout: ChildStdout) {
                 Some("textDocument/publishDiagnostics") => {
                     let params = &msg["params"];
                     if let Some(uri) = params["uri"].as_str() {
-                        let version = params["version"].as_i64().unwrap_or(0);
                         let diags = params["diagnostics"]
                             .as_array()
                             .cloned()
                             .unwrap_or_default();
-                        inner.diagnostics.lock().unwrap().insert(
-                            uri.to_string(),
-                            FileDiagnostics {
-                                version,
-                                diagnostics: diags,
-                            },
-                        );
+                        inner
+                            .diagnostics
+                            .lock()
+                            .unwrap()
+                            .insert(uri.to_string(), FileDiagnostics { diagnostics: diags });
                     }
                     // First diagnostics push implies the server is answering.
                     let mut h = inner.health.lock().unwrap();
@@ -421,13 +414,10 @@ async fn read_frame(reader: &mut BufReader<ChildStdout>) -> anyhow::Result<Value
 }
 
 /// Map a filesystem path to a `file://` URI. Best-effort; assumes UTF-8 paths.
+/// Paths handed to the LSP layer are already absolute (the manager resolves them
+/// against cwd), so there's a single format here.
 fn path_to_uri(path: &Path) -> String {
-    let s = path.to_string_lossy();
-    if s.starts_with('/') {
-        format!("file://{}", s)
-    } else {
-        format!("file://{}", s) // relative shouldn't happen; servers get cwd too
-    }
+    format!("file://{}", path.to_string_lossy())
 }
 
 /// Guess an LSP languageId from a file extension.

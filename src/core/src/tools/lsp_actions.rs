@@ -189,7 +189,7 @@ fn apply_and_report(edits: BTreeMap<PathBuf, Vec<TextEdit>>, ctx: &ToolContext) 
         };
         // Apply edits from the END of the file backwards so earlier offsets stay
         // valid as we splice. Sort by (start_line, start_char) descending.
-        file_edits.sort_by(|a, b| (b.start_line, b.start_char).cmp(&(a.start_line, a.start_char)));
+        file_edits.sort_by_key(|b| std::cmp::Reverse((b.start_line, b.start_char)));
         let after = match apply_edits(&before, &file_edits) {
             Ok(s) => s,
             Err(e) => {
@@ -269,13 +269,11 @@ fn offset_at(line_starts: &[usize], s: &str, line: usize, character: usize) -> O
     let line_start = *line_starts.get(line)?;
     let line_str = s[line_start..].split('\n').next().unwrap_or("");
     let mut byte = line_start;
-    let mut chars = 0;
-    for ch in line_str.chars() {
+    for (chars, ch) in line_str.chars().enumerate() {
         if chars >= character {
             break;
         }
         byte += ch.len_utf8();
-        chars += 1;
     }
     Some(byte)
 }

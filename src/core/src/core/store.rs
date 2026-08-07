@@ -102,55 +102,74 @@ impl SessionStore for SqliteStore {
     }
 }
 
+/// A process-local, non-persistent store. Everything lives in memory and is gone
+/// when the process exits — the right default for the SDK and for tests, where
+/// silently writing to `~/.bob/bob.db` would be surprising. Swap in
+/// [`SqliteStore`] to persist.
+#[derive(Default)]
+pub struct MemoryStore {
+    sessions: std::sync::Mutex<std::collections::HashMap<String, Session>>,
+    events: std::sync::Mutex<std::collections::HashMap<String, Vec<AgentEvent>>>,
+}
+
+impl MemoryStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl SessionStore for MemoryStore {
+    fn save(&self, session: &Session) -> anyhow::Result<()> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .insert(session.id.clone(), session.clone());
+        Ok(())
+    }
+
+    fn load(&self, id: &str) -> anyhow::Result<Option<Session>> {
+        Ok(self.sessions.lock().unwrap().get(id).cloned())
+    }
+
+    fn latest_in(&self, cwd: &str) -> anyhow::Result<Option<Session>> {
+        // Newest by updated_at among sessions in this cwd.
+        let g = self.sessions.lock().unwrap();
+        let latest = g
+            .values()
+            .filter(|s| s.cwd == cwd)
+            .max_by(|a, b| a.updated_at.cmp(&b.updated_at))
+            .cloned();
+        Ok(latest)
+    }
+
+    fn list(&self) -> Vec<SessionSummary> {
+        Vec::new()
+    }
+
+    fn append_event(&self, session_id: &str, event: &AgentEvent) {
+        self.events
+            .lock()
+            .unwrap()
+            .entry(session_id.to_string())
+            .or_default()
+            .push(event.clone());
+    }
+
+    fn flush(&self) {}
+
+    fn load_events(&self, session_id: &str) -> Option<Vec<AgentEvent>> {
+        self.events.lock().unwrap().get(session_id).cloned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::core::types::Role;
-    use std::sync::Mutex;
-
-    /// An in-memory store — the whole point of the trait. Proves a non-SQLite
-    /// backend satisfies the seam (used by future agent end-to-end tests without
-    /// touching disk).
-    #[derive(Default)]
-    struct MemStore {
-        sessions: Mutex<std::collections::HashMap<String, Session>>,
-        events: Mutex<std::collections::HashMap<String, Vec<AgentEvent>>>,
-    }
-
-    impl SessionStore for MemStore {
-        fn save(&self, session: &Session) -> anyhow::Result<()> {
-            self.sessions
-                .lock()
-                .unwrap()
-                .insert(session.id.clone(), session.clone());
-            Ok(())
-        }
-        fn load(&self, id: &str) -> anyhow::Result<Option<Session>> {
-            Ok(self.sessions.lock().unwrap().get(id).cloned())
-        }
-        fn latest_in(&self, _cwd: &str) -> anyhow::Result<Option<Session>> {
-            Ok(self.sessions.lock().unwrap().values().next().cloned())
-        }
-        fn list(&self) -> Vec<SessionSummary> {
-            Vec::new()
-        }
-        fn append_event(&self, session_id: &str, event: &AgentEvent) {
-            self.events
-                .lock()
-                .unwrap()
-                .entry(session_id.to_string())
-                .or_default()
-                .push(event.clone());
-        }
-        fn flush(&self) {}
-        fn load_events(&self, session_id: &str) -> Option<Vec<AgentEvent>> {
-            self.events.lock().unwrap().get(session_id).cloned()
-        }
-    }
 
     #[test]
     fn in_memory_store_round_trips_and_reconstructs_history() {
-        let store = MemStore::default();
+        let store = MemoryStore::default();
         let mut s = session::new_session("mock", "s1".into(), "0".into(), ".".into());
         s.messages.push(Message {
             role: Role::User,

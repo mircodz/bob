@@ -83,17 +83,13 @@ fn is_responses_model(model: &str) -> bool {
         || m == "gpt-5-codex"
 }
 
-/// Registry constructor for the "copilot" provider — uniform
+/// Registry constructor for the "copilot" provider (uniform
 /// `async fn create(model) -> Result<Arc<dyn Provider>>` shape shared by every
-/// provider family (delegates to [`native_copilot`]).
+/// provider family). Builds the native Copilot provider, or an error if not
+/// logged in: discovers the correct API base by minting a token up front, and
+/// routes newer models to the Responses API (`/responses`) while classic models
+/// use /chat/completions.
 pub async fn create(model: Option<String>) -> anyhow::Result<Arc<dyn Provider>> {
-    native_copilot(model).await
-}
-
-/// Build the native Copilot provider, or an error if not logged in. Discovers
-/// the correct API base by minting a token up front, and routes newer models to
-/// the Responses API (`/responses`) while classic models use /chat/completions.
-pub async fn native_copilot(model: Option<String>) -> anyhow::Result<Arc<dyn Provider>> {
     let github_token = auth::github_token()
         .ok_or_else(|| anyhow::anyhow!("not logged in to Copilot — run `bob login copilot`"))?;
     let source = CopilotAuth {

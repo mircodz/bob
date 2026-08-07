@@ -2,7 +2,7 @@
 //!   * per-message  — one `UsageEntry` per provider completion
 //!   * per-session  — a session owns a `Vec<UsageEntry>` (summed on demand)
 //!   * global       — every entry is also appended to ~/.bob/usage.jsonl, the
-//!                    append-only ledger the future /usage dashboard reads.
+//!     append-only ledger the future /usage dashboard reads.
 
 use crate::core::types::Usage;
 use serde::{Deserialize, Serialize};

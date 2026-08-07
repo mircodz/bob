@@ -4,10 +4,10 @@
 //!
 //! Each connection's first WS text frame is a `Hello` identifying role + session
 //! + an opaque **admission proof**. The relay pairs one host with one controller
-//! per `session`: it records the first peer's proof and admits the second only if
-//! its proof byte-matches. It never learns the pairing secret, and every frame
-//! after the Hello is end-to-end encrypted — the relay forwards opaque blobs and
-//! cannot read them. No agent logic, no persistence.
+//!   per `session`: it records the first peer's proof and admits the second only if
+//!   its proof byte-matches. It never learns the pairing secret, and every frame
+//!   after the Hello is end-to-end encrypted — the relay forwards opaque blobs and
+//!   cannot read them. No agent logic, no persistence.
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
