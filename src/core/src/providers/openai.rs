@@ -12,20 +12,11 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-/// Supplies the bearer token + any extra headers for each request. Implementors
-/// can refresh short-lived tokens transparently (native Copilot does this).
-#[async_trait]
-pub trait TokenSource: Send + Sync {
-    /// Return the current bearer token (refreshing if needed).
-    async fn token(&self) -> anyhow::Result<String>;
-    /// Extra headers required by this backend (e.g. Copilot editor headers).
-    fn extra_headers(&self) -> Vec<(String, String)> {
-        vec![]
-    }
-}
-
-/// A fixed API key (OpenAI, proxies, local gateways).
-struct StaticKey(String);
+/// The auth seam for the OpenAI-family providers. This is now just the canonical
+/// [`crate::auth::AuthProvider`] — kept as a re-export under the old name so the
+/// existing `TokenSource` call sites (copilot, responses, this module) don't have
+/// to change while the whole workspace converges on one auth trait.
+pub use crate::auth::AuthProvider as TokenSource;
 
 /// Shared HTTP client with sane timeouts. A connect timeout prevents hanging on
 /// an unreachable endpoint; we deliberately do NOT set an overall read timeout,
@@ -37,13 +28,6 @@ pub(crate) fn http_client() -> reqwest::Client {
         .connect_timeout(std::time::Duration::from_secs(20))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
-}
-
-#[async_trait]
-impl TokenSource for StaticKey {
-    async fn token(&self) -> anyhow::Result<String> {
-        Ok(self.0.clone())
-    }
 }
 
 pub struct OpenAiProvider {
@@ -59,13 +43,15 @@ pub struct OpenAiProvider {
 
 impl OpenAiProvider {
     pub fn new(model: Option<String>, base_url: Option<String>) -> Self {
-        let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_else(|_| "unused".to_string());
         let base_url = base_url
             .or_else(|| std::env::var("OPENAI_BASE_URL").ok())
             .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
         let base_url = base_url.trim_end_matches('/').to_string();
         OpenAiProvider {
-            auth: Arc::new(StaticKey(api_key)),
+            auth: Arc::new(crate::auth::EnvKey {
+                var: "OPENAI_API_KEY".to_string(),
+                fallback: "unused".to_string(),
+            }),
             model: model.unwrap_or_else(|| "gpt-4o".to_string()),
             base_url,
             client: http_client(),

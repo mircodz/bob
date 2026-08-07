@@ -17,8 +17,10 @@ const OAUTH_BETA: &str = "oauth-2025-04-20";
 enum AuthMode {
     /// Console API key (x-api-key header) — pay per token.
     ApiKey(String),
-    /// Claude Pro/Max subscription OAuth (Bearer + oauth beta header).
-    Oauth,
+    /// Claude Pro/Max subscription OAuth (Bearer + oauth beta header). Holds the
+    /// injected token source instead of reaching into `auth::anthropic` inline, so
+    /// auth goes through the same `AuthProvider` seam as every other provider.
+    Oauth(std::sync::Arc<dyn crate::auth::AuthProvider>),
 }
 
 pub struct AnthropicProvider {
@@ -33,7 +35,7 @@ impl AnthropicProvider {
         // Prefer subscription OAuth if the user logged in; else use an API key.
         if crate::auth::anthropic::is_logged_in() {
             return Ok(AnthropicProvider {
-                auth: AuthMode::Oauth,
+                auth: AuthMode::Oauth(std::sync::Arc::new(crate::auth::AnthropicOAuth)),
                 model: model.unwrap_or_else(|| "claude-sonnet-4-5-20250929".to_string()),
                 base_url: API_URL.to_string(),
                 client: reqwest::Client::new(),
@@ -132,8 +134,8 @@ impl AnthropicProvider {
     ) -> anyhow::Result<reqwest::RequestBuilder> {
         Ok(match &self.auth {
             AuthMode::ApiKey(key) => req.header("x-api-key", key),
-            AuthMode::Oauth => {
-                let token = crate::auth::anthropic::access_token().await?;
+            AuthMode::Oauth(source) => {
+                let token = source.token().await?;
                 req.header("authorization", format!("Bearer {}", token))
                     .header("anthropic-beta", OAUTH_BETA)
             }

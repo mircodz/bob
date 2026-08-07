@@ -15,6 +15,61 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+/// The auth seam: something that supplies a bearer token (refreshing short-lived
+/// ones transparently) plus any extra headers a backend requires. Every provider
+/// holds an `Arc<dyn AuthProvider>` instead of reaching into the auth modules
+/// directly — so auth is injectable (tests, alternate credential sources) and no
+/// single provider owns the notion of "how do I get a token".
+///
+/// This is the canonical home of what used to be `providers::openai::TokenSource`
+/// (which now re-exports this), so all provider families share ONE trait.
+#[async_trait::async_trait]
+pub trait AuthProvider: Send + Sync {
+    /// The current bearer token, refreshing if needed (single-flight inside).
+    async fn token(&self) -> anyhow::Result<String>;
+    /// Extra headers this backend requires (e.g. Copilot editor headers).
+    fn extra_headers(&self) -> Vec<(String, String)> {
+        vec![]
+    }
+}
+
+/// A fixed API key (OpenAI-compatible endpoints, proxies, local gateways).
+pub struct StaticKey(pub String);
+
+#[async_trait::async_trait]
+impl AuthProvider for StaticKey {
+    async fn token(&self) -> anyhow::Result<String> {
+        Ok(self.0.clone())
+    }
+}
+
+/// An API key read from an environment variable at request time (so a key set
+/// after startup is still picked up). `fallback` is used when the var is unset.
+pub struct EnvKey {
+    pub var: String,
+    pub fallback: String,
+}
+
+#[async_trait::async_trait]
+impl AuthProvider for EnvKey {
+    async fn token(&self) -> anyhow::Result<String> {
+        Ok(std::env::var(&self.var).unwrap_or_else(|_| self.fallback.clone()))
+    }
+}
+
+/// The Anthropic subscription (Claude Pro/Max) OAuth token source — refreshes via
+/// the stored refresh token. Lets the Anthropic provider go through the same
+/// `AuthProvider` seam as the OpenAI family instead of calling `auth::anthropic`
+/// inline.
+pub struct AnthropicOAuth;
+
+#[async_trait::async_trait]
+impl AuthProvider for AnthropicOAuth {
+    async fn token(&self) -> anyhow::Result<String> {
+        anthropic::access_token().await
+    }
+}
+
 /// One provider's stored credentials. Flexible bag so different auth schemes fit
 /// (an OAuth token here, a refresh token there). `extra` holds provider-specific
 /// fields (e.g. Copilot's cached short-lived token + its expiry).

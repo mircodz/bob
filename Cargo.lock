@@ -259,6 +259,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bob-types",
  "brush-parser",
  "dirs",
  "futures",
@@ -334,6 +335,14 @@ dependencies = [
  "sha2",
  "toml",
  "x25519-dalek",
+]
+
+[[package]]
+name = "bob-types"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
