@@ -29,6 +29,13 @@ pub enum MockReply {
         name: String,
         input: serde_json::Value,
     },
+    /// A truncated tool call: `stop_reason = MaxTokens` with the given output-token
+    /// count, so tests can drive the agent loop's output-truncation recovery.
+    Truncated {
+        name: String,
+        input: serde_json::Value,
+        output_tokens: u64,
+    },
 }
 
 /// One matching rule: if the latest user/tool message text contains `needle`,
@@ -97,8 +104,10 @@ impl MockProvider {
     }
 
     fn completion_for(&self, reply: MockReply) -> Completion {
-        let (content, stop_reason) = match reply {
-            MockReply::Text(text) => (vec![ContentBlock::Text { text }], StopReason::EndTurn),
+        let (content, stop_reason, output_tokens) = match reply {
+            MockReply::Text(text) => {
+                (vec![ContentBlock::Text { text }], StopReason::EndTurn, 5)
+            }
             MockReply::ToolCall { name, input } => (
                 vec![ContentBlock::ToolUse {
                     id: format!("mock_{}", self.calls.load(Ordering::Relaxed)),
@@ -106,6 +115,20 @@ impl MockProvider {
                     input,
                 }],
                 StopReason::ToolUse,
+                5,
+            ),
+            MockReply::Truncated {
+                name,
+                input,
+                output_tokens,
+            } => (
+                vec![ContentBlock::ToolUse {
+                    id: format!("mock_{}", self.calls.load(Ordering::Relaxed)),
+                    name,
+                    input,
+                }],
+                StopReason::MaxTokens,
+                output_tokens,
             ),
         };
         Completion {
@@ -116,7 +139,7 @@ impl MockProvider {
             stop_reason,
             usage: Usage {
                 input_tokens: 10,
-                output_tokens: 5,
+                output_tokens,
                 ..Default::default()
             },
         }

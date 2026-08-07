@@ -100,7 +100,9 @@ impl AnthropicProvider {
 
         let mut body = json!({
             "model": self.model,
-            "max_tokens": opts.max_tokens.unwrap_or(4096),
+            "max_tokens": opts.max_tokens.unwrap_or_else(|| {
+                crate::providers::provider::max_output_tokens_for(&self.model)
+            }),
             "stream": stream,
             "messages": messages,
             "tools": tools,

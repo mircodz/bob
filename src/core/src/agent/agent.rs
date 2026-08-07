@@ -4,7 +4,7 @@
 use crate::agent::compaction::{maybe_compact, CompactionOptions};
 use crate::core::events::{AgentEvent, EventBus};
 use crate::core::types::{
-    Completion, ContentBlock, GenerateOptions, Message, Role, StreamEvent, Usage,
+    Completion, ContentBlock, GenerateOptions, Message, Role, StopReason, StreamEvent, Usage,
 };
 use crate::providers::provider::Provider;
 use crate::tools::file_tracker::FileTracker;
@@ -326,6 +326,16 @@ impl Agent {
         // that explicitly rather than returning an empty result.
         let mut finished = false;
 
+        // Output-cap recovery: normally we send NO max_tokens (the server enforces
+        // the model's true maximum). But if a response still comes back truncated
+        // (`StopReason::MaxTokens`) — e.g. a large `structured_output` — we retry the
+        // SAME turn with an explicit, raised cap so the model can finish instead of
+        // emitting a truncated tool call the loop would retry forever. `None` = let
+        // the server decide; `Some(n)` = a recovery override for the next attempt.
+        let mut max_tokens_override: Option<u32> = None;
+        let mut truncation_recoveries: u32 = 0;
+        const MAX_TRUNCATION_RECOVERIES: u32 = 2;
+
         for _turn in 0..self.cfg.max_turns {
             // Interrupt before starting a new turn — history ends on a valid
             // boundary here (a tool_result message or the initial user prompt),
@@ -422,6 +432,9 @@ impl Agent {
                     tools: self.cfg.tools.specs(),
                     cache: true,
                     reasoning: self.reasoning,
+                    // Normally None (server enforces the true max); set only while
+                    // recovering from a truncated response (see below).
+                    max_tokens: max_tokens_override,
                     ..Default::default()
                 };
                 let mut rx = match self.cfg.provider.stream(opts).await {
@@ -496,6 +509,45 @@ impl Agent {
             }
             let completion =
                 completion.ok_or_else(|| anyhow::anyhow!("stream ended without completion"))?;
+
+            // Output truncation recovery: the response was cut off mid-content —
+            // typically a partial tool call whose arguments won't parse, which the
+            // loop would otherwise retry forever. We detect this two ways, because a
+            // stream that drops mid-tool-call may never deliver the `finish_reason`:
+            //   1. the provider reported `StopReason::MaxTokens`, or
+            //   2. a tool call's arguments are the `parse_tool_input` error sentinel
+            //      (truncated JSON) — a strong truncation signal on its own.
+            // On either, retry the SAME turn with an explicit, doubled cap so the
+            // model can finish. Bounded so a genuinely oversized request fails cleanly
+            // instead of looping. Done BEFORE pushing the message to history, so a
+            // discarded partial turn never pollutes the transcript.
+            let truncated_tool_args = completion.message.content.iter().any(|b| {
+                matches!(b, ContentBlock::ToolUse { input, .. }
+                    if crate::providers::codec::tool_input_parse_error(input).is_some())
+            });
+            let looks_truncated =
+                completion.stop_reason == StopReason::MaxTokens || truncated_tool_args;
+            if looks_truncated && truncation_recoveries < MAX_TRUNCATION_RECOVERIES {
+                truncation_recoveries += 1;
+                // Base the next cap on what the model actually produced, doubled, and
+                // clamped so we never ask past the model's real output ceiling.
+                let ceiling =
+                    crate::providers::provider::max_output_tokens_for(self.cfg.provider.model());
+                let produced = completion.usage.output_tokens as u32;
+                let bumped = produced.saturating_mul(2).max(8_192).min(ceiling);
+                // Retry only if the bumped cap actually grows the budget; otherwise
+                // fall through (we're at the ceiling — the partial + parse-error
+                // message at least gives the model something actionable).
+                if Some(bumped) != max_tokens_override && bumped > produced {
+                    max_tokens_override = Some(bumped);
+                    // Silent, self-healing retry (like the transient-error backoff):
+                    // re-enter the turn with the larger cap. Nothing user-visible.
+                    continue;
+                }
+            }
+            // Cleared on any non-truncated (or unrecoverable) completion so the next
+            // turn starts back at the server default rather than a stale override.
+            max_tokens_override = None;
 
             total.input_tokens += completion.usage.input_tokens;
             total.output_tokens += completion.usage.output_tokens;
@@ -669,20 +721,30 @@ impl Agent {
             That tool call IS your deliverable — do not also write a prose summary.";
 
         // First attempt: the real prompt + the structured-output instruction.
-        let _ = self.run(&format!("{prompt}{instruction}")).await?;
+        // Capture the run Results WITHOUT `?` so a provider/stream error can't
+        // early-return past the registry restore below — leaking the one-off
+        // structured_output tool (and its finish-instruction schema) into every
+        // later normal turn on this agent.
+        let first = self.run(&format!("{prompt}{instruction}")).await;
         let mut captured = sink.lock().unwrap().take();
 
         // One corrective retry if the model didn't call the tool (empty-prompt wake
         // turn — no new user message, just the nudge folded into history).
-        if captured.is_none() && !self.is_cancelled() {
+        let mut second = Ok(String::new());
+        if first.is_ok() && captured.is_none() && !self.is_cancelled() {
             let nudge = "You did not record a result. Call the `structured_output` tool now \
                 with your final answer matching its schema.";
-            let _ = self.run(nudge).await?;
+            second = self.run(nudge).await;
             captured = sink.lock().unwrap().take();
         }
 
-        // Restore the registry regardless of outcome.
+        // Restore the registry regardless of outcome (success, run error, or a
+        // missing result), so the agent is unchanged for any later run.
         self.cfg.tools = original_tools;
+
+        // Surface a run error only after restoring — the restore must always happen.
+        first?;
+        second?;
 
         captured.ok_or_else(|| {
             anyhow::anyhow!("agent did not produce a structured result matching the schema")
@@ -980,5 +1042,60 @@ mod structured_tests {
         let provider = MockProvider::new(vec![]).with_default(MockReply::Text("hi".into()));
         let mut agent = agent_with(Arc::new(provider));
         assert!(agent.run_structured("go", schema).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn truncated_response_recovers_a_bounded_number_of_times_then_stops() {
+        // A provider that ALWAYS returns a MaxTokens-truncated tool call (as the
+        // 4096-cap bug did) must not loop forever: the output-truncation recovery
+        // retries with a raised cap a bounded number of times, then lets the turn
+        // proceed (the parse-error path handles the partial). The whole run must
+        // TERMINATE — a regression here would hang the test via the timeout.
+        let provider = MockProvider::new(vec![]).with_default(MockReply::Truncated {
+            name: "some_tool".to_string(),
+            // Truncated JSON — exactly the sentinel `parse_tool_input` produces.
+            input: json!({ "__bob_tool_args_parse_error__": { "raw": "{\"x\":", "error": "eof" } }),
+            output_tokens: 4096,
+        });
+        let provider = Arc::new(provider);
+        // A tiny max_turns so that, once recovery is exhausted, the loop still exits
+        // promptly instead of grinding to 200 turns.
+        let mut agent = Agent::new(AgentConfig {
+            provider: provider.clone(),
+            tools: ToolRegistry::new(None),
+            bus: EventBus::new(),
+            system: None,
+            cwd: ".".to_string(),
+            max_turns: 4,
+            id: Some("root".to_string()),
+            context_window: 200_000,
+            compact_threshold: 0.8,
+            keep_recent: 6,
+            jobs: crate::tools::jobs::JobRegistry::new(),
+            user_asker: None,
+            lsp: None,
+            inbox: None,
+            team: None,
+            name: "root".to_string(),
+            depth: 0,
+            parent_cancel: None,
+            cancel: None,
+        });
+        // Must return (not hang). The exact text isn't important — that it completes
+        // is. The 10s guard turns a regression (infinite loop) into a failure.
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            agent.run("do something big"),
+        )
+        .await;
+        assert!(res.is_ok(), "run must terminate, not loop on truncation");
+        assert!(res.unwrap().is_ok());
+        // Recovery is bounded: at most (max_turns) turns × a small constant of
+        // recovery retries — nowhere near an unbounded loop.
+        assert!(
+            provider.call_count() <= 12,
+            "expected a bounded number of provider calls, got {}",
+            provider.call_count()
+        );
     }
 }

@@ -104,9 +104,16 @@ impl OpenAiProvider {
         let mut body = json!({
             "model": self.model,
             "stream": stream,
-            "max_tokens": opts.max_tokens.unwrap_or(4096),
             "messages": messages,
         });
+        // Output cap: omit it unless the caller explicitly pins one, so the server
+        // enforces the model's TRUE maximum. A hardcoded 4096 used to truncate large
+        // tool-call arguments mid-stream (a workflow subagent's `structured_output`),
+        // which the agent loop then retried forever. Only wind-down/compaction pin a
+        // small cap, and those are honored here.
+        if let Some(max) = opts.max_tokens {
+            body["max_tokens"] = json!(max);
+        }
         // Ask for usage in the streaming case (arrives in a final chunk).
         if stream {
             body["stream_options"] = json!({ "include_usage": true });

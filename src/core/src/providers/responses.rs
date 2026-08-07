@@ -60,6 +60,11 @@ impl ResponsesProvider {
         if let Some(sys) = &opts.system {
             body["instructions"] = json!(sys);
         }
+        // Output cap: omit unless explicitly pinned, so the server enforces the
+        // model's true max (only wind-down/compaction pin a small cap).
+        if let Some(max) = opts.max_tokens {
+            body["max_output_tokens"] = json!(max);
+        }
         // Reasoning intensity (gpt-5.x / o-series). Off → omit the field.
         if let Some(effort) = opts.reasoning.as_str() {
             body["reasoning"] = json!({ "effort": effort });
@@ -149,6 +154,12 @@ impl Provider for ResponsesProvider {
             // the right spot among reasoning/tool blocks when finalizing.
             let mut text_index: Option<i64> = None;
             let mut usage = Usage::default();
+            // Whether a terminal event (completed / failed / error) was seen. If the
+            // SSE stream ends WITHOUT one — dropped connection, truncated body, a
+            // `response.incomplete`, or an unrecognized terminal type — we must still
+            // send a MessageStop below, or the agent loop's receiver closes with no
+            // completion and the turn hangs. (Anthropic guards the same case.)
+            let mut terminal_seen = false;
 
             let _ = parse_sse(res, |evt| {
                 let kind = evt["type"].as_str().unwrap_or("");
@@ -209,6 +220,7 @@ impl Provider for ResponsesProvider {
                     }
                     // Terminal event with final output + usage.
                     "response.completed" => {
+                        terminal_seen = true;
                         let u = &evt["response"]["usage"];
                         usage.input_tokens = u["input_tokens"].as_u64().unwrap_or(0);
                         usage.output_tokens = u["output_tokens"].as_u64().unwrap_or(0);
@@ -262,6 +274,7 @@ impl Provider for ResponsesProvider {
                         let _ = tx.send(StreamEvent::MessageStop { completion });
                     }
                     "response.failed" | "error" => {
+                        terminal_seen = true;
                         // A real API failure — propagate it as an error event so the
                         // agent loop surfaces it (and can retry), rather than
                         // fabricating an assistant turn that poisons history.
@@ -277,6 +290,50 @@ impl Provider for ResponsesProvider {
                 }
             })
             .await;
+
+            // Stream ended without any terminal event: assemble a best-effort
+            // MessageStop from whatever we accumulated so the agent loop always
+            // gets a completion and terminates the turn (instead of hanging on a
+            // silently-closed channel). Mirrors anthropic.rs's stop fallback.
+            if !terminal_seen {
+                let mut ordered: Vec<(i64, ContentBlock)> = Vec::new();
+                for (idx, item) in &reasoning {
+                    ordered.push((*idx, ContentBlock::ReasoningItem { item: item.clone() }));
+                }
+                if !text.is_empty() {
+                    ordered.push((
+                        text_index.unwrap_or(i64::MAX),
+                        ContentBlock::Text { text: text.clone() },
+                    ));
+                }
+                for (idx, (id, name, args)) in &tools {
+                    ordered.push((
+                        *idx,
+                        ContentBlock::ToolUse {
+                            id: id.clone(),
+                            name: name.clone(),
+                            input: crate::providers::codec::parse_tool_input(args),
+                        },
+                    ));
+                }
+                ordered.sort_by_key(|(idx, _)| *idx);
+                let content: Vec<ContentBlock> = ordered.into_iter().map(|(_, b)| b).collect();
+                let stop = if tools.is_empty() {
+                    StopReason::EndTurn
+                } else {
+                    StopReason::ToolUse
+                };
+                let _ = tx.send(StreamEvent::MessageStop {
+                    completion: Completion {
+                        message: Message {
+                            role: Role::Assistant,
+                            content,
+                        },
+                        stop_reason: stop,
+                        usage,
+                    },
+                });
+            }
         });
 
         Ok(rx)

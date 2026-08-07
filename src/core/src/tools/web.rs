@@ -219,9 +219,13 @@ fn percent_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
+        // Decode `%XX` by reading the two following BYTES directly. Slicing the
+        // &str as `&s[i+1..i+3]` panics when a `%` is followed by a multi-byte
+        // UTF-8 char (the slice lands off a char boundary) — reachable from
+        // untrusted search-result HTML, so it must never panic.
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(b);
+            if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                out.push(hi * 16 + lo);
                 i += 3;
                 continue;
             }
@@ -230,6 +234,16 @@ fn percent_decode(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).to_string()
+}
+
+/// One hex digit (ASCII) → its value, or None if not a hex digit.
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Strip HTML tags + decode common entities from a small result fragment.
@@ -296,5 +310,17 @@ mod tests {
     #[test]
     fn clean_fragment_strips_tags_and_entities() {
         assert_eq!(clean_fragment("a &amp; <b>b</b>  c"), "a & b c");
+    }
+
+    #[test]
+    fn percent_decode_handles_normal_and_multibyte_without_panicking() {
+        // Normal decoding still works.
+        assert_eq!(percent_decode("https%3A%2F%2Fx"), "https://x");
+        // Regression: a `%` immediately before a multi-byte UTF-8 char used to
+        // panic (`&s[i+1..i+3]` off a char boundary). Must pass the `%` through.
+        assert_eq!(percent_decode("%a€x"), "%a€x");
+        // A bare trailing `%` and a `%` with a non-hex follower are passed through.
+        assert_eq!(percent_decode("100%"), "100%");
+        assert_eq!(percent_decode("%zz"), "%zz");
     }
 }

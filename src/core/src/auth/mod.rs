@@ -45,10 +45,32 @@ fn auth_path() -> PathBuf {
 impl AuthStore {
     pub fn load() -> AuthStore {
         let path = auth_path();
-        std::fs::read_to_string(path)
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or_default()
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            // Absent (or unreadable) → a legitimately empty store. This is the
+            // normal first-run case; nothing to preserve.
+            Err(_) => return AuthStore::default(),
+        };
+        match serde_json::from_str(&raw) {
+            Ok(store) => store,
+            Err(e) => {
+                // The file EXISTS but doesn't parse — a partial/corrupt write, most
+                // likely from an interrupted (non-atomic, historically) save. Do NOT
+                // silently return an empty store: the next store_tokens()->save()
+                // would overwrite this file and permanently destroy every provider's
+                // tokens. Back the bad file up first so a later save can't clobber
+                // the only copy, and so it can be recovered by hand.
+                let backup = path.with_extension("json.corrupt");
+                let _ = std::fs::rename(&path, &backup);
+                eprintln!(
+                    "bob: warning: {} was unreadable ({e}); backed it up to {} and \
+                     started with an empty credential store. Re-run login if needed.",
+                    path.display(),
+                    backup.display()
+                );
+                AuthStore::default()
+            }
+        }
     }
 
     pub fn save(&self) -> anyhow::Result<()> {
@@ -56,7 +78,19 @@ impl AuthStore {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&path, serde_json::to_string_pretty(self)?)?;
+        let body = serde_json::to_string_pretty(self)?;
+        // Write atomically: serialize to a temp file in the same dir, fsync-free
+        // rename over the target. A crash mid-write then leaves EITHER the old file
+        // or the new one intact — never a half-written file that load() would treat
+        // as corrupt and back away from.
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, &body)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        }
+        std::fs::rename(&tmp, &path)?;
         // Best-effort: restrict permissions (contains tokens).
         #[cfg(unix)]
         {
@@ -417,7 +451,15 @@ pub(crate) fn store_tokens(
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("no access_token"))?
         .to_string();
-    let refresh = tokens["refresh_token"].as_str().map(|s| s.to_string());
+    let mut store = AuthStore::load();
+    // Preserve the existing refresh_token when the refresh response omits one.
+    // Many OAuth servers (rotation setups, or providers that just don't re-send it)
+    // return no refresh_token on a refresh; overwriting with None here would brick
+    // the NEXT expiry ("no refresh token; log in again").
+    let refresh = tokens["refresh_token"]
+        .as_str()
+        .map(|s| s.to_string())
+        .or_else(|| store.get(provider).and_then(|c| c.refresh_token.clone()));
     // These tokens are typically ~1h; store an expiry so we refresh proactively.
     let expires_in = tokens["expires_in"].as_u64().unwrap_or(3600);
     let expires_at = now() + expires_in;
@@ -430,7 +472,6 @@ pub(crate) fn store_tokens(
         }
     }
 
-    let mut store = AuthStore::load();
     store.set(
         provider,
         Credential {
@@ -449,8 +490,10 @@ fn urldecode(s: &str) -> String {
     while i < bytes.len() {
         match bytes[i] {
             b'%' if i + 2 < bytes.len() => {
-                if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                    out.push(v);
+                // Read the two hex BYTES directly — `&s[i+1..i+3]` panics when the
+                // `%` precedes a multi-byte char (slice off a char boundary).
+                if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                    out.push(hi * 16 + lo);
                     i += 3;
                     continue;
                 }
@@ -468,4 +511,14 @@ fn urldecode(s: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).to_string()
+}
+
+/// One hex digit (ASCII) → its value, or None if not a hex digit.
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }

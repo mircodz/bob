@@ -370,6 +370,8 @@ enum BgOutcome {
         before: usize,
         after: usize,
     },
+    /// An off-thread session blob save failed. Carries the error to notice.
+    SessionSaveFailed(String),
 }
 
 /// Run `fut` off the event loop and deliver its [`BgOutcome`] back to the UI.
@@ -1005,8 +1007,26 @@ pub async fn run(
                 session.agent_threads = app.teams.to_persisted();
                 session.workflows = app.view.to_persisted_workflows();
                 session.updated_at = now_stamp();
-                if let Err(e) = save_session(&session) {
-                    app.view.push_notice(format!("warning: couldn't save session: {e}"));
+                // Persist the blob off the event-loop thread: save_session runs a
+                // full synchronous SQLite pipeline (open, PRAGMA WAL, schema, UPSERT,
+                // fsync) and with busy_timeout a contended WAL write can stall the
+                // whole TUI for seconds. Do it on the blocking pool (the event log
+                // already uses a dedicated writer thread for the same reason). Clone
+                // the blob for the task; `session` stays for the next turn.
+                {
+                    let snapshot = session.clone();
+                    let tx = app.bg_tx.clone();
+                    tokio::spawn(async move {
+                        let res = tokio::task::spawn_blocking(move || save_session(&snapshot)).await;
+                        let err = match res {
+                            Ok(Ok(())) => None,
+                            Ok(Err(e)) => Some(e.to_string()),
+                            Err(e) => Some(e.to_string()),
+                        };
+                        if let Some(e) = err {
+                            let _ = tx.send(BgOutcome::SessionSaveFailed(e));
+                        }
+                    });
                 }
                 drop(a);
                 // If this turn had been detached (Ctrl+B), close out its job.
@@ -1547,6 +1567,9 @@ impl App {
             } => {
                 self.view.finish_compaction(cell, before, after, did);
                 self.stick_to_bottom();
+            }
+            BgOutcome::SessionSaveFailed(e) => {
+                self.view.push_notice(format!("warning: couldn't save session: {e}"));
             }
         }
     }

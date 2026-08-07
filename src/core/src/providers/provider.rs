@@ -162,6 +162,25 @@ pub fn context_window_for(model: &str) -> usize {
     128_000
 }
 
+/// The documented max OUTPUT-token ceiling for a model id, by family substring.
+/// Unlike the OpenAI providers (which can OMIT the cap and let the server enforce
+/// the true max), Anthropic REQUIRES `max_tokens` on every request — so we must
+/// send a concrete number. These are the real per-family ceilings (not a
+/// conservative guess); anything the model wants beyond this is caught by the
+/// agent loop's truncation recovery. Keep arms most-specific first.
+pub fn max_output_tokens_for(model: &str) -> u32 {
+    let m = model.to_ascii_lowercase();
+    // Claude Sonnet 3.7/4.x support up to 64k output; Opus 4.x up to 32k.
+    if m.contains("opus") {
+        return 32_000;
+    }
+    if m.contains("sonnet") || m.contains("claude") {
+        return 64_000;
+    }
+    // Conservative fallback for a non-Claude model routed here.
+    16_000
+}
+
 #[cfg(test)]
 mod tests {
     use super::context_window_for;
@@ -185,5 +204,17 @@ mod tests {
         // it must not be capped at the family's standard 200k.
         assert_eq!(context_window_for("claude-opus-1m"), 1_000_000);
         assert_eq!(context_window_for("claude-opus-4.8-1m"), 1_000_000);
+    }
+
+    #[test]
+    fn anthropic_output_ceiling_by_family() {
+        use super::max_output_tokens_for;
+        // Opus caps lower than Sonnet; both must exceed the old 4096 that truncated
+        // large tool-call arguments.
+        assert_eq!(max_output_tokens_for("claude-opus-4.8"), 32_000);
+        assert_eq!(max_output_tokens_for("claude-sonnet-5"), 64_000);
+        // Bare "claude" (unknown sub-family) still gets a generous ceiling.
+        assert_eq!(max_output_tokens_for("claude-future"), 64_000);
+        assert!(max_output_tokens_for("something-else") >= 16_000);
     }
 }
