@@ -8,6 +8,10 @@ description = "Provider-agnostic, multi-agent coding assistant — core (no UI).
 name = "bob_core"
 path = "src/lib.rs"
 
+[features]
+# Exposes test doubles (MockProvider) to downstream crates for their own tests.
+testing = []
+
 [dependencies]
 bob-types.workspace = true
 tokio.workspace = true

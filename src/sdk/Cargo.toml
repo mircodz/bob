@@ -15,6 +15,11 @@ anyhow.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
 
+[dev-dependencies]
+# Enable bob-core's test doubles (MockProvider) for the SDK's own tests.
+bob-core = { path = "../core", features = ["testing"] }
+serde_json.workspace = true
+
 [[example]]
 name = "minimal"
 path = "examples/minimal.rs"

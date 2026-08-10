@@ -1,7 +1,7 @@
 pub mod anthropic;
 pub mod codec;
 pub mod copilot;
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 pub mod mock;
 pub mod models;
 pub mod openai;

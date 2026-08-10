@@ -329,6 +329,7 @@ dependencies = [
  "async-trait",
  "bob-core",
  "bob-types",
+ "serde_json",
  "tokio",
 ]
 

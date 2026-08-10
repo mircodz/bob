@@ -80,6 +80,7 @@ pub struct AgentBuilder {
     asker: Option<Arc<dyn Asker>>,
     user_asker: Option<Arc<dyn UserAsker>>,
     credential: Option<ProviderAuth>,
+    provider: Option<Arc<dyn bob_core::providers::provider::Provider>>,
     store: Option<Arc<dyn SessionStore>>,
     resume: Resume,
     max_turns: Option<u32>,
@@ -98,6 +99,7 @@ impl Default for AgentBuilder {
             asker: None,
             user_asker: None,
             credential: None,
+            provider: None,
             store: None,
             resume: Resume::Fresh,
             max_turns: None,
@@ -133,6 +135,14 @@ impl AgentBuilder {
     /// environment + project context).
     pub fn system_prompt(mut self, prompt: impl Into<String>) -> Self {
         self.system_override = Some(prompt.into());
+        self
+    }
+
+    /// Supply a pre-built provider directly, bypassing model/credential resolution.
+    /// The escape hatch for advanced callers (a custom provider impl) and for tests
+    /// (a mock). When set, `.model()` and `.credential()` are ignored.
+    pub fn provider(mut self, provider: Arc<dyn bob_core::providers::provider::Provider>) -> Self {
+        self.provider = Some(provider);
         self
     }
 
@@ -183,10 +193,19 @@ impl AgentBuilder {
     /// Build the agent: resolve the provider, assemble tools + permissions, compose
     /// the prompt, and seed history from the chosen session.
     pub async fn build(self) -> anyhow::Result<Agent> {
-        let model = self
-            .model
-            .ok_or_else(|| anyhow::anyhow!("no model set — call `.model(\"provider/model\")`"))?;
-        let provider = create_provider_with_auth(&model, self.credential).await?;
+        // A pre-built provider (escape hatch / tests) wins; otherwise resolve one
+        // from the required model spec + optional credential.
+        let provider = match self.provider {
+            Some(p) => p,
+            None => {
+                let model = self.model.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "no model set — call `.model(\"provider/model\")` or `.provider(...)`"
+                    )
+                })?;
+                create_provider_with_auth(&model, self.credential).await?
+            }
+        };
         let bus = EventBus::new();
         let jobs = JobRegistry::new();
         let team = AgentRegistry::new();
@@ -235,14 +254,52 @@ impl AgentBuilder {
             }
         }
 
-        Ok(Agent { inner: agent })
+        let bus = agent.bus();
+        let cancel = agent.cancel_handle();
+        Ok(Agent {
+            inner: Arc::new(tokio::sync::Mutex::new(agent)),
+            bus,
+            cancel,
+        })
     }
 }
 
 /// A ready-to-run agent. Thin handle over the core agent with the ergonomic
-/// entry points; drop to [`Agent::core`] for the full core API.
+/// entry points; drop to [`Agent::with_core`] for the full core API.
+///
+/// The core agent lives behind an async mutex so a streamed run can execute on a
+/// background task while the caller drains its event stream, and so [`interrupt`]
+/// can signal cancellation without waiting for the lock.
 pub struct Agent {
-    inner: CoreAgent,
+    inner: Arc<tokio::sync::Mutex<CoreAgent>>,
+    bus: bob_core::core::events::EventBus,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// One event from a streamed run — a re-export of the core [`AgentEvent`] so a
+/// consumer can pattern-match reasoning deltas, tool calls/results, and turn
+/// boundaries as they happen.
+pub use bob_core::core::events::AgentEvent;
+
+/// The handle returned by [`Agent::run_streamed`]: an async stream of
+/// [`AgentEvent`]s plus the eventual final result. Drain `events` to observe
+/// progress, then `await` `finish()` for the assistant's final text.
+pub struct RunStream {
+    /// Live events as the turn progresses (reasoning, tool calls/results, …).
+    pub events: tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
+    handle: tokio::task::JoinHandle<anyhow::Result<String>>,
+}
+
+impl RunStream {
+    /// Await the run's completion and return the assistant's final text. Call this
+    /// after the `events` stream closes (or concurrently — the events channel and
+    /// this future are independent).
+    pub async fn finish(self) -> anyhow::Result<String> {
+        match self.handle.await {
+            Ok(r) => r,
+            Err(e) => Err(anyhow::anyhow!("streamed run task failed: {e}")),
+        }
+    }
 }
 
 impl Agent {
@@ -253,12 +310,40 @@ impl Agent {
 
     /// Run one turn to completion and return the assistant's final text.
     pub async fn run(&mut self, prompt: &str) -> anyhow::Result<String> {
-        self.inner.run(prompt).await
+        self.inner.lock().await.run(prompt).await
     }
 
-    /// Borrow the underlying core agent for anything the SDK doesn't surface.
-    pub fn core(&mut self) -> &mut CoreAgent {
-        &mut self.inner
+    /// Run one turn, streaming [`AgentEvent`]s as they happen. Returns immediately
+    /// with a [`RunStream`]: consume its `events` receiver for live progress and
+    /// `finish()` for the final text. The run executes on a background task.
+    pub async fn run_streamed(&mut self, prompt: &str) -> RunStream {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        // Forward every bus event into the channel for the lifetime of this run.
+        // The subscription is moved into the task and dropped when the run ends,
+        // so the listener never outlives the stream.
+        let sub = self.bus.subscribe(Arc::new(move |e: &AgentEvent| {
+            let _ = tx.send(e.clone());
+        }));
+        let inner = self.inner.clone();
+        let prompt = prompt.to_string();
+        let handle = tokio::spawn(async move {
+            let _sub = sub; // held for the duration; dropped (unsubscribes) on exit
+            inner.lock().await.run(&prompt).await
+        });
+        RunStream { events: rx, handle }
+    }
+
+    /// Cooperatively interrupt an in-flight run (e.g. from another task). The
+    /// current turn finishes its step, leaves history valid, and returns early.
+    pub fn interrupt(&self) {
+        self.cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Run a closure with mutable access to the underlying core agent, for anything
+    /// the SDK doesn't surface (the escape hatch).
+    pub async fn with_core<R>(&self, f: impl FnOnce(&mut CoreAgent) -> R) -> R {
+        f(&mut *self.inner.lock().await)
     }
 }
 
@@ -286,5 +371,44 @@ mod tests {
         assert!(d.model.is_none());
         // No default credential: auth resolves from env / login unless set.
         assert!(d.credential.is_none());
+    }
+
+    #[tokio::test]
+    async fn run_streamed_yields_events_and_final_text() {
+        use bob_core::providers::mock::{MockProvider, MockReply};
+        // A provider that answers with plain text — one clean turn.
+        let provider = MockProvider::new(vec![]).with_default(MockReply::Text("hello sdk".into()));
+        let mut agent = Agent::builder()
+            .provider(Arc::new(provider))
+            .permission_default(Decision::Allow)
+            .build()
+            .await
+            .unwrap();
+
+        let mut stream = agent.run_streamed("hi").await;
+        // Drain events while the run proceeds.
+        let mut kinds = Vec::new();
+        while let Some(ev) = stream.events.recv().await {
+            kinds.push(ev.kind().to_string());
+        }
+        // The turn boundary events are present in the stream.
+        assert!(kinds.iter().any(|k| k == "TurnStart"), "{kinds:?}");
+        assert!(kinds.iter().any(|k| k == "TurnEnd"), "{kinds:?}");
+        // And the final text is available from finish().
+        let out = stream.finish().await.unwrap();
+        assert_eq!(out, "hello sdk");
+    }
+
+    #[tokio::test]
+    async fn plain_run_works_through_the_provider_escape_hatch() {
+        use bob_core::providers::mock::{MockProvider, MockReply};
+        let provider = MockProvider::new(vec![]).with_default(MockReply::Text("ok".into()));
+        let mut agent = Agent::builder()
+            .provider(Arc::new(provider))
+            .permission_default(Decision::Allow)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(agent.run("go").await.unwrap(), "ok");
     }
 }

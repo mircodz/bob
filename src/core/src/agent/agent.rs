@@ -247,6 +247,13 @@ impl Agent {
         self.cancel.clone()
     }
 
+    /// A clone of this agent's event bus, so a caller can attach a listener (the
+    /// SDK's streaming path forwards these to an async channel). The bus is a
+    /// cheap shared handle — cloning shares the same listener set.
+    pub fn bus(&self) -> EventBus {
+        self.cfg.bus.clone()
+    }
+
     fn is_cancelled(&self) -> bool {
         cancel_requested(&self.cancel, self.cfg.parent_cancel.as_ref())
     }

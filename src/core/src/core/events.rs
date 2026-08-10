@@ -161,6 +161,29 @@ pub type EventListener = Arc<dyn Fn(&AgentEvent) + Send + Sync>;
 #[derive(Clone, Default)]
 pub struct EventBus {
     listeners: Arc<Mutex<Vec<EventListener>>>,
+    /// Keyed listeners that can be removed again (see [`EventBus::subscribe`]).
+    /// Separate from the permanent `listeners` so the common fire-and-forget
+    /// `on()` path stays a plain push.
+    keyed: Arc<Mutex<Vec<(u64, EventListener)>>>,
+    next_id: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// A live subscription created by [`EventBus::subscribe`]. Dropping it removes the
+/// listener from the bus — so a short-lived consumer (e.g. one `run_streamed`
+/// call) can't leak a listener that fires forever afterward.
+pub struct Subscription {
+    bus: EventBus,
+    id: u64,
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        self.bus
+            .keyed
+            .lock()
+            .unwrap()
+            .retain(|(id, _)| *id != self.id);
+    }
 }
 
 impl EventBus {
@@ -170,6 +193,21 @@ impl EventBus {
 
     pub fn on(&self, listener: EventListener) {
         self.listeners.lock().unwrap().push(listener);
+    }
+
+    /// Attach a *removable* listener, returning a [`Subscription`] that unsubscribes
+    /// on drop. Use this for short-lived consumers (e.g. a single streamed run) so
+    /// the listener doesn't outlive its purpose.
+    #[must_use]
+    pub fn subscribe(&self, listener: EventListener) -> Subscription {
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.keyed.lock().unwrap().push((id, listener));
+        Subscription {
+            bus: self.clone(),
+            id,
+        }
     }
 
     pub fn emit(&self, event: AgentEvent) {
@@ -182,6 +220,13 @@ impl EventBus {
             guard.clone()
         };
         for l in listeners.iter() {
+            l(&event);
+        }
+        let keyed = {
+            let guard = self.keyed.lock().unwrap();
+            guard.clone()
+        };
+        for (_, l) in keyed.iter() {
             l(&event);
         }
     }
