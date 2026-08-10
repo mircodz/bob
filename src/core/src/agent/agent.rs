@@ -348,7 +348,6 @@ impl Agent {
         // the server decide; `Some(n)` = a recovery override for the next attempt.
         let mut max_tokens_override: Option<u32> = None;
         let mut truncation_recoveries: u32 = 0;
-        const MAX_TRUNCATION_RECOVERIES: u32 = 2;
 
         for _turn in 0..self.cfg.max_turns {
             // Interrupt before starting a new turn — history ends on a valid
@@ -429,135 +428,29 @@ impl Agent {
                 self.rearm_context_warning(compaction.after_tokens);
             }
 
-            // Stream the assistant turn, forwarding text deltas to the bus. This is
-            // wrapped in a small retry loop: a transient provider error (429 /
-            // overloaded / dropped stream) is retried with backoff, and a
-            // context-length rejection triggers a reactive compaction + one retry,
-            // so a single bad response doesn't abort the whole run.
-            const MAX_STREAM_ATTEMPTS: u32 = 4;
-            let mut completion: Option<Completion> = None;
-            let mut attempt = 0u32;
-            let mut recovered_overflow = false;
-            loop {
-                attempt += 1;
-                let opts = GenerateOptions {
-                    system: self.cfg.system.clone(),
-                    messages: self.history.clone(),
-                    tools: self.cfg.tools.specs(),
-                    cache: true,
-                    reasoning: self.reasoning,
-                    // Normally None (server enforces the true max); set only while
-                    // recovering from a truncated response (see below).
-                    max_tokens: max_tokens_override,
-                    ..Default::default()
-                };
-                let mut rx = match self.cfg.provider.stream(opts).await {
-                    Ok(rx) => rx,
-                    Err(e) => {
-                        // Failure before the stream even opened (network/auth/length).
-                        if is_overflow_error(&e.to_string()) && !recovered_overflow {
-                            recovered_overflow = true;
-                            self.compact_now().await;
-                            continue;
-                        }
-                        if attempt < MAX_STREAM_ATTEMPTS && is_transient_error(&e.to_string()) {
-                            self.backoff(attempt).await;
-                            continue;
-                        }
-                        return Err(e);
-                    }
-                };
-
-                let mut c = None;
-                let mut stream_error = None;
-                while let Some(evt) = rx.recv().await {
-                    match evt {
-                        StreamEvent::TextDelta { text } => {
-                            self.cfg.bus.emit(AgentEvent::TextDelta {
-                                agent_id: self.id.clone(),
-                                text,
-                            });
-                        }
-                        StreamEvent::MessageStop { completion: done } => {
-                            c = Some(done);
-                        }
-                        StreamEvent::Error { message } => {
-                            stream_error = Some(message);
-                            break;
-                        }
-                        _ => {}
-                    }
-                    if self.is_cancelled() {
-                        break;
-                    }
-                }
-
-                // Interrupted mid-stream before the model finished: stop cleanly.
-                if self.is_cancelled() && c.is_none() {
+            // Stream the assistant turn (text deltas forwarded to the bus), with a
+            // small internal retry loop for transient/overflow errors. Extracted so
+            // the turn loop reads at one level of abstraction.
+            let completion = match self.stream_completion(max_tokens_override).await? {
+                StreamOutcome::Completed(c) => c,
+                StreamOutcome::Interrupted => {
                     final_text = "[interrupted]".to_string();
                     break;
                 }
+            };
 
-                if let Some(message) = stream_error {
-                    // A context-length rejection: compact reactively and retry once.
-                    if is_overflow_error(&message) && !recovered_overflow {
-                        recovered_overflow = true;
-                        self.compact_now().await;
-                        continue;
-                    }
-                    // A transient error: back off and retry, up to the cap.
-                    if attempt < MAX_STREAM_ATTEMPTS && is_transient_error(&message) {
-                        self.backoff(attempt).await;
-                        continue;
-                    }
-                    // Out of retries, or a genuinely fatal error.
-                    return Err(anyhow::anyhow!("{}", message));
-                }
-
-                completion = c;
-                break;
-            }
-            // If the interrupt path set final_text, stop the turn.
-            if self.is_cancelled() && completion.is_none() {
-                break;
-            }
-            let completion =
-                completion.ok_or_else(|| anyhow::anyhow!("stream ended without completion"))?;
-
-            // Output truncation recovery: the response was cut off mid-content —
-            // typically a partial tool call whose arguments won't parse, which the
-            // loop would otherwise retry forever. We detect this two ways, because a
-            // stream that drops mid-tool-call may never deliver the `finish_reason`:
-            //   1. the provider reported `StopReason::MaxTokens`, or
-            //   2. a tool call's arguments are the `parse_tool_input` error sentinel
-            //      (truncated JSON) — a strong truncation signal on its own.
-            // On either, retry the SAME turn with an explicit, doubled cap so the
-            // model can finish. Bounded so a genuinely oversized request fails cleanly
-            // instead of looping. Done BEFORE pushing the message to history, so a
-            // discarded partial turn never pollutes the transcript.
-            let truncated_tool_args = completion.message.content.iter().any(|b| {
-                matches!(b, ContentBlock::ToolUse { input, .. }
-                    if crate::providers::codec::tool_input_parse_error(input).is_some())
-            });
-            let looks_truncated =
-                completion.stop_reason == StopReason::MaxTokens || truncated_tool_args;
-            if looks_truncated && truncation_recoveries < MAX_TRUNCATION_RECOVERIES {
+            // Output-truncation recovery: if the response was cut off (a partial
+            // tool call the loop would otherwise retry forever), retry the SAME turn
+            // with a raised cap. Decided BEFORE pushing to history, so a discarded
+            // partial turn never pollutes the transcript. Bounded so a genuinely
+            // oversized request fails cleanly instead of looping.
+            if let Some(bumped) =
+                self.truncation_retry_cap(&completion, truncation_recoveries, max_tokens_override)
+            {
                 truncation_recoveries += 1;
-                // Base the next cap on what the model actually produced, doubled, and
-                // clamped so we never ask past the model's real output ceiling.
-                let ceiling =
-                    crate::providers::provider::max_output_tokens_for(self.cfg.provider.model());
-                let produced = completion.usage.output_tokens as u32;
-                let bumped = produced.saturating_mul(2).max(8_192).min(ceiling);
-                // Retry only if the bumped cap actually grows the budget; otherwise
-                // fall through (we're at the ceiling — the partial + parse-error
-                // message at least gives the model something actionable).
-                if Some(bumped) != max_tokens_override && bumped > produced {
-                    max_tokens_override = Some(bumped);
-                    // Silent, self-healing retry (like the transient-error backoff):
-                    // re-enter the turn with the larger cap. Nothing user-visible.
-                    continue;
-                }
+                max_tokens_override = Some(bumped);
+                // Silent, self-healing retry — nothing user-visible.
+                continue;
             }
             // Cleared on any non-truncated (or unrecoverable) completion so the next
             // turn starts back at the server default rather than a stale override.
@@ -624,54 +517,9 @@ impl Agent {
                 break;
             }
 
-            // Execute the requested tools. Read-only tools (reads/searches/status)
-            // run concurrently for speed; mutating tools (edits, writes, bash,
-            // refactors, coordination) run sequentially so two edits to the same
-            // file in one turn can't race and corrupt each other. Order within the
-            // turn is preserved so results map back to their tool_use ids.
-            for (id, name, input) in &tool_uses {
-                self.cfg.bus.emit(AgentEvent::ToolCall {
-                    agent_id: self.id.clone(),
-                    tool_use_id: id.clone(),
-                    name: name.clone(),
-                    input: input.clone(),
-                });
-            }
-            let mut results: Vec<ContentBlock> = Vec::with_capacity(tool_uses.len());
-            let mut concurrent = Vec::new();
-            for (id, name, input) in &tool_uses {
-                if self.cfg.tools.is_read_only(name) {
-                    let tools = self.cfg.tools.clone();
-                    let bus = self.cfg.bus.clone();
-                    let agent_id = self.id.clone();
-                    let ctx = ctx.clone();
-                    let (id, name, input) = (id.clone(), name.clone(), input.clone());
-                    concurrent.push(async move {
-                        run_one(&tools, &bus, &agent_id, &ctx, id, name, input).await
-                    });
-                }
-            }
-            let mut concurrent_results = futures::future::join_all(concurrent).await.into_iter();
-            for (id, name, input) in &tool_uses {
-                if self.cfg.tools.is_read_only(name) {
-                    if let Some(r) = concurrent_results.next() {
-                        results.push(r);
-                    }
-                } else {
-                    results.push(
-                        run_one(
-                            &self.cfg.tools,
-                            &self.cfg.bus,
-                            &self.id,
-                            &ctx,
-                            id.clone(),
-                            name.clone(),
-                            input.clone(),
-                        )
-                        .await,
-                    );
-                }
-            }
+            // Execute the requested tools (concurrent reads, sequential mutations),
+            // then record the results as one Tool-role message.
+            let results = self.execute_tool_uses(&ctx, &tool_uses).await;
             let msg = Message {
                 role: Role::Tool,
                 content: results,
@@ -699,6 +547,195 @@ impl Agent {
             usage: total,
         });
         Ok(final_text)
+    }
+
+    /// Stream one assistant turn to completion, forwarding text deltas to the bus.
+    /// Owns the internal retry state machine: a context-length rejection triggers a
+    /// reactive compaction + retry (once), a transient error backs off and retries
+    /// up to the attempt cap, and a fatal/exhausted error propagates. Returns
+    /// `Interrupted` if the run was cancelled mid-stream before a completion.
+    async fn stream_completion(
+        &mut self,
+        max_tokens_override: Option<u32>,
+    ) -> anyhow::Result<StreamOutcome> {
+        const MAX_STREAM_ATTEMPTS: u32 = 4;
+        let mut attempt = 0u32;
+        let mut recovered_overflow = false;
+        loop {
+            attempt += 1;
+            let opts = GenerateOptions {
+                system: self.cfg.system.clone(),
+                messages: self.history.clone(),
+                tools: self.cfg.tools.specs(),
+                cache: true,
+                reasoning: self.reasoning,
+                // Normally None (server enforces the true max); set only while
+                // recovering from a truncated response.
+                max_tokens: max_tokens_override,
+                ..Default::default()
+            };
+            let mut rx = match self.cfg.provider.stream(opts).await {
+                Ok(rx) => rx,
+                Err(e) => {
+                    // Failure before the stream even opened (network/auth/length).
+                    match classify_error(&e.to_string()) {
+                        ProviderErrorKind::Overflow if !recovered_overflow => {
+                            recovered_overflow = true;
+                            self.compact_now().await;
+                            continue;
+                        }
+                        ProviderErrorKind::Transient if attempt < MAX_STREAM_ATTEMPTS => {
+                            self.backoff(attempt).await;
+                            continue;
+                        }
+                        _ => return Err(e),
+                    }
+                }
+            };
+
+            let mut completion = None;
+            let mut stream_error = None;
+            while let Some(evt) = rx.recv().await {
+                match evt {
+                    StreamEvent::TextDelta { text } => {
+                        self.cfg.bus.emit(AgentEvent::TextDelta {
+                            agent_id: self.id.clone(),
+                            text,
+                        });
+                    }
+                    StreamEvent::MessageStop { completion: done } => {
+                        completion = Some(done);
+                    }
+                    StreamEvent::Error { message } => {
+                        stream_error = Some(message);
+                        break;
+                    }
+                    _ => {}
+                }
+                if self.is_cancelled() {
+                    break;
+                }
+            }
+
+            // Interrupted mid-stream before the model finished: stop cleanly.
+            if self.is_cancelled() && completion.is_none() {
+                return Ok(StreamOutcome::Interrupted);
+            }
+
+            if let Some(message) = stream_error {
+                match classify_error(&message) {
+                    ProviderErrorKind::Overflow if !recovered_overflow => {
+                        recovered_overflow = true;
+                        self.compact_now().await;
+                        continue;
+                    }
+                    ProviderErrorKind::Transient if attempt < MAX_STREAM_ATTEMPTS => {
+                        self.backoff(attempt).await;
+                        continue;
+                    }
+                    // Out of retries, or a genuinely fatal error.
+                    _ => return Err(anyhow::anyhow!("{}", message)),
+                }
+            }
+
+            return Ok(match completion {
+                Some(c) => StreamOutcome::Completed(c),
+                None => return Err(anyhow::anyhow!("stream ended without completion")),
+            });
+        }
+    }
+
+    /// Execute a turn's tool calls and return their result blocks in request order.
+    /// Read-only tools (reads/searches/status) run concurrently for speed; mutating
+    /// tools (edits, writes, bash, coordination) run sequentially so two edits to
+    /// the same file in one turn can't race. Emits a `ToolCall` event per call
+    /// first, so the UI shows every invocation before results stream back.
+    async fn execute_tool_uses(
+        &self,
+        ctx: &ToolContext,
+        tool_uses: &[(String, String, serde_json::Value)],
+    ) -> Vec<ContentBlock> {
+        for (id, name, input) in tool_uses {
+            self.cfg.bus.emit(AgentEvent::ToolCall {
+                agent_id: self.id.clone(),
+                tool_use_id: id.clone(),
+                name: name.clone(),
+                input: input.clone(),
+            });
+        }
+        // Kick off the read-only calls concurrently, preserving their order.
+        let mut concurrent = Vec::new();
+        for (id, name, input) in tool_uses {
+            if self.cfg.tools.is_read_only(name) {
+                let tools = self.cfg.tools.clone();
+                let bus = self.cfg.bus.clone();
+                let agent_id = self.id.clone();
+                let ctx = ctx.clone();
+                let (id, name, input) = (id.clone(), name.clone(), input.clone());
+                concurrent.push(async move {
+                    run_one(&tools, &bus, &agent_id, &ctx, id, name, input).await
+                });
+            }
+        }
+        let mut concurrent_results = futures::future::join_all(concurrent).await.into_iter();
+        // Weave concurrent read results back into request order; run mutating tools
+        // inline where they sit.
+        let mut results: Vec<ContentBlock> = Vec::with_capacity(tool_uses.len());
+        for (id, name, input) in tool_uses {
+            if self.cfg.tools.is_read_only(name) {
+                if let Some(r) = concurrent_results.next() {
+                    results.push(r);
+                }
+            } else {
+                results.push(
+                    run_one(
+                        &self.cfg.tools,
+                        &self.cfg.bus,
+                        &self.id,
+                        ctx,
+                        id.clone(),
+                        name.clone(),
+                        input.clone(),
+                    )
+                    .await,
+                );
+            }
+        }
+        results
+    }
+
+    /// Decide whether a completion looks truncated and, if so, the raised
+    /// `max_tokens` cap to retry the SAME turn with. Returns `None` to proceed
+    /// (not truncated, out of recovery budget, or already at the model's ceiling).
+    /// Detects truncation two ways because a stream that drops mid-tool-call may
+    /// never deliver `finish_reason`: an explicit `MaxTokens` stop, OR a tool call
+    /// whose arguments are the `parse_tool_input` error sentinel (truncated JSON).
+    fn truncation_retry_cap(
+        &self,
+        completion: &Completion,
+        recoveries: u32,
+        current_override: Option<u32>,
+    ) -> Option<u32> {
+        const MAX_TRUNCATION_RECOVERIES: u32 = 2;
+        if recoveries >= MAX_TRUNCATION_RECOVERIES {
+            return None;
+        }
+        let truncated_tool_args = completion.message.content.iter().any(|b| {
+            matches!(b, ContentBlock::ToolUse { input, .. }
+                if crate::providers::codec::tool_input_parse_error(input).is_some())
+        });
+        if completion.stop_reason != StopReason::MaxTokens && !truncated_tool_args {
+            return None;
+        }
+        // Base the next cap on what the model actually produced, doubled, and
+        // clamped to the model's real output ceiling.
+        let ceiling = crate::providers::provider::max_output_tokens_for(self.cfg.provider.model());
+        let produced = completion.usage.output_tokens as u32;
+        let bumped = produced.saturating_mul(2).max(8_192).min(ceiling);
+        // Retry only if the bumped cap actually grows the budget over what we last
+        // asked for; otherwise proceed (the partial + parse-error message at least
+        // gives the model something actionable).
+        (Some(bumped) != current_override && bumped > produced).then_some(bumped)
     }
 
     /// Run the agent on `prompt` but force its FINAL answer to be a single JSON
@@ -890,32 +927,86 @@ impl Agent {
 
 /// Whether a provider error string indicates the request exceeded the model's
 /// context window (so a reactive compaction + retry is worth attempting).
-fn is_overflow_error(msg: &str) -> bool {
+/// How the agent loop should react to a provider error, decided from its message
+/// text (the errors flowing here are all `String`/`anyhow` — a typed error at the
+/// provider source is a separate, larger change). Classification is centralized
+/// here instead of scattered `msg.contains(...)` checks, and tightened so a stray
+/// digit run like "1500 tokens" no longer reads as an HTTP 500.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProviderErrorKind {
+    /// Context-length rejection → compact history and retry once.
+    Overflow,
+    /// Rate limit / overload / transient network hiccup → back off and retry.
+    Transient,
+    /// Anything else → fatal, propagate to the caller.
+    Fatal,
+}
+
+/// Whether `hay` contains `code` as a standalone HTTP status token (bounded by a
+/// non-digit or the string edge on both sides), so "500" matches "http 500" /
+/// "error 500" / "status: 500" but NOT "1500 tokens" or "cost 5008".
+fn has_status_code(hay: &str, code: &str) -> bool {
+    let bytes = hay.as_bytes();
+    let mut from = 0;
+    while let Some(pos) = hay[from..].find(code) {
+        let start = from + pos;
+        let end = start + code.len();
+        let left_ok = start == 0 || !bytes[start - 1].is_ascii_digit();
+        let right_ok = end == bytes.len() || !bytes[end].is_ascii_digit();
+        if left_ok && right_ok {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
+}
+
+/// Classify a provider error message into the loop's reaction. Overflow is checked
+/// before Transient so a length rejection compacts rather than blindly retrying.
+fn classify_error(msg: &str) -> ProviderErrorKind {
     let m = msg.to_ascii_lowercase();
-    m.contains("context length")
+
+    // Context-length rejections — specific phrases, no false-positive risk.
+    let overflow = m.contains("context length")
         || m.contains("context_length")
         || m.contains("maximum context")
         || m.contains("too many tokens")
         || m.contains("prompt is too long")
         || m.contains("reduce the length")
-        || (m.contains("token") && m.contains("exceed"))
-}
+        || (m.contains("token") && m.contains("exceed"));
+    if overflow {
+        return ProviderErrorKind::Overflow;
+    }
 
-/// Whether a provider error looks transient (rate limit / overload / network) and
-/// worth retrying with backoff.
-fn is_transient_error(msg: &str) -> bool {
-    let m = msg.to_ascii_lowercase();
-    m.contains("429")
-        || m.contains("rate limit")
+    // Transient: rate limits, overload, retryable HTTP statuses (as whole tokens),
+    // timeouts, and dropped streams. "connection" alone is too broad, so require a
+    // network qualifier alongside it.
+    let transient = m.contains("rate limit")
         || m.contains("overloaded")
-        || m.contains("529")
-        || m.contains("500")
-        || m.contains("502")
-        || m.contains("503")
         || m.contains("timeout")
         || m.contains("timed out")
-        || m.contains("connection")
         || m.contains("stream ended")
+        || ["429", "500", "502", "503", "529"]
+            .iter()
+            .any(|c| has_status_code(&m, c))
+        || (m.contains("connection")
+            && (m.contains("reset")
+                || m.contains("refused")
+                || m.contains("closed")
+                || m.contains("error")
+                || m.contains("aborted")));
+    if transient {
+        return ProviderErrorKind::Transient;
+    }
+
+    ProviderErrorKind::Fatal
+}
+
+/// The result of [`Agent::stream_completion`]: a finished completion, or a clean
+/// stop because the run was interrupted mid-stream.
+enum StreamOutcome {
+    Completed(Completion),
+    Interrupted,
 }
 
 /// Execute one tool call, emit its result event, and return the tool_result block.
@@ -953,6 +1044,73 @@ async fn run_one(
         tool_use_id: id,
         content,
         is_error: Some(is_error),
+    }
+}
+
+#[cfg(test)]
+mod classify_tests {
+    use super::{classify_error, ProviderErrorKind};
+
+    #[test]
+    fn overflow_phrases_classify_as_overflow() {
+        for m in [
+            "This model's maximum context length is 200000 tokens",
+            "prompt is too long",
+            "reduce the length of the messages",
+            "input tokens exceed the limit",
+        ] {
+            assert_eq!(classify_error(m), ProviderErrorKind::Overflow, "{m}");
+        }
+    }
+
+    #[test]
+    fn transient_statuses_and_phrases_classify_as_transient() {
+        for m in [
+            "HTTP 500: internal server error",
+            "error 502 bad gateway",
+            "status: 503",
+            "429 Too Many Requests",
+            "the model is overloaded",
+            "rate limit exceeded",
+            "request timed out",
+            "stream ended unexpectedly",
+            "connection reset by peer",
+        ] {
+            assert_eq!(classify_error(m), ProviderErrorKind::Transient, "{m}");
+        }
+    }
+
+    #[test]
+    fn digit_run_containing_500_is_not_a_status_code() {
+        // Regression: `contains("500")` used to force a spurious retry on messages
+        // that merely mention a number containing 500.
+        assert_eq!(
+            classify_error("model produced 1500 tokens but the schema was invalid"),
+            ProviderErrorKind::Fatal,
+        );
+        assert_eq!(
+            classify_error("cost was 5008 microcents"),
+            ProviderErrorKind::Fatal,
+        );
+    }
+
+    #[test]
+    fn bare_connection_word_is_not_transient() {
+        // "connection" needs a network qualifier (reset/refused/closed/error/…).
+        assert_eq!(
+            classify_error("the tool returned a database connection handle"),
+            ProviderErrorKind::Fatal,
+        );
+        assert_eq!(
+            classify_error("connection refused"),
+            ProviderErrorKind::Transient,
+        );
+    }
+
+    #[test]
+    fn unknown_errors_are_fatal() {
+        assert_eq!(classify_error("invalid api key"), ProviderErrorKind::Fatal,);
+        assert_eq!(classify_error(""), ProviderErrorKind::Fatal);
     }
 }
 
