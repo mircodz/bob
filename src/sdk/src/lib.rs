@@ -411,10 +411,36 @@ impl Agent {
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// A cheap, `Send + 'static` handle that can interrupt this agent's run from
+    /// another task (e.g. a timeout or a UI cancel button). Cloning the agent's
+    /// cancel flag; calling [`Interrupter::interrupt`] is equivalent to
+    /// [`Agent::interrupt`].
+    pub fn interrupter(&self) -> Interrupter {
+        Interrupter {
+            cancel: self.cancel.clone(),
+        }
+    }
+
     /// Run a closure with mutable access to the underlying core agent, for anything
     /// the SDK doesn't surface (the escape hatch).
     pub async fn with_core<R>(&self, f: impl FnOnce(&mut CoreAgent) -> R) -> R {
         f(&mut *self.inner.lock().await)
+    }
+}
+
+/// A detached handle to interrupt an [`Agent`]'s run from another task. Cheap to
+/// clone and `Send + 'static`, so it can be moved into a timeout task, a signal
+/// handler, or a UI cancel button.
+#[derive(Clone)]
+pub struct Interrupter {
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Interrupter {
+    /// Signal the agent to stop at its next safe point.
+    pub fn interrupt(&self) {
+        self.cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
