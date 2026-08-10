@@ -34,7 +34,7 @@ use bob_core::agent::prompt::build_system_prompt;
 use bob_core::agent::team::AgentRegistry;
 use bob_core::auth::ProviderAuth;
 use bob_core::core::events::EventBus;
-use bob_core::core::permissions::{Asker, Decision, PermissionEngine};
+use bob_core::core::permissions::{Asker, Decision, Mode, PermissionEngine};
 use bob_core::core::store::{MemoryStore, SessionStore};
 use bob_core::providers::create_provider_with_auth;
 use bob_core::tools::jobs::JobRegistry;
@@ -45,7 +45,7 @@ use bob_core::tools::registry::{UserAsker, UserQuery};
 pub mod prelude {
     pub use crate::{Agent, AgentBuilder};
     pub use bob_core::auth::ProviderAuth;
-    pub use bob_core::core::permissions::{Asker, Decision};
+    pub use bob_core::core::permissions::{Asker, Decision, Mode};
     pub use bob_core::core::store::{MemoryStore, SessionStore, SqliteStore};
     pub use bob_types::{ContentBlock, Message, ReasoningEffort, Role};
 }
@@ -82,6 +82,9 @@ pub struct AgentBuilder {
     credential: Option<ProviderAuth>,
     provider: Option<Arc<dyn bob_core::providers::provider::Provider>>,
     store: Option<Arc<dyn SessionStore>>,
+    mode: Option<Mode>,
+    allow_tools: Vec<String>,
+    deny_tools: Vec<String>,
     resume: Resume,
     max_turns: Option<u32>,
 }
@@ -101,6 +104,9 @@ impl Default for AgentBuilder {
             credential: None,
             provider: None,
             store: None,
+            mode: None,
+            allow_tools: Vec::new(),
+            deny_tools: Vec::new(),
             resume: Resume::Fresh,
             max_turns: None,
         }
@@ -150,6 +156,41 @@ impl AgentBuilder {
     pub fn permission_default(mut self, decision: Decision) -> Self {
         self.permission_default = decision;
         self
+    }
+
+    /// The interaction mode: `Normal` (prompt per rules), `AutoAccept` (auto-allow
+    /// edits), or `Plan` (read-only — block all mutating tools). Default `Normal`.
+    pub fn permission_mode(mut self, mode: Mode) -> Self {
+        self.mode = Some(mode);
+        self
+    }
+
+    /// Auto-allow these tools by name (a permission rule). Names match the tool's
+    /// `spec().name` (e.g. `"read_file"`, `"bash"`).
+    pub fn allow_tools<I, S>(mut self, tools: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.allow_tools.extend(tools.into_iter().map(Into::into));
+        self
+    }
+
+    /// Force a prompt (never silently auto-run) for these tools by name — a `Deny`
+    /// rule surfaced to the asker, so the human still gets the final say.
+    pub fn deny_tools<I, S>(mut self, tools: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.deny_tools.extend(tools.into_iter().map(Into::into));
+        self
+    }
+
+    /// Alias for [`asker`]: supply the callback consulted when a tool call needs
+    /// approval. Mirrors Claude's `canUseTool`.
+    pub fn on_permission(self, asker: Arc<dyn Asker>) -> Self {
+        self.asker(asker)
     }
 
     /// Supply a permission asker (interactive approval). Without one, `Ask`/`Deny`
@@ -215,7 +256,20 @@ impl AgentBuilder {
             .store
             .unwrap_or_else(|| Arc::new(MemoryStore::default()));
 
-        let permissions = Arc::new(PermissionEngine::new(self.permission_default, self.asker));
+        // Permission engine: the default decision + asker, plus optional allow/deny
+        // tool rules and an interaction mode. Deny rules are added AFTER allow rules
+        // so a denied tool still forces a prompt even if broadly allowed.
+        let mut engine = PermissionEngine::new(self.permission_default, self.asker);
+        if !self.allow_tools.is_empty() {
+            engine.add(bob_core::core::policies::allow_tools(self.allow_tools));
+        }
+        if !self.deny_tools.is_empty() {
+            engine.add(bob_core::core::policies::deny_tools(self.deny_tools));
+        }
+        if let Some(mode) = self.mode {
+            engine.set_mode(mode);
+        }
+        let permissions = Arc::new(engine);
 
         let cwd_path = std::path::Path::new(&self.cwd);
         let system_prompt = self
