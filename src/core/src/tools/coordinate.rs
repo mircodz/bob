@@ -45,7 +45,8 @@ impl Tool for SpawnAgentTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "spawn_agent".to_string(),
-            description: "Start a named subagent that runs in the background and is part of your \
+            description: format!(
+                "Start a named subagent that runs in the background and is part of your \
                 team. Unlike `task` (fire-and-forget), a spawned agent is addressable: you can \
                 `send_message` to steer it while it works, and it can message you back. \
                 \n\nThe agent does NOT share your context — it starts blank. So the `task` prompt \
@@ -64,14 +65,16 @@ impl Tool for SpawnAgentTool {
                 a separate paragraph per agent as each trickles in. Use `task` instead for simple \
                 independent fan-out you don't need to coordinate with. \
                 \n\nFor read-only investigation/audit work, set `read_only: true` so the agent \
-                gets only read/search tools (no write/edit/bash)."
-                .to_string(),
+                gets only read/search tools (no write/edit/bash).{}",
+                self.deps.env.definitions_help()
+            ),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "name": { "type": "string", "description": "Short handle for the agent (e.g. \"researcher\")." },
                     "description": { "type": "string", "description": "A 3-5 word summary of what this agent does (e.g. \"review src/core\"), shown in the UI. NOT the full task." },
                     "task": { "type": "string", "description": "Complete, self-contained instructions: exact files/scope + the concrete deliverable + demand for specific findings. The agent has none of your context." },
+                    "subagent_type": { "type": "string", "description": "Optional: the name of a predefined agent type to run (see the list in this tool's description). Uses that definition's specialized prompt + tools." },
                     "read_only": { "type": "boolean", "description": "Confine the agent to read-only tools (reads/searches, no write/edit/bash). Use for audits/analysis that must not mutate files (default false)." }
                 },
                 "required": ["name", "task"]
@@ -144,16 +147,21 @@ impl Tool for SpawnAgentTool {
                 prompt: task.clone(),
             });
 
-        // The child gets the same tool set PLUS the coordination tools, so nesting
+        // Resolve the child's system prompt + toolset: a named `subagent_type`
+        // definition (its prompt + tool restriction), else a `read_only` flag, else
+        // the shared defaults. An unknown type is a clear error naming the set.
+        let subagent_type = input["subagent_type"].as_str();
+        let read_only = input["read_only"].as_bool().unwrap_or(false);
+        let (child_system, mut child_tools) = self
+            .deps
+            .env
+            .resolve_child(subagent_type, read_only)
+            .map_err(ToolError::invalid_input)?;
+        // The child gets its resolved tools PLUS the coordination tools, so nesting
         // works: a spawned agent can itself spawn/message/inspect. We add them at
         // spawn time (rather than baking them into subagent_tools up front) to
         // avoid a self-referential cycle — SpawnAgentTool would otherwise need to
         // contain a copy of itself.
-        let mut child_tools = if input["read_only"].as_bool().unwrap_or(false) {
-            self.deps.env.subagent_tools.read_only_subset()
-        } else {
-            self.deps.env.subagent_tools.clone()
-        };
         child_tools.add(Arc::new(SpawnAgentTool {
             deps: self.deps.clone(),
         }));
@@ -169,7 +177,7 @@ impl Tool for SpawnAgentTool {
             provider: self.deps.env.provider.clone(),
             tools: child_tools,
             bus: self.deps.env.bus.clone(),
-            system: self.deps.env.subagent_system.clone(),
+            system: child_system,
             cwd: if self.deps.env.cwd.is_empty() {
                 ctx.cwd.clone()
             } else {

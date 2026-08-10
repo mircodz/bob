@@ -44,6 +44,7 @@ use bob_core::tools::registry::{UserAsker, UserQuery};
 /// `use bob_sdk::prelude::*;` is enough to get going.
 pub mod prelude {
     pub use crate::{Agent, AgentBuilder};
+    pub use bob_core::agent::env::AgentDefinition;
     pub use bob_core::auth::ProviderAuth;
     pub use bob_core::core::permissions::{Asker, Decision, Mode};
     pub use bob_core::core::store::{MemoryStore, SessionStore, SqliteStore};
@@ -85,6 +86,7 @@ pub struct AgentBuilder {
     mode: Option<Mode>,
     allow_tools: Vec<String>,
     deny_tools: Vec<String>,
+    definitions: std::collections::HashMap<String, bob_core::agent::env::AgentDefinition>,
     resume: Resume,
     max_turns: Option<u32>,
 }
@@ -107,6 +109,7 @@ impl Default for AgentBuilder {
             mode: None,
             allow_tools: Vec::new(),
             deny_tools: Vec::new(),
+            definitions: std::collections::HashMap::new(),
             resume: Resume::Fresh,
             max_turns: None,
         }
@@ -191,6 +194,19 @@ impl AgentBuilder {
     /// approval. Mirrors Claude's `canUseTool`.
     pub fn on_permission(self, asker: Arc<dyn Asker>) -> Self {
         self.asker(asker)
+    }
+
+    /// Register a named subagent definition the model can delegate to (Claude's
+    /// `agents` param). The model auto-delegates by matching a task to the
+    /// definition's `description`, or you can name it explicitly in a prompt. The
+    /// spawned child runs with this definition's prompt + tool restriction.
+    pub fn agent(
+        mut self,
+        name: impl Into<String>,
+        def: bob_core::agent::env::AgentDefinition,
+    ) -> Self {
+        self.definitions.insert(name.into(), def);
+        self
     }
 
     /// Supply a permission asker (interactive approval). Without one, `Ask`/`Deny`
@@ -292,6 +308,7 @@ impl AgentBuilder {
             lsp: None,
             user_asker,
             max_turns: self.max_turns,
+            definitions: self.definitions,
         });
 
         // Seed history from the chosen session (if any), reconstructing from the
@@ -464,5 +481,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(agent.run("go").await.unwrap(), "ok");
+    }
+
+    #[tokio::test]
+    async fn agent_definition_is_advertised_to_the_model() {
+        use bob_core::agent::env::AgentDefinition;
+        use bob_core::providers::mock::{MockProvider, MockReply};
+        let provider = MockProvider::new(vec![]).with_default(MockReply::Text("ok".into()));
+        let mut agent = Agent::builder()
+            .provider(Arc::new(provider))
+            .permission_default(Decision::Allow)
+            .agent(
+                "reviewer",
+                AgentDefinition {
+                    description: "reviews code for bugs".into(),
+                    prompt: "you are a code reviewer".into(),
+                    tools: None,
+                    read_only: true,
+                    model: None,
+                },
+            )
+            .build()
+            .await
+            .unwrap();
+        // The definition threads into the agent's tools: the `task`/`spawn_agent`
+        // specs advertise it so the model can delegate by name.
+        let advertised = agent
+            .with_core(|a| {
+                a.tool_specs()
+                    .iter()
+                    .any(|s| s.description.contains("reviews code for bugs"))
+            })
+            .await;
+        assert!(
+            advertised,
+            "the reviewer definition should be advertised in a tool spec"
+        );
     }
 }

@@ -193,6 +193,13 @@ impl Agent {
         &self.full_history
     }
 
+    /// The specs of the tools this agent exposes to the model — its names,
+    /// descriptions, and input schemas. Lets a caller introspect the toolset (e.g.
+    /// verify a registered subagent definition is advertised).
+    pub fn tool_specs(&self) -> Vec<crate::core::types::ToolSpec> {
+        self.cfg.tools.specs()
+    }
+
     pub fn todos(&self) -> Arc<TodoStore> {
         self.todos.clone()
     }

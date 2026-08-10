@@ -365,6 +365,7 @@ pub async fn run(
             lsp: lsp.clone(),
             user_asker: user_asker.clone(),
             max_turns: config.max_turns,
+            definitions: std::collections::HashMap::new(),
         });
 
     // Resume the most recent conversation session (or start fresh), and load

@@ -40,6 +40,9 @@ pub struct RootAgentParams {
     pub user_asker: Arc<dyn UserAsker>,
     /// Turn budget for the root agent; None → the default.
     pub max_turns: Option<u32>,
+    /// Named subagent definitions the model may delegate to (SDK `.agent(...)`).
+    /// Empty for the frontends, which don't register custom types.
+    pub definitions: std::collections::HashMap<String, crate::agent::env::AgentDefinition>,
 }
 
 /// Build the shared subagent tool registry: builtins + MCP + LSP tools + the
@@ -104,6 +107,7 @@ pub fn build_root_agent(p: RootAgentParams) -> Agent {
         jobs: p.jobs.clone(),
         lsp: p.lsp.clone(),
         parent_cancel: cancel.clone(),
+        definitions: p.definitions.clone(),
     };
     tools.add(Arc::new(TaskTool { env: env.clone() }));
     // The `workflow` tool: the model composes a parameterized fan_out/map_reduce

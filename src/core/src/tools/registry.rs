@@ -239,6 +239,22 @@ impl ToolRegistry {
         out
     }
 
+    /// A registry containing only the tools whose names appear in `names` — used to
+    /// confine a named subagent definition to an explicit tool allow-list. Names
+    /// that match no registered tool are silently skipped (a caller's allow-list
+    /// may reference tools this build doesn't have).
+    pub fn subset(&self, names: &[String]) -> ToolRegistry {
+        let mut out = ToolRegistry::new(self.permissions.clone());
+        for name in &self.order {
+            if names.iter().any(|n| n == name) {
+                if let Some(t) = self.tools.get(name) {
+                    out.add(t.clone());
+                }
+            }
+        }
+        out
+    }
+
     pub fn specs(&self) -> Vec<ToolSpec> {
         self.order
             .iter()

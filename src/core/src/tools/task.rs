@@ -31,21 +31,24 @@ pub struct TaskTool {
 
 impl TaskTool {
     /// Build a subagent for one task and return the future that runs it.
-    /// `read_only` confines the child to the read-only tool subset (no
-    /// write/edit/bash) — for audit/analysis delegation that must not mutate.
-    fn make_child(&self, id: String, cwd: String, read_only: bool) -> Agent {
+    /// `subagent_type` selects a named definition (its prompt + tools); `read_only`
+    /// otherwise confines the child to the read-only tool subset. Returns an error
+    /// if `subagent_type` names an unknown definition.
+    fn make_child(
+        &self,
+        id: String,
+        cwd: String,
+        subagent_type: Option<&str>,
+        read_only: bool,
+    ) -> Result<Agent, String> {
         // The simple `task` tool stays fire-and-forget: its children are not team
         // members (no inbox/registry). Coordinated agents come from `spawn_agent`.
-        let tools = if read_only {
-            self.env.subagent_tools.read_only_subset()
-        } else {
-            self.env.subagent_tools.clone()
-        };
-        build_subagent(SubagentSpec {
+        let (system, tools) = self.env.resolve_child(subagent_type, read_only)?;
+        Ok(build_subagent(SubagentSpec {
             provider: self.env.provider.clone(),
             tools,
             bus: self.env.bus.clone(),
-            system: self.env.subagent_system.clone(),
+            system,
             cwd,
             jobs: self.env.jobs.clone(),
             lsp: self.env.lsp.clone(),
@@ -55,7 +58,7 @@ impl TaskTool {
             inbox: None,
             team: None,
             parent_cancel: Some(self.env.parent_cancel.clone()),
-        })
+        }))
     }
 }
 
@@ -64,7 +67,7 @@ impl Tool for TaskTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "task".to_string(),
-            description:
+            description: format!(
                 "Delegate one or more independent sub-tasks to fresh subagents, each with \
                 its own isolated context and tools. By default they run inline and this returns \
                 every subagent's final result. Set `background: true` to detach them as background \
@@ -78,8 +81,9 @@ impl Tool for TaskTool {
                 prompt, so give it exact scope, the concrete deliverable, and the specific findings \
                 to report back — then verify its result rather than trusting it blindly. \
                 For read/analysis/audit work that must not modify anything, set \
-                `read_only: true` so the subagent gets only read/search tools (no write/edit/bash)."
-                    .to_string(),
+                `read_only: true` so the subagent gets only read/search tools (no write/edit/bash).{}",
+                self.env.definitions_help()
+            ),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -89,7 +93,8 @@ impl Tool for TaskTool {
                             "type": "object",
                             "properties": {
                                 "description": { "type": "string", "description": "A 3-5 word label for the sub-task (e.g. \"review src/core\"), shown in the UI. NOT the full instructions." },
-                                "prompt": { "type": "string", "description": "Full instructions for the subagent." }
+                                "prompt": { "type": "string", "description": "Full instructions for the subagent." },
+                                "subagent_type": { "type": "string", "description": "Optional: name of a predefined agent type to run this sub-task as (see the list in this tool's description). Uses that definition's prompt + tools." }
                             },
                             "required": ["description", "prompt"]
                         }
@@ -122,7 +127,14 @@ impl Tool for TaskTool {
                 let description = t["description"].as_str().unwrap_or("").to_string();
                 let prompt = t["prompt"].as_str().unwrap_or("").to_string();
                 let job_id = ctx.jobs.next_id();
-                let child = self.make_child(job_id.clone(), base_cwd.clone(), read_only);
+                let child = self
+                    .make_child(
+                        job_id.clone(),
+                        base_cwd.clone(),
+                        t["subagent_type"].as_str(),
+                        read_only,
+                    )
+                    .map_err(ToolError::invalid_input)?;
                 let jobs = ctx.jobs.clone();
                 let jid = job_id.clone();
                 let handle = tokio::spawn(async move {
@@ -157,7 +169,14 @@ impl Tool for TaskTool {
                     task: description.clone(),
                     prompt: prompt.clone(),
                 });
-            let child = self.make_child(id.clone(), base_cwd.clone(), read_only);
+            let child = self
+                .make_child(
+                    id.clone(),
+                    base_cwd.clone(),
+                    t["subagent_type"].as_str(),
+                    read_only,
+                )
+                .map_err(ToolError::invalid_input)?;
             let bus = self.env.bus.clone();
             handles.push(tokio::spawn(async move {
                 let mut child = child;
