@@ -985,8 +985,20 @@ pub async fn run(
             }
             Some(q) = query_rx.recv() => {
                 dirty = true;
+                // exit_plan carries the full plan as Markdown. The approval modal is a
+                // fixed, non-scrollable band, so render the WHOLE plan into the
+                // scrollable transcript (full markdown) and keep the modal to the
+                // decision — otherwise a long plan would push the Yes/No options
+                // off-screen. ask_user's shorter detail still shows inline in the modal.
+                let mut query = q.query;
+                if query.title == "Ready to code?" && !query.detail.is_empty() {
+                    app.view.push_plan(std::mem::take(&mut query.detail));
+                    if app.scrollback.at_bottom() {
+                        app.stick_to_bottom();
+                    }
+                }
                 app.pending_query = Some(PendingQuery {
-                    query: q.query,
+                    query,
                     list: widgets::SelectList::new(),
                     other_text: None,
                     purpose: QueryPurpose::Tool(q.resp),

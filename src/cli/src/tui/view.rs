@@ -57,6 +57,10 @@ pub enum Cell {
     },
     /// A generic dim notice (startup notices, errors).
     Notice(String),
+    /// A proposed plan (from `exit_plan`), rendered as full Markdown in the
+    /// transcript so the user can read and scroll the whole thing before the
+    /// approval modal asks them to accept or refine it.
+    Plan(String),
     /// A system event surfaced inline as a bulleted line (model/mode switches),
     /// e.g. "• Model changed to gpt-5.5 medium".
     Event(String),
@@ -186,7 +190,7 @@ impl Cell {
                 after.hash(&mut h);
                 done.hash(&mut h);
             }
-            Cell::Notice(t) | Cell::Event(t) => t.hash(&mut h),
+            Cell::Notice(t) | Cell::Event(t) | Cell::Plan(t) => t.hash(&mut h),
             Cell::AgentMsg { from, text } => {
                 from.hash(&mut h);
                 text.hash(&mut h);
@@ -417,6 +421,12 @@ impl ViewModel {
 
     pub fn push_notice(&mut self, text: String) {
         self.cells.push(Cell::Notice(text));
+        self.revision += 1;
+    }
+
+    /// Push a proposed plan (rendered as full Markdown) into the transcript.
+    pub fn push_plan(&mut self, plan: String) {
+        self.cells.push(Cell::Plan(plan));
         self.revision += 1;
     }
 

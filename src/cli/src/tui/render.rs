@@ -246,6 +246,21 @@ pub fn render_cell(cell: &Cell, width: usize, out: &mut Vec<Line<'static>>) {
                 Style::default().fg(color),
             )));
         }
+        Cell::Plan(text) => {
+            // A proposed plan: a labeled header, then the full plan as Markdown so
+            // the user can read/scroll all of it before approving in the modal.
+            out.push(Line::from(Span::styled(
+                "  ▏plan proposed",
+                Style::default()
+                    .fg(Palette::ACCENT())
+                    .add_modifier(Modifier::BOLD),
+            )));
+            out.push(Line::from(""));
+            for l in render_markdown(text) {
+                out.push(l);
+            }
+            out.push(Line::from(""));
+        }
         Cell::Event(text) => {
             out.push(Line::from(vec![
                 Span::styled("• ", Style::default().fg(Palette::ACCENT())),
