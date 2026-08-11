@@ -31,6 +31,12 @@ pub struct Analysis {
     /// dynamic enough that the caller should be cautious (a command name that is
     /// itself an expansion, an eval, etc.). Reserved for future refinement.
     pub has_dynamic: bool,
+    /// True if any command writes to a file via an output/append redirection
+    /// (`> f`, `>> f`, `&> f`, `>| f`, `<> f`, `>&`). The command *name* can be
+    /// harmless and allowlisted (`echo payload > .zshrc`) while the redirection
+    /// is the real mutation — so a redirecting command must never auto-allow.
+    /// Input redirections (`< f`, here-docs, here-strings) do not set this.
+    pub has_output_redirect: bool,
 }
 
 /// Shell interpreters that, when a pipe feeds into them, mean "run piped input as
@@ -107,13 +113,89 @@ fn walk_pipeline(p: &ast::Pipeline, a: &mut Analysis, depth: usize) -> Option<()
 fn walk_command(cmd: &ast::Command, a: &mut Analysis, depth: usize) -> Option<()> {
     match cmd {
         ast::Command::Simple(sc) => walk_simple(sc, a, depth),
-        ast::Command::Compound(cc, _redirects) => walk_compound(cc, a, depth),
+        ast::Command::Compound(cc, redirects) => {
+            walk_compound(cc, a, depth)?;
+            walk_redirect_list(redirects.as_ref(), a, depth)
+        }
         // A function DEFINITION doesn't run its body now, but we still walk it so an
         // allowlist can't be fooled by hiding `rm` in a function some later command
         // calls. `FunctionBody(CompoundCommand, …)`.
         ast::Command::Function(f) => walk_compound(&f.body.0, a, depth),
-        ast::Command::ExtendedTest(_, _) => Some(()), // `[[ … ]]`: no command execution
+        // `[[ … ]]` runs no simple command itself, but a command substitution inside
+        // it IS executed (`[[ -n $(rm x) ]]`). Walk the expression's words so those
+        // hidden commands are surfaced, and any trailing redirections.
+        ast::Command::ExtendedTest(e, redirects) => {
+            walk_extended_test(&e.expr, a, depth)?;
+            walk_redirect_list(redirects.as_ref(), a, depth)
+        }
     }
+}
+
+/// Walk an extended-test expression, running every word through [`walk_word`] so a
+/// command substitution hidden in `[[ … ]]` lands in `a.commands` like any other.
+fn walk_extended_test(e: &ast::ExtendedTestExpr, a: &mut Analysis, depth: usize) -> Option<()> {
+    match e {
+        ast::ExtendedTestExpr::And(l, r) | ast::ExtendedTestExpr::Or(l, r) => {
+            walk_extended_test(l, a, depth)?;
+            walk_extended_test(r, a, depth)
+        }
+        ast::ExtendedTestExpr::Not(inner) | ast::ExtendedTestExpr::Parenthesized(inner) => {
+            walk_extended_test(inner, a, depth)
+        }
+        ast::ExtendedTestExpr::UnaryTest(_, w) => walk_word(&w.value, a, depth),
+        ast::ExtendedTestExpr::BinaryTest(_, l, r) => {
+            walk_word(&l.value, a, depth)?;
+            walk_word(&r.value, a, depth)
+        }
+    }
+}
+
+/// Walk a compound-level redirect list (redirections attached to a subshell, brace
+/// group, `[[ … ]]`, etc.), recording output redirections and any substitutions in
+/// their targets.
+fn walk_redirect_list(
+    redirects: Option<&ast::RedirectList>,
+    a: &mut Analysis,
+    depth: usize,
+) -> Option<()> {
+    if let Some(list) = redirects {
+        for r in &list.0 {
+            note_redirect(r, a, depth)?;
+        }
+    }
+    Some(())
+}
+
+/// Inspect one I/O redirection: flag output/append forms (the real mutation in
+/// `echo x > f`), and walk substitutions in the target so `> $(f)` / `> >(cmd)`
+/// still surface their commands. Input-only forms don't flag but are still walked.
+fn note_redirect(r: &ast::IoRedirect, a: &mut Analysis, depth: usize) -> Option<()> {
+    match r {
+        ast::IoRedirect::File(_, kind, target) => {
+            use ast::IoFileRedirectKind::*;
+            if matches!(
+                kind,
+                Write | Append | Clobber | ReadAndWrite | DuplicateOutput
+            ) {
+                a.has_output_redirect = true;
+            }
+            match target {
+                ast::IoFileRedirectTarget::Filename(w)
+                | ast::IoFileRedirectTarget::Duplicate(w) => walk_word(&w.value, a, depth)?,
+                ast::IoFileRedirectTarget::ProcessSubstitution(_, sub) => {
+                    walk_compound_list(&sub.list, a, depth)?
+                }
+                ast::IoFileRedirectTarget::Fd(_) => {}
+            }
+        }
+        ast::IoRedirect::OutputAndError(w, _) => {
+            a.has_output_redirect = true;
+            walk_word(&w.value, a, depth)?;
+        }
+        ast::IoRedirect::HereString(_, w) => walk_word(&w.value, a, depth)?,
+        ast::IoRedirect::HereDocument(_, _) => {}
+    }
+    Some(())
 }
 
 fn walk_compound(cc: &ast::CompoundCommand, a: &mut Analysis, depth: usize) -> Option<()> {
@@ -200,7 +282,7 @@ fn walk_prefix_suffix_item(
             // `<( … )` / `>( … )` runs its own command list.
             walk_compound_list(&sub.list, a, depth)?;
         }
-        ast::CommandPrefixOrSuffixItem::IoRedirect(_) => {}
+        ast::CommandPrefixOrSuffixItem::IoRedirect(r) => note_redirect(r, a, depth)?,
     }
     Some(())
 }
@@ -319,5 +401,41 @@ mod tests {
         // Unterminated substitution / quote → None, so the caller won't auto-allow.
         assert!(analyze("echo $(").is_none());
         assert!(analyze("echo 'unterminated").is_none());
+    }
+
+    #[test]
+    fn output_redirections_are_flagged() {
+        // The mutation lives in the redirection, not the (harmless) command name.
+        for cmd in ["echo x > f", "echo x >> f", "echo x >| f", "cat a &> b"] {
+            assert!(
+                analyze(cmd).unwrap().has_output_redirect,
+                "should flag output redirect: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn input_redirections_are_not_flagged() {
+        for cmd in ["cat < in", "grep x <<< 'here'"] {
+            assert!(
+                !analyze(cmd).unwrap().has_output_redirect,
+                "input redirect must not flag: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn substitution_in_redirect_target_is_surfaced() {
+        assert!(names("echo x > $(dangerous)").contains(&"dangerous".to_string()));
+        assert!(names("echo x > >(rm y)").contains(&"rm".to_string()));
+    }
+
+    #[test]
+    fn extended_test_substitutions_are_surfaced() {
+        // The `[[ … ]]` bypass: a command substitution inside an extended test IS
+        // executed and must be surfaced so the allowlist can't be fooled.
+        assert!(names("ls && [[ -n $(rm x) ]]").contains(&"rm".to_string()));
+        assert!(names("[[ $(whoami) = root ]]").contains(&"whoami".to_string()));
+        assert!(names("[[ `id -u` -eq 0 ]]").contains(&"id".to_string()));
     }
 }

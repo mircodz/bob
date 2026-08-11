@@ -466,6 +466,10 @@ pub struct ParsedCommand {
     pub commands: Vec<Vec<String>>,
     /// True if a pipe feeds into a shell interpreter (`curl … | sh`).
     pub pipes_to_shell: bool,
+    /// True if any command writes via an output/append redirection (`> f`, `>> f`,
+    /// `&> f`). The command name may be allowlisted while the redirection is the
+    /// real mutation, so a redirecting command must never auto-allow.
+    pub has_output_redirect: bool,
     /// Whether the command parsed cleanly. False when the input is malformed or
     /// uses a construct we don't model — the classifier then refuses to auto-allow
     /// (fail closed) and prompts the user.
@@ -501,6 +505,7 @@ pub fn parse_bash(raw: &str) -> ParsedCommand {
         Some(analysis) => ParsedCommand {
             commands: analysis.commands,
             pipes_to_shell: analysis.pipes_to_shell,
+            has_output_redirect: analysis.has_output_redirect,
             // A construct we couldn't fully model (arithmetic-eval, coprocess, …)
             // is treated as un-analyzable so it can't slip through an allowlist.
             analyzable: !analysis.has_dynamic,
@@ -509,6 +514,7 @@ pub fn parse_bash(raw: &str) -> ParsedCommand {
         None => ParsedCommand {
             commands: Vec::new(),
             pipes_to_shell: false,
+            has_output_redirect: false,
             analyzable: false,
             raw: raw.to_string(),
         },

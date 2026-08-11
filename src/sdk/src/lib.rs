@@ -312,14 +312,15 @@ impl AgentBuilder {
             .unwrap_or_else(|| Arc::new(MemoryStore::default()));
 
         // Permission engine: the default decision + asker, plus optional allow/deny
-        // tool rules and an interaction mode. Deny rules are added AFTER allow rules
-        // so a denied tool still forces a prompt even if broadly allowed.
+        // tool rules and an interaction mode. The engine is first-match-wins, so deny
+        // rules are registered BEFORE allow rules — a denied tool wins even if it is
+        // also broadly allowed (`allow_tools(["bash"]).deny_tools(["bash"])` denies).
         let mut engine = PermissionEngine::new(self.permission_default, self.asker);
-        if !self.allow_tools.is_empty() {
-            engine.add(bob_core::core::policies::allow_tools(self.allow_tools));
-        }
         if !self.deny_tools.is_empty() {
             engine.add(bob_core::core::policies::deny_tools(self.deny_tools));
+        }
+        if !self.allow_tools.is_empty() {
+            engine.add(bob_core::core::policies::allow_tools(self.allow_tools));
         }
         if let Some(mode) = self.mode {
             engine.set_mode(mode);
@@ -548,6 +549,56 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(agent.run("go").await.unwrap(), "ok");
+    }
+
+    #[tokio::test]
+    async fn deny_tools_beats_allow_tools() {
+        use bob_core::providers::mock::{MockProvider, MockReply, MockRule};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // An asker that records it was consulted and always declines. The engine
+        // only consults the asker when the decision is Deny/Ask — so if `allow_tools`
+        // had won (Allow), the asker would never be called and bash would run.
+        struct RecordingAsker(Arc<AtomicBool>);
+        #[async_trait::async_trait]
+        impl Asker for RecordingAsker {
+            async fn ask(
+                &self,
+                _req: &bob_core::core::permissions::PermissionRequest,
+                _options: &[bob_core::core::permissions::PermissionOption],
+            ) -> Option<usize> {
+                self.0.store(true, Ordering::SeqCst);
+                None // decline
+            }
+        }
+
+        let asked = Arc::new(AtomicBool::new(false));
+        // First turn (prompt contains "go") calls bash; the tool result won't match
+        // the rule, so the default text reply ends the run.
+        let provider = MockProvider::new(vec![MockRule {
+            needle: "go".into(),
+            reply: MockReply::ToolCall {
+                name: "bash".into(),
+                input: serde_json::json!({ "command": "echo hi" }),
+            },
+        }])
+        .with_default(MockReply::Text("done".into()));
+
+        let mut agent = Agent::builder()
+            .provider(Arc::new(provider))
+            .permission_default(Decision::Allow)
+            .allow_tools(["bash"])
+            .deny_tools(["bash"])
+            .on_permission(Arc::new(RecordingAsker(asked.clone())))
+            .build()
+            .await
+            .unwrap();
+
+        let _ = agent.run("go run bash").await.unwrap();
+        assert!(
+            asked.load(Ordering::SeqCst),
+            "deny_tools must win: the engine should have prompted, not silently allowed"
+        );
     }
 
     #[tokio::test]

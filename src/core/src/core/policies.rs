@@ -220,6 +220,54 @@ fn base_name(cmd: &str) -> &str {
     cmd.rsplit('/').next().unwrap_or(cmd)
 }
 
+/// Git subcommands that only read repository state — safe to auto-allow.
+const GIT_READ_ONLY_SUBCOMMANDS: &[&str] = &[
+    "status",
+    "diff",
+    "show",
+    "log",
+    "branch",
+    "tag",
+    "describe",
+    "rev-parse",
+    "ls-files",
+    "ls-remote",
+    "cat-file",
+    "blame",
+    "shortlog",
+    "remote",
+    "reflog",
+    "whatchanged",
+    "grep",
+];
+
+/// Whether a `git` invocation (args after `git`) is a read-only subcommand with no
+/// execution-injecting global flags. `git` can run arbitrary code via globals like
+/// `-c core.pager=cmd` / `-c alias.x=!sh`, `-C`, `--exec-path`, `--upload-pack`, or
+/// mutating subcommands (`push`, `reset`, `commit`), so anything not explicitly
+/// recognized here falls through to a prompt.
+fn git_is_read_only(args: &[String]) -> bool {
+    let mut i = 0;
+    // Skip only a conservative set of harmless global flags. Any `-c`/`-C`/exec-path
+    // style flag, or an unknown flag, is not auto-approvable.
+    while let Some(arg) = args.get(i) {
+        if arg == "--no-pager" || arg == "--paginate" || arg == "--no-optional-locks" {
+            i += 1;
+            continue;
+        }
+        if arg.starts_with('-') {
+            // Includes `-c`, `-C`, `--exec-path`, `--git-dir`, `--work-tree`,
+            // `--namespace`, `--upload-pack`, and any unrecognized flag.
+            return false;
+        }
+        break;
+    }
+    match args.get(i) {
+        Some(sub) => GIT_READ_ONLY_SUBCOMMANDS.contains(&sub.as_str()),
+        None => false,
+    }
+}
+
 /// Allow a curated allowlist of harmless shell commands without asking. Refuses to
 /// auto-allow anything containing un-analyzable shell metacharacters (command
 /// substitution, subshells, newlines) or any interpreter/exec-wrapper — those
@@ -236,16 +284,30 @@ pub fn allow_bash_commands(names: Vec<String>) -> Rule {
         if !bash.analyzable || bash.commands.is_empty() {
             return None;
         }
+        // An output/append redirection (`echo x > .zshrc`) is a file mutation the
+        // harmless command name hides. Never auto-allow a redirecting command.
+        if bash.has_output_redirect {
+            return None;
+        }
         // Every command that would run (including ones the AST surfaced from inside
         // `$( … )`, subshells, and pipes) must be an allowlisted, non-interpreter
         // command — otherwise a dangerous one could hide in a substitution.
         let all_safe = bash.commands.iter().all(|argv| {
-            argv.first()
-                .map(|c| {
-                    let name = base_name(c);
-                    set.contains(name) && !NEVER_AUTO_ALLOW.contains(&name)
-                })
-                .unwrap_or(false)
+            let name = match argv.first() {
+                Some(c) => base_name(c),
+                None => return false,
+            };
+            if NEVER_AUTO_ALLOW.contains(&name) || !set.contains(name) {
+                return false;
+            }
+            // `git` is on the allowlist but is arbitrary code execution in general
+            // (`git -c core.pager=cmd log`, `!`-aliases, hooks, `push`, `reset`).
+            // Only auto-allow explicitly read-only subcommands with no exec-injecting
+            // global flags; everything else falls through to a prompt.
+            if name == "git" {
+                return git_is_read_only(&argv[1..]);
+            }
+            true
         });
         if all_safe {
             Some(Decision::Allow)
@@ -371,6 +433,55 @@ mod tests {
         assert_eq!(rule(&bash_req("python -c 'import os'")), None);
         assert_eq!(rule(&bash_req("find . -exec rm {} +")), None);
         assert_eq!(rule(&bash_req("env rm -rf /")), None);
+    }
+
+    #[test]
+    fn output_redirection_never_auto_allows() {
+        let rule = allow_bash_commands(vec!["echo".into(), "cat".into()]);
+        // The command name is allowlisted, but the redirection is a file write.
+        for cmd in [
+            "echo payload > .zshrc",
+            "echo x >> f",
+            "cat a &> b",
+            "echo x >| f",
+        ] {
+            assert_eq!(rule(&bash_req(cmd)), None, "must prompt on redirect: {cmd}");
+        }
+        // Input redirection is fine to auto-allow.
+        assert_eq!(rule(&bash_req("cat < in.txt")), Some(Decision::Allow));
+        assert_eq!(rule(&bash_req("echo hi")), Some(Decision::Allow));
+    }
+
+    #[test]
+    fn git_only_auto_allows_read_only_subcommands() {
+        let rule = allow_bash_commands(vec!["git".into(), "ls".into()]);
+        // Read-only subcommands are auto-allowed.
+        for cmd in [
+            "git status",
+            "git log --oneline",
+            "git diff HEAD",
+            "git show",
+            "git rev-parse HEAD",
+        ] {
+            assert_eq!(
+                rule(&bash_req(cmd)),
+                Some(Decision::Allow),
+                "should allow: {cmd}"
+            );
+        }
+        // Mutating / arbitrary-exec forms fall through to a prompt.
+        for cmd in [
+            "git commit -m x",
+            "git add .",
+            "git push",
+            "git reset --hard",
+            "git clean -fd",
+            "git -c core.pager=touch\\ pwned log",
+            "git -C /etc status",
+            "git foobar",
+        ] {
+            assert_eq!(rule(&bash_req(cmd)), None, "should prompt: {cmd}");
+        }
     }
 
     #[test]
