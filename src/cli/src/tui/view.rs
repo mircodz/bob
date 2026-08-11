@@ -15,7 +15,7 @@ fn unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ToolStatus {
     Running,
     Ok,
@@ -406,14 +406,34 @@ impl ViewModel {
     }
 
     /// Settle transient state after replaying a session's event log on resume.
-    /// Replay reruns the live reducers, which may leave `busy` true or a workflow
-    /// still "active" (its terminating event isn't always in the log). A resumed
-    /// session is idle, and any workflow that was mid-run is treated as finished.
+    /// Replay reruns the live reducers, but a session killed mid-run may have a
+    /// `SubagentSpawn`/`ToolCall`/`WorkflowPhase` with no matching terminating event
+    /// in the log — leaving cells stuck rendering as "running" forever. A resumed
+    /// session is idle: clear `busy` and finalize every straggler to a terminal state
+    /// (interrupted work reads as finished, not failed).
     pub fn reset_after_replay(&mut self) {
         self.busy = false;
-        if let Some(id) = self.active_workflow.take() {
-            if let Some(Cell::Workflow { done, .. }) = self.find_workflow(&id) {
-                *done = true;
+        self.active_workflow = None;
+        for cell in &mut self.cells {
+            match cell {
+                Cell::Subagent { done, .. } => *done = true,
+                Cell::Tool { status, output, .. } if *status == ToolStatus::Running => {
+                    *status = ToolStatus::Ok;
+                    if output.is_none() {
+                        *output = Some("(interrupted)".to_string());
+                    }
+                }
+                Cell::Workflow { done, phases, .. } => {
+                    *done = true;
+                    for phase in phases {
+                        for agent in &mut phase.agents {
+                            if agent.status == WfStatus::Running {
+                                agent.status = WfStatus::Done;
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         self.revision += 1;
@@ -1239,5 +1259,46 @@ mod workflow_view_tests {
             .cells
             .iter()
             .any(|c| matches!(c, Cell::Tool { name, .. } if name == "workflow")));
+    }
+
+    #[test]
+    fn reset_after_replay_finalizes_running_stragglers() {
+        // A session killed mid-run leaves spawn/tool/workflow events with no matching
+        // terminating event. After replay, reset_after_replay must finalize them all
+        // so nothing renders as stuck "running".
+        let mut vm = ViewModel::new();
+        // A standalone subagent that never got its SubagentDone.
+        vm.apply(&spawn("root", "task_1", "do work"));
+        // A tool call with no ToolResult.
+        vm.apply(&AgentEvent::ToolCall {
+            agent_id: "root".into(),
+            tool_use_id: "tu1".into(),
+            name: "bash".into(),
+            input: serde_json::json!({ "command": "sleep 999" }),
+        });
+        // A workflow whose agent never finished.
+        vm.apply(&phase("wf-x", "Round 1", 0, 1));
+        vm.apply(&spawn("wf-x", "wf-x.1-a", "find"));
+
+        vm.reset_after_replay();
+
+        for cell in &vm.cells {
+            match cell {
+                Cell::Subagent { done, .. } => assert!(*done, "subagent left running"),
+                Cell::Tool { status, .. } => {
+                    assert_ne!(*status, ToolStatus::Running, "tool left running")
+                }
+                Cell::Workflow { done, phases, .. } => {
+                    assert!(*done, "workflow left running");
+                    for p in phases {
+                        for a in &p.agents {
+                            assert_ne!(a.status, WfStatus::Running, "wf agent left running");
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(!vm.busy, "busy must be cleared on resume");
     }
 }
