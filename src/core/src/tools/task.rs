@@ -161,14 +161,11 @@ impl Tool for TaskTool {
             let description = t["description"].as_str().unwrap_or("").to_string();
             let prompt = t["prompt"].as_str().unwrap_or("").to_string();
             let id = next_subagent_id();
-            self.env
-                .bus
-                .emit(crate::core::events::AgentEvent::SubagentSpawn {
-                    parent_id: ROOT_AGENT_ID.to_string(),
-                    agent_id: id.clone(),
-                    task: description.clone(),
-                    prompt: prompt.clone(),
-                });
+            // Build the child FIRST — `make_child` is fallible (e.g. an unknown
+            // `subagent_type`). Announcing the spawn before this could leave a
+            // phantom "running" agent in the roster with no matching SubagentDone
+            // if `?` returned early. Announce only once the child is guaranteed to
+            // run.
             let child = self
                 .make_child(
                     id.clone(),
@@ -177,6 +174,14 @@ impl Tool for TaskTool {
                     read_only,
                 )
                 .map_err(ToolError::invalid_input)?;
+            self.env
+                .bus
+                .emit(crate::core::events::AgentEvent::SubagentSpawn {
+                    parent_id: ROOT_AGENT_ID.to_string(),
+                    agent_id: id.clone(),
+                    task: description.clone(),
+                    prompt: prompt.clone(),
+                });
             let bus = self.env.bus.clone();
             handles.push(tokio::spawn(async move {
                 let mut child = child;
@@ -308,8 +313,14 @@ impl Tool for ExploreTool {
 
 #[cfg(test)]
 mod tests {
-    use super::next_subagent_id;
+    use super::*;
+    use crate::agent::env::AgentEnv;
+    use crate::core::events::{AgentEvent, EventBus};
+    use crate::providers::mock::MockProvider;
+    use crate::tools::file_tracker::FileTracker;
+    use crate::tools::todo::TodoStore;
     use std::collections::HashSet;
+    use std::sync::{Arc, Mutex};
 
     // Regression: subagent ids used to be `task_{i+1}` numbered per-batch, so a
     // second `task` call reused `task_1..` and the team drawer (which keys threads
@@ -323,5 +334,67 @@ mod tests {
             let id = next_subagent_id();
             assert!(seen.insert(id.clone()), "duplicate subagent id: {id}");
         }
+    }
+
+    fn task_tool_with(bus: EventBus) -> TaskTool {
+        TaskTool {
+            env: AgentEnv {
+                provider: Arc::new(MockProvider::new(vec![])),
+                subagent_tools: crate::tools::registry::ToolRegistry::new(None),
+                bus,
+                cwd: ".".to_string(),
+                subagent_system: Some("sys".to_string()),
+                jobs: crate::tools::jobs::JobRegistry::new(),
+                lsp: None,
+                parent_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                definitions: std::collections::HashMap::new(),
+            },
+        }
+    }
+
+    fn ctx() -> ToolContext {
+        ToolContext {
+            cwd: ".".to_string(),
+            files: Arc::new(FileTracker::new()),
+            todos: Arc::new(TodoStore::new()),
+            jobs: crate::tools::jobs::JobRegistry::new(),
+            user_asker: None,
+            lsp: None,
+            coord: None,
+            permissions: None,
+        }
+    }
+
+    // Regression: `SubagentSpawn` was emitted BEFORE the fallible `make_child`, so
+    // an unknown `subagent_type` announced a phantom agent to the roster that never
+    // ran and never got a `SubagentDone` — leaving it stuck "running" forever with
+    // no tool calls or output. A failed spawn must emit NO SubagentSpawn.
+    #[tokio::test]
+    async fn unknown_subagent_type_emits_no_phantom_spawn() {
+        let bus = EventBus::new();
+        let spawns = Arc::new(Mutex::new(0usize));
+        {
+            let spawns = spawns.clone();
+            bus.on(Arc::new(move |e: &AgentEvent| {
+                if matches!(e, AgentEvent::SubagentSpawn { .. }) {
+                    *spawns.lock().unwrap() += 1;
+                }
+            }));
+        }
+        let tool = task_tool_with(bus);
+        let input = json!({
+            "tasks": [{
+                "description": "x",
+                "prompt": "do x",
+                "subagent_type": "does-not-exist"
+            }]
+        });
+        // The call fails (unknown type) — and crucially announced nothing.
+        assert!(tool.execute(input, &ctx()).await.is_err());
+        assert_eq!(
+            *spawns.lock().unwrap(),
+            0,
+            "a failed spawn must not announce a phantom agent"
+        );
     }
 }
