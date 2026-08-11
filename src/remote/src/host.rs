@@ -362,6 +362,7 @@ pub async fn run(
             cwd: cwd.to_string_lossy().to_string(),
             system_prompt: system_prompt.clone(),
             mcp_tools: mcp_tools.clone(),
+            extra_tools: Vec::new(),
             lsp: lsp.clone(),
             user_asker: user_asker.clone(),
             max_turns: config.max_turns,

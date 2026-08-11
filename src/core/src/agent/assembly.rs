@@ -34,6 +34,10 @@ pub struct RootAgentParams {
     pub system_prompt: String,
     /// Configured MCP tools (already connected), namespaced `<server>.<tool>`.
     pub mcp_tools: Vec<Arc<dyn Tool>>,
+    /// Caller-supplied custom tools (SDK `.tool(...)`). Merged into the root +
+    /// subagent registries alongside the builtins and MCP tools. Empty for the
+    /// frontends, which don't register custom tools.
+    pub extra_tools: Vec<Arc<dyn Tool>>,
     /// Shared language servers, or None if none are configured.
     pub lsp: Option<Arc<LspManager>>,
     /// UI hook for ask_user / exit_plan.
@@ -57,6 +61,9 @@ fn build_subagent_tools(p: &RootAgentParams) -> ToolRegistry {
         tools.add(t);
     }
     for t in &p.mcp_tools {
+        tools.add(t.clone());
+    }
+    for t in &p.extra_tools {
         tools.add(t.clone());
     }
     if let Some(lsp) = &p.lsp {
@@ -91,6 +98,9 @@ pub fn build_root_agent(p: RootAgentParams) -> Agent {
         tools.add(t);
     }
     for t in &p.mcp_tools {
+        tools.add(t.clone());
+    }
+    for t in &p.extra_tools {
         tools.add(t.clone());
     }
     if let Some(lsp) = &p.lsp {

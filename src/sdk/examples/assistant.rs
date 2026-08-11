@@ -1,12 +1,14 @@
 //! A fuller tour of the bob-sdk surface — everything the `minimal` example leaves
 //! out. It builds a configured agent, registers a specialized subagent the model
-//! can delegate to, STREAMS the first turn (rendering events as they arrive),
-//! shows how to interrupt a run, and then takes a SECOND turn on the same agent to
-//! demonstrate multi-turn conversation state.
+//! can delegate to, installs tool-call HOOKS (a guardrail + an audit log), STREAMS
+//! the first turn (rendering events as they arrive), shows how to interrupt a run,
+//! and then takes a SECOND turn on the same agent to demonstrate multi-turn state.
 //!
 //! Run with: `ANTHROPIC_API_KEY=sk-... cargo run -p bob-sdk --example assistant`
 
 use bob_sdk::{prelude::*, AgentEvent};
+use serde_json::Value;
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -37,10 +39,18 @@ async fn main() -> anyhow::Result<()> {
                 model: None,
             },
         )
+        // 3. Install tool-call hooks. Hooks run INLINE in the tool-dispatch path,
+        //    so unlike event listeners they can change what happens:
+        //    - a PreToolUse hook can DENY a call or rewrite its input,
+        //    - a PostToolUse hook can rewrite the recorded output.
+        //    Here: a guardrail that blocks writes to sensitive files, and an audit
+        //    log that records every call. Both are just trait impls (below).
+        .on_pre_tool(Arc::new(ProtectSecrets))
+        .on_post_tool(Arc::new(AuditLog))
         .build()
         .await?;
 
-    // 3. Stream the first turn, rendering events live instead of waiting for the
+    // 4. Stream the first turn, rendering events live instead of waiting for the
     //    final text. `run_streamed` returns immediately; the run drives on a
     //    background task while we drain its event channel.
     println!("── streaming first turn ──");
@@ -71,7 +81,7 @@ async fn main() -> anyhow::Result<()> {
     let first = stream.finish().await?;
     println!("\n── final ──\n{first}\n");
 
-    // 4. A second turn on the SAME agent — it retains full context from the first,
+    // 5. A second turn on the SAME agent — it retains full context from the first,
     //    so this follow-up can reference "the architecture" without repeating it.
     println!("── second turn ──");
     let second = agent
@@ -80,6 +90,39 @@ async fn main() -> anyhow::Result<()> {
     println!("{second}");
 
     Ok(())
+}
+
+/// A `PreToolUse` guardrail: deny any write/edit whose `path` targets a sensitive
+/// file, so the model can never touch `.env` or secrets even in AutoAccept mode.
+/// Read-only tools and non-file tools pass straight through.
+struct ProtectSecrets;
+
+#[async_trait::async_trait]
+impl PreToolUse for ProtectSecrets {
+    async fn on_pre_tool(&self, tool: &str, input: &Value) -> PreToolDecision {
+        let is_write = matches!(tool, "write_file" | "edit_file" | "multi_edit");
+        let path = input.get("path").and_then(Value::as_str).unwrap_or("");
+        if is_write && (path.contains(".env") || path.contains("secrets")) {
+            PreToolDecision::Deny(format!(
+                "policy: refusing to modify a sensitive file ({path})"
+            ))
+        } else {
+            PreToolDecision::Proceed(input.clone())
+        }
+    }
+}
+
+/// A `PostToolUse` audit hook: log every tool result to stderr (compliance /
+/// debugging) and pass the output through unchanged.
+struct AuditLog;
+
+#[async_trait::async_trait]
+impl PostToolUse for AuditLog {
+    async fn on_post_tool(&self, tool: &str, output: String, is_error: bool) -> String {
+        let status = if is_error { "error" } else { "ok" };
+        eprintln!("[audit] {tool} → {status} ({} bytes)", output.len());
+        output
+    }
 }
 
 /// Spawn a timer that interrupts the agent after `after`, returning the task

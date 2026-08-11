@@ -49,7 +49,8 @@ pub mod prelude {
     pub use bob_core::auth::ProviderAuth;
     pub use bob_core::core::permissions::{Asker, Decision, Mode};
     pub use bob_core::core::store::{MemoryStore, SessionStore, SqliteStore};
-    pub use bob_types::{ContentBlock, Message, ReasoningEffort, Role};
+    pub use bob_core::tools::registry::{Tool, ToolContext, ToolError, ToolResult};
+    pub use bob_types::{ContentBlock, Message, ReasoningEffort, Role, ToolSpec};
 }
 
 /// A no-op user-asker for headless use: every `ask_user` / `exit_plan` query is
@@ -89,6 +90,7 @@ pub struct AgentBuilder {
     deny_tools: Vec<String>,
     definitions: std::collections::HashMap<String, bob_core::agent::env::AgentDefinition>,
     hooks: bob_core::agent::hooks::Hooks,
+    tools: Vec<Arc<dyn bob_core::tools::registry::Tool>>,
     resume: Resume,
     max_turns: Option<u32>,
 }
@@ -113,6 +115,7 @@ impl Default for AgentBuilder {
             deny_tools: Vec::new(),
             definitions: std::collections::HashMap::new(),
             hooks: bob_core::agent::hooks::Hooks::default(),
+            tools: Vec::new(),
             resume: Resume::Fresh,
             max_turns: None,
         }
@@ -227,6 +230,24 @@ impl AgentBuilder {
         self
     }
 
+    /// Register a custom in-process tool. It's merged with the builtins and offered
+    /// to the model (and to subagents) like any other tool — the model calls it by
+    /// its `spec().name`. Implement the [`Tool`](bob_core::tools::registry::Tool)
+    /// trait; the prelude re-exports what you need.
+    pub fn tool(mut self, tool: Arc<dyn bob_core::tools::registry::Tool>) -> Self {
+        self.tools.push(tool);
+        self
+    }
+
+    /// Register several custom tools at once.
+    pub fn tools<I>(mut self, tools: I) -> Self
+    where
+        I: IntoIterator<Item = Arc<dyn bob_core::tools::registry::Tool>>,
+    {
+        self.tools.extend(tools);
+        self
+    }
+
     /// Supply a permission asker (interactive approval). Without one, `Ask`/`Deny`
     /// decisions decline — safe for headless use.
     pub fn asker(mut self, asker: Arc<dyn Asker>) -> Self {
@@ -323,6 +344,7 @@ impl AgentBuilder {
             cwd: self.cwd.clone(),
             system_prompt,
             mcp_tools: Vec::new(),
+            extra_tools: self.tools,
             lsp: None,
             user_asker,
             max_turns: self.max_turns,
@@ -562,5 +584,46 @@ mod tests {
             advertised,
             "the reviewer definition should be advertised in a tool spec"
         );
+    }
+
+    #[tokio::test]
+    async fn custom_tool_is_registered_and_offered_to_the_model() {
+        use async_trait::async_trait;
+        use bob_core::core::types::ToolSpec;
+        use bob_core::providers::mock::{MockProvider, MockReply};
+        use bob_core::tools::registry::{Tool, ToolContext, ToolResult};
+        use serde_json::{json, Value};
+
+        struct Weather;
+        #[async_trait]
+        impl Tool for Weather {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: "get_weather".to_string(),
+                    description: "Return the weather for a city.".to_string(),
+                    input_schema: json!({"type": "object"}),
+                }
+            }
+            async fn execute(&self, _input: Value, _ctx: &ToolContext) -> ToolResult {
+                Ok("sunny".to_string())
+            }
+            fn is_read_only(&self) -> bool {
+                true
+            }
+        }
+
+        let provider = MockProvider::new(vec![]).with_default(MockReply::Text("ok".into()));
+        let mut agent = Agent::builder()
+            .provider(Arc::new(provider))
+            .permission_default(Decision::Allow)
+            .tool(Arc::new(Weather))
+            .build()
+            .await
+            .unwrap();
+        // The custom tool is in the agent's advertised toolset.
+        let present = agent
+            .with_core(|a| a.tool_specs().iter().any(|s| s.name == "get_weather"))
+            .await;
+        assert!(present, "custom tool should be registered in the toolset");
     }
 }

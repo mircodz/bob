@@ -27,3 +27,27 @@ path = "examples/minimal.rs"
 [[example]]
 name = "assistant"
 path = "examples/assistant.rs"
+
+[[example]]
+name = "streaming"
+path = "examples/streaming.rs"
+
+[[example]]
+name = "subagents"
+path = "examples/subagents.rs"
+
+[[example]]
+name = "hooks"
+path = "examples/hooks.rs"
+
+[[example]]
+name = "permissions"
+path = "examples/permissions.rs"
+
+[[example]]
+name = "sessions"
+path = "examples/sessions.rs"
+
+[[example]]
+name = "custom_tool"
+path = "examples/custom_tool.rs"
