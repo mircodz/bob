@@ -28,6 +28,11 @@ pub struct PermissionRequest {
     /// agent), so the prompt can say WHO wants the permission during a fan-out.
     /// `None` for the root agent and the fire-and-forget `task` children.
     pub agent: Option<String>,
+    /// Whether the tool is read-only per the registry (`Tool::is_read_only`) — the
+    /// single source of truth. Plan mode uses this (plus a small plan-safe interaction
+    /// allowlist) to block every mutating tool, so a new mutating tool is confined by
+    /// default instead of needing to be added to a hardcoded list.
+    pub read_only: bool,
 }
 
 /// A single choice presented to the user when a decision is "ask". The `grant`
@@ -111,9 +116,12 @@ impl Mode {
     }
 }
 
-/// Tools that MUTATE state (files, shell). Used for mode gating.
-pub fn is_mutating_tool(name: &str) -> bool {
-    matches!(name, "write_file" | "edit_file" | "multi_edit" | "bash")
+/// Interaction/bookkeeping tools that are technically not "read-only" but are safe
+/// (and necessary) to run in Plan mode: they don't touch the workspace. `enter_plan`
+/// and `exit_plan` are how bob enters/leaves the mode; `ask_user` just prompts;
+/// `todo_write` updates the in-memory plan list.
+fn is_plan_safe_tool(name: &str) -> bool {
+    matches!(name, "enter_plan" | "exit_plan" | "ask_user" | "todo_write")
 }
 
 /// Tools that edit FILES (auto-accepted in AutoAccept mode).
@@ -178,9 +186,12 @@ impl PermissionEngine {
     pub async fn check(&self, req: &PermissionRequest) -> bool {
         let mode = self.mode();
 
-        // Plan mode: block every mutating tool outright (read-only research).
-        // The `exit_plan` tool is exempt — it's how bob leaves plan mode.
-        if mode == Mode::Plan && is_mutating_tool(&req.tool) {
+        // Plan mode: research only. Block every tool that isn't read-only (per the
+        // registry's `Tool::is_read_only`) unless it's a plan-safe interaction tool.
+        // Inverting the check — allow read-only, deny the rest — means a new mutating
+        // tool (rename_symbol, code_action apply, memory, an MCP tool) is confined by
+        // default instead of slipping through a hardcoded mutating-name list.
+        if mode == Mode::Plan && !req.read_only && !is_plan_safe_tool(&req.tool) {
             return false;
         }
 
@@ -571,6 +582,7 @@ mod tests {
             bash: Some(parse_bash(raw)),
             preview: None,
             agent: None,
+            read_only: false,
         }
     }
 
@@ -610,10 +622,55 @@ mod tests {
             bash: None,
             preview: None,
             agent: None,
+            read_only: false,
         };
         assert!(
             !engine.check(&edit).await,
             "plan mode still blocks a mutating tool under yolo"
         );
+    }
+
+    #[tokio::test]
+    async fn plan_mode_blocks_non_read_only_tools_by_default() {
+        // The inverted plan-mode gate: anything not read-only (and not a plan-safe
+        // interaction tool) is blocked — even a tool never named in a hardcoded list,
+        // like `memory` (writes AGENTS.md) or an MCP tool. Read-only + plan-safe pass.
+        let engine = PermissionEngine::new(Decision::Allow, None);
+        engine.set_mode(Mode::Plan);
+
+        let mut deny = req_named("memory");
+        deny.read_only = false;
+        assert!(
+            !engine.check(&deny).await,
+            "memory (mutating) blocked in plan"
+        );
+
+        let mut mcp = req_named("some_mcp_tool");
+        mcp.read_only = false;
+        assert!(
+            !engine.check(&mcp).await,
+            "unknown mutating tool blocked in plan"
+        );
+
+        let mut ro = req_named("read_file");
+        ro.read_only = true;
+        assert!(engine.check(&ro).await, "read-only tool allowed in plan");
+
+        // Plan-safe interaction tools run even though they aren't read-only.
+        let mut plan_tool = req_named("exit_plan");
+        plan_tool.read_only = false;
+        assert!(engine.check(&plan_tool).await, "exit_plan allowed in plan");
+    }
+
+    fn req_named(tool: &str) -> PermissionRequest {
+        PermissionRequest {
+            tool: tool.to_string(),
+            input: serde_json::Value::Null,
+            cwd: ".".to_string(),
+            bash: None,
+            preview: None,
+            agent: None,
+            read_only: false,
+        }
     }
 }

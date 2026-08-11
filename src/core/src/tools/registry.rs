@@ -292,6 +292,9 @@ impl ToolRegistry {
                     .as_ref()
                     .map(|c| c.name.clone())
                     .filter(|n| n != crate::agent::agent::ROOT_AGENT_ID),
+                // The registry is the single source of truth for read-only status;
+                // Plan mode gates on this so mutating tools are confined by default.
+                read_only: tool.is_read_only(),
             };
             if !perms.check(&req).await {
                 return Err(ToolError::permission_denied(format!(

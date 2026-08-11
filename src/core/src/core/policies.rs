@@ -353,6 +353,7 @@ mod tests {
             bash: None,
             preview: None,
             agent: None,
+            read_only: false,
         }
     }
 
@@ -397,6 +398,7 @@ mod tests {
             bash: Some(crate::core::permissions::parse_bash(raw)),
             preview: None,
             agent: None,
+            read_only: false,
         }
     }
 
