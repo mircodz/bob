@@ -693,6 +693,7 @@ fn is_remote_event(e: &AgentEvent) -> bool {
         | AgentEvent::Message { agent_id, .. }
         | AgentEvent::Compaction { agent_id, .. }
         | AgentEvent::ContextWarning { agent_id, .. }
+        | AgentEvent::StreamRetry { agent_id, .. }
         | AgentEvent::Error { agent_id, .. } => agent_id == "root",
         // Inter-agent coordination chatter stays internal — never sent to the phone.
         AgentEvent::AgentMessage { .. } => false,

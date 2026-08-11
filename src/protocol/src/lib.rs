@@ -206,6 +206,11 @@ pub enum AgentEventDto {
         context_window: usize,
         pct: u8,
     },
+    StreamRetry {
+        agent_id: String,
+        attempt: u32,
+        max_attempts: u32,
+    },
     Completion {
         agent_id: String,
         model: String,
@@ -322,6 +327,15 @@ impl From<&AgentEvent> for AgentEventDto {
                 used_tokens: *used_tokens,
                 context_window: *context_window,
                 pct: *pct,
+            },
+            AgentEvent::StreamRetry {
+                agent_id,
+                attempt,
+                max_attempts,
+            } => AgentEventDto::StreamRetry {
+                agent_id: agent_id.clone(),
+                attempt: *attempt,
+                max_attempts: *max_attempts,
             },
             AgentEvent::Completion {
                 agent_id,

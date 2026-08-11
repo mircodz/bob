@@ -593,6 +593,11 @@ impl Agent {
                             continue;
                         }
                         ProviderErrorKind::Transient if attempt < MAX_STREAM_ATTEMPTS => {
+                            self.cfg.bus.emit(AgentEvent::StreamRetry {
+                                agent_id: self.id.clone(),
+                                attempt,
+                                max_attempts: MAX_STREAM_ATTEMPTS,
+                            });
                             self.backoff(attempt).await;
                             continue;
                         }
@@ -638,6 +643,11 @@ impl Agent {
                         continue;
                     }
                     ProviderErrorKind::Transient if attempt < MAX_STREAM_ATTEMPTS => {
+                        self.cfg.bus.emit(AgentEvent::StreamRetry {
+                            agent_id: self.id.clone(),
+                            attempt,
+                            max_attempts: MAX_STREAM_ATTEMPTS,
+                        });
                         self.backoff(attempt).await;
                         continue;
                     }

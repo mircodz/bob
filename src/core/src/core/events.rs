@@ -107,6 +107,16 @@ pub enum AgentEvent {
         /// The crossed threshold as a percentage (70, 85, 95).
         pct: u8,
     },
+    /// A provider stream failed transiently (dropped connection, 429/5xx, overload)
+    /// and the agent is retrying after a backoff. Advisory only — surfaced so a
+    /// flaky network shows "retrying (N/max)…" instead of looking hung.
+    StreamRetry {
+        agent_id: String,
+        /// The attempt that just failed (1-based).
+        attempt: u32,
+        /// The maximum number of attempts before the turn gives up.
+        max_attempts: u32,
+    },
     /// Emitted once per provider completion (finer than TurnEnd), carrying the
     /// exact token usage for that single model call, tagged with the model.
     Completion {
@@ -147,6 +157,7 @@ impl AgentEvent {
             AgentEvent::WorkflowPhase { .. } => "WorkflowPhase",
             AgentEvent::WorkflowLog { .. } => "WorkflowLog",
             AgentEvent::ContextWarning { .. } => "ContextWarning",
+            AgentEvent::StreamRetry { .. } => "StreamRetry",
             AgentEvent::Completion { .. } => "Completion",
             AgentEvent::TurnEnd { .. } => "TurnEnd",
             AgentEvent::Error { .. } => "Error",

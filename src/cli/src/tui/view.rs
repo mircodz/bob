@@ -352,6 +352,16 @@ pub fn apply_content_event(cells: &mut Vec<Cell>, event: &AgentEvent, include_me
                 pct, used_k, window_k
             )));
         }
+        AgentEvent::StreamRetry {
+            attempt,
+            max_attempts,
+            ..
+        } => {
+            cells.push(Cell::Notice(format!(
+                "connection hiccup — retrying ({}/{})…",
+                attempt, max_attempts
+            )));
+        }
         AgentEvent::Error { message, .. } => {
             cells.push(Cell::Notice(format!("error: {}", message)));
         }
@@ -954,6 +964,7 @@ fn subagent_id(event: &AgentEvent) -> Option<&str> {
         | AgentEvent::ToolResult { agent_id, .. }
         | AgentEvent::Compaction { agent_id, .. }
         | AgentEvent::ContextWarning { agent_id, .. }
+        | AgentEvent::StreamRetry { agent_id, .. }
         | AgentEvent::TurnEnd { agent_id, .. }
         | AgentEvent::Completion { agent_id, .. }
         | AgentEvent::Error { agent_id, .. } => agent_id.as_str(),
