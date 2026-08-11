@@ -86,6 +86,33 @@ fn wrap_plain(text: &str, width: usize) -> Vec<String> {
     rows
 }
 
+/// Prepend `lead` to each styled line, pre-wrapping to `width` so the OUTER
+/// scrollback wrapper never re-splits a row and drops the lead. This is the
+/// error-prone core behind any left-decorated block (a `▏`/`│` gutter, an accent
+/// bar): the decoration must repeat on every VISUAL row, but the outer wrapper only
+/// sees column 0, so if a row is wider than the viewport it gets re-split with the
+/// lead stranded on the first fragment only. Pre-wrapping here — reserving the lead's
+/// own columns — keeps every emitted row within `width`, so downstream wrapping is a
+/// no-op and the lead survives on each row.
+fn with_left_lead(
+    lines: Vec<Line<'static>>,
+    lead: Span<'static>,
+    width: usize,
+) -> Vec<Line<'static>> {
+    use unicode_width::UnicodeWidthStr;
+    let lead_w = lead.content.width();
+    let content_w = width.saturating_sub(lead_w).max(1);
+    let mut out = Vec::new();
+    for l in lines {
+        for wl in super::wrap_line(l, content_w) {
+            let mut spans = vec![lead.clone()];
+            spans.extend(wl.spans);
+            out.push(Line::from(spans));
+        }
+    }
+    out
+}
+
 /// Render one cell into zero or more display lines. `width` is the render width,
 /// used to fill full-width background bands (the user message).
 pub fn render_cell(cell: &Cell, width: usize, out: &mut Vec<Line<'static>>) {
@@ -248,14 +275,12 @@ pub fn render_cell(cell: &Cell, width: usize, out: &mut Vec<Line<'static>>) {
         }
         Cell::Plan(text) => {
             // A proposed plan, set off as a bordered block: a labeled header, then
-            // the full plan as Markdown with a left accent bar on every line (like a
-            // blockquote) so it reads as one distinct region the user must approve.
+            // the full plan as Markdown with a left accent bar on every (wrapped) row
+            // so it reads as one distinct region the user must approve.
             let bar = || Span::styled(" ▏ ", Style::default().fg(Palette::ACCENT()));
-            // Pre-wrap each markdown line to a reduced width — reserving our 3-col bar
-            // plus the scrollback's hanging-indent (2) and right margin (2) — and
-            // repeat the bar on EVERY visual row. Otherwise the outer wrapper re-splits
-            // a long line and the continuation rows lose the bar (misaligned).
-            let content_w = width.saturating_sub(3 + 4).max(8);
+            // Reserve the scrollback's hanging-indent (2) + right margin (2) on top of
+            // the bar so pre-wrapping matches the final viewport width.
+            let block_w = width.saturating_sub(4).max(8);
             out.push(Line::from(vec![
                 bar(),
                 Span::styled(
@@ -266,13 +291,7 @@ pub fn render_cell(cell: &Cell, width: usize, out: &mut Vec<Line<'static>>) {
                 ),
             ]));
             out.push(Line::from(bar()));
-            for l in render_markdown(text) {
-                for wl in super::wrap_line(l, content_w) {
-                    let mut spans = vec![bar()];
-                    spans.extend(wl.spans);
-                    out.push(Line::from(spans));
-                }
-            }
+            out.extend(with_left_lead(render_markdown(text), bar(), block_w));
             out.push(Line::from(bar()));
             out.push(Line::from(""));
         }
@@ -604,6 +623,28 @@ mod tests {
         // A trailing newline yields an empty final row (a blank band line), not a
         // dropped one.
         assert_eq!(wrap_plain("x\n", 10), vec!["x".to_string(), "".to_string()]);
+    }
+
+    #[test]
+    fn with_left_lead_repeats_lead_on_every_wrapped_row() {
+        use ratatui::text::{Line, Span};
+        // A single line wider than the content width must wrap into multiple rows,
+        // each carrying the lead as its first span (the bug: continuation rows used to
+        // lose it after the outer wrapper re-split them).
+        let lead = Span::raw("| ");
+        let lines = vec![Line::from(Span::raw("aaaa bbbb cccc dddd"))];
+        let out = with_left_lead(lines, lead, 8); // content width 6 after the 2-col lead
+        assert!(out.len() > 1, "long line should wrap into multiple rows");
+        for row in &out {
+            assert_eq!(
+                row.spans.first().map(|s| s.content.as_ref()),
+                Some("| "),
+                "every wrapped row must start with the lead"
+            );
+            // Every emitted row fits the reserved width, so the outer wrapper is a
+            // no-op and can't strand the lead.
+            assert!(row.width() <= 8, "row exceeds width: {}", row.width());
+        }
     }
 
     #[test]
