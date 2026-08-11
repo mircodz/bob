@@ -247,18 +247,33 @@ pub fn render_cell(cell: &Cell, width: usize, out: &mut Vec<Line<'static>>) {
             )));
         }
         Cell::Plan(text) => {
-            // A proposed plan: a labeled header, then the full plan as Markdown so
-            // the user can read/scroll all of it before approving in the modal.
-            out.push(Line::from(Span::styled(
-                "  ▏plan proposed",
-                Style::default()
-                    .fg(Palette::ACCENT())
-                    .add_modifier(Modifier::BOLD),
-            )));
-            out.push(Line::from(""));
+            // A proposed plan, set off as a bordered block: a labeled header, then
+            // the full plan as Markdown with a left accent bar on every line (like a
+            // blockquote) so it reads as one distinct region the user must approve.
+            let bar = || Span::styled(" ▏ ", Style::default().fg(Palette::ACCENT()));
+            // Pre-wrap each markdown line to a reduced width — reserving our 3-col bar
+            // plus the scrollback's hanging-indent (2) and right margin (2) — and
+            // repeat the bar on EVERY visual row. Otherwise the outer wrapper re-splits
+            // a long line and the continuation rows lose the bar (misaligned).
+            let content_w = width.saturating_sub(3 + 4).max(8);
+            out.push(Line::from(vec![
+                bar(),
+                Span::styled(
+                    "plan proposed",
+                    Style::default()
+                        .fg(Palette::ACCENT())
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            out.push(Line::from(bar()));
             for l in render_markdown(text) {
-                out.push(l);
+                for wl in super::wrap_line(l, content_w) {
+                    let mut spans = vec![bar()];
+                    spans.extend(wl.spans);
+                    out.push(Line::from(spans));
+                }
             }
+            out.push(Line::from(bar()));
             out.push(Line::from(""));
         }
         Cell::Event(text) => {
