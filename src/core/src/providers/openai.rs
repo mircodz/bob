@@ -268,7 +268,7 @@ impl Provider for OpenAiProvider {
             // Tool calls arrive incrementally, keyed by index (ordered).
             let mut tool_acc: BTreeMap<i64, (String, String, String)> = BTreeMap::new();
 
-            let _ = parse_sse(res, |evt| {
+            let sse = parse_sse(res, |evt| {
                 // The final chunk carries usage with an empty choices array.
                 if let Some(u) = evt.get("usage") {
                     if !u.is_null() {
@@ -335,6 +335,18 @@ impl Provider for OpenAiProvider {
                 }
             })
             .await;
+
+            // A transport failure (dropped connection, truncated SSE frame) must NOT
+            // be fabricated into a successful turn: emit a typed stream error so the
+            // agent loop can retry or fail, instead of returning partial text labeled
+            // as a complete answer. (OpenAI Chat has no terminal SSE event, so a clean
+            // EOF is a normal completion — only a parse_sse error is a real failure.)
+            if let Err(e) = sse {
+                let _ = tx.send(StreamEvent::Error {
+                    message: format!("openai stream ended: {e}"),
+                });
+                return;
+            }
 
             let mut content: Vec<ContentBlock> = Vec::new();
             if !text.is_empty() {

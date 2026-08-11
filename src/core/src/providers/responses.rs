@@ -161,7 +161,7 @@ impl Provider for ResponsesProvider {
             // completion and the turn hangs. (Anthropic guards the same case.)
             let mut terminal_seen = false;
 
-            let _ = parse_sse(res, |evt| {
+            let sse = parse_sse(res, |evt| {
                 let kind = evt["type"].as_str().unwrap_or("");
                 match kind {
                     // Streamed assistant text.
@@ -294,8 +294,16 @@ impl Provider for ResponsesProvider {
             // Stream ended without any terminal event: assemble a best-effort
             // MessageStop from whatever we accumulated so the agent loop always
             // gets a completion and terminates the turn (instead of hanging on a
-            // silently-closed channel). Mirrors anthropic.rs's stop fallback.
+            // silently-closed channel). Mirrors anthropic.rs's stop fallback. But a
+            // transport failure (dropped connection) must surface as a retryable
+            // error, not a fabricated success.
             if !terminal_seen {
+                if let Err(e) = sse {
+                    let _ = tx.send(StreamEvent::Error {
+                        message: format!("responses stream ended: {e}"),
+                    });
+                    return;
+                }
                 let mut ordered: Vec<(i64, ContentBlock)> = Vec::new();
                 for (idx, item) in &reasoning {
                     ordered.push((*idx, ContentBlock::ReasoningItem { item: item.clone() }));

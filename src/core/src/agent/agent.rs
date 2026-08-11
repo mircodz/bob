@@ -563,7 +563,10 @@ impl Agent {
         &mut self,
         max_tokens_override: Option<u32>,
     ) -> anyhow::Result<StreamOutcome> {
-        const MAX_STREAM_ATTEMPTS: u32 = 4;
+        // Retry a transient stream failure (dropped connection, 429/5xx, overload)
+        // up to 10 times with capped exponential backoff before giving up — matches
+        // Claude Code's persistence so a flaky network doesn't kill a turn.
+        const MAX_STREAM_ATTEMPTS: u32 = 10;
         let mut attempt = 0u32;
         let mut recovered_overflow = false;
         loop {
@@ -1124,6 +1127,21 @@ mod classify_tests {
             classify_error("connection refused"),
             ProviderErrorKind::Transient,
         );
+    }
+
+    #[test]
+    fn provider_stream_drop_messages_are_retryable() {
+        // Contract: the transport-failure messages the providers emit on a dropped
+        // stream (openai.rs / anthropic.rs / responses.rs) must classify as Transient
+        // so the loop retries instead of surfacing a fabricated success. They embed
+        // "stream ended" so the classification holds regardless of the reqwest tail.
+        for m in [
+            "openai stream ended: error decoding response body",
+            "anthropic stream ended: connection reset by peer",
+            "responses stream ended: unexpected EOF during chunked read",
+        ] {
+            assert_eq!(classify_error(m), ProviderErrorKind::Transient, "{m}");
+        }
     }
 
     #[test]

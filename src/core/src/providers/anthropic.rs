@@ -221,7 +221,7 @@ impl Provider for AnthropicProvider {
             let mut usage = Usage::default();
             let mut stopped = false;
 
-            let _ = parse_sse(res, |data| {
+            let sse = parse_sse(res, |data| {
                 let typ = data["type"].as_str().unwrap_or("");
                 match typ {
                     "message_start" => {
@@ -328,12 +328,20 @@ impl Provider for AnthropicProvider {
             })
             .await;
 
-            // The stream ended without a `message_stop` event (dropped connection,
-            // truncated response). Emit whatever we accumulated so the agent loop
-            // gets a completion instead of hanging forever on an empty receiver.
+            // A clean `message_stop` already sent the completion above. Otherwise the
+            // stream ended early: distinguish a transport failure (dropped connection,
+            // truncated frame) — which must surface as a retryable error, not a fake
+            // success — from a benign clean EOF with no terminal event, where the
+            // best-effort completion is all we have and preserves prior behavior.
             if !stopped {
-                let completion = finalize(&mut blocks, &tool_json, &stop_reason, usage);
-                let _ = tx.send(StreamEvent::MessageStop { completion });
+                if let Err(e) = sse {
+                    let _ = tx.send(StreamEvent::Error {
+                        message: format!("anthropic stream ended: {e}"),
+                    });
+                } else {
+                    let completion = finalize(&mut blocks, &tool_json, &stop_reason, usage);
+                    let _ = tx.send(StreamEvent::MessageStop { completion });
+                }
             }
         });
 
