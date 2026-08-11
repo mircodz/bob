@@ -45,6 +45,7 @@ use bob_core::tools::registry::{UserAsker, UserQuery};
 pub mod prelude {
     pub use crate::{Agent, AgentBuilder};
     pub use bob_core::agent::env::AgentDefinition;
+    pub use bob_core::agent::hooks::{PostToolUse, PreToolDecision, PreToolUse};
     pub use bob_core::auth::ProviderAuth;
     pub use bob_core::core::permissions::{Asker, Decision, Mode};
     pub use bob_core::core::store::{MemoryStore, SessionStore, SqliteStore};
@@ -87,6 +88,7 @@ pub struct AgentBuilder {
     allow_tools: Vec<String>,
     deny_tools: Vec<String>,
     definitions: std::collections::HashMap<String, bob_core::agent::env::AgentDefinition>,
+    hooks: bob_core::agent::hooks::Hooks,
     resume: Resume,
     max_turns: Option<u32>,
 }
@@ -110,6 +112,7 @@ impl Default for AgentBuilder {
             allow_tools: Vec::new(),
             deny_tools: Vec::new(),
             definitions: std::collections::HashMap::new(),
+            hooks: bob_core::agent::hooks::Hooks::default(),
             resume: Resume::Fresh,
             max_turns: None,
         }
@@ -206,6 +209,21 @@ impl AgentBuilder {
         def: bob_core::agent::env::AgentDefinition,
     ) -> Self {
         self.definitions.insert(name.into(), def);
+        self
+    }
+
+    /// Register a `PreToolUse` hook: it runs before every tool call and can deny it
+    /// or rewrite its input (Claude's `PreToolUse`). Multiple hooks run in order;
+    /// the first deny wins. A guardrail seam — e.g. block writes to `.env`.
+    pub fn on_pre_tool(mut self, hook: Arc<dyn bob_core::agent::hooks::PreToolUse>) -> Self {
+        self.hooks.pre.push(hook);
+        self
+    }
+
+    /// Register a `PostToolUse` hook: it runs after every tool call and can rewrite
+    /// the recorded output (e.g. redact secrets) before the model sees it.
+    pub fn on_post_tool(mut self, hook: Arc<dyn bob_core::agent::hooks::PostToolUse>) -> Self {
+        self.hooks.post.push(hook);
         self
     }
 
@@ -309,6 +327,7 @@ impl AgentBuilder {
             user_asker,
             max_turns: self.max_turns,
             definitions: self.definitions,
+            hooks: self.hooks,
         });
 
         // Seed history from the chosen session (if any), reconstructing from the

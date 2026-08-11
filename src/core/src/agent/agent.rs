@@ -84,6 +84,8 @@ pub fn build_subagent(spec: SubagentSpec) -> Agent {
         depth: spec.depth,
         parent_cancel: spec.parent_cancel,
         cancel: None,
+        // Hooks are a root-agent guardrail; subagents don't inherit them (yet).
+        hooks: crate::agent::hooks::Hooks::default(),
     })
 }
 
@@ -141,6 +143,9 @@ pub struct AgentConfig {
     /// the root injects one so it can hand the same flag to its subagent-spawning
     /// tools as their `parent_cancel` — one Cancel then reaches root and every child.
     pub cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Tool-call hooks (SDK `.on_pre_tool` / `.on_post_tool`). Empty by default;
+    /// applied in `run_one` to gate/rewrite every tool call.
+    pub hooks: crate::agent::hooks::Hooks,
 }
 
 pub struct Agent {
@@ -669,11 +674,12 @@ impl Agent {
             if self.cfg.tools.is_read_only(name) {
                 let tools = self.cfg.tools.clone();
                 let bus = self.cfg.bus.clone();
+                let hooks = self.cfg.hooks.clone();
                 let agent_id = self.id.clone();
                 let ctx = ctx.clone();
                 let (id, name, input) = (id.clone(), name.clone(), input.clone());
                 concurrent.push(async move {
-                    run_one(&tools, &bus, &agent_id, &ctx, id, name, input).await
+                    run_one(&tools, &bus, &hooks, &agent_id, &ctx, id, name, input).await
                 });
             }
         }
@@ -691,6 +697,7 @@ impl Agent {
                     run_one(
                         &self.cfg.tools,
                         &self.cfg.bus,
+                        &self.cfg.hooks,
                         &self.id,
                         ctx,
                         id.clone(),
@@ -1010,10 +1017,14 @@ enum StreamOutcome {
 }
 
 /// Execute one tool call, emit its result event, and return the tool_result block.
-/// `is_error` comes from the typed Result, not from sniffing the text.
+/// `is_error` comes from the typed Result, not from sniffing the text. `hooks`
+/// gate/rewrite the call: a `PreToolUse` deny skips execution, and `PostToolUse`
+/// hooks fold the recorded output.
+#[allow(clippy::too_many_arguments)]
 async fn run_one(
     tools: &ToolRegistry,
     bus: &EventBus,
+    hooks: &crate::agent::hooks::Hooks,
     agent_id: &str,
     ctx: &ToolContext,
     id: String,
@@ -1025,15 +1036,23 @@ async fn run_one(
     // used to make the tool fail downstream with a misleading "missing field"
     // error the model couldn't diagnose). Surface the real cause so it retries
     // with well-formed arguments.
-    let (content, is_error) =
+    let (mut content, is_error) =
         if let Some(explain) = crate::providers::codec::tool_input_parse_error(&input) {
             (explain, true)
         } else {
-            match tools.execute(&name, input, ctx).await {
-                Ok(output) => (output, false),
-                Err(e) => (e.wire(), true),
+            // PreToolUse hooks: may deny (skip execution) or rewrite the input.
+            match hooks.run_pre(&name, input).await {
+                Err(reason) => (reason, true),
+                Ok(input) => match tools.execute(&name, input, ctx).await {
+                    Ok(output) => (output, false),
+                    Err(e) => (e.wire(), true),
+                },
             }
         };
+    // PostToolUse hooks: may rewrite the recorded output (e.g. redact secrets).
+    if !hooks.post.is_empty() {
+        content = hooks.run_post(&name, content, is_error).await;
+    }
     bus.emit(AgentEvent::ToolResult {
         agent_id: agent_id.to_string(),
         tool_use_id: id.clone(),
@@ -1181,6 +1200,7 @@ mod structured_tests {
             depth: 0,
             parent_cancel: None,
             cancel: None,
+            hooks: crate::agent::hooks::Hooks::default(),
         })
     }
 
@@ -1252,6 +1272,7 @@ mod structured_tests {
             depth: 0,
             parent_cancel: None,
             cancel: None,
+            hooks: crate::agent::hooks::Hooks::default(),
         });
         // Must return (not hang). The exact text isn't important — that it completes
         // is. The 10s guard turns a regression (infinite loop) into a failure.
@@ -1337,6 +1358,7 @@ mod e2e_tests {
             depth: 0,
             parent_cancel: None,
             cancel: None,
+            hooks: crate::agent::hooks::Hooks::default(),
         });
         (agent, seen)
     }
@@ -1402,5 +1424,129 @@ mod e2e_tests {
         assert_eq!(out, "hi there");
         // user + assistant only.
         assert_eq!(agent.messages().len(), 2);
+    }
+
+    // ---- hooks ----
+    use crate::agent::hooks::{Hooks, PostToolUse, PreToolDecision, PreToolUse};
+
+    /// Build an echo-tool agent with a specific hook set.
+    fn agent_with_hooks(
+        provider: Arc<dyn crate::providers::provider::Provider>,
+        hooks: Hooks,
+    ) -> (Agent, Arc<Mutex<Vec<Value>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut tools = ToolRegistry::new(None);
+        tools.add(Arc::new(EchoTool { seen: seen.clone() }));
+        let agent = Agent::new(AgentConfig {
+            provider,
+            tools,
+            bus: EventBus::new(),
+            system: None,
+            cwd: ".".to_string(),
+            max_turns: DEFAULT_MAX_TURNS,
+            id: Some("root".to_string()),
+            context_window: 200_000,
+            compact_threshold: 0.8,
+            keep_recent: 6,
+            jobs: crate::tools::jobs::JobRegistry::new(),
+            user_asker: None,
+            lsp: None,
+            inbox: None,
+            team: None,
+            name: "root".to_string(),
+            depth: 0,
+            parent_cancel: None,
+            cancel: None,
+            hooks,
+        });
+        (agent, seen)
+    }
+
+    fn echo_provider() -> MockProvider {
+        // Calls `echo` once on the first prompt, then finishes with text.
+        MockProvider::new(vec![MockRule {
+            needle: "go".to_string(),
+            reply: MockReply::ToolCall {
+                name: "echo".to_string(),
+                input: json!({"msg": "hi"}),
+            },
+        }])
+        .with_default(MockReply::Text("done".into()))
+    }
+
+    struct DenyEcho;
+    #[async_trait]
+    impl PreToolUse for DenyEcho {
+        async fn on_pre_tool(&self, tool: &str, _input: &Value) -> PreToolDecision {
+            if tool == "echo" {
+                PreToolDecision::Deny("blocked by policy".into())
+            } else {
+                PreToolDecision::Proceed(_input.clone())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_tool_hook_denies_and_tool_never_runs() {
+        let hooks = Hooks {
+            pre: vec![Arc::new(DenyEcho)],
+            post: vec![],
+        };
+        let (mut agent, seen) = agent_with_hooks(Arc::new(echo_provider()), hooks);
+        agent.run("go").await.unwrap();
+        // The tool was blocked before executing.
+        assert!(seen.lock().unwrap().is_empty(), "denied tool must not run");
+    }
+
+    struct RewriteMsg;
+    #[async_trait]
+    impl PreToolUse for RewriteMsg {
+        async fn on_pre_tool(&self, _tool: &str, input: &Value) -> PreToolDecision {
+            let mut v = input.clone();
+            v["msg"] = json!("rewritten");
+            PreToolDecision::Proceed(v)
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_tool_hook_rewrites_the_input() {
+        let hooks = Hooks {
+            pre: vec![Arc::new(RewriteMsg)],
+            post: vec![],
+        };
+        let (mut agent, seen) = agent_with_hooks(Arc::new(echo_provider()), hooks);
+        agent.run("go").await.unwrap();
+        // The tool saw the hook's rewritten input, not the model's original.
+        assert_eq!(seen.lock().unwrap()[0]["msg"], "rewritten");
+    }
+
+    struct ShoutOutput;
+    #[async_trait]
+    impl PostToolUse for ShoutOutput {
+        async fn on_post_tool(&self, _tool: &str, output: String, _is_error: bool) -> String {
+            output.to_uppercase()
+        }
+    }
+
+    #[tokio::test]
+    async fn post_tool_hook_rewrites_the_output() {
+        let hooks = Hooks {
+            pre: vec![],
+            post: vec![Arc::new(ShoutOutput)],
+        };
+        // Capture the tool-result event to inspect the recorded output.
+        let (agent_provider, recorded) = (Arc::new(echo_provider()), Arc::new(Mutex::new(None)));
+        let (mut agent, _seen) = agent_with_hooks(agent_provider, hooks);
+        {
+            let recorded = recorded.clone();
+            agent.bus().on(Arc::new(move |e: &AgentEvent| {
+                if let AgentEvent::ToolResult { output, .. } = e {
+                    *recorded.lock().unwrap() = Some(output.clone());
+                }
+            }));
+        }
+        agent.run("go").await.unwrap();
+        // EchoTool returns "echoed: hi"; the post hook uppercased it.
+        assert_eq!(recorded.lock().unwrap().as_deref(), Some("ECHOED: HI"),);
     }
 }

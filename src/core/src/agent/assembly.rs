@@ -43,6 +43,9 @@ pub struct RootAgentParams {
     /// Named subagent definitions the model may delegate to (SDK `.agent(...)`).
     /// Empty for the frontends, which don't register custom types.
     pub definitions: std::collections::HashMap<String, crate::agent::env::AgentDefinition>,
+    /// Tool-call hooks (SDK `.on_pre_tool` / `.on_post_tool`). Empty for the
+    /// frontends, which don't register hooks.
+    pub hooks: crate::agent::hooks::Hooks,
 }
 
 /// Build the shared subagent tool registry: builtins + MCP + LSP tools + the
@@ -160,5 +163,6 @@ pub fn build_root_agent(p: RootAgentParams) -> Agent {
         depth: 0,
         parent_cancel: None,
         cancel: Some(cancel),
+        hooks: p.hooks,
     })
 }

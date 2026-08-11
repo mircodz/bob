@@ -31,9 +31,7 @@ async fn main() -> anyhow::Result<()> {
             "code-reviewer",
             AgentDefinition {
                 description: "Expert code reviewer. Use for correctness and design review.".into(),
-                prompt: "You are a meticulous code reviewer. Report each issue as \
-                         file:line — problem — suggested fix. Be concise."
-                    .into(),
+                prompt: "You are a meticulous code reviewer. Report each issue as file:line — problem — suggested fix. Be concise.".into(),
                 tools: None,
                 read_only: true,
                 model: None,

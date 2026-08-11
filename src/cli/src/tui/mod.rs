@@ -503,6 +503,7 @@ pub async fn run(
             user_asker: user_asker.clone(),
             max_turns: config.max_turns,
             definitions: std::collections::HashMap::new(),
+            hooks: bob_core::agent::hooks::Hooks::default(),
         });
     if !session.messages.is_empty() {
         // Seed the agent from the event log when it's authoritative (blob fallback
