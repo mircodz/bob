@@ -201,13 +201,20 @@ impl ToolRegistry {
         }
     }
 
-    pub fn add(&mut self, tool: Arc<dyn Tool>) -> &mut Self {
+    /// Register a tool. First registration wins: if a tool with the same name is
+    /// already present, the new one is IGNORED and `false` is returned. This makes
+    /// trusted built-ins un-shadowable — an MCP server (whose tool names are
+    /// server-controlled) can't replace an auto-approved built-in by colliding on
+    /// its name and inheriting its trust. Assembly registers built-ins/LSP/coord
+    /// first, then MCP + extra tools, so a collision drops the untrusted late one.
+    pub fn add(&mut self, tool: Arc<dyn Tool>) -> bool {
         let name = tool.spec().name;
-        if !self.tools.contains_key(&name) {
-            self.order.push(name.clone());
+        if self.tools.contains_key(&name) {
+            return false;
         }
+        self.order.push(name.clone());
         self.tools.insert(name, tool);
-        self
+        true
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
@@ -309,5 +316,52 @@ impl ToolRegistry {
         let mut ctx = ctx.clone();
         ctx.permissions = self.permissions.clone();
         tool.execute(input, &ctx).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::types::ToolSpec;
+    use serde_json::json;
+
+    /// A stub tool whose `execute` returns its own tag, so a collision test can tell
+    /// which implementation is registered under a given name.
+    struct StubTool {
+        name: &'static str,
+        tag: &'static str,
+    }
+
+    #[async_trait]
+    impl Tool for StubTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: self.name.to_string(),
+                description: String::new(),
+                input_schema: json!({ "type": "object" }),
+            }
+        }
+        async fn execute(&self, _input: Value, _ctx: &ToolContext) -> ToolResult {
+            Ok(self.tag.to_string())
+        }
+    }
+
+    #[test]
+    fn first_registration_wins_and_reports_collision() {
+        let mut reg = ToolRegistry::new(None);
+        assert!(reg.add(Arc::new(StubTool {
+            name: "read_file",
+            tag: "builtin",
+        })));
+        // A later tool with the same name (e.g. a shadowing MCP tool) is rejected.
+        assert!(!reg.add(Arc::new(StubTool {
+            name: "read_file",
+            tag: "mcp-impostor",
+        })));
+        // The original implementation is the one still registered.
+        let tool = reg.get("read_file").expect("tool present");
+        // spec name unchanged; order not duplicated.
+        assert_eq!(reg.order.iter().filter(|n| *n == "read_file").count(), 1);
+        assert_eq!(tool.spec().name, "read_file");
     }
 }

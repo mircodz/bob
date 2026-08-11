@@ -57,14 +57,11 @@ pub struct RootAgentParams {
 /// *spawned* agent gets; `spawn_agent` itself is added only to the root's tools.
 fn build_subagent_tools(p: &RootAgentParams) -> ToolRegistry {
     let mut tools = ToolRegistry::new(Some(p.permissions.clone()));
+    // Trusted tools FIRST — built-ins, LSP, coordination — so their names are
+    // reserved. MCP + extra tools are added last and can't shadow them (add() is
+    // first-registration-wins).
     for t in crate::tools::builtin_tools() {
         tools.add(t);
-    }
-    for t in &p.mcp_tools {
-        tools.add(t.clone());
-    }
-    for t in &p.extra_tools {
-        tools.add(t.clone());
     }
     if let Some(lsp) = &p.lsp {
         tools.add(Arc::new(LspTool::new(lsp.clone())));
@@ -77,6 +74,14 @@ fn build_subagent_tools(p: &RootAgentParams) -> ToolRegistry {
     tools.add(Arc::new(ListAgentsTool {
         team: p.team.clone(),
     }));
+    // Untrusted last: a server-controlled MCP name colliding with a built-in is
+    // dropped rather than replacing it.
+    for t in &p.mcp_tools {
+        tools.add(t.clone());
+    }
+    for t in &p.extra_tools {
+        tools.add(t.clone());
+    }
     tools
 }
 
@@ -94,19 +99,22 @@ pub fn build_root_agent(p: RootAgentParams) -> Agent {
     // The root's tools are the subagent set (minus its coordination tools, which
     // we re-add explicitly below) plus the task + spawn tools it uses to delegate.
     let mut tools = ToolRegistry::new(Some(p.permissions.clone()));
+    // Trusted tools first (built-ins, LSP); MCP + extra tools last so a
+    // server-controlled name can't shadow a built-in (add() is first-wins). The
+    // delegation tools (task/spawn/…) are added further below and are also trusted.
     for t in crate::tools::builtin_tools() {
         tools.add(t);
+    }
+    if let Some(lsp) = &p.lsp {
+        tools.add(Arc::new(LspTool::new(lsp.clone())));
+        tools.add(Arc::new(RenameSymbolTool::new(lsp.clone())));
+        tools.add(Arc::new(CodeActionTool::new(lsp.clone())));
     }
     for t in &p.mcp_tools {
         tools.add(t.clone());
     }
     for t in &p.extra_tools {
         tools.add(t.clone());
-    }
-    if let Some(lsp) = &p.lsp {
-        tools.add(Arc::new(LspTool::new(lsp.clone())));
-        tools.add(Arc::new(RenameSymbolTool::new(lsp.clone())));
-        tools.add(Arc::new(CodeActionTool::new(lsp.clone())));
     }
     // The shared dependency bundle every delegation tool needs to spawn children.
     // Built once, cloned into each tool — instead of respelling the same eight
