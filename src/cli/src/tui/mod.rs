@@ -1145,8 +1145,11 @@ pub async fn run(
         // freeze on quit. Signal cancel first so `run()` breaks out cooperatively
         // and releases the lock; bound the wait with a timeout so a wedged turn
         // can't hold exit hostage — we still persist whatever history we can read.
+        // The run loop polls its cancel flag on a 100ms interval even while parked on
+        // the provider stream, so a clean stop is fast; the timeout only bites if a
+        // tool call itself is wedged.
         cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-        let locked = tokio::time::timeout(std::time::Duration::from_secs(5), agent.lock()).await;
+        let locked = tokio::time::timeout(std::time::Duration::from_secs(2), agent.lock()).await;
         match locked {
             Ok(a) => {
                 session.messages = a.messages().to_vec();

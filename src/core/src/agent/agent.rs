@@ -608,7 +608,26 @@ impl Agent {
 
             let mut completion = None;
             let mut stream_error = None;
-            while let Some(evt) = rx.recv().await {
+            loop {
+                // Cancel-aware receive: poll on a short interval so a cancel (e.g. the
+                // user quitting) is observed PROMPTLY even while the provider stream is
+                // parked waiting on the network. Without the timeout, `recv().await`
+                // only wakes on the next event, so cancel wasn't seen until the stream
+                // yielded — which made quit wait out the caller's exit timeout.
+                let evt =
+                    match tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+                        .await
+                    {
+                        Ok(Some(evt)) => evt,
+                        Ok(None) => break, // stream closed
+                        Err(_) => {
+                            // Poll interval elapsed with no event: check cancel, keep waiting.
+                            if self.is_cancelled() {
+                                break;
+                            }
+                            continue;
+                        }
+                    };
                 match evt {
                     StreamEvent::TextDelta { text } => {
                         self.cfg.bus.emit(AgentEvent::TextDelta {
@@ -1262,6 +1281,29 @@ mod structured_tests {
         let provider = MockProvider::new(vec![]).with_default(MockReply::Text("hi".into()));
         let mut agent = agent_with(Arc::new(provider));
         assert!(agent.run_structured("go", schema).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn cancel_is_observed_promptly_while_the_stream_is_parked() {
+        // Regression for the quit-hang: a provider stream that takes a long time to
+        // yield its first event must not keep `run()` from noticing a cancel. The run
+        // loop polls its cancel flag on a short interval even while parked on
+        // `rx.recv()`, so setting the flag stops the turn well before the stream would
+        // have produced anything. Without the poll, this test would take ~30s.
+        let provider = MockProvider::new(vec![]).with_delay(std::time::Duration::from_secs(30));
+        let mut agent = agent_with(Arc::new(provider));
+        let cancel = agent.cancel_handle();
+
+        // Fire the cancel shortly after the run starts (once it's parked on recv).
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+
+        // The run must return quickly (interrupted), not wait out the 30s stream.
+        let res = tokio::time::timeout(std::time::Duration::from_secs(3), agent.run("go")).await;
+        assert!(res.is_ok(), "cancel must break the parked stream promptly");
+        assert_eq!(res.unwrap().unwrap(), "[interrupted]");
     }
 
     #[tokio::test]
