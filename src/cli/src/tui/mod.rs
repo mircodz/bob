@@ -24,7 +24,7 @@ use bob_core::core::permissions::{
 };
 use bob_core::core::policies::{
     allow_bash_commands, allow_code_action_list, allow_read_only, allow_tools, deny_tools,
-    flag_dangerous_bash,
+    flag_dangerous_bash, flag_out_of_workspace_paths,
 };
 use bob_core::core::session::Session;
 use bob_core::providers::create_provider;
@@ -450,6 +450,7 @@ pub async fn run(
         _ => Decision::Ask,
     };
     let mut engine = PermissionEngine::new(default_decision, Some(asker));
+    engine.add(flag_out_of_workspace_paths());
     engine.add(allow_read_only());
     engine.add(allow_code_action_list());
     engine.add(flag_dangerous_bash());

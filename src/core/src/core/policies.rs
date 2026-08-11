@@ -62,6 +62,121 @@ pub fn allow_code_action_list() -> Rule {
     })
 }
 
+/// File tools and the input key holding their target path. Used to force a prompt
+/// when the path escapes the workspace root.
+const PATH_TOOLS: &[(&str, &str)] = &[
+    ("read_file", "path"),
+    ("write_file", "path"),
+    ("edit_file", "path"),
+    ("multi_edit", "path"),
+    ("list_dir", "path"),
+    ("glob", "path"),
+    ("grep", "path"),
+    ("lsp", "filePath"),
+    ("rename_symbol", "filePath"),
+    ("code_action", "filePath"),
+];
+
+/// Force a prompt for any tool call that touches a path OUTSIDE the workspace root
+/// (`req.cwd`). Covers the file tools (via their `path`/`filePath` input) and bash
+/// (via every literal path-like argument the shell analyzer surfaced). Returns `Ask`
+/// — which wins over a later auto-allow — so an out-of-workspace read/write is never
+/// silently auto-approved; the human decides (or a prior session grant satisfies it).
+/// In-workspace paths abstain (`None`) so normal auto-approve still applies.
+pub fn flag_out_of_workspace_paths() -> Rule {
+    Arc::new(|req: &PermissionRequest| {
+        // File tools: check the single declared path input.
+        if let Some((_, key)) = PATH_TOOLS.iter().find(|(t, _)| *t == req.tool) {
+            if let Some(p) = req.input.get(*key).and_then(|v| v.as_str()) {
+                if path_escapes_workspace(&req.cwd, p) {
+                    return Some(Decision::Ask);
+                }
+            }
+            return None;
+        }
+        // Bash: check every literal path-like argument the analyzer found. A command
+        // reading/writing outside the workspace (`cat /etc/hosts`, `cp x ~/..`) must
+        // prompt even if the command name itself is allowlisted.
+        if req.tool == "bash" {
+            if let Some(bash) = req.bash.as_ref() {
+                for argv in &bash.commands {
+                    for arg in argv.iter().skip(1) {
+                        if looks_like_path(arg) && path_escapes_workspace(&req.cwd, arg) {
+                            return Some(Decision::Ask);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    })
+}
+
+/// Whether an argument looks like a filesystem path we should confine — an absolute
+/// path, a `~`/`~user` home reference, or a relative path with a `..` component or a
+/// `/`. Bare flags (`-la`), option values, and plain tokens (`build`) are ignored so
+/// we don't prompt on every command.
+fn looks_like_path(arg: &str) -> bool {
+    if arg.starts_with('-') {
+        return false;
+    }
+    arg.starts_with('/')
+        || arg.starts_with('~')
+        || arg.split('/').any(|c| c == "..")
+        || arg.contains('/')
+}
+
+/// Whether `path` (resolved against `cwd` the same way the tools resolve it) points
+/// OUTSIDE the workspace root. Absolute paths and `~` home references are always
+/// outside unless they fall under `cwd`. Normalization is LEXICAL (`.`/`..` folded
+/// without touching the filesystem) so it works for not-yet-existing write targets;
+/// a `..` that pops above the root is therefore treated as an escape (fail safe).
+pub fn path_escapes_workspace(cwd: &str, path: &str) -> bool {
+    use std::path::{Component, Path, PathBuf};
+
+    // `~` is a shell home reference — never inside the workspace.
+    if path.starts_with('~') {
+        return true;
+    }
+
+    let resolved: PathBuf = {
+        let p = Path::new(path);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            Path::new(cwd).join(p)
+        }
+    };
+    let root = Path::new(cwd);
+
+    // Lexically normalize both, folding `.`/`..` without hitting disk.
+    let norm = |p: &Path| -> Option<PathBuf> {
+        let mut out: Vec<Component> = Vec::new();
+        for c in p.components() {
+            match c {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    match out.last() {
+                        Some(Component::Normal(_)) => {
+                            out.pop();
+                        }
+                        // A `..` above the root (or after another `..`) → can't stay
+                        // confined; signal escape by returning None.
+                        _ => return None,
+                    }
+                }
+                other => out.push(other),
+            }
+        }
+        Some(out.iter().collect())
+    };
+
+    let (Some(nr), Some(nroot)) = (norm(&resolved), norm(root)) else {
+        return true; // popped above root ⇒ escape
+    };
+    !nr.starts_with(&nroot)
+}
+
 /// Force a prompt for obviously destructive shell patterns. We NEVER auto-reject a
 /// command — a risky one is surfaced to the user to approve or decline, not silently
 /// denied. This rule returns `Ask` (which wins over a later auto-allow) so patterns
@@ -483,6 +598,77 @@ mod tests {
             "git foobar",
         ] {
             assert_eq!(rule(&bash_req(cmd)), None, "should prompt: {cmd}");
+        }
+    }
+
+    #[test]
+    fn workspace_escape_detection() {
+        assert!(path_escapes_workspace("/work", "/etc/hosts"));
+        assert!(path_escapes_workspace("/work", "../../secrets"));
+        assert!(path_escapes_workspace("/work", "~/.ssh/id_rsa"));
+        assert!(path_escapes_workspace("/work", "sub/../../out"));
+        // In-workspace paths do NOT escape.
+        assert!(!path_escapes_workspace("/work", "src/main.rs"));
+        assert!(!path_escapes_workspace("/work", "/work/src/x"));
+        assert!(!path_escapes_workspace("/work", "./a/../b"));
+        assert!(!path_escapes_workspace("/work", "."));
+    }
+
+    #[test]
+    fn out_of_workspace_file_tool_prompts_but_in_workspace_abstains() {
+        let rule = flag_out_of_workspace_paths();
+        let file_req = |tool: &str, path: &str| PermissionRequest {
+            tool: tool.to_string(),
+            input: serde_json::json!({ "path": path }),
+            cwd: "/work".to_string(),
+            bash: None,
+            preview: None,
+            agent: None,
+            read_only: false,
+        };
+        // Escape → prompt (wins over the later allow_read_only auto-allow).
+        assert_eq!(
+            rule(&file_req("read_file", "/etc/hosts")),
+            Some(Decision::Ask)
+        );
+        assert_eq!(
+            rule(&file_req("write_file", "../../.aws/credentials")),
+            Some(Decision::Ask)
+        );
+        // In-workspace → abstain (None), so normal auto-approve applies.
+        assert_eq!(rule(&file_req("read_file", "src/main.rs")), None);
+        // A non-path tool is ignored entirely.
+        assert_eq!(rule(&req("todo_write")), None);
+    }
+
+    #[test]
+    fn out_of_workspace_bash_arg_prompts() {
+        let rule = flag_out_of_workspace_paths();
+        // A literal out-of-workspace path in a bash arg forces a prompt even when the
+        // command name is otherwise harmless.
+        assert_eq!(
+            rule(&bash_req_cwd("cat /etc/hosts", "/work")),
+            Some(Decision::Ask)
+        );
+        assert_eq!(
+            rule(&bash_req_cwd("cat ../../secrets", "/work")),
+            Some(Decision::Ask)
+        );
+        // In-workspace / non-path args abstain.
+        assert_eq!(rule(&bash_req_cwd("cat src/main.rs", "/work")), None);
+        assert_eq!(rule(&bash_req_cwd("ls -la", "/work")), None);
+        assert_eq!(rule(&bash_req_cwd("npm run build", "/work")), None);
+    }
+
+    fn bash_req_cwd(raw: &str, cwd: &str) -> PermissionRequest {
+        PermissionRequest {
+            tool: "bash".to_string(),
+            input: serde_json::json!({ "command": raw }),
+            cwd: cwd.to_string(),
+            bash: Some(crate::core::permissions::parse_bash(raw)),
+            preview: None,
+            agent: None,
+            read_only: false,
         }
     }
 
