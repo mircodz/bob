@@ -11,6 +11,11 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
+/// The most recent pending ask, shared between the reader task and the input loop.
+/// `(id, kind)` where kind is `None` = permission, `Some(label)` = query (label of
+/// option 0). Wrapped in `Arc<Mutex<…>>` so both tasks can read/update it.
+type LastAsk = Arc<Mutex<Option<(String, Option<String>)>>>;
+
 pub async fn run(
     relay: String,
     session: String,
@@ -73,7 +78,7 @@ pub async fn run(
 
     // Track the most recent ask id so /y and /n can answer it without typing it.
     // Kind: None = permission, Some(label) = query (label of option 0).
-    let last_ask: Arc<Mutex<Option<(String, Option<String>)>>> = Arc::new(Mutex::new(None));
+    let last_ask: LastAsk = Arc::new(Mutex::new(None));
 
     // Reader task: incoming sealed frames -> opened HostFrames -> stdout.
     {
@@ -164,11 +169,7 @@ pub async fn run(
 
 /// Build an AnswerQuery or AnswerPermission for the given id, based on the
 /// tracked ask's kind. `approve` is true for /y, false for /n.
-async fn answer(
-    id: &str,
-    approve: bool,
-    last_ask: &Arc<Mutex<Option<(String, Option<String>)>>>,
-) -> ControlFrame {
+async fn answer(id: &str, approve: bool, last_ask: &LastAsk) -> ControlFrame {
     // Look up the tracked ask; only act if the id matches what we're waiting on.
     let kind = last_ask
         .lock()

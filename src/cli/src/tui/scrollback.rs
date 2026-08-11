@@ -93,6 +93,7 @@ impl ScrollbackRenderer {
 
     /// Draw the transcript into `full`. `working` + `spinner` + `turn_elapsed_secs`
     /// drive the transient "Working" line while a turn runs.
+    #[allow(clippy::too_many_arguments)] // frame + layout + the three working-line inputs
     pub fn render(
         &mut self,
         f: &mut ratatui::Frame,
