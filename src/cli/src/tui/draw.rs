@@ -924,10 +924,12 @@ impl App {
 
         render_row(&mut lines, &mut hit, 0, "", "main", 0, "");
         for (i, id) in running.iter().enumerate() {
+            // Use the human display label (the task description for auto-id'd
+            // `task_N` agents), matching the team drawer — not the raw id.
             let (label, meta) = self
                 .teams
                 .get(id)
-                .map(|t| (t.name.clone(), String::new()))
+                .map(|t| (t.display_label().to_string(), String::new()))
                 .unwrap_or_else(|| (id.clone(), String::new()));
             let depth = self.teams.depth_of(id) + 1;
             render_row(&mut lines, &mut hit, i + 1, id, &label, depth, &meta);
