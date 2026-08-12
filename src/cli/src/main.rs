@@ -2,7 +2,8 @@ mod tui;
 
 use bob_core::core::config::load_config;
 use bob_core::core::session::{
-    latest_session_in, list_sessions, list_sessions_in, load_session, new_session, Session,
+    latest_session_in, list_sessions, list_sessions_in, load_session, new_session, session_preview,
+    Session, SessionSummary,
 };
 use bob_core::providers::create_provider;
 use clap::{Parser, Subcommand};
@@ -200,56 +201,267 @@ fn time_ago(updated_at: &str) -> String {
     }
 }
 
-/// Interactive session picker shown for a bare `--resume`. Lists sessions started
-/// in the current directory (via `list_sessions_in`) and lets the user choose one
-/// by number. Enter/empty or `n` starts a new session. Falls back to ALL sessions
-/// if none exist for this directory (e.g. legacy sessions saved without a cwd).
+/// Case-insensitive subsequence match: every char of `query` appears in `hay` in
+/// order (not necessarily adjacent). Empty query matches everything. Powers the
+/// picker's type-to-filter.
+fn fuzzy_match(query: &str, hay: &str) -> bool {
+    let mut q = query.chars().flat_map(char::to_lowercase).peekable();
+    if q.peek().is_none() {
+        return true;
+    }
+    for h in hay.chars().flat_map(char::to_lowercase) {
+        if q.peek() == Some(&h) {
+            q.next();
+        }
+    }
+    q.peek().is_none()
+}
+
+/// A session plus its cached preview lines, for the picker.
+struct PickerItem {
+    summary: SessionSummary,
+    preview: Vec<String>,
+    /// Lowercased title + preview, precomputed for fuzzy filtering.
+    haystack: String,
+}
+
+/// Interactive session picker shown for a bare `--resume`. Renders an arrow-key
+/// selectable list (↑/↓ or j/k) with a preview of each conversation's tail; typing
+/// fuzzy-filters by title + preview. Enter opens the highlighted session; Esc (or an
+/// empty list) starts a new one. Sessions are scoped to the current directory, with
+/// a fallback to all sessions for legacy entries saved without a cwd.
 fn pick_session(cwd: &str) -> anyhow::Result<Option<Session>> {
     let mut summaries = list_sessions_in(cwd);
-    let scoped = !summaries.is_empty();
     if summaries.is_empty() {
         summaries = list_sessions();
     }
     if summaries.is_empty() {
         return Ok(None); // nothing to resume → caller creates a fresh one
     }
-    if scoped {
-        println!("\x1b[1mResume a session in this directory:\x1b[0m");
-    } else {
-        println!("\x1b[1mResume a session:\x1b[0m");
-    }
-    for (i, s) in summaries.iter().enumerate() {
-        // Short id + relative time disambiguate sessions that share a title.
-        let short_id = s.id.get(..8).unwrap_or(&s.id);
-        println!(
-            "  \x1b[36m{:>2}\x1b[0m  {}  \x1b[90m({} msgs · {} · {} · {})\x1b[0m",
-            i + 1,
-            s.title,
-            s.message_count,
-            time_ago(&s.updated_at),
-            short_id,
-            s.provider,
-        );
-    }
-    print!("\nnumber to resume, or Enter for a new session: ");
-    std::io::stdout().flush()?;
 
-    let mut line = String::new();
-    std::io::stdin().read_line(&mut line)?;
-    let choice = line.trim();
-    if choice.is_empty() || choice.eq_ignore_ascii_case("n") {
-        return Ok(None);
+    // Cache each session's preview (last 3 messages) up front.
+    let items: Vec<PickerItem> = summaries
+        .into_iter()
+        .map(|summary| {
+            let preview = session_preview(&summary.id, 3);
+            let haystack = format!("{} {}", summary.title, preview.join(" ")).to_lowercase();
+            PickerItem {
+                summary,
+                preview,
+                haystack,
+            }
+        })
+        .collect();
+
+    match run_picker(&items)? {
+        Some(idx) => Ok(load_session(&items[idx].summary.id)?),
+        None => Ok(None),
     }
-    match choice.parse::<usize>() {
-        Ok(n) if n >= 1 && n <= summaries.len() => {
-            let id = &summaries[n - 1].id;
-            Ok(load_session(id)?)
-        }
-        _ => {
-            println!("no such session; starting a new one.");
-            Ok(None)
+}
+
+/// Drive the full-screen ratatui picker, returning the chosen index into `items`
+/// (or None for "start a new session"). Runs on the alternate screen and restores
+/// the terminal before returning, so it never scrolls the user's scrollback — the
+/// list is windowed to the viewport, so it handles hundreds of sessions cleanly.
+fn run_picker(items: &[PickerItem]) -> anyhow::Result<Option<usize>> {
+    use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+    use crossterm::execute;
+    use crossterm::terminal::{
+        disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    };
+    use ratatui::backend::CrosstermBackend;
+    use ratatui::Terminal;
+
+    enable_raw_mode()?;
+    let mut stdout = std::io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    // Restore the terminal from one place, even on an early `?` return.
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = disable_raw_mode();
+            let _ = crossterm::execute!(std::io::stdout(), LeaveAlternateScreen);
         }
     }
+    let _restore = Restore;
+
+    let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
+    let mut query = String::new();
+    let mut selected = 0usize;
+    let mut scroll = 0usize;
+
+    let result = loop {
+        // Filter to the indices matching the current query (fuzzy over title+preview).
+        let filtered: Vec<usize> = (0..items.len())
+            .filter(|&i| fuzzy_match(&query, &items[i].haystack))
+            .collect();
+        if selected >= filtered.len() {
+            selected = filtered.len().saturating_sub(1);
+        }
+
+        terminal.draw(|f| draw_picker(f, items, &filtered, selected, &mut scroll, &query))?;
+
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if key.kind != crossterm::event::KeyEventKind::Press {
+            continue;
+        }
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => break None,
+            (KeyCode::Enter, _) => break filtered.get(selected).copied(),
+            (KeyCode::Up, _) | (KeyCode::Char('k'), KeyModifiers::NONE) if !filtered.is_empty() => {
+                selected = selected.saturating_sub(1);
+            }
+            (KeyCode::Down, _) | (KeyCode::Char('j'), KeyModifiers::NONE)
+                if !filtered.is_empty() =>
+            {
+                selected = (selected + 1).min(filtered.len() - 1);
+            }
+            (KeyCode::Backspace, _) => {
+                query.pop();
+                selected = 0;
+            }
+            (KeyCode::Char(c), m) if m == KeyModifiers::NONE || m == KeyModifiers::SHIFT => {
+                query.push(c);
+                selected = 0;
+            }
+            _ => {}
+        }
+    };
+    Ok(result)
+}
+
+/// Render one frame of the picker: a title, the windowed session list (each row =
+/// title + metadata; the selected row highlighted), a preview pane for the selected
+/// session, and a filter/hints footer. `scroll` is updated to keep `selected` visible.
+fn draw_picker(
+    f: &mut ratatui::Frame,
+    items: &[PickerItem],
+    filtered: &[usize],
+    selected: usize,
+    scroll: &mut usize,
+    query: &str,
+) {
+    use ratatui::layout::{Constraint, Direction, Layout};
+    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::{Block, Borders, Paragraph};
+
+    let area = f.area();
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // title
+            Constraint::Min(3),    // list
+            Constraint::Length(6), // preview pane
+            Constraint::Length(1), // filter/footer
+        ])
+        .split(area);
+
+    // Title.
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                "Resume a session",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("   {} sessions", filtered.len()),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])),
+        chunks[0],
+    );
+
+    // Windowed list: keep the selection visible within the list area's height.
+    let list_h = chunks[1].height as usize;
+    if selected < *scroll {
+        *scroll = selected;
+    } else if list_h > 0 && selected >= *scroll + list_h {
+        *scroll = selected + 1 - list_h;
+    }
+    let mut rows: Vec<Line> = Vec::new();
+    if filtered.is_empty() {
+        rows.push(Line::from(Span::styled(
+            "  no sessions match",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    for (row, &i) in filtered.iter().enumerate().skip(*scroll).take(list_h) {
+        let it = &items[i];
+        let s = &it.summary;
+        let short_id = s.id.get(..8).unwrap_or(&s.id);
+        let sel = row == selected;
+        let marker = if sel { "❯ " } else { "  " };
+        let title_style = if sel {
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        rows.push(Line::from(vec![
+            Span::styled(marker, Style::default().fg(Color::Cyan)),
+            Span::styled(s.title.clone(), title_style),
+            Span::styled(
+                format!(
+                    "  ({} msgs · {} · {} · {})",
+                    s.message_count,
+                    time_ago(&s.updated_at),
+                    short_id,
+                    s.provider
+                ),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+    f.render_widget(Paragraph::new(rows), chunks[1]);
+
+    // Preview pane for the selected session.
+    let preview_lines: Vec<Line> = filtered
+        .get(selected)
+        .map(|&i| &items[i].preview)
+        .map(|p| {
+            if p.is_empty() {
+                vec![Line::from(Span::styled(
+                    "(no messages yet)",
+                    Style::default().fg(Color::DarkGray),
+                ))]
+            } else {
+                p.iter()
+                    .map(|l| Line::from(Span::styled(l.clone(), Style::default().fg(Color::Gray))))
+                    .collect()
+            }
+        })
+        .unwrap_or_default();
+    f.render_widget(
+        Paragraph::new(preview_lines).block(
+            Block::default()
+                .borders(Borders::TOP)
+                .border_style(Style::default().fg(Color::DarkGray))
+                .title(Span::styled(
+                    " preview ",
+                    Style::default().fg(Color::DarkGray),
+                )),
+        ),
+        chunks[2],
+    );
+
+    // Filter/footer.
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("› ", Style::default().fg(Color::DarkGray)),
+            Span::styled(query.to_string(), Style::default().fg(Color::White)),
+            Span::styled(
+                "    ↑/↓ move · type to filter · enter open · esc new",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])),
+        chunks[3],
+    );
 }
 
 #[tokio::main]
@@ -834,4 +1046,19 @@ fn done(pretty: &str, id: &str) {
         "\n\x1b[32m✓ logged in to {}.\x1b[0m Use it with:  bob --provider {}",
         pretty, id
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fuzzy_match;
+
+    #[test]
+    fn fuzzy_match_is_case_insensitive_subsequence() {
+        assert!(fuzzy_match("", "anything"));
+        assert!(fuzzy_match("fb", "foo bar")); // subsequence, not adjacent
+        assert!(fuzzy_match("BAR", "foo bar")); // case-insensitive
+        assert!(fuzzy_match("foobar", "foo bar")); // spaces skipped as gaps
+        assert!(!fuzzy_match("baz", "foo bar")); // 'z' absent
+        assert!(!fuzzy_match("rab", "foo bar")); // wrong order
+    }
 }

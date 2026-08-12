@@ -562,6 +562,48 @@ pub fn load_session(id: &str) -> anyhow::Result<Option<Session>> {
     }
 }
 
+/// A short multi-line preview of a session's tail: the last `n` user/assistant
+/// text messages, each collapsed to one line, role-prefixed and truncated. Powers
+/// the `--resume` picker so the user sees where a conversation left off. Returns an
+/// empty vec for an unknown id or a session with no readable text.
+pub fn session_preview(id: &str, n: usize) -> Vec<String> {
+    let session = match load_session(id) {
+        Ok(Some(s)) => s,
+        _ => return Vec::new(),
+    };
+    preview_lines(&session.messages, n)
+}
+
+/// Build the last-`n` preview lines from a message list (split out for testing).
+fn preview_lines(messages: &[Message], n: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for m in messages.iter().rev() {
+        if out.len() >= n {
+            break;
+        }
+        let role = match m.role {
+            Role::User => "you",
+            Role::Assistant => "bob",
+            _ => continue, // skip system/tool turns in the preview
+        };
+        let text = m.text();
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let one_line = text.replace('\n', " ");
+        let snippet: String = if one_line.chars().count() <= 80 {
+            one_line
+        } else {
+            let cut: String = one_line.chars().take(80).collect();
+            format!("{cut}…")
+        };
+        out.push(format!("{role}: {snippet}"));
+    }
+    out.reverse(); // chronological order (oldest of the tail first)
+    out
+}
+
 /// Find the most recently updated session (for `--resume` with no id).
 pub fn latest_session() -> anyhow::Result<Option<Session>> {
     let conn = open_db()?;
@@ -700,6 +742,44 @@ pub fn latest_session_in(cwd: &str) -> anyhow::Result<Option<Session>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assistant(text: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: vec![crate::core::types::ContentBlock::Text { text: text.into() }],
+        }
+    }
+
+    #[test]
+    fn preview_lines_returns_last_n_role_prefixed() {
+        let msgs = vec![
+            Message::user_text("first question"),
+            assistant("first answer"),
+            Message::user_text("second question"),
+            assistant("second answer"),
+        ];
+        let p = preview_lines(&msgs, 2);
+        // Last two, chronological, role-prefixed.
+        assert_eq!(p, vec!["you: second question", "bob: second answer"]);
+    }
+
+    #[test]
+    fn preview_lines_skips_empty_and_non_chat_roles_and_truncates() {
+        let long = "x".repeat(200);
+        let msgs = vec![
+            Message::user_text("   "), // empty after trim → skipped
+            Message::user_text(&long),
+        ];
+        let p = preview_lines(&msgs, 3);
+        assert_eq!(p.len(), 1);
+        assert!(p[0].starts_with("you: "));
+        assert!(p[0].ends_with('…'), "long line should be truncated");
+    }
+
+    #[test]
+    fn preview_lines_empty_for_no_messages() {
+        assert!(preview_lines(&[], 3).is_empty());
+    }
 
     #[test]
     fn agent_threads_round_trip() {
