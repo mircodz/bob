@@ -5,6 +5,7 @@
 
 use super::diffview::render_diff;
 use super::highlight::highlight;
+use super::render::{safe_display_text, sanitize_display_lines};
 use super::theme::Palette;
 use pulldown_cmark::{Alignment, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Modifier, Style};
@@ -12,13 +13,15 @@ use ratatui::text::{Line, Span};
 
 /// Render a markdown string into styled lines.
 pub fn render_markdown(md: &str) -> Vec<Line<'static>> {
+    let md = safe_display_text(md);
     let mut r = Renderer::default();
     let opts = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES;
-    let parser = Parser::new_ext(md, opts);
+    let parser = Parser::new_ext(&md, opts);
     for event in parser {
         r.event(event);
     }
     r.finish();
+    sanitize_display_lines(&mut r.lines);
     r.lines
 }
 
@@ -361,5 +364,40 @@ fn heading_num(level: HeadingLevel) -> usize {
         HeadingLevel::H4 => 4,
         HeadingLevel::H5 => 5,
         HeadingLevel::H6 => 6,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn markdown_strips_controls_before_parsing_and_preserves_styles() {
+        for clean in [
+            "**日本語** and *café*",
+            "```rust\nlet café = 1;\n```",
+            "```diff file.rs\n+日本語\n-café\n```",
+            "| heading |\n| --- |\n| 日本語 |",
+        ] {
+            let raw = format!("\u{1b}[31m{clean}\u{1b}[0m\u{1b}]52;c;payload\u{7}");
+            let original = raw.clone();
+            assert_eq!(render_markdown(&raw), render_markdown(clean));
+            assert_eq!(raw, original);
+        }
+    }
+
+    #[test]
+    fn markdown_decoded_entities_cannot_reintroduce_controls() {
+        let lines = render_markdown("**before&#27;[31mred&#27;]52;c;payload&#7;after**");
+        assert_eq!(lines[0].to_string(), "beforeredafter");
+        assert!(lines[0]
+            .spans
+            .iter()
+            .all(|span| span.style.add_modifier.contains(Modifier::BOLD)));
+        for line in lines {
+            for span in line.spans {
+                assert!(!span.content.chars().any(char::is_control));
+            }
+        }
     }
 }

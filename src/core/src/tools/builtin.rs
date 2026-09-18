@@ -101,12 +101,11 @@ impl Tool for WriteFileTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "write_file".to_string(),
-            description: "Create a new file, or completely overwrite an existing one, with the \
-                given content. PREFER `edit_file`/`multi_edit` for changing existing files — only \
-                use write_file for genuinely new files or a deliberate full rewrite. If the file \
-                exists you must read it first (overwriting unseen content is rejected). Do NOT \
-                create documentation/README files unless the user explicitly asks. Writes exactly \
-                what you provide — no automatic formatting or headers."
+            description: "Create a file or replace its entire contents. Prefer edit_file or \
+                multi_edit for existing code. Read an existing file's current contents before \
+                overwriting it, preserve unrelated work, and use full replacement only when \
+                deliberate. Do not create documentation/README files unless requested. The \
+                supplied content is written without automatic formatting or headers."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -128,18 +127,8 @@ impl Tool for WriteFileTool {
         }
         std::fs::write(&full, content)?;
         ctx.files.record_write(&full.to_string_lossy());
-        let mut result = format!("wrote {} bytes to {}", content.len(), path);
-        if let Some(diags) = crate::tools::lsp::post_edit_diagnostics(
-            &ctx.lsp,
-            &ctx.cwd,
-            path,
-            std::time::Duration::from_millis(700),
-        )
-        .await
-        {
-            result.push_str(&diags);
-        }
-        Ok(result)
+        crate::tools::lsp::sync_after_edit(&ctx.lsp, &full, content).await;
+        Ok(format!("wrote {} bytes to {}", content.len(), path))
     }
 
     fn preview(&self, input: &Value, ctx: &ToolContext) -> Option<String> {

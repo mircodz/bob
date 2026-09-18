@@ -413,7 +413,7 @@ pub async fn run(
         let evt_tx = evt_tx.clone();
         bus.on(Arc::new(move |e: &AgentEvent| {
             // Every event is forwarded to the UI channel; the apply site routes each
-            // to the main transcript or a team-drawer thread by agent id.
+            // to the main transcript or a agent thread by agent id.
             let _ = evt_tx.send(e.clone());
         }));
     }
@@ -488,8 +488,7 @@ pub async fn run(
     let system_prompt =
         bob_core::agent::prompt::build_system_prompt(config.system.as_deref(), &cwd);
 
-    // Build the fully-wired root agent (tools + coordination + team mailbox). The
-    // same builder backs the remote host, so the two can't drift.
+    // Build the fully-wired root agent (tools + coordination + team mailbox).
     let mut agent =
         bob_core::agent::assembly::build_root_agent(bob_core::agent::assembly::RootAgentParams {
             provider: provider.clone(),
@@ -573,7 +572,7 @@ pub async fn run(
     app.todos = Some(todos);
     // Load user-defined slash commands from .bob/commands/*.md (global + project).
     app.custom_commands = bob_core::core::commands::load_custom_commands(&cwd);
-    // Restore per-agent drawer transcripts from a resumed session.
+    // Restore per-agent transcripts from a resumed session.
     if !session.agent_threads.is_empty() {
         app.teams = team::AgentTranscripts::from_persisted(&session.agent_threads);
     }
@@ -593,8 +592,8 @@ pub async fn run(
             Some(events) => {
                 let rebuilt = bob_core::core::session::root_history_from_events(&events);
                 if rebuilt.len() >= session.messages.len() {
+                    app.teams = team::AgentTranscripts::replay(&events);
                     for evt in &events {
-                        app.teams.apply(evt, None);
                         app.view.apply(evt);
                     }
                     app.view.reset_after_replay();
@@ -614,9 +613,13 @@ pub async fn run(
             session.messages.len()
         ));
     }
+    for id in app.teams.display_order() {
+        app.jobs.reserve_id(&id);
+        bob_core::tools::task::reserve_subagent_id(&id);
+    }
     // Surface MCP connection results.
     for note in &mcp_notices {
-        app.view.push_notice(note.clone());
+        app.view.push_event(note.clone());
     }
 
     let mut keys = EventStream::new();
@@ -632,6 +635,7 @@ pub async fn run(
     let mut dirty = false;
 
     let result = 'outer: loop {
+        dirty |= app.clear_closed_prompts();
         if dirty && last_draw.elapsed() >= FRAME {
             draw_frame(&mut terminal, &mut app)?;
             last_draw = tokio::time::Instant::now();
@@ -650,28 +654,13 @@ pub async fn run(
                 // Wake to repaint at the frame boundary; the top of the loop draws.
             }
             maybe_key = keys.next() => {
-                // Assume this event changes something; the arms that DON'T (a key
-                // release, an unhandled event, a no-op mouse move) reset it. On
-                // Windows every key press has a matching release and the mouse emits
-                // a stream of move events — repainting on those forces a 60fps redraw
-                // that shows as a flickering cursor, so only repaint on real changes.
-                dirty = true;
                 match maybe_key {
-                    Some(Ok(CtEvent::Key(key))) if key.kind != KeyEventKind::Release => {
-                        match app.on_key(key.code, key.modifiers) {
+                    Some(Ok(event)) => {
+                        match app.on_terminal_event(event, &mut dirty) {
                             KeyOutcome::Quit => break 'outer Ok(()),
                             KeyOutcome::Submit(text) => {
                                 if let Some(id) = app.focused_agent.clone() {
-                                    // Focused on a subagent: the message goes TO it
-                                    // (the send_message path + coordination wake), not
-                                    // to root. Echo it into the agent's thread so it
-                                    // shows in the swapped transcript immediately.
-                                    if app.agent_team.send(&id, "user", &text) {
-                                        app.teams.push_message(&id, "user", &text, Some(&id));
-                                    } else {
-                                        app.notify(format!("{id} is not reachable"));
-                                    }
-                                    app.stick_to_bottom();
+                                    app.send_agent_message(&id, &text);
                                 } else if app.running {
                                     // A turn is in flight — queue this as a pinned
                                     // chip above the input (NOT the transcript). It's
@@ -875,59 +864,6 @@ pub async fn run(
                             KeyOutcome::None => {}
                         }
                     }
-                    Some(Ok(CtEvent::Paste(text))) => app.input.paste(&text),
-                    Some(Ok(CtEvent::Mouse(m))) => match m.kind {
-                        MouseEventKind::ScrollUp => {
-                            // One line per wheel notch for a smooth, precise feel
-                            // (batching coalesces a fast flick into one redraw).
-                            if let Some(d) = app.team_drawer.as_mut() {
-                                d.scroll = d.scroll.saturating_sub(1);
-                            } else {
-                                app.active_scrollback().scroll_up(1);
-                            }
-                        }
-                        MouseEventKind::ScrollDown => {
-                            if let Some(d) = app.team_drawer.as_mut() {
-                                d.scroll = d.scroll.saturating_add(1);
-                            } else {
-                                app.active_scrollback().scroll_down(1);
-                            }
-                        }
-                        MouseEventKind::Down(MouseButton::Left) => {
-                            // In the workflow view, a click on an agent row drills in.
-                            // In the drawer, a click on a roster row selects that
-                            // agent. In the main view, a click on a tool cell
-                            // expands/collapses its output; a click elsewhere sticks
-                            // to the bottom.
-                            if app.workflow_view.is_some() {
-                                app.click_workflow_view(m.column, m.row);
-                            } else if app.team_drawer.is_some() {
-                                app.click_roster(m.column, m.row);
-                            } else if app.sidebar_open
-                                && app
-                                    .sidebar_rows
-                                    .as_ref()
-                                    .is_some_and(|r| r.iter().any(|(row, _)| *row == m.row))
-                            {
-                                // A click on a sidebar agent row focuses that agent.
-                                app.click_sidebar(m.column, m.row);
-                            } else if !app.click_scrollback(m.column, m.row) {
-                                app.stick_to_bottom();
-                            }
-                        }
-                        MouseEventKind::Moved => {
-                            // Hover highlight in the drawer. Only a CHANGE in the
-                            // hovered row warrants a repaint (mouse-move fires a lot).
-                            let changed = if app.team_drawer.is_some() {
-                                app.hover_roster(m.column, m.row)
-                            } else {
-                                false
-                            };
-                            dirty = changed;
-                        }
-                        _ => {}
-                    },
-                    Some(Ok(_)) => dirty = false,
                     Some(Err(_)) | None => break 'outer Ok(()),
                 }
             }
@@ -953,16 +889,7 @@ pub async fn run(
                         let _ = bob_core::core::usage::append_global(&entry);
                     });
                 }
-                // Route to the right transcript: the main view always sees the
-                // event (it updates the "• Spawned" cell for subagents and ignores
-                // their prose), and the team store captures each subagent's full
-                // thread for the drawer.
-                let showing = app
-                    .team_drawer
-                    .as_ref()
-                    .and_then(|d| app.teams.display_order().get(d.list.selected).cloned());
-                app.teams.apply(&evt, showing.as_deref());
-                app.view.apply(&evt);
+                app.apply_agent_event(&evt);
                 // Follow new output only when already pinned to the bottom. If the
                 // user has scrolled up to read, don't yank them back down on every
                 // streamed token.
@@ -1074,6 +1001,7 @@ pub async fn run(
                 app.apply_bg(outcome, &agent);
             }
             _ = ticker.tick() => {
+                dirty |= app.refresh_job_panel();
                 // Only the animated states (spinner/Working line) need a periodic
                 // repaint. When fully idle, leave `dirty` false so the loop parks in
                 // sleep_until instead of repainting 10×/s for nothing.
@@ -1085,7 +1013,7 @@ pub async fn run(
                 // drive a fresh empty-prompt turn so the root folds the result into
                 // history and acts on it — an idle agent is re-driven by a new turn
                 // rather than blocking.
-                if !app.running {
+                if !app.running && !app.cancel.load(std::sync::atomic::Ordering::Relaxed) {
                     // Job-completion wake: a background job (e.g. a benchmark run)
                     // that finished while the agent was idle would otherwise just
                     // sit there until the user nudged it. Inject a turn naming the
@@ -1290,6 +1218,7 @@ struct App {
     global_usage: bob_core::core::types::Usage,
     /// Shared background-job registry (for the pinned panel + Ctrl+B detach).
     jobs: bob_core::tools::jobs::JobRegistry,
+    running_shell_jobs: Vec<String>,
     /// Permission engine handle (for mode switching via Shift+Tab).
     permissions: Arc<PermissionEngine>,
     /// Cancel flag for the running turn (set on Esc to interrupt).
@@ -1328,34 +1257,25 @@ struct App {
     /// behavior as the root conversation (one renderer, two transcripts). Reset
     /// when the focused agent changes.
     focused_scrollback: scrollback::ScrollbackRenderer,
-    /// Per-agent transcripts for the team drawer (fed by subagent events).
+    /// Per-agent transcripts for the sidebar (fed by subagent events).
     teams: team::AgentTranscripts,
-    /// Team drawer overlay state; `None` when closed.
-    team_drawer: Option<team::TeamDrawer>,
     /// Full-screen workflow view overlay; `None` when closed.
     workflow_view: Option<team::WorkflowView>,
     /// The workflow view's per-selectable-row (screen row, agent id), set each
     /// draw, so key-nav and clicks map to an agent. `None` when the view is closed.
     wf_view_agents: Option<Vec<(u16, String)>>,
-    /// Screen rect of the drawer's agent roster (set each draw), so left-clicks can
-    /// be hit-tested to select an agent. `None` when the drawer is closed.
-    roster_rect: Option<Rect>,
-    /// First roster index visible after windowing (the drawer roster scrolls when
-    /// the team is taller than the pane), so click/hover hit-tests add this offset.
-    roster_scroll: usize,
     /// Whether the sticky todo panel is shown (toggled with Ctrl+L).
     show_todos: bool,
-    /// Shared team roster, so the drawer can message agents (send_message path).
+    /// Shared team roster, so the input can message agents (send_message path).
     agent_team: bob_core::agent::team::AgentRegistry,
+    agent_control_notice: Option<(String, String)>,
     /// Event bus + composed system prompt, kept so `/workflow` can build a
     /// `WorkflowContext` (agents + progress events route through the same bus).
     bus: EventBus,
     system_prompt: String,
-    /// The collapsible right info sidebar. `open` = shown (Ctrl+G toggles it,
+    /// The collapsible right info sidebar. `open` = shown (Ctrl+T toggles it,
     /// manual-open only). `sidebar.selected` indexes the AGENTS tree (0 = "main").
-    /// The sidebar is full-height and lists only running agents, so it isn't
-    /// windowed — `sidebar.scroll` is unused until a scrolling section (LSP/MCP)
-    /// lands.
+    /// The viewport follows selection through running and terminal agents.
     sidebar_open: bool,
     sidebar: widgets::SelectList,
     /// The agent whose conversation the LEFT transcript is currently showing, and
@@ -1364,6 +1284,7 @@ struct App {
     /// Screen-row → agent id hit map for the sidebar's AGENTS rows (set each draw),
     /// so clicks select an agent. "main" maps to an empty id.
     sidebar_rows: Option<Vec<(u16, String)>>,
+    sidebar_rect: Option<Rect>,
 }
 
 /// The turn `/init` submits: asks the agent to survey the project and write an
@@ -1431,6 +1352,7 @@ impl App {
             session_usage: bob_core::core::types::Usage::default(),
             global_usage: bob_core::core::types::Usage::default(),
             jobs,
+            running_shell_jobs: Vec::new(),
             permissions,
             cancel,
             pending_query: None,
@@ -1450,20 +1372,40 @@ impl App {
             scrollback: scrollback::ScrollbackRenderer::new(),
             focused_scrollback: scrollback::ScrollbackRenderer::new(),
             teams: team::AgentTranscripts::new(),
-            team_drawer: None,
             workflow_view: None,
             wf_view_agents: None,
-            roster_rect: None,
-            roster_scroll: 0,
             show_todos: true,
             agent_team,
+            agent_control_notice: None,
             bus: EventBus::new(),
             system_prompt: String::new(),
             sidebar_open: false,
             sidebar: widgets::SelectList::new(),
             focused_agent: None,
             sidebar_rows: None,
+            sidebar_rect: None,
         }
+    }
+
+    fn stop_target(&self) -> Option<String> {
+        if self.workflow_view.is_some() {
+            return None;
+        }
+        let id = if self.pending_query.as_ref().is_none_or(|query| {
+            query.other_text.is_none() && matches!(query.purpose, QueryPurpose::Tool(_))
+        }) {
+            self.focused_agent.clone()
+        } else {
+            None
+        };
+        id.filter(|id| !id.is_empty() && id != "root")
+    }
+
+    fn control_notice(&self, id: &str) -> Option<&str> {
+        self.agent_control_notice
+            .as_ref()
+            .filter(|(target, _)| target == id)
+            .map(|(_, message)| message.as_str())
     }
 
     fn stick_to_bottom(&mut self) {
@@ -1853,66 +1795,24 @@ impl App {
         });
     }
 
-    /// Open the team drawer (if any agents exist) or close it if already open.
-    fn toggle_team_drawer(&mut self) {
-        if self.team_drawer.is_some() {
-            self.team_drawer = None;
-            return;
-        }
-        if self.teams.is_empty() {
-            self.notify("no agents yet");
-            return;
-        }
-        if let Some(id) = self.teams.display_order().first().cloned() {
-            self.teams.mark_read(&id);
-        }
-        self.team_drawer = Some(team::TeamDrawer::default());
-    }
-
-    /// Select a drawer agent by mouse click. `col`/`row` are terminal cells. The
-    /// roster has one leading blank line, so agent `i` is at `rect.y + 1 + i`.
-    fn click_roster(&mut self, col: u16, row: u16) {
-        let Some(rect) = self.roster_rect else {
-            return;
-        };
-        // Ignore clicks outside the roster column (e.g. on the transcript pane).
-        if col < rect.x || col >= rect.x + rect.width {
-            return;
-        }
-        if row <= rect.y {
-            return; // header/blank line
-        }
-        let idx = (row - rect.y - 1) as usize + self.roster_scroll;
-        let order = self.teams.display_order();
-        if idx >= order.len() {
-            return;
-        }
-        if let Some(drawer) = self.team_drawer.as_mut() {
-            if drawer.list.selected != idx {
-                drawer.list.selected = idx;
-                drawer.scroll = 0;
-            }
-        }
-        if let Some(id) = order.get(idx) {
-            self.teams.mark_read(id);
-        }
-    }
-
     /// Toggle a tool cell's expanded state when the scrollback is clicked at
     /// `row`. Maps the row → cell via the scrollback's hit-test; only `Cell::Tool`
     /// cells toggle. Returns true if something toggled (so the caller marks dirty).
     fn click_scrollback(&mut self, _col: u16, row: u16) -> bool {
-        let Some((cell_idx, offset)) = self.scrollback.hit_test_offset(row) else {
+        let Some((cell_idx, offset)) = self.active_scrollback().hit_test_offset(row) else {
             return false;
         };
+        if let Some(id) = self.focused_agent.as_deref() {
+            return self.teams.toggle_tool(id, cell_idx);
+        }
         // A click on a workflow cell: an agent row drills into that agent's
-        // transcript (team drawer); the header/phase rows open the full-screen
+        // transcript; the header/phase rows open the full-screen
         // workflow view. Anything else falls back to the tool-expand toggle.
         if let Some(cell) = self.view.cells.get(cell_idx) {
             if let view::Cell::Workflow { id, .. } = cell {
                 if let Some(agent_id) = cell.workflow_agent_at(offset) {
                     let id = agent_id.to_string();
-                    return self.open_drawer_on(&id);
+                    return self.open_sidebar_on(&id);
                 }
                 // Header or phase row → open the full-screen view for this run.
                 let run_id = id.clone();
@@ -1931,58 +1831,22 @@ impl App {
         });
     }
 
-    /// Open the team drawer focused on `agent_id` (used when clicking a workflow
-    /// tree row). Selects that agent, marks it read, and opens the drawer if closed.
-    /// Returns true if the drawer state changed.
-    fn open_drawer_on(&mut self, agent_id: &str) -> bool {
+    fn open_sidebar_on(&mut self, agent_id: &str) -> bool {
         let order = self.teams.display_order();
         let Some(idx) = order.iter().position(|id| id == agent_id) else {
-            // The agent isn't in the transcript store (shouldn't happen for a live
-            // workflow agent) — nothing to open.
             return false;
         };
-        self.teams.mark_read(agent_id);
-        match self.team_drawer.as_mut() {
-            Some(drawer) => {
-                drawer.list.selected = idx;
-                drawer.scroll = 0;
-            }
-            None => {
-                self.team_drawer = Some(team::TeamDrawer {
-                    list: widgets::SelectList {
-                        selected: idx,
-                        scroll: 0,
-                    },
-                    ..Default::default()
-                });
-            }
-        }
+        self.workflow_view = None;
+        self.wf_view_agents = None;
+        self.sidebar_open = true;
+        self.sidebar.selected = idx + 1;
+        self.set_focused_agent(Some(agent_id.to_string()));
         true
     }
 
-    /// `hovered` to the roster index under the cursor, or `None` when off-roster.
-    /// Returns true if the hover state changed (so the caller can mark dirty).
-    fn hover_roster(&mut self, col: u16, row: u16) -> bool {
-        let scroll = self.roster_scroll;
-        let new_hover = self.roster_rect.and_then(|rect| {
-            if col < rect.x || col >= rect.x + rect.width || row <= rect.y {
-                return None;
-            }
-            let idx = (row - rect.y - 1) as usize + scroll;
-            (idx < self.teams.display_order().len()).then_some(idx)
-        });
-        if let Some(drawer) = self.team_drawer.as_mut() {
-            if drawer.hovered != new_hover {
-                drawer.hovered = new_hover;
-                return true;
-            }
-        }
-        false
-    }
-
     /// Key handling for the collapsible workflow view. ↑↓ move the cursor over the
-    /// flattened phase/agent rows; Enter toggles (collapse a phase / expand an
-    /// agent's inline detail); Esc closes. PgUp/PgDn jump the cursor.
+    /// flattened phase/agent rows; Enter toggles a phase or opens an agent's
+    /// transcript; Esc closes. PgUp/PgDn jump the cursor.
     fn handle_workflow_view_key(&mut self, code: KeyCode) -> KeyOutcome {
         use draw::{workflow_rows, WfRow};
         // Rebuild the current row list so the cursor clamps to what's visible.
@@ -2013,17 +1877,25 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => vw.list.down(n),
             KeyCode::PageUp => vw.list.page_up(10),
             KeyCode::PageDown => vw.list.page_down(10, n),
-            KeyCode::Enter | KeyCode::Char(' ') => {
-                // Enter toggles a phase's collapse. On an agent it's a no-op — the
-                // detail pane already shows the selected agent.
-                if let Some(WfRow::Phase(pi)) = rows.get(vw.list.selected) {
+            KeyCode::Enter | KeyCode::Char(' ') => match rows.get(vw.list.selected) {
+                Some(WfRow::Phase(pi)) => {
                     if vw.collapsed.contains(pi) {
                         vw.collapsed.remove(pi);
                     } else {
                         vw.collapsed.insert(*pi);
                     }
                 }
-            }
+                Some(WfRow::Agent(pi, ai)) => {
+                    let agent_id = self
+                        .view
+                        .workflow_by_id(&vw.run_id)
+                        .map(|(_, phases, _)| phases[*pi].agents[*ai].agent_id.clone());
+                    if let Some(id) = agent_id {
+                        self.open_sidebar_on(&id);
+                    }
+                }
+                None => {}
+            },
             KeyCode::Right | KeyCode::Char('l') => {
                 // Expand a collapsed phase.
                 if let Some(WfRow::Phase(pi)) = rows.get(vw.list.selected) {
@@ -2044,10 +1916,7 @@ impl App {
         KeyOutcome::None
     }
 
-    /// A left-click in the workflow view selects the clicked agent row (its detail
-    /// then shows in the right pane).
     fn click_workflow_view(&mut self, _col: u16, row: u16) {
-        use draw::{workflow_rows, WfRow};
         let Some(agent_id) = self
             .wf_view_agents
             .as_ref()
@@ -2055,108 +1924,33 @@ impl App {
         else {
             return;
         };
-        if let Some(vw) = self.workflow_view.as_ref() {
-            if let Some((_, phases, _)) = self.view.workflow_by_id(&vw.run_id) {
-                let rows = workflow_rows(phases, &vw.collapsed);
-                let idx = rows.iter().position(|r| {
-                    matches!(r, WfRow::Agent(pi, ai) if phases[*pi].agents[*ai].agent_id == agent_id)
-                });
-                if let (Some(idx), Some(vw)) = (idx, self.workflow_view.as_mut()) {
-                    vw.list.selected = idx;
-                }
-            }
-        }
+        self.open_sidebar_on(&agent_id);
     }
 
-    fn handle_drawer_key(&mut self, code: KeyCode) -> KeyOutcome {
-        let count = self.teams.len();
-        // Compose mode: keys edit/submit the message to the selected agent.
-        if self
-            .team_drawer
+    fn apply_agent_event(&mut self, event: &AgentEvent) {
+        self.teams.apply(event, self.focused_agent.as_deref());
+        let order = self.teams.display_order();
+        self.sync_sidebar_selection(&order);
+        self.view.apply(event);
+    }
+
+    fn sync_sidebar_selection(&mut self, order: &[String]) {
+        self.sidebar.selected = self
+            .focused_agent
             .as_ref()
-            .is_some_and(|d| d.composing.is_some())
-        {
-            return self.handle_drawer_compose_key(code);
-        }
-        let Some(drawer) = self.team_drawer.as_mut() else {
-            return KeyOutcome::None;
-        };
-        let mut selection_changed = false;
-        match code {
-            KeyCode::Esc => {
-                self.team_drawer = None;
-                return KeyOutcome::None;
-            }
-            KeyCode::Char('i') => {
-                drawer.composing = Some(String::new());
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                if drawer.list.selected > 0 {
-                    drawer.list.up();
-                    drawer.scroll = 0;
-                    selection_changed = true;
-                }
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if drawer.list.selected + 1 < count {
-                    drawer.list.down(count);
-                    drawer.scroll = 0;
-                    selection_changed = true;
-                }
-            }
-            KeyCode::PageUp => {
-                drawer.scroll = drawer.scroll.saturating_sub(5);
-            }
-            KeyCode::PageDown => {
-                drawer.scroll = drawer.scroll.saturating_add(5);
-            }
-            _ => {}
-        }
-        if selection_changed {
-            let sel = drawer.list.selected;
-            if let Some(id) = self.teams.display_order().get(sel).cloned() {
-                self.teams.mark_read(&id);
-            }
-        }
-        KeyOutcome::None
+            .and_then(|id| order.iter().position(|r| r == id))
+            .map(|idx| idx + 1)
+            .unwrap_or(0);
     }
 
-    /// Keys while composing a drawer message. Enter sends it into the selected
-    /// agent's inbox (the send_message path); Esc cancels; chars/backspace edit.
-    fn handle_drawer_compose_key(&mut self, code: KeyCode) -> KeyOutcome {
-        match code {
-            KeyCode::Esc => {
-                if let Some(d) = self.team_drawer.as_mut() {
-                    d.composing = None;
-                }
-            }
-            KeyCode::Char(c) => {
-                if let Some(buf) = self.team_drawer.as_mut().and_then(|d| d.composing.as_mut()) {
-                    buf.push(c);
-                }
-            }
-            KeyCode::Backspace => {
-                if let Some(buf) = self.team_drawer.as_mut().and_then(|d| d.composing.as_mut()) {
-                    buf.pop();
-                }
-            }
-            KeyCode::Enter => {
-                self.send_drawer_message();
-            }
-            _ => {}
-        }
-        KeyOutcome::None
-    }
-
-    /// Set `focused_agent` from the current sidebar selection: index 0 = "main"
-    /// (root, `None`), otherwise the running agent at that position.
+    /// Set `focused_agent` from the current sidebar selection: index 0 = "main".
     fn apply_sidebar_focus(&mut self) {
         if self.sidebar.selected == 0 {
             self.set_focused_agent(None);
             return;
         }
-        let running = self.teams.running_ids();
-        let id = running.get(self.sidebar.selected - 1).cloned();
+        let order = self.teams.display_order();
+        let id = order.get(self.sidebar.selected - 1).cloned();
         self.set_focused_agent(id);
     }
 
@@ -2178,12 +1972,35 @@ impl App {
         if self.focused_agent != id {
             self.focused_scrollback = scrollback::ScrollbackRenderer::new();
         }
+        if let Some(id) = id.as_deref() {
+            self.teams.mark_read(id);
+        }
         self.focused_agent = id;
+    }
+
+    fn send_agent_message(&mut self, id: &str, text: &str) {
+        if self.agent_team.send(id, "user", text) {
+            self.teams.push_message(id, "user", text, Some(id));
+            self.agent_control_notice = None;
+            self.focused_scrollback.stick_to_bottom();
+        } else {
+            let message = format!("{id} is not reachable");
+            self.notify(message.clone());
+            self.agent_control_notice = Some((id.to_string(), message));
+        }
+    }
+
+    fn sidebar_contains(&self, col: u16, row: u16) -> bool {
+        self.sidebar_rect
+            .is_some_and(|r| col >= r.x && col < r.right() && row >= r.y && row < r.bottom())
     }
 
     /// A click in the sidebar selects that agent row (and focuses it). An empty id
     /// is the "main" row → back to the root conversation.
-    fn click_sidebar(&mut self, _col: u16, row: u16) {
+    fn click_sidebar(&mut self, col: u16, row: u16) {
+        if !self.sidebar_contains(col, row) {
+            return;
+        }
         let Some(id) = self
             .sidebar_rows
             .as_ref()
@@ -2194,37 +2011,93 @@ impl App {
         if id.is_empty() {
             self.sidebar.selected = 0;
             self.set_focused_agent(None);
-        } else if let Some(idx) = self.teams.running_ids().iter().position(|r| *r == id) {
+        } else if let Some(idx) = self.teams.display_order().iter().position(|r| *r == id) {
             self.sidebar.selected = idx + 1;
             self.set_focused_agent(Some(id));
         }
     }
 
-    /// Deliver the composed message into the selected agent's inbox, mirroring the
-    /// `send_message` tool, and echo it into that agent's thread immediately.
-    fn send_drawer_message(&mut self) {
-        let Some(drawer) = self.team_drawer.as_mut() else {
-            return;
-        };
-        let text = drawer.composing.take().unwrap_or_default();
-        let text = text.trim().to_string();
-        let sel = drawer.list.selected;
-        if text.is_empty() {
-            return;
+    fn on_terminal_event(&mut self, event: CtEvent, dirty: &mut bool) -> KeyOutcome {
+        match event {
+            CtEvent::Key(key) if key.kind != KeyEventKind::Release => {
+                *dirty = true;
+                return self.on_key(key.code, key.modifiers);
+            }
+            CtEvent::Paste(text) => {
+                self.input.paste(&text);
+                *dirty = true;
+            }
+            CtEvent::Resize(_, _) => {
+                // Ratatui resizes on the next draw; discard stale click coordinates now.
+                self.sidebar_rect = None;
+                self.sidebar_rows = None;
+                self.wf_view_agents = None;
+                *dirty = true;
+            }
+            CtEvent::Mouse(m) => match m.kind {
+                MouseEventKind::ScrollUp => {
+                    self.active_scrollback().scroll_up(1);
+                    *dirty = true;
+                }
+                MouseEventKind::ScrollDown => {
+                    self.active_scrollback().scroll_down(1);
+                    *dirty = true;
+                }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if self.workflow_view.is_some() {
+                        self.click_workflow_view(m.column, m.row);
+                    } else if self.sidebar_open && self.sidebar_contains(m.column, m.row) {
+                        self.click_sidebar(m.column, m.row);
+                    } else if !self.click_scrollback(m.column, m.row) {
+                        self.active_scrollback().stick_to_bottom();
+                    }
+                    *dirty = true;
+                }
+                _ => {}
+            },
+            _ => {}
         }
-        let Some(id) = self.teams.display_order().get(sel).cloned() else {
-            return;
-        };
-        // Route through the shared team registry (same path SendMessageTool uses),
-        // so the agent is woken to process it by the coordination loop.
-        if self.agent_team.send(&id, "user", &text) {
-            self.teams.push_message(&id, "user", &text, Some(&id));
-        } else {
-            self.notify(format!("{} is not reachable", id));
+        KeyOutcome::None
+    }
+
+    fn refresh_job_panel(&mut self) -> bool {
+        let running: Vec<_> = draw::shell_jobs(&self.jobs)
+            .into_iter()
+            .map(|(id, _, _, _)| id)
+            .collect();
+        if running == self.running_shell_jobs {
+            return false;
         }
+        self.running_shell_jobs = running;
+        true
+    }
+
+    fn clear_closed_prompts(&mut self) -> bool {
+        let count = self.perm_queue.len();
+        self.perm_queue.retain(|prompt| !prompt.resp.is_closed());
+        let permissions_changed = self.perm_queue.len() != count;
+        let query_closed = self
+            .pending_query
+            .as_ref()
+            .is_some_and(|q| matches!(&q.purpose, QueryPurpose::Tool(resp) if resp.is_closed()));
+        if query_closed {
+            self.pending_query = None;
+        }
+        permissions_changed || query_closed
     }
 
     fn on_key(&mut self, code: KeyCode, mods: KeyModifiers) -> KeyOutcome {
+        if code == KeyCode::Char('x') && mods.contains(KeyModifiers::CONTROL) {
+            if let Some(id) = self.stop_target() {
+                let message = match self.agent_team.stop("root", &id) {
+                    Ok(count) => format!("cancellation requested ({count})"),
+                    Err(error) => error,
+                };
+                self.notify(format!("{id}: {message}"));
+                self.agent_control_notice = Some((id, message));
+            }
+            return KeyOutcome::None;
+        }
         // Shift+Tab cycles the interaction mode (normal → auto-accept → plan).
         if code == KeyCode::BackTab {
             let next = self.permissions.mode().next();
@@ -2232,20 +2105,26 @@ impl App {
             return KeyOutcome::None;
         }
 
-        // Ctrl+T toggles the team drawer (only meaningful once agents exist).
         if code == KeyCode::Char('t') && mods.contains(KeyModifiers::CONTROL) {
-            self.toggle_team_drawer();
+            self.sidebar_open = !self.sidebar_open;
+            self.workflow_view = None;
+            self.wf_view_agents = None;
+            self.sidebar_rect = None;
+            self.sidebar_rows = None;
             return KeyOutcome::None;
         }
-        // Ctrl+G toggles the info sidebar (agents tree). Manual open only.
         if code == KeyCode::Char('g') && mods.contains(KeyModifiers::CONTROL) {
-            self.sidebar_open = !self.sidebar_open;
             return KeyOutcome::None;
         }
         // With the sidebar open, ↑/↓ move its selection and Enter/Esc switch the
         // focused conversation — but ONLY when the input is empty, so typing is
         // unaffected. Esc always returns to main when focused.
-        if self.sidebar_open {
+        if self.sidebar_open
+            && self.workflow_view.is_none()
+            && self.pending_query.is_none()
+            && self.perm_queue.is_empty()
+        {
+            self.sync_sidebar_selection(&self.teams.display_order());
             match code {
                 KeyCode::Up if self.input.text().is_empty() => {
                     self.sidebar.up();
@@ -2253,7 +2132,7 @@ impl App {
                     return KeyOutcome::None;
                 }
                 KeyCode::Down if self.input.text().is_empty() => {
-                    let n = 1 + self.teams.running_ids().len();
+                    let n = 1 + self.teams.display_order().len();
                     self.sidebar.down(n);
                     self.apply_sidebar_focus();
                     return KeyOutcome::None;
@@ -2265,10 +2144,6 @@ impl App {
                 }
                 _ => {}
             }
-        }
-        // 0a') While the drawer is open it owns the keyboard.
-        if self.team_drawer.is_some() {
-            return self.handle_drawer_key(code);
         }
         // 0a'') The full-screen workflow view owns the keyboard while open.
         if self.workflow_view.is_some() {
@@ -2332,7 +2207,10 @@ impl App {
             (KeyCode::Esc, _) => {
                 // Esc interrupts a running turn (cooperative). Only meaningful
                 // while busy — otherwise it's ignored (prompts handle Esc above).
-                if self.running {
+                if self.focused_agent.is_some() {
+                    self.set_focused_agent(None);
+                    self.sidebar.selected = 0;
+                } else if self.running {
                     self.interrupt();
                 }
                 return KeyOutcome::None;
@@ -2443,7 +2321,8 @@ impl App {
                 if let Some(out) = self.handle_command(&display) {
                     return out;
                 }
-                if mods.contains(KeyModifiers::ALT) && self.running {
+                if mods.contains(KeyModifiers::ALT) && self.running && self.focused_agent.is_none()
+                {
                     KeyOutcome::Steer(text)
                 } else {
                     KeyOutcome::Submit(text)
@@ -2863,8 +2742,284 @@ pub(super) fn indent_line(line: Line<'static>) -> Line<'static> {
 
 #[cfg(test)]
 mod tests {
-    use super::{fmt_ctx_window, fmt_duration, fmt_tokens, trim_dot, truncate_mid, wrap_line};
+    use super::*;
     use ratatui::text::{Line, Span};
+
+    pub(super) fn test_app() -> App {
+        App::new(
+            bob_core::tools::jobs::JobRegistry::new(),
+            Arc::new(PermissionEngine::new(Decision::Allow, None)),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            bob_core::agent::team::AgentRegistry::new(),
+        )
+    }
+
+    #[test]
+    fn redraw_requests_survive_noop_input_until_the_frame_is_drawn() {
+        use crossterm::event::{KeyEvent, MouseEvent};
+        let mut app = test_app();
+        let mouse = |kind| {
+            CtEvent::Mouse(MouseEvent {
+                kind,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        let release = CtEvent::Key(KeyEvent::new_with_kind(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        ));
+        let noops = [
+            mouse(MouseEventKind::Moved),
+            mouse(MouseEventKind::Up(MouseButton::Left)),
+            release,
+            CtEvent::FocusLost,
+        ];
+        for trigger in [mouse(MouseEventKind::ScrollUp), CtEvent::Resize(90, 20)] {
+            let mut dirty = false;
+            app.on_terminal_event(trigger, &mut dirty);
+            assert!(dirty);
+            // All inputs arrive inside the same frame budget: none may consume it.
+            for event in noops.clone() {
+                app.on_terminal_event(event, &mut dirty);
+                assert!(dirty);
+            }
+            dirty = false;
+            for event in noops.clone() {
+                app.on_terminal_event(event, &mut dirty);
+                assert!(!dirty);
+            }
+        }
+    }
+
+    #[test]
+    fn ctrl_x_targets_only_selected_agents_and_preserves_composition() {
+        use bob_core::agent::team::mailbox;
+        let mut app = test_app();
+        let (_root_inbox, root_tx) = mailbox();
+        let root = app
+            .agent_team
+            .register("root".into(), 0, String::new(), root_tx);
+        let (_a_inbox, a_tx) = mailbox();
+        let a = app.agent_team.register("a".into(), 1, "root".into(), a_tx);
+        let (_b_inbox, b_tx) = mailbox();
+        let b = app.agent_team.register("b".into(), 1, "root".into(), b_tx);
+        app.teams.on_spawn("a", "root", "review a", "");
+        app.teams.on_spawn("b", "root", "review b", "");
+        app.running = true;
+        app.sidebar_open = true;
+        app.on_key(KeyCode::Char('x'), KeyModifiers::CONTROL);
+        assert!(!root.cancellation_requested());
+        assert!(!a.cancellation_requested());
+        assert!(app.agent_control_notice.is_none());
+
+        app.open_sidebar_on("a");
+        app.input.set("draft");
+        app.on_key(KeyCode::Char('x'), KeyModifiers::CONTROL);
+        assert_eq!(app.input.text(), "draft");
+        assert!(a.cancellation_requested());
+        assert!(!b.cancellation_requested());
+        assert!(app
+            .control_notice("a")
+            .unwrap()
+            .contains("cancellation requested"));
+        app.set_focused_agent(Some("b".into()));
+        app.sidebar_open = false;
+        app.input.set("keep this message");
+        app.on_key(KeyCode::Char('x'), KeyModifiers::CONTROL);
+        assert!(b.cancellation_requested());
+        assert_eq!(app.input.text(), "keep this message");
+        assert!(!root.cancellation_requested());
+        assert!(!app.cancel.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn ctrl_x_surfaces_unreachable_agent_errors_without_changing_status() {
+        let mut app = test_app();
+        app.teams.on_spawn("old", "root", "review old", "");
+        app.teams.on_done("old", false);
+        app.open_sidebar_on("old");
+        app.on_key(KeyCode::Char('x'), KeyModifiers::CONTROL);
+        assert!(app.control_notice("old").is_some());
+        assert!(!app
+            .control_notice("old")
+            .unwrap()
+            .contains("cancellation requested"));
+        assert_eq!(
+            app.teams.get("old").unwrap().status,
+            team::ThreadStatus::Done
+        );
+        app.set_focused_agent(Some("old".into()));
+        assert_eq!(app.stop_target().as_deref(), Some("old"));
+    }
+
+    #[test]
+    fn closed_worker_prompts_are_removed_without_dropping_live_requests() {
+        let mut app = test_app();
+        let mut receivers = Vec::new();
+        for id in ["closed-front", "live", "closed-back"] {
+            let (resp, rx) = oneshot::channel();
+            app.perm_queue.push_back(PendingPerm {
+                title: id.into(),
+                detail: String::new(),
+                preview: None,
+                options: Vec::new(),
+                list: widgets::SelectList::new(),
+                resp,
+            });
+            if id == "live" {
+                receivers.push(rx);
+            }
+        }
+        let (resp, rx) = oneshot::channel();
+        app.pending_query = Some(PendingQuery {
+            query: bob_core::tools::registry::UserQuery {
+                title: "question".into(),
+                detail: String::new(),
+                options: vec![],
+                allow_other: true,
+            },
+            list: widgets::SelectList::new(),
+            other_text: Some("draft".into()),
+            purpose: QueryPurpose::Tool(resp),
+        });
+        assert!(app.clear_closed_prompts());
+        assert_eq!(app.perm_queue.len(), 1);
+        assert_eq!(app.perm_queue.front().unwrap().title, "live");
+        assert!(app.pending_query.is_some());
+        app.sidebar_open = true;
+        app.set_focused_agent(Some("live".into()));
+        assert!(
+            app.stop_target().is_none(),
+            "free-text answers are compose mode"
+        );
+        app.pending_query.as_mut().unwrap().other_text = None;
+        assert_eq!(app.stop_target().as_deref(), Some("live"));
+        assert!(!app.clear_closed_prompts());
+        drop(rx);
+        assert!(app.clear_closed_prompts());
+        assert!(app.pending_query.is_none());
+        app.open_reasoning_picker(bob_core::core::types::ReasoningEffort::Off);
+        assert!(!app.clear_closed_prompts());
+        assert!(app.pending_query.is_some());
+        drop(receivers);
+        assert!(app.clear_closed_prompts());
+        assert!(app.perm_queue.is_empty());
+    }
+
+    #[test]
+    fn sidebar_keeps_agent_identity_when_status_reorders_rows() {
+        let mut app = test_app();
+        app.sidebar_open = true;
+        for id in ["task_1", "job_2", "reviewer"] {
+            app.apply_agent_event(&AgentEvent::SubagentSpawn {
+                agent_id: id.into(),
+                parent_id: "root".into(),
+                task: format!("Review {id}"),
+                prompt: String::new(),
+            });
+        }
+        app.on_key(KeyCode::Down, KeyModifiers::NONE);
+        app.open_sidebar_on("task_1");
+        app.apply_agent_event(&AgentEvent::SubagentDone {
+            agent_id: "task_1".into(),
+            failed: false,
+            cancelled: false,
+        });
+        assert_eq!(app.teams.display_order(), ["job_2", "reviewer", "task_1"]);
+        assert_eq!(app.focused_agent.as_deref(), Some("task_1"));
+        assert_eq!(app.sidebar.selected, 3);
+        app.on_key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.focused_agent.as_deref(), Some("reviewer"));
+        app.on_key(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.focused_agent.as_deref(), Some("task_1"));
+        app.apply_agent_event(&AgentEvent::SubagentSpawn {
+            agent_id: "new-reviewer".into(),
+            parent_id: "root".into(),
+            task: "Check tests".into(),
+            prompt: String::new(),
+        });
+        assert_eq!(app.sidebar.selected, 4);
+        assert_eq!(app.focused_agent.as_deref(), Some("task_1"));
+    }
+
+    #[test]
+    fn ctrl_t_is_the_only_sidebar_shortcut_and_preserves_focus() {
+        let mut app = test_app();
+        app.input.set("draft");
+        app.on_key(KeyCode::Char('g'), KeyModifiers::CONTROL);
+        assert!(!app.sidebar_open);
+        assert_eq!(app.input.text(), "draft");
+        app.input.set("");
+        app.on_key(KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert!(app.sidebar_open);
+        app.on_key(KeyCode::Char('g'), KeyModifiers::CONTROL);
+        assert!(app.sidebar_open);
+        assert_eq!(app.input.text(), "");
+        app.on_key(KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert!(!app.sidebar_open);
+        app.teams.on_spawn("a", "root", "review a", "");
+        app.on_key(KeyCode::Char('t'), KeyModifiers::CONTROL);
+        app.on_key(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.focused_agent.as_deref(), Some("a"));
+        app.input.set("draft");
+        app.on_key(KeyCode::Char('g'), KeyModifiers::CONTROL);
+        assert!(app.sidebar_open);
+        assert_eq!(app.input.text(), "draft");
+        app.on_key(KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert!(!app.sidebar_open);
+        assert_eq!(app.focused_agent.as_deref(), Some("a"));
+        assert_eq!(app.input.text(), "draft");
+        app.running = true;
+        app.on_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.focused_agent.is_none());
+        assert_eq!(app.sidebar.selected, 0);
+        assert!(!app.cancel.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn focused_input_messages_the_agent_even_with_alt_enter_while_root_runs() {
+        use bob_core::agent::team::mailbox;
+        for mods in [KeyModifiers::NONE, KeyModifiers::ALT] {
+            let mut app = test_app();
+            let (mut root_inbox, root_tx) = mailbox();
+            app.agent_team
+                .register("root".into(), 0, String::new(), root_tx);
+            let (mut inbox, tx) = mailbox();
+            app.agent_team.register("a".into(), 1, "root".into(), tx);
+            app.teams.on_spawn("a", "root", "review", "");
+            app.open_sidebar_on("a");
+            app.running = true;
+            app.input.set("check the tests");
+            let KeyOutcome::Submit(text) = app.on_key(KeyCode::Enter, mods) else {
+                panic!("focused input must submit to the selected agent");
+            };
+            app.send_agent_message("a", &text);
+            let messages = inbox.drain();
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].from, "user");
+            assert_eq!(messages[0].text, "check the tests");
+            assert!(root_inbox.drain().is_empty());
+            assert!(app.queue.is_empty());
+            assert!(app.view.cells.is_empty());
+            assert!(matches!(&app.teams.get("a").unwrap().cells[0],
+                view::Cell::AgentMsg { from, text } if from == "user" && text == "check the tests"));
+            assert_eq!(app.teams.get("a").unwrap().unread, 0);
+        }
+    }
+
+    #[test]
+    fn unreachable_agent_message_is_not_echoed_as_delivered() {
+        let mut app = test_app();
+        app.teams.on_spawn("old", "root", "review", "");
+        app.teams.on_done("old", false);
+        app.open_sidebar_on("old");
+        app.send_agent_message("old", "hello");
+        assert!(app.teams.get("old").unwrap().cells.is_empty());
+        assert_eq!(app.control_notice("old"), Some("old is not reachable"));
+    }
 
     #[test]
     fn ctx_window_labels() {

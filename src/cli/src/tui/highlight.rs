@@ -1,6 +1,7 @@
 //! Syntax highlighting for fenced code blocks via syntect. Loads the default
 //! syntax + theme sets once (lazily) and maps syntect styles to ratatui spans.
 
+use super::render::safe_display_text;
 use once_cell::sync::Lazy;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
@@ -22,13 +23,14 @@ static HIGHLIGHTER: Lazy<Highlighter> = Lazy::new(|| Highlighter {
 /// given language, returning one ratatui Line per source line. Falls back to
 /// plain, uncolored lines when the language isn't recognized.
 pub fn highlight(code: &str, lang: &str) -> Vec<Line<'static>> {
+    let code = safe_display_text(code);
     let hl = &*HIGHLIGHTER;
     let theme = &hl.themes.themes["base16-eighties.dark"];
 
     let syntax = lang_syntax(&hl.syntaxes, lang);
     let syntax = match syntax {
         Some(s) => s,
-        None => return plain(code),
+        None => return plain(&code),
     };
 
     let mut h = HighlightLines::new(syntax, theme);
@@ -85,6 +87,7 @@ fn lang_syntax<'a>(
 /// Highlight a single line of `code` in `lang`, returning styled spans (no
 /// trailing newline). Used by the diff renderer, which owns its own gutters.
 pub fn highlight_line(code: &str, lang: &str) -> Vec<Span<'static>> {
+    let code = safe_display_text(code);
     let hl = &*HIGHLIGHTER;
     let theme = &hl.themes.themes["base16-eighties.dark"];
     let syntax = match lang_syntax(&hl.syntaxes, lang) {
@@ -132,4 +135,25 @@ fn plain(code: &str) -> Vec<Line<'static>> {
 
 fn syntect_color(c: syntect::highlighting::Color) -> Color {
     Color::Rgb(c.r, c.g, c.b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn highlighting_strips_controls_before_syntax_splitting_and_preserves_styles() {
+        let clean = "let café = \"日本語\";";
+        let raw = format!("\u{1b}[31m{clean}\u{1b}[0m\u{9d}52;c;payload\u{9c}");
+        let original = raw.clone();
+        for lang in ["rust", "sh", "unknown-language"] {
+            assert_eq!(highlight_line(&raw, lang), highlight_line(clean, lang));
+            assert_eq!(highlight(&raw, lang), highlight(clean, lang));
+            assert_eq!(
+                highlight(&format!("{raw}\n\t{clean}"), lang),
+                highlight(&format!("{clean}\n\t{clean}"), lang)
+            );
+        }
+        assert_eq!(raw, original);
+    }
 }

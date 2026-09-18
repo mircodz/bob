@@ -4,7 +4,7 @@
 //! child module, they can access App's private fields directly.
 
 use super::theme::Palette;
-use super::widgets::{divider_col, inset, BAND_INSET};
+use super::widgets::{inset, BAND_INSET};
 use super::{indent_line, render, team, truncate_mid, App};
 use bob_core::core::permissions::Mode;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -19,11 +19,6 @@ const INPUT_PAD: u16 = 1;
 
 /// Width of the collapsible info sidebar (agents/LSP/MCP), in columns.
 const SIDEBAR_W: u16 = 44;
-
-/// Team-drawer roster column width, and the name budget inside it once the
-/// `"  • "` dot chrome (~8 cols) is subtracted. Nesting eats 2 cols per depth.
-const ROSTER_W: u16 = 24;
-const ROSTER_NAME_W: usize = 16;
 
 impl App {
     /// Build the wrapped, prompt-prefixed display lines for the input box, given
@@ -64,6 +59,11 @@ impl App {
     }
 
     pub(super) fn draw(&mut self, f: &mut ratatui::Frame) {
+        self.draw_content(f);
+        sanitize_buffer(f.buffer_mut());
+    }
+
+    fn draw_content(&mut self, f: &mut ratatui::Frame) {
         let area = f.area();
         // Force the theme's base background across the whole screen so bob looks
         // identical regardless of the terminal's own background. Themes that want
@@ -101,9 +101,8 @@ impl App {
             0
         };
 
-        // A pinned background-jobs panel sits just above the input when any
-        // jobs exist (one row per job + a header).
-        let job_rows = self.jobs.list();
+        // Only background shell commands belong in the pinned jobs panel.
+        let job_rows = shell_jobs(&self.jobs);
         let jobs_height = if job_rows.is_empty() {
             0
         } else {
@@ -140,6 +139,7 @@ impl App {
             (split[0], Some(split[1]))
         } else {
             self.sidebar_rows = None;
+            self.sidebar_rect = None;
             (area, None)
         };
 
@@ -183,14 +183,6 @@ impl App {
         }
         if !self.file_menu.is_empty() {
             self.draw_file_menu(f, input_area);
-        }
-        // The team drawer is a full overlay above everything else; the full-screen
-        // workflow view is another (they're mutually exclusive in practice).
-        if self.team_drawer.is_some() {
-            self.draw_team_drawer(f, area);
-        } else {
-            // Drop the stale roster hit-box so clicks don't select a hidden agent.
-            self.roster_rect = None;
         }
         if self.workflow_view.is_some() {
             self.draw_workflow_view(f, area);
@@ -292,7 +284,7 @@ impl App {
             .filter(|(_, _, _, s)| *s == JobStatus::Running)
             .count();
         let mut lines: Vec<Line> = vec![Line::from(Span::styled(
-            format!("background jobs · {} running", running),
+            format!("background shell commands · {} running", running),
             Style::default()
                 .fg(Palette::ACCENT())
                 .add_modifier(Modifier::BOLD),
@@ -360,210 +352,9 @@ impl App {
             area,
         );
     }
-    /// on the right, the selected agent's live transcript. Toggled with Ctrl+T.
-    fn draw_team_drawer(&mut self, f: &mut ratatui::Frame, area: Rect) {
-        let Some(drawer) = self.team_drawer.as_ref() else {
-            return;
-        };
-        // Snapshot the fields we need so we can later take a mutable borrow of
-        // `self.team_drawer` to write the clamped scroll back without a conflict.
-        let sel = drawer.list.selected;
-        let hovered = drawer.hovered;
-        let drawer_scroll = drawer.scroll;
-        let compose_buf: Option<String> = drawer.composing.clone();
-        let composing = compose_buf.is_some();
-        // Chrome-free overlay: base background, one status dot per agent, selected
-        // agent bold, whitespace separation (no boxes/borders/bars).
-        f.render_widget(Clear, area);
-        f.render_widget(
-            Block::default().style(Style::default().bg(Palette::BG())),
-            area,
-        );
-
-        // Header · body · hint, all on the base background.
-        let outer = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(2), // blank + header
-                Constraint::Min(1),    // body
-                Constraint::Length(1), // hint
-            ])
-            .split(area);
-
-        let order = self.teams.display_order();
-        let running = order
-            .iter()
-            .filter(|id| {
-                matches!(
-                    self.teams.get(id).map(|t| t.status),
-                    Some(team::ThreadStatus::Running)
-                )
-            })
-            .count();
-        // Terse lowercase header, like the jobs/todos panels.
-        let header = Line::from(Span::styled(
-            format!("  team · {} agents · {} running", order.len(), running),
-            Style::default().fg(Palette::DIM()),
-        ));
-        f.render_widget(
-            Paragraph::new(vec![Line::from(""), header]).style(Style::default().bg(Palette::BG())),
-            outer[0],
-        );
-
-        // Roster on the left, a subtle vertical divider, then the transcript.
-        let body = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Length(ROSTER_W),
-                Constraint::Length(2), // divider column (│ + a space of breathing room)
-                Constraint::Min(10),
-            ])
-            .split(outer[1]);
-        // Remember the roster rect so left-clicks can select an agent. The roster
-        // has one leading blank line, so agent `i` sits at row `body[0].y + 1 + i`.
-        self.roster_rect = Some(body[0]);
-        // Draw the faint divider down the middle column.
-        {
-            let dcol = body[1];
-            f.render_widget(
-                Paragraph::new(divider_col(dcol)).style(Style::default().bg(Palette::BG())),
-                dcol,
-            );
-        }
-
-        // Left: agent roster (running first, finished at the bottom & dimmed).
-        // Window it so a large team scrolls to keep the selection visible instead of
-        // overflowing the pane. One leading blank line, so the roster body is
-        // `height - 1` rows; the resolved scroll is written back for the click map.
-        let roster_h = (body[0].height as usize).saturating_sub(1);
-        let range = {
-            let mut list = super::widgets::SelectList {
-                selected: sel,
-                scroll: self
-                    .team_drawer
-                    .as_ref()
-                    .map(|d| d.list.scroll)
-                    .unwrap_or(0),
-            };
-            let r = list.window(order.len(), roster_h);
-            if let Some(d) = self.team_drawer.as_mut() {
-                d.list.scroll = list.scroll;
-            }
-            r
-        };
-        self.roster_scroll = range.start;
-        let mut roster: Vec<Line> = vec![Line::from("")];
-        for i in range.clone() {
-            let id = &order[i];
-            let Some(t) = self.teams.get(id) else {
-                continue;
-            };
-            let finished = !matches!(t.status, team::ThreadStatus::Running);
-            let dot_color = match t.status {
-                team::ThreadStatus::Running => Palette::RUNNING(),
-                team::ThreadStatus::Done => Palette::OK(),
-                team::ThreadStatus::Failed => Palette::ERROR(),
-            };
-            let selected = i == sel;
-            let hover = hovered == Some(i);
-            // Names are white (TEXT) and legible; the SELECTED or HOVERED row is
-            // bold so the agent under the cursor/selection stands out. FINISHED
-            // agents are faint AND struck through so done work is unmistakable.
-            let mut name_style = if selected || hover {
-                Style::default()
-                    .fg(Palette::TEXT())
-                    .add_modifier(Modifier::BOLD)
-            } else if finished {
-                Style::default().fg(Palette::FAINT())
-            } else {
-                Style::default().fg(Palette::TEXT())
-            };
-            if finished {
-                name_style = name_style.add_modifier(Modifier::CROSSED_OUT);
-            }
-            let depth = self.teams.depth_of(id);
-            let indent = "  ".repeat(depth);
-            let mut spans = vec![
-                Span::styled(format!("  {}• ", indent), Style::default().fg(dot_color)),
-                Span::styled(
-                    truncate_mid(t.display_label(), ROSTER_NAME_W.saturating_sub(depth * 2)),
-                    name_style,
-                ),
-            ];
-            if t.unread > 0 && !finished {
-                spans.push(Span::styled(
-                    format!(" ({})", t.unread),
-                    Style::default().fg(Palette::DIM()),
-                ));
-            }
-            roster.push(Line::from(spans));
-        }
-        f.render_widget(
-            Paragraph::new(roster).style(Style::default().bg(Palette::BG())),
-            body[0],
-        );
-
-        // Right: the selected agent's transcript, rendered with the same cells as
-        // the main scrollback. Inset the pane horizontally so content has breathing
-        // room on both sides (and doesn't hug the divider), and so the full-width
-        // user-message band wraps/pads to the SAME width it's rendered at.
-        let pane = inset(body[2], 1);
-        let pane_w = pane.width as usize;
-        let mut transcript: Vec<Line> = vec![Line::from("")];
-        if let Some(id) = order.get(sel) {
-            if let Some(t) = self.teams.get(id) {
-                for cell in &t.cells {
-                    render::render_cell(cell, pane_w, &mut transcript);
-                }
-            }
-        }
-        // Wrap long lines to the pane width so conversations don't get clipped at
-        // the right edge (the same wrapping the main scrollback uses). Wrapping
-        // BEFORE the scroll math keeps the offset counted in real rows.
-        let transcript: Vec<Line> = transcript
-            .into_iter()
-            .flat_map(|l| super::wrap_line(l, pane_w))
-            .collect();
-        // Apply the drawer's scroll offset, clamping it and WRITING IT BACK so the
-        // stored value can't run past the end. Otherwise a fast wheel flick keeps
-        // incrementing `scroll` past max, and you have to scroll back down through
-        // all that phantom overshoot before the view visibly moves ("runoff").
-        let view_h = pane.height as usize;
-        let max_scroll = transcript.len().saturating_sub(view_h);
-        let scroll = (drawer_scroll as usize).min(max_scroll);
-        if let Some(d) = self.team_drawer.as_mut() {
-            d.scroll = scroll as u16;
-        }
-        let visible: Vec<Line> = transcript.into_iter().skip(scroll).collect();
-        f.render_widget(
-            Paragraph::new(visible).style(Style::default().bg(Palette::BG())),
-            pane,
-        );
-
-        // Terse dim hint / compose line — no filled bar.
-        let hint = if composing {
-            let buf = compose_buf.as_deref().unwrap_or("");
-            Line::from(vec![
-                Span::styled("› ", Style::default().fg(Palette::DIM())),
-                Span::styled(buf.to_string(), Style::default().fg(Palette::TEXT())),
-            ])
-        } else {
-            Line::from(Span::styled(
-                "  ↑↓ select · i message · esc close",
-                Style::default().fg(Palette::FAINT()),
-            ))
-        };
-        f.render_widget(
-            Paragraph::new(hint).style(Style::default().bg(Palette::BG())),
-            outer[2],
-        );
-    }
-
     /// Full-screen workflow view — a single scrollable pane with a collapsible
     /// phase/agent tree. Phase headers (`▾ Map 4/4`) collapse/expand their agents;
-    /// the selected agent expands INLINE to show its Prompt / Activity / Outcome.
-    /// Chrome-free (no borders), full width so the detail reads well. ↑↓ move the
-    /// cursor, Enter toggles (collapse a phase / expand an agent), Esc closes.
+    /// Enter on an agent opens its transcript in the main conversation.
     fn draw_workflow_view(&mut self, f: &mut ratatui::Frame, area: Rect) {
         use super::view::WfStatus;
         let Some(vw) = self.workflow_view.as_ref() else {
@@ -638,24 +429,7 @@ impl App {
             outer[0],
         );
 
-        // Flatten the tree into selectable rows (phase headers + agents, honoring
-        // Split body: left = the collapsible tree, right = the selected agent's
-        // detail. A faint ` │` divider separates them (chrome-free, like the team
-        // drawer).
-        let body = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(42),
-                Constraint::Length(2),
-                Constraint::Min(20),
-            ])
-            .split(outer[1]);
-        let tree_area = Rect {
-            x: body[0].x + 1,
-            y: body[0].y,
-            width: body[0].width.saturating_sub(1),
-            height: body[0].height,
-        };
+        let tree_area = inset(outer[1], 1);
         let tree_w = tree_area.width as usize;
 
         // Flatten the tree into selectable rows (phase headers + agents, honoring
@@ -705,7 +479,7 @@ impl App {
                     } else {
                         Style::default().fg(Palette::TEXT())
                     };
-                    // Duration only in the tree (model·tokens live in the detail pane).
+                    // Keep the workflow tree compact with a duration or tool count.
                     let dur = a
                         .duration_secs
                         .map(super::fmt_duration)
@@ -771,51 +545,9 @@ impl App {
             tree_area,
         );
 
-        // Divider — full height: spans the header rows down through the body (stops
-        // above the hint line), so the two columns read as one continuous split.
-        let dcol = Rect {
-            x: body[1].x,
-            y: area.y,
-            width: body[1].width,
-            height: outer[0].height + outer[1].height,
-        };
-        f.render_widget(
-            Paragraph::new(divider_col(dcol)).style(Style::default().bg(Palette::BG())),
-            dcol,
-        );
-
-        // Right pane: the selected agent's detail (Prompt / Activity / Outcome). A
-        // phase-header row shows a short phase summary instead.
-        // 1-col gap off the divider on the left, ~3 cols reserved on the right so
-        // wrapped text doesn't hug the terminal edge (the body lines carry their own
-        // 4-col indent, so we don't add more on the left).
-        let detail = Rect {
-            x: body[2].x + 1,
-            y: body[2].y,
-            width: body[2].width.saturating_sub(4),
-            height: body[2].height,
-        };
-        let dw = detail.width as usize;
-        let sel_agent = rows.get(sel).and_then(|r| match r {
-            WfRow::Agent(pi, ai) => phases[*pi].agents.get(*ai),
-            _ => None,
-        });
-        let mut dlines = detail_lines(self, sel_agent, dw);
-        // Body text (Prompt/Outcome) is indented 4 cols; wrap with a matching
-        // hanging indent so continuation rows stay aligned instead of hugging the
-        // divider.
-        let dlines: Vec<Line> = dlines
-            .drain(..)
-            .flat_map(|l| super::wrap_line_hanging(l, dw, 4))
-            .collect();
-        f.render_widget(
-            Paragraph::new(dlines).style(Style::default().bg(Palette::BG())),
-            detail,
-        );
-
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "  ↑↓ move · enter collapse phase · esc close",
+                "  ↑↓ move · enter toggle phase / open agent · esc close",
                 Style::default().fg(Palette::FAINT()),
             )))
             .style(Style::default().bg(Palette::BG())),
@@ -869,81 +601,75 @@ impl App {
             .render(f, full, cells, revision, working, self.spinner, secs);
     }
 
-    /// The collapsible right info sidebar (lighter background). AGENTS section: a
-    /// tree with "main" (the root conversation) plus each running agent, indented by
-    /// spawn depth. The selected row is the focused conversation. Records screen-row
-    /// → agent-id hit-boxes so clicks select. (LSP/MCP sections come later.)
+    /// The sidebar lists all agents, active first, and windows around selection.
     fn draw_sidebar(&mut self, f: &mut ratatui::Frame, area: Rect) {
-        // Lighter panel background to set the sidebar apart (opencode-style).
         let bg = Style::default().bg(Palette::INPUT_BG());
         f.render_widget(Clear, area);
         f.render_widget(Block::default().style(bg), area);
         let pane = inset(area, 1);
-        let w = pane.width as usize;
-
-        let running = self.teams.running_ids();
-        let mut lines: Vec<Line> = Vec::new();
-        let mut hit: Vec<(u16, String)> = Vec::new();
-
-        // Section header.
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            format!("  AGENTS · {} running", running.len()),
-            bg.fg(Palette::DIM()),
-        )));
-
-        // Rows: index 0 = "main" (empty id), then the running agents.
-        let render_row = |lines: &mut Vec<Line>,
-                          hit: &mut Vec<(u16, String)>,
-                          idx: usize,
-                          id: &str,
-                          label: &str,
-                          depth: usize,
-                          meta: &str| {
-            let is_sel = idx == self.sidebar.selected;
-            let indent = "  ".repeat(depth);
-            // No chevron — the SELECTED (current) agent is just bold.
-            let name_style = if is_sel {
-                bg.fg(Palette::TEXT()).add_modifier(Modifier::BOLD)
+        let order = self.teams.display_order();
+        self.sync_sidebar_selection(&order);
+        let range = self
+            .sidebar
+            .window(order.len() + 1, pane.height.saturating_sub(4) as usize);
+        let mut lines = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("  AGENTS · {} running", self.teams.running_ids().len()),
+                bg.fg(Palette::DIM()),
+            )),
+        ];
+        let mut hit = Vec::new();
+        for idx in range {
+            let (id, label, depth, color, finished) = if idx == 0 {
+                (
+                    "",
+                    "main",
+                    0,
+                    root_color(self.running || self.view.busy),
+                    false,
+                )
             } else {
-                bg.fg(Palette::TEXT())
+                let id = &order[idx - 1];
+                let t = self.teams.get(id).unwrap();
+                let label = if t.task.trim().is_empty() {
+                    t.display_label()
+                } else {
+                    &t.task
+                };
+                (
+                    id.as_str(),
+                    label,
+                    self.teams.depth_of(id) + 1,
+                    thread_color(t.status),
+                    t.status != team::ThreadStatus::Running,
+                )
             };
-            let left = format!("  {indent}• {label}");
-            let pad = w.saturating_sub(left.chars().count() + meta.chars().count());
-            let row = pane.y + lines.len() as u16;
-            if row < pane.y + pane.height {
-                hit.push((row, id.to_string()));
-            }
-            lines.push(Line::from(vec![
-                Span::styled(format!("  {indent}• "), bg.fg(Palette::RUNNING())),
-                Span::styled(label.to_string(), name_style),
-                Span::styled(" ".repeat(pad.max(1)), bg),
-                Span::styled(meta.to_string(), bg.fg(Palette::DIM())),
-            ]));
-        };
-
-        render_row(&mut lines, &mut hit, 0, "", "main", 0, "");
-        for (i, id) in running.iter().enumerate() {
-            // Use the human display label (the task description for auto-id'd
-            // `task_N` agents), matching the team drawer — not the raw id.
-            let (label, meta) = self
-                .teams
-                .get(id)
-                .map(|t| (t.display_label().to_string(), String::new()))
-                .unwrap_or_else(|| (id.clone(), String::new()));
-            let depth = self.teams.depth_of(id) + 1;
-            render_row(&mut lines, &mut hit, i + 1, id, &label, depth, &meta);
+            hit.push((pane.y + lines.len() as u16, id.to_string()));
+            lines.push(sidebar_row(
+                label,
+                depth,
+                color,
+                finished,
+                idx == self.sidebar.selected,
+                pane.width as usize,
+            ));
         }
-
         self.sidebar_rows = Some(hit);
-
-        // Footer hint.
+        self.sidebar_rect = Some(area);
         lines.push(Line::from(""));
+        let notice = self
+            .focused_agent
+            .as_deref()
+            .and_then(|id| self.control_notice(id));
         lines.push(Line::from(Span::styled(
-            "  ↑↓ select · esc main · ⌃g close",
-            bg.fg(Palette::FAINT()),
+            notice.unwrap_or("  ↑↓ select · ^X stop · esc main · ⌃t close"),
+            bg.fg(if notice.is_some() {
+                Palette::WARN()
+            } else {
+                Palette::FAINT()
+            }),
         )));
-
         f.render_widget(Paragraph::new(lines).style(bg), pane);
     }
 
@@ -1017,12 +743,12 @@ impl App {
         };
         f.render_widget(Paragraph::new(Line::from(spans)), bar);
 
-        // Right-aligned key hints: team drawer (only when agents exist) + the
+        // Right-aligned key hints: agents sidebar (only when agents exist) + the
         // todo-panel toggle. Kept terse so they don't crowd the status info.
         let hint = Style::default().fg(Palette::FAINT());
         let mut hints: Vec<Span> = Vec::new();
         if !self.teams.is_empty() {
-            hints.push(Span::styled("^T team", hint));
+            hints.push(Span::styled("^T agents", hint));
             hints.push(Span::styled("  ", hint));
         }
         let todos_present = self
@@ -1504,6 +1230,106 @@ impl App {
     }
 }
 
+// Cell symbols are printed verbatim by the backend. Guard every pane, including
+// labels and inputs that do not pass through the transcript renderer.
+fn sanitize_buffer(buffer: &mut ratatui::buffer::Buffer) {
+    for cell in &mut buffer.content {
+        if cell.symbol().chars().any(char::is_control) {
+            let clean: String = cell
+                .symbol()
+                .chars()
+                .filter(|ch| !ch.is_control())
+                .collect();
+            cell.set_symbol(if clean.is_empty() { " " } else { &clean });
+        }
+    }
+}
+
+pub(super) fn shell_jobs(
+    jobs: &bob_core::tools::jobs::JobRegistry,
+) -> Vec<(String, String, String, bob_core::tools::jobs::JobStatus)> {
+    jobs.list()
+        .into_iter()
+        .filter(|(_, kind, _, status)| {
+            kind == "bash" && *status == bob_core::tools::jobs::JobStatus::Running
+        })
+        .collect()
+}
+
+fn thread_color(status: team::ThreadStatus) -> ratatui::style::Color {
+    match status {
+        team::ThreadStatus::Running => Palette::RUNNING(),
+        team::ThreadStatus::Done => Palette::OK(),
+        team::ThreadStatus::Failed => Palette::ERROR(),
+        team::ThreadStatus::Cancelled => Palette::FAINT(),
+    }
+}
+
+fn root_color(running: bool) -> ratatui::style::Color {
+    if running {
+        Palette::RUNNING()
+    } else {
+        Palette::FAINT()
+    }
+}
+
+fn agent_name_style(finished: bool, selected: bool) -> Style {
+    let mut style = if finished {
+        Style::default()
+            .fg(Palette::DIM())
+            .add_modifier(Modifier::CROSSED_OUT)
+    } else {
+        Style::default().fg(Palette::TEXT())
+    };
+    if selected {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    style
+}
+
+fn sidebar_row(
+    label: &str,
+    depth: usize,
+    color: ratatui::style::Color,
+    finished: bool,
+    selected: bool,
+    width: usize,
+) -> Line<'static> {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    let bg = Style::default().bg(Palette::INPUT_BG());
+    let depth = depth.min(width.saturating_sub(8) / 2);
+    let lead = format!("  {}• ", "  ".repeat(depth));
+    let budget = width.saturating_sub(lead.width());
+    let clean = label.replace(['\n', '\r', '\t'], " ");
+    let label = if clean.width() <= budget {
+        clean
+    } else {
+        let mut short = String::new();
+        let mut used = 0;
+        for ch in clean.chars() {
+            let w = ch.width().unwrap_or(0);
+            if used + w > budget.saturating_sub(1) {
+                break;
+            }
+            short.push(ch);
+            used += w;
+        }
+        if budget > 0 {
+            short.push('…');
+        }
+        short
+    };
+    let pad = width.saturating_sub(lead.width() + label.width());
+    Line::from(vec![
+        Span::styled(lead, bg.fg(color)),
+        Span::styled(
+            label,
+            agent_name_style(finished, selected).bg(Palette::INPUT_BG()),
+        ),
+        Span::styled(" ".repeat(pad), bg),
+    ])
+}
+
 // --- workflow-view helpers -------------------------------------------------
 
 /// A selectable row in the collapsible workflow tree: a phase header, or an agent
@@ -1546,136 +1372,517 @@ fn phase_status(agents: &[super::view::WfAgent]) -> super::view::WfStatus {
     }
 }
 
-/// The right-aligned metadata string for an agent row: model · tokens · duration,
-/// omitting parts not known yet.
-fn agent_meta(a: &super::view::WfAgent) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(m) = &a.model {
-        parts.push(m.clone());
-    }
-    if a.tokens > 0 {
-        parts.push(format!("{} tok", super::fmt_tokens(a.tokens)));
-    }
-    match a.status {
-        super::view::WfStatus::Running => parts.push(format!("{} tools", a.tools)),
-        _ => {
-            if let Some(d) = a.duration_secs {
-                parts.push(super::fmt_duration(d));
+#[cfg(test)]
+mod tests {
+    use super::super::tests::test_app;
+    use super::super::{KeyCode, KeyModifiers};
+    use super::*;
+    use bob_core::tools::jobs::{JobRegistry, JobStatus};
+    use ratatui::{backend::TestBackend, Terminal};
+
+    fn visible_buffer(buffer: &ratatui::buffer::Buffer) -> ratatui::buffer::Buffer {
+        let mut visible = buffer.clone();
+        for y in buffer.area.y..buffer.area.bottom() {
+            let mut x = buffer.area.x;
+            while x < buffer.area.right() {
+                let width = Span::raw(buffer[(x, y)].symbol()).width().max(1) as u16;
+                // Ratatui skips hidden wide-glyph continuation slots when diffing;
+                // TestBackend retains arbitrary old values there, unlike a real screen.
+                for hidden in x + 1..x.saturating_add(width).min(buffer.area.right()) {
+                    visible[(hidden, y)].reset();
+                }
+                x = x.saturating_add(width);
             }
         }
+        visible
     }
-    parts.join(" · ")
-}
 
-/// Build the Detail-pane lines for one workflow agent: a status/meta line, then its
-/// Prompt / Activity / Outcome distilled from its team-drawer transcript cells.
-fn detail_lines(
-    app: &App,
-    agent: Option<&super::view::WfAgent>,
-    _width: usize,
-) -> Vec<Line<'static>> {
-    use super::view::{Cell, WfStatus};
-    let mut out: Vec<Line> = vec![Line::from("")];
-    let Some(agent) = agent else {
-        out.push(Line::from(Span::styled(
-            "  (no agent selected)",
-            Style::default().fg(Palette::DIM()),
-        )));
-        return out;
-    };
+    fn assert_matches_fresh_frame(app: &mut App, terminal: &Terminal<TestBackend>) {
+        let actual = terminal.backend().buffer();
+        let mut fresh =
+            Terminal::new(TestBackend::new(actual.area.width, actual.area.height)).unwrap();
+        fresh.draw(|f| app.draw(f)).unwrap();
+        assert_eq!(
+            visible_buffer(actual),
+            visible_buffer(fresh.backend().buffer()),
+            "incremental frame must match a fresh frame, including styles"
+        );
+    }
 
-    // Header: label + status + meta.
-    let status_word = match agent.status {
-        WfStatus::Running => "running",
-        WfStatus::Done => "done",
-        WfStatus::Failed => "failed",
-    };
-    out.push(Line::from(Span::styled(
-        format!("  {}", agent.label),
-        Style::default()
-            .fg(Palette::TEXT())
-            .add_modifier(Modifier::BOLD),
-    )));
-    out.push(Line::from(vec![
-        Span::raw("  "),
-        render::wf_dot(agent.status),
-        Span::styled(
-            format!(" {} · {}", status_word, agent_meta(agent)),
-            Style::default().fg(Palette::DIM()),
-        ),
-    ]));
+    fn mouse(
+        kind: crossterm::event::MouseEventKind,
+        column: u16,
+        row: u16,
+    ) -> super::super::CtEvent {
+        super::super::CtEvent::Mouse(crossterm::event::MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
 
-    // The agent's transcript (Prompt/Activity/Outcome) lives in the team store.
-    let thread = app.teams.get(&agent.agent_id);
-    let Some(thread) = thread else {
-        out.push(Line::from(""));
-        out.push(Line::from(Span::styled(
-            "  (transcript not captured)",
-            Style::default().fg(Palette::FAINT()),
-        )));
-        return out;
-    };
+    #[test]
+    fn frames_repaint_scrolling_sidebar_toggles_and_resize_without_stale_colors() {
+        use super::super::CtEvent;
+        use crossterm::event::{KeyEvent, MouseEventKind};
+        let mut app = test_app();
+        for i in 0..40 {
+            app.view.push_user(format!("message {i} 界"));
+            app.view.push_event(format!("result {i}"));
+        }
+        app.teams.on_spawn("reviewer", "root", "Review parser", "");
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let bottom = terminal.backend().buffer().clone();
+        let mut dirty = false;
+        app.on_terminal_event(mouse(MouseEventKind::ScrollUp, 10, 5), &mut dirty);
+        app.on_terminal_event(mouse(MouseEventKind::Moved, 10, 5), &mut dirty);
+        assert!(dirty);
+        terminal.draw(|f| app.draw(f)).unwrap();
+        assert_ne!(&bottom, terminal.backend().buffer());
+        assert_matches_fresh_frame(&mut app, &terminal);
 
-    let section = |out: &mut Vec<Line>, name: &str| {
-        out.push(Line::from(""));
-        out.push(Line::from(Span::styled(
-            format!("  {name}"),
-            Style::default()
-                .fg(Palette::ACCENT())
-                .add_modifier(Modifier::BOLD),
-        )));
-    };
+        for (key, open) in [
+            ('t', true),
+            ('g', true),
+            ('t', false),
+            ('g', false),
+            ('t', true),
+            ('t', false),
+        ] {
+            dirty = false;
+            app.on_terminal_event(
+                CtEvent::Key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::CONTROL)),
+                &mut dirty,
+            );
+            app.on_terminal_event(mouse(MouseEventKind::Moved, 10, 5), &mut dirty);
+            assert!(dirty);
+            assert_eq!(app.sidebar_open, open);
+            terminal.draw(|f| app.draw(f)).unwrap();
+            assert_eq!(
+                terminal.backend().buffer()[(99, 0)].bg,
+                if open {
+                    Palette::INPUT_BG()
+                } else {
+                    Palette::BG()
+                }
+            );
+            assert_matches_fresh_frame(&mut app, &terminal);
+        }
+        for (width, height) in [(70, 18), (120, 35), (45, 12), (100, 30)] {
+            dirty = false;
+            terminal.backend_mut().resize(width, height);
+            app.on_terminal_event(CtEvent::Resize(width, height), &mut dirty);
+            app.on_terminal_event(mouse(MouseEventKind::Moved, 10, 5), &mut dirty);
+            assert!(dirty);
+            terminal.draw(|f| app.draw(f)).unwrap();
+            assert_eq!(
+                terminal.backend().buffer().area,
+                Rect::new(0, 0, width, height)
+            );
+            assert_matches_fresh_frame(&mut app, &terminal);
+        }
+        app.active_scrollback().stick_to_bottom();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        assert_eq!(
+            visible_buffer(&bottom),
+            visible_buffer(terminal.backend().buffer())
+        );
+    }
 
-    // Prompt: the first User cell (the delegated instructions).
-    if let Some(Cell::User(text)) = thread.cells.iter().find(|c| matches!(c, Cell::User(_))) {
-        section(&mut out, "Prompt");
-        for l in text.lines().take(12) {
-            out.push(Line::from(Span::styled(
-                format!("    {l}"),
-                Style::default().fg(Palette::TEXT()),
-            )));
+    #[test]
+    fn final_buffer_guard_removes_controls_without_changing_styles_or_unicode() {
+        let mut buffer = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 3, 1));
+        let style = Style::default()
+            .fg(Palette::ERROR())
+            .bg(Palette::INPUT_BG());
+        buffer[(0, 0)]
+            .set_symbol("e\u{301}\x1b\u{9b}\n")
+            .set_style(style);
+        buffer[(1, 0)].set_symbol("界").set_style(style);
+        buffer[(2, 0)].set_symbol("\x07\t");
+        sanitize_buffer(&mut buffer);
+        assert_eq!(buffer[(0, 0)].symbol(), "e\u{301}");
+        assert_eq!(buffer[(1, 0)].symbol(), "界");
+        assert_eq!(buffer[(2, 0)].symbol(), " ");
+        assert_eq!(buffer[(0, 0)].fg, Palette::ERROR());
+        assert_eq!(buffer[(0, 0)].bg, Palette::INPUT_BG());
+    }
+
+    #[test]
+    fn focused_agent_skips_the_hidden_main_transcript() {
+        let mut app = test_app();
+        for i in 0..100 {
+            app.view.push_notice(format!("root transcript row {i}"));
+        }
+        app.teams
+            .on_spawn("reviewer", "root", "Review parser", "Start here");
+        app.teams.on_done("reviewer", false);
+        app.open_sidebar_on("reviewer");
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        assert!(
+            app.scrollback.hit_test_offset(5).is_none(),
+            "covered root transcript must not be prepared"
+        );
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("Start here"));
+        app.on_key(KeyCode::Esc, KeyModifiers::NONE);
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        assert!(app.scrollback.hit_test_offset(5).is_some());
+        app.open_sidebar_on("reviewer");
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let main_row = app
+            .sidebar_rows
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|(_, id)| id.is_empty())
+            .unwrap()
+            .0;
+        app.click_sidebar(app.sidebar_rect.unwrap().x + 2, main_row);
+        assert!(app.focused_agent.is_none());
+        assert_eq!(app.sidebar.selected, 0);
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        assert_matches_fresh_frame(&mut app, &terminal);
+    }
+
+    #[test]
+    fn workflow_agent_click_and_enter_focus_the_main_transcript() {
+        use bob_core::core::events::AgentEvent;
+        let mut app = test_app();
+        app.apply_agent_event(&AgentEvent::WorkflowPhase {
+            workflow_id: "wf-review".into(),
+            title: "Review".into(),
+            index: 0,
+            total: 1,
+        });
+        app.apply_agent_event(&AgentEvent::SubagentSpawn {
+            agent_id: "reviewer".into(),
+            parent_id: "wf-review".into(),
+            task: "Review code".into(),
+            prompt: "Inspect this code".into(),
+        });
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let agent_row = (0..30)
+            .find(|row| {
+                app.scrollback
+                    .hit_test_offset(*row)
+                    .is_some_and(|(idx, offset)| {
+                        app.view.cells[idx].workflow_agent_at(offset) == Some("reviewer")
+                    })
+            })
+            .expect("workflow agent row must be clickable");
+        assert!(app.click_scrollback(5, agent_row));
+        assert!(app.sidebar_open);
+        assert_eq!(app.focused_agent.as_deref(), Some("reviewer"));
+        assert_eq!(app.sidebar.selected, 1);
+        assert_eq!(app.teams.get("reviewer").unwrap().unread, 0);
+        app.on_key(KeyCode::Esc, KeyModifiers::NONE);
+        app.open_workflow_view("wf-review".into());
+        app.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.workflow_view.as_ref().unwrap().collapsed.contains(&0));
+        app.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.workflow_view.as_ref().unwrap().collapsed.is_empty());
+        app.on_key(KeyCode::Down, KeyModifiers::NONE);
+        assert!(app.focused_agent.is_none());
+        app.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.workflow_view.is_none());
+        assert_eq!(app.focused_agent.as_deref(), Some("reviewer"));
+        app.on_key(KeyCode::Esc, KeyModifiers::NONE);
+        app.open_workflow_view("wf-review".into());
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let row = app.wf_view_agents.as_ref().unwrap()[0].0;
+        app.click_workflow_view(5, row);
+        assert!(app.workflow_view.is_none());
+        assert!(app.wf_view_agents.is_none());
+        assert_eq!(app.focused_agent.as_deref(), Some("reviewer"));
+        terminal.draw(|f| app.draw(f)).unwrap();
+        assert_matches_fresh_frame(&mut app, &terminal);
+        assert!(terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>()
+            .contains("Inspect this code"));
+    }
+
+    #[test]
+    fn focused_tool_click_uses_its_renderer_and_bumps_only_its_revision() {
+        use bob_core::core::events::AgentEvent;
+        let mut app = test_app();
+        app.view.push_user("root message".into());
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let root_revision = app.view.revision;
+        app.teams.on_spawn("reviewer", "root", "Review code", "");
+        app.teams.apply(
+            &AgentEvent::ToolCall {
+                agent_id: "reviewer".into(),
+                tool_use_id: "t1".into(),
+                name: "bash".into(),
+                input: serde_json::json!({"command": "echo hello"}),
+            },
+            None,
+        );
+        app.teams.apply(
+            &AgentEvent::ToolResult {
+                agent_id: "reviewer".into(),
+                tool_use_id: "t1".into(),
+                output: "hello\n".repeat(20),
+                is_error: false,
+            },
+            None,
+        );
+        app.teams.on_done("reviewer", false);
+        app.open_sidebar_on("reviewer");
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let revision = app.teams.get("reviewer").unwrap().revision;
+        for expanded in [true, false] {
+            let row = (0..30)
+                .find(|row| {
+                    app.focused_scrollback
+                        .hit_test_offset(*row)
+                        .is_some_and(|(idx, _)| idx == 0)
+                })
+                .unwrap();
+            assert!(app.click_scrollback(5, row));
+            assert!(matches!(&app.teams.get("reviewer").unwrap().cells[0],
+                super::super::view::Cell::Tool { expanded: value, .. } if *value == expanded));
+            terminal.draw(|f| app.draw(f)).unwrap();
+            assert_matches_fresh_frame(&mut app, &terminal);
+        }
+        assert_eq!(app.teams.get("reviewer").unwrap().revision, revision + 2);
+        assert_eq!(app.view.revision, root_revision);
+        assert!(!app.teams.toggle_tool("missing", 0));
+        assert!(!app.teams.toggle_tool("reviewer", 99));
+        assert_eq!(app.teams.get("reviewer").unwrap().revision, revision + 2);
+    }
+
+    #[test]
+    fn focused_scroll_position_survives_agent_reordering() {
+        use bob_core::core::events::AgentEvent;
+        let mut app = test_app();
+        app.teams.on_spawn("a", "root", "Review a", "");
+        app.teams.on_spawn("b", "root", "Review b", "");
+        for i in 0..40 {
+            app.teams
+                .push_message("a", "user", &format!("message {i}"), None);
+        }
+        app.open_sidebar_on("a");
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        app.focused_scrollback.scroll_up(10);
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let anchor = app.focused_scrollback.hit_test_offset(5);
+        assert!(anchor.is_some());
+        assert!(!app.focused_scrollback.at_bottom());
+        app.apply_agent_event(&AgentEvent::SubagentDone {
+            agent_id: "a".into(),
+            failed: false,
+            cancelled: false,
+        });
+        terminal.draw(|f| app.draw(f)).unwrap();
+        assert_eq!(app.focused_agent.as_deref(), Some("a"));
+        assert_eq!(app.sidebar.selected, 2);
+        assert_eq!(app.focused_scrollback.hit_test_offset(5), anchor);
+        assert!(!app.focused_scrollback.at_bottom());
+        assert_matches_fresh_frame(&mut app, &terminal);
+    }
+
+    #[test]
+    fn connection_events_use_full_contrast_text() {
+        let mut app = test_app();
+        let notice = "MCP 'github': 3 tool(s)";
+        app.view.push_event(notice.into());
+        let mut lines = Vec::new();
+        render::render_cell(&app.view.cells[0], 80, &mut lines);
+        assert!(lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .any(|span| span.content.contains(notice) && span.style.fg == Some(Palette::TEXT())));
+    }
+
+    #[test]
+    fn jobs_panel_shows_only_running_shell_commands() {
+        let jobs = JobRegistry::new();
+        for (id, kind) in [
+            ("job_1", "task"),
+            ("job_2", "turn"),
+            ("task_3", "bash"),
+            ("job_4", "bash"),
+            ("job_5", "bash"),
+            ("job_6", "bash"),
+        ] {
+            jobs.register_tracking(id.into(), kind, format!("{kind} work"));
+        }
+        jobs.finish("task_3", JobStatus::Done, "finished".into());
+        jobs.finish("job_5", JobStatus::Failed, "failed".into());
+        jobs.cancel("job_6");
+        let rows = shell_jobs(&jobs);
+        assert_eq!(
+            rows.iter()
+                .map(|(id, _, _, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            ["job_4"]
+        );
+        assert_eq!(rows[0].3, JobStatus::Running);
+        assert_eq!(
+            jobs.output_of("task_3"),
+            Some((JobStatus::Done, "finished".into()))
+        );
+        jobs.finish("job_4", JobStatus::Done, "last finished".into());
+        assert!(shell_jobs(&jobs).is_empty());
+    }
+
+    #[test]
+    fn shell_panel_disappears_on_completion_even_when_root_is_cancelled() {
+        for status in [JobStatus::Done, JobStatus::Failed, JobStatus::Cancelled] {
+            let mut app = test_app();
+            app.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            app.jobs
+                .register_tracking("job_1".into(), "bash", "shell-smoke-command".into());
+            assert!(app.refresh_job_panel());
+            assert!(!app.refresh_job_panel());
+            let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            terminal.draw(|f| app.draw(f)).unwrap();
+            let text = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(text.contains("background shell commands"));
+            app.jobs.finish("job_1", status, "retained output".into());
+            assert!(app.refresh_job_panel());
+            assert!(!app.refresh_job_panel());
+            terminal.draw(|f| app.draw(f)).unwrap();
+            let text = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(!text.contains("background shell commands"));
+            assert!(!text.contains("shell-smoke-command"));
+            assert!(!app.running);
+            assert!(app.cancel.load(std::sync::atomic::Ordering::Relaxed));
+            assert_eq!(
+                app.jobs.output_of("job_1"),
+                Some((status, "retained output".into()))
+            );
         }
     }
 
-    // Activity: the tool calls, as `Name(arg)`.
-    let tools: Vec<&Cell> = thread
-        .cells
-        .iter()
-        .filter(|c| matches!(c, Cell::Tool { .. }))
-        .collect();
-    if !tools.is_empty() {
-        section(&mut out, "Activity");
-        for c in tools {
-            if let Cell::Tool { name, input, .. } = c {
-                let arg = input
-                    .get("path")
-                    .or_else(|| input.get("pattern"))
-                    .or_else(|| input.get("command"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                out.push(Line::from(Span::styled(
-                    format!("    {name}({arg})"),
-                    Style::default().fg(Palette::DIM()),
-                )));
+    #[test]
+    fn sidebar_uses_color_only_and_strikes_terminal_agents() {
+        use team::ThreadStatus;
+        for (status, color) in [
+            (ThreadStatus::Running, Palette::RUNNING()),
+            (ThreadStatus::Done, Palette::OK()),
+            (ThreadStatus::Failed, Palette::ERROR()),
+            (ThreadStatus::Cancelled, Palette::FAINT()),
+        ] {
+            for selected in [false, true] {
+                let finished = status != ThreadStatus::Running;
+                let row = sidebar_row(
+                    "Review parser",
+                    1,
+                    thread_color(status),
+                    finished,
+                    selected,
+                    42,
+                );
+                assert_eq!(row.to_string().trim(), "• Review parser");
+                assert_eq!(row.spans[0].style.fg, Some(color));
+                let style = row.spans[1].style;
+                assert_eq!(
+                    style.fg,
+                    Some(if finished {
+                        Palette::DIM()
+                    } else {
+                        Palette::TEXT()
+                    })
+                );
+                assert_eq!(style.add_modifier.contains(Modifier::CROSSED_OUT), finished);
+                assert_eq!(style.add_modifier.contains(Modifier::BOLD), selected);
+                assert_eq!(row.width(), 42);
             }
         }
-    }
-
-    // Outcome: the last assistant cell (the agent's final answer / structured out).
-    if let Some(Cell::Assistant { text, .. }) = thread
-        .cells
-        .iter()
-        .rev()
-        .find(|c| matches!(c, Cell::Assistant { .. }))
-    {
-        section(&mut out, "Outcome");
-        for l in text.lines().take(20) {
-            out.push(Line::from(Span::styled(
-                format!("    {l}"),
-                Style::default().fg(Palette::TEXT()),
-            )));
+        for (running, color) in [(true, Palette::RUNNING()), (false, Palette::FAINT())] {
+            let row = sidebar_row("main", 0, root_color(running), false, false, 42);
+            assert_eq!(row.to_string().trim(), "• main");
+            assert_eq!(row.spans[0].style.fg, Some(color));
+            assert!(!row.spans[1]
+                .style
+                .add_modifier
+                .contains(Modifier::CROSSED_OUT));
         }
+        let row = sidebar_row(
+            &"界".repeat(60),
+            16,
+            thread_color(ThreadStatus::Cancelled),
+            true,
+            false,
+            42,
+        );
+        assert_eq!(row.width(), 42);
+        assert!(!row.to_string().contains("Cancelled"));
     }
 
-    out
+    #[test]
+    fn sidebar_windows_completed_agents_and_clicks_match_display_order() {
+        let mut app = test_app();
+        app.sidebar_open = true;
+        for i in 0..30 {
+            let id = format!("job_{i}");
+            app.teams
+                .on_spawn(&id, "root", &format!("Review module {i}"), "");
+            app.teams.on_done(&id, false);
+        }
+        app.teams.on_spawn("reviewer", "root", "Check new work", "");
+        let mut terminal = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        let area = Rect::new(16, 0, 44, 10);
+        terminal.draw(|f| app.draw_sidebar(f, area)).unwrap();
+        assert_eq!(app.sidebar_rows.as_ref().unwrap()[1].1, "reviewer");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Check new work"));
+        assert!(rendered.contains("AGENTS · 1 running"));
+        for _ in 0..31 {
+            app.on_key(KeyCode::Down, KeyModifiers::NONE);
+        }
+        terminal.draw(|f| app.draw_sidebar(f, area)).unwrap();
+        assert_eq!(app.focused_agent.as_deref(), Some("job_29"));
+        assert!(app.sidebar.scroll > 0);
+        let hit = app.sidebar_rows.clone().unwrap();
+        assert!(hit.iter().any(|(_, id)| id == "job_29"));
+        let (row, id) = &hit[0];
+        app.click_sidebar(0, *row);
+        assert_eq!(app.focused_agent.as_deref(), Some("job_29"));
+        app.click_sidebar(20, *row);
+        assert_eq!(app.focused_agent.as_ref(), Some(id));
+        assert_eq!(app.teams.display_order()[app.sidebar.selected - 1], *id);
+        app.on_key(KeyCode::Esc, KeyModifiers::NONE);
+        terminal.draw(|f| app.draw_sidebar(f, area)).unwrap();
+        assert_eq!(app.sidebar.scroll, 0);
+        assert_eq!(app.sidebar_rows.as_ref().unwrap()[0].1, "");
+    }
 }

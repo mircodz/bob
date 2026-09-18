@@ -12,9 +12,11 @@
 //! embedded scripting engine. What it deliberately can NOT do is arbitrary
 //! computation between steps (sorting/formulas); that's the scripting escape hatch.
 
-use super::{agent, parallel, AgentSpec, WorkflowContext};
+use super::validation::{placeholders, reference_parts};
+use super::{agent, parallel, AgentSpec, WorkflowContext, WorkflowRun};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
+use std::collections::BTreeMap;
 
 /// A whole workflow: an ordered list of named steps. Looping is a step op
 /// (`Op::Loop`), so a loop can wrap just PART of the pipeline and can nest — not
@@ -47,9 +49,8 @@ pub enum Op {
     /// Run several named branches concurrently; the step's result is an object of
     /// each branch's result keyed by branch name.
     Parallel(ParallelOp),
-    /// Re-run an inner sequence of steps until `until` resolves truthy (or the
-    /// round cap is hit). The inner steps write to the SAME scope, so `until` can
-    /// reference an output produced inside the loop.
+    /// Re-run an inner sequence until a boolean condition is true or the cap is
+    /// reached. Inner results are exposed through the loop step's output.
     Loop(LoopOp),
 }
 
@@ -75,20 +76,18 @@ pub struct FanOutOp {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ParallelOp {
     /// Named branches run concurrently; each is itself a single-step op.
-    pub branches: Map<String, Value>,
+    pub branches: BTreeMap<String, Op>,
 }
 
-/// Re-run `steps` until `until` resolves truthy (or `max` iterations). The inner
-/// steps share the enclosing scope, so `until` typically references an output a
-/// step inside the loop produces (e.g. a coverage check). Loops nest — a `Loop`
-/// step may appear inside another loop's `steps`.
+/// Re-run `steps` until `until` resolves to true, or the iteration cap is reached.
+/// Each iteration starts from the enclosing scope, without stale prior results.
 #[derive(Debug, Clone, Deserialize)]
 pub struct LoopOp {
     pub steps: Vec<Step>,
-    /// A `$ref` to a boolean; when truthy the loop stops. Omit to always run `max`.
+    /// A reference to a boolean. Omit to always run `max` iterations.
     #[serde(default)]
     pub until: Option<String>,
-    /// Iteration cap (default 5, clamped to 1..=20).
+    /// Iteration cap (default 5, accepted range 1..=20).
     #[serde(default)]
     pub max: Option<usize>,
 }
@@ -96,27 +95,39 @@ pub struct LoopOp {
 /// Run a spec to completion: execute its steps in order, threading each step's
 /// output into a shared scope. Returns the final scope (every step's output keyed
 /// by id).
-pub async fn run(ctx: WorkflowContext, spec: Spec) -> Value {
+pub async fn run(ctx: WorkflowContext, spec: Spec) -> WorkflowRun {
     let mut scope = Map::new();
-    run_steps(&ctx, &spec.steps, &mut scope).await;
-    Value::Object(scope)
+    if let Err(error) = super::validation::validate(&spec) {
+        return WorkflowRun::failed(Value::Object(scope), error);
+    }
+    match run_steps(&ctx, &spec.steps, &mut scope).await {
+        Ok(()) => WorkflowRun::success(Value::Object(scope)),
+        Err(error) => WorkflowRun::failed(Value::Object(scope), error),
+    }
 }
 
 /// Run an ordered list of steps, writing each result into `scope` under its id.
 /// Each step announces a phase (so the inline tree groups agents by step name),
 /// EXCEPT loop steps, which emit their own per-pass phases.
-async fn run_steps(ctx: &WorkflowContext, steps: &[Step], scope: &mut Map<String, Value>) {
-    let total = steps.len();
+async fn run_steps(
+    ctx: &WorkflowContext,
+    steps: &[Step],
+    scope: &mut Map<String, Value>,
+) -> Result<(), String> {
     for (i, step) in steps.iter().enumerate() {
-        if ctx.cancel.load(std::sync::atomic::Ordering::Relaxed) {
-            break;
+        if ctx.is_cancelled() {
+            return Err(format!("cancelled before step '{}'", step.id));
         }
         if !matches!(step.op, Op::Loop(_)) {
-            ctx.phase(&step.id, i, total);
+            ctx.phase(&step.id, i, steps.len());
         }
-        let out = run_step(ctx, step, scope).await;
-        scope.insert(step.id.clone(), out);
+        let run = run_step(ctx, step, scope).await;
+        scope.insert(step.id.clone(), run.output);
+        if let Some(error) = run.error {
+            return Err(format!("step '{}': {error}", step.id));
+        }
     }
+    Ok(())
 }
 
 /// Execute one step, returning its output value. Boxed because steps recurse
@@ -125,7 +136,7 @@ fn run_step<'a>(
     ctx: &'a WorkflowContext,
     step: &'a Step,
     scope: &'a Map<String, Value>,
-) -> futures::future::BoxFuture<'a, Value> {
+) -> futures::future::BoxFuture<'a, WorkflowRun> {
     Box::pin(async move {
         match &step.op {
             Op::Agent(a) => run_agent_op(ctx, &step.id, a, scope).await,
@@ -144,33 +155,74 @@ async fn run_loop(
     id: &str,
     op: &LoopOp,
     outer: &Map<String, Value>,
-) -> Value {
-    let max = op.max.unwrap_or(5).clamp(1, 20);
-    // Start from the enclosing scope so inner steps can read prior outputs.
-    let mut scope = outer.clone();
+) -> WorkflowRun {
+    let max = op.max.unwrap_or(5);
+    let mut local = Map::new();
     let mut iterations = 0;
     loop {
+        if ctx.is_cancelled() {
+            return loop_result(
+                local,
+                iterations,
+                "cancelled",
+                Some("workflow cancelled".into()),
+            );
+        }
         iterations += 1;
         ctx.phase(&format!("{id} · pass {iterations}"), iterations - 1, max);
-        run_steps(ctx, &op.steps, &mut scope).await;
-        let stop = match &op.until {
-            None => iterations >= max,
-            Some(cond) => truthy(&resolve_ref(cond, &scope)) || iterations >= max,
+        let mut scope = outer.clone();
+        let result = run_steps(ctx, &op.steps, &mut scope).await;
+        local = op
+            .steps
+            .iter()
+            .filter_map(|step| {
+                scope
+                    .get(&step.id)
+                    .map(|value| (step.id.clone(), value.clone()))
+            })
+            .collect();
+        if let Err(error) = result {
+            let reason = if ctx.is_cancelled() {
+                "cancelled"
+            } else {
+                "failed"
+            };
+            return loop_result(local, iterations, reason, Some(error));
+        }
+        let stop = match op.until.as_deref() {
+            None => false,
+            Some(reference) => match resolve_ref(reference, &scope).and_then(|value| {
+                value
+                    .as_bool()
+                    .ok_or_else(|| format!("loop condition '{reference}' must be a boolean"))
+            }) {
+                Ok(stop) => stop,
+                Err(error) => return loop_result(local, iterations, "failed", Some(error)),
+            },
         };
-        if stop {
-            break;
+        if stop || iterations >= max {
+            return loop_result(
+                local,
+                iterations,
+                if stop { "condition_met" } else { "max_rounds" },
+                None,
+            );
         }
     }
-    // Return only the keys the loop's own steps produced, plus the count, so the
-    // parent scope isn't polluted with duplicates of the outer keys.
-    let mut local = Map::new();
-    for step in &op.steps {
-        if let Some(v) = scope.get(&step.id) {
-            local.insert(step.id.clone(), v.clone());
-        }
-    }
+}
+
+fn loop_result(
+    mut local: Map<String, Value>,
+    iterations: usize,
+    reason: &str,
+    error: Option<String>,
+) -> WorkflowRun {
     local.insert("_iterations".into(), json!(iterations));
-    Value::Object(local)
+    local.insert("_stop_reason".into(), json!(reason));
+    WorkflowRun {
+        output: Value::Object(local),
+        error,
+    }
 }
 
 async fn run_agent_op(
@@ -178,13 +230,21 @@ async fn run_agent_op(
     id: &str,
     op: &AgentOp,
     scope: &Map<String, Value>,
-) -> Value {
-    let prompt = interpolate(&op.prompt, scope, None);
+) -> WorkflowRun {
+    let prompt = match interpolate(&op.prompt, scope, None) {
+        Ok(prompt) => prompt,
+        Err(error) => return WorkflowRun::failed(Value::Null, error),
+    };
     let mut spec = AgentSpec::new(prompt, id.to_string());
     if let Some(s) = &op.schema {
         spec = spec.with_schema(s.clone());
     }
-    agent(ctx, spec).await.unwrap_or(Value::Null)
+    let outcome = agent(ctx, spec).await;
+    if outcome.is_success() {
+        WorkflowRun::success(outcome.output.expect("successful agent has output"))
+    } else {
+        WorkflowRun::failed(Value::Null, outcome.failure_message())
+    }
 }
 
 async fn run_fan_out(
@@ -192,49 +252,79 @@ async fn run_fan_out(
     id: &str,
     op: &FanOutOp,
     scope: &Map<String, Value>,
-) -> Value {
-    // `over` is either a $ref to a list, or an inline array.
-    let items = as_list(&resolve_value(&op.over, scope));
-    let repeat = op.repeat.unwrap_or(1).max(1);
-    let schema = op.schema.clone();
-    let prompt_tpl = op.prompt.clone();
-
+) -> WorkflowRun {
+    let items = match prepare_items(op, scope) {
+        Ok(items) => items,
+        Err(error) => return WorkflowRun::failed(Value::Null, error),
+    };
+    let repeat = op.repeat.unwrap_or(1);
     let thunks: Vec<_> = items
-        .iter()
+        .into_iter()
         .enumerate()
-        .flat_map(|(i, item)| (0..repeat).map(move |r| (i, r, item.clone())))
-        .map(|(i, r, item)| {
-            let ctx = ctx.clone();
-            let prompt = interpolate(&prompt_tpl, scope, Some(&item));
+        .flat_map(|(i, (item, prompt))| {
+            (0..repeat).map(move |r| (i, r, item.clone(), prompt.clone()))
+        })
+        .map(|(i, r, item, prompt)| {
             let label = if repeat > 1 {
                 format!("{id}:{}#{}", i + 1, r + 1)
             } else {
                 format!("{id}:{}", i + 1)
             };
-            let mut spec = AgentSpec::new(prompt, label);
-            if let Some(s) = schema.clone() {
-                spec = spec.with_schema(s);
+            let mut spec = AgentSpec::new(prompt, label).with_input(item);
+            if let Some(schema) = &op.schema {
+                spec = spec.with_schema(schema.clone());
             }
-            async move { agent(&ctx, spec).await }
+            agent(ctx, spec)
         })
         .collect();
-
-    let flat = parallel(thunks).await;
-    if repeat > 1 {
-        // Group by item: [[r1, r2], [r1, r2], …].
-        let mut grouped: Vec<Value> = Vec::new();
-        for chunk in flat.chunks(repeat) {
-            grouped.push(Value::Array(
-                chunk
-                    .iter()
-                    .map(|o| o.clone().unwrap_or(Value::Null))
-                    .collect(),
-            ));
-        }
-        Value::Array(grouped)
+    let outcomes = parallel(thunks).await;
+    let error = outcomes
+        .iter()
+        .find(|outcome| !outcome.is_success())
+        .map(|outcome| format!("fan-out incomplete: {}", outcome.failure_message()));
+    let values: Vec<Value> = outcomes
+        .into_iter()
+        .map(|outcome| {
+            if outcome.is_success() {
+                outcome.output.unwrap_or(Value::Null)
+            } else {
+                Value::Null
+            }
+        })
+        .collect();
+    let output = if repeat > 1 {
+        Value::Array(
+            values
+                .chunks(repeat)
+                .map(|chunk| Value::Array(chunk.to_vec()))
+                .collect(),
+        )
     } else {
-        Value::Array(flat.into_iter().map(|o| o.unwrap_or(Value::Null)).collect())
-    }
+        Value::Array(values)
+    };
+    WorkflowRun { output, error }
+}
+
+fn prepare_items(
+    op: &FanOutOp,
+    scope: &Map<String, Value>,
+) -> Result<Vec<(Value, String)>, String> {
+    let value = match op.over.as_str() {
+        Some(reference) => resolve_ref(reference, scope)?,
+        None => &op.over,
+    };
+    let items = value
+        .as_array()
+        .ok_or_else(|| "fan-out 'over' must resolve to an array".to_string())?;
+    items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            interpolate(&op.prompt, scope, Some(item))
+                .map(|prompt| (item.clone(), prompt))
+                .map_err(|error| format!("fan-out item {}: {error}", i + 1))
+        })
+        .collect()
 }
 
 async fn run_parallel(
@@ -242,92 +332,70 @@ async fn run_parallel(
     id: &str,
     op: &ParallelOp,
     scope: &Map<String, Value>,
-) -> Value {
-    // Each branch is a single-step op (agent/fan_out/parallel). Run them together
-    // and return an object keyed by branch name.
-    let names: Vec<String> = op.branches.keys().cloned().collect();
+) -> WorkflowRun {
+    let thunks = op.branches.iter().map(|(name, op)| {
+        let step = Step {
+            id: format!("{id}.{name}"),
+            op: op.clone(),
+        };
+        async move { (name.clone(), run_step(ctx, &step, scope).await) }
+    });
     let mut result = Map::new();
-    // Sequentially build sub-steps (cheap), then run their futures concurrently.
-    let thunks: Vec<_> = names
-        .iter()
-        .map(|name| {
-            let branch_val = op.branches[name].clone();
-            let ctx = ctx.clone();
-            let scope = scope.clone();
-            let sub_id = format!("{id}.{name}");
-            async move {
-                // Parse the branch as a step op and run it.
-                match serde_json::from_value::<Op>(branch_val) {
-                    Ok(sub_op) => {
-                        let sub = Step {
-                            id: sub_id,
-                            op: sub_op,
-                        };
-                        run_step(&ctx, &sub, &scope).await
-                    }
-                    Err(_) => Value::Null,
-                }
-            }
-        })
-        .collect();
-    let outs = futures::future::join_all(thunks).await;
-    for (name, out) in names.into_iter().zip(outs) {
-        result.insert(name, out);
+    let mut errors = Vec::new();
+    for (name, run) in futures::future::join_all(thunks).await {
+        if let Some(error) = run.error {
+            errors.push(format!("branch '{name}': {error}"));
+        }
+        result.insert(name, run.output);
     }
-    Value::Object(result)
-}
-
-// --- reference resolution + interpolation ----------------------------------
-
-/// Resolve a value that may be a `$ref` string, otherwise return it as-is.
-fn resolve_value(v: &Value, scope: &Map<String, Value>) -> Value {
-    match v.as_str() {
-        Some(s) if s.starts_with('$') => resolve_ref(s, scope),
-        _ => v.clone(),
-    }
-}
-
-/// Resolve a `$id` / `$id.field.sub` reference against the scope. Missing → Null.
-fn resolve_ref(reference: &str, scope: &Map<String, Value>) -> Value {
-    let path = reference.trim_start_matches('$');
-    let mut cur = Value::Object(scope.clone());
-    for seg in path.split('.') {
-        cur = cur.get(seg).cloned().unwrap_or(Value::Null);
-    }
-    cur
-}
-
-/// Interpolate `{...}` placeholders in a prompt: `{item}` → the current fan-out
-/// item (as compact JSON if not a string), and `{$id.field}` → a scope ref.
-fn interpolate(template: &str, scope: &Map<String, Value>, item: Option<&Value>) -> String {
-    let mut out = String::with_capacity(template.len());
-    let mut rest = template;
-    while let Some(open) = rest.find('{') {
-        out.push_str(&rest[..open]);
-        let after = &rest[open + 1..];
-        let Some(close) = after.find('}') else {
-            out.push('{');
-            rest = after;
-            continue;
-        };
-        let key = &after[..close];
-        let replacement = if key == "item" {
-            item.map(value_to_text).unwrap_or_default()
-        } else if let Some(field) = key.strip_prefix("item.") {
-            item.and_then(|it| it.get(field))
-                .map(value_to_text)
-                .unwrap_or_default()
-        } else if key.starts_with('$') {
-            value_to_text(&resolve_ref(key, scope))
+    WorkflowRun {
+        output: Value::Object(result),
+        error: if errors.is_empty() {
+            None
         } else {
-            // Unknown placeholder — leave it literally so it's visible.
-            format!("{{{key}}}")
-        };
-        out.push_str(&replacement);
-        rest = &after[close + 1..];
+            Some(errors.join("; "))
+        },
     }
-    out.push_str(rest);
-    out
+}
+
+fn resolve_ref<'a>(reference: &str, scope: &'a Map<String, Value>) -> Result<&'a Value, String> {
+    let parts = reference_parts(reference)?;
+    let mut value = scope
+        .get(parts[0])
+        .ok_or_else(|| format!("unresolved reference '{reference}'"))?;
+    for field in &parts[1..] {
+        value = value
+            .get(*field)
+            .ok_or_else(|| format!("missing field '{field}' in reference '{reference}'"))?;
+    }
+    Ok(value)
+}
+
+fn interpolate(
+    template: &str,
+    scope: &Map<String, Value>,
+    item: Option<&Value>,
+) -> Result<String, String> {
+    let mut out = String::with_capacity(template.len());
+    let mut cursor = 0;
+    for (range, key) in placeholders(template)? {
+        out.push_str(&template[cursor..range.start]);
+        let value = if key.starts_with('$') {
+            resolve_ref(key, scope)?
+        } else {
+            let mut value = item.ok_or_else(|| format!("'{{{key}}}' requires a fan-out item"))?;
+            for field in key.split('.').skip(1) {
+                value = value
+                    .get(field)
+                    .ok_or_else(|| format!("missing item field in '{{{key}}}'"))?;
+            }
+            value
+        };
+        out.push_str(&value_to_text(value));
+        cursor = range.end;
+    }
+    out.push_str(&template[cursor..]);
+    Ok(out)
 }
 
 /// Render a JSON value as prompt text: strings verbatim, everything else pretty JSON.
@@ -335,26 +403,6 @@ fn value_to_text(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
         _ => serde_json::to_string_pretty(v).unwrap_or_default(),
-    }
-}
-
-/// Coerce a value into a list of items to fan out over. An array stays as-is; a
-/// non-array becomes a single-element list; Null becomes empty.
-fn as_list(v: &Value) -> Vec<Value> {
-    match v {
-        Value::Array(a) => a.clone(),
-        Value::Null => Vec::new(),
-        other => vec![other.clone()],
-    }
-}
-
-/// Truthiness for `loop_until`: `true`, a non-zero number, or a non-empty string.
-fn truthy(v: &Value) -> bool {
-    match v {
-        Value::Bool(b) => *b,
-        Value::Number(n) => n.as_f64().map(|f| f != 0.0).unwrap_or(false),
-        Value::String(s) => !s.is_empty() && s != "false",
-        _ => false,
     }
 }
 
@@ -366,8 +414,14 @@ mod tests {
     fn resolves_nested_ref() {
         let mut scope = Map::new();
         scope.insert("crates".into(), json!({ "list": ["a", "b"] }));
-        assert_eq!(resolve_ref("$crates.list", &scope), json!(["a", "b"]));
-        assert_eq!(resolve_ref("$missing.x", &scope), Value::Null);
+        assert_eq!(
+            resolve_ref("$crates.list", &scope).unwrap(),
+            &json!(["a", "b"])
+        );
+        assert!(resolve_ref("$missing.x", &scope)
+            .unwrap_err()
+            .contains("$missing.x"));
+        assert!(resolve_ref("$crates.missing", &scope).is_err());
     }
 
     #[test]
@@ -376,22 +430,30 @@ mod tests {
         scope.insert("cov".into(), json!({ "pct": 87 }));
         let item = json!({ "name": "core", "feedback": "add edge tests" });
         assert_eq!(
-            interpolate("fix {item.feedback} in {item.name}", &scope, Some(&item)),
+            interpolate("fix {item.feedback} in {item.name}", &scope, Some(&item)).unwrap(),
             "fix add edge tests in core"
         );
         assert_eq!(
-            interpolate("coverage is {$cov.pct}", &scope, None),
+            interpolate("coverage is {$cov.pct}", &scope, None).unwrap(),
             "coverage is 87"
         );
     }
 
     #[test]
-    fn truthy_covers_common_cases() {
-        assert!(truthy(&json!(true)));
-        assert!(!truthy(&json!(false)));
-        assert!(truthy(&json!(1)));
-        assert!(!truthy(&json!(0)));
-        assert!(!truthy(&Value::Null));
+    fn interpolation_preserves_json_and_rejects_missing_item_fields() {
+        let scope = Map::from_iter([("data".into(), json!({"value": 2}))]);
+        let item = json!({"nested":{"0":{"name":"cli"}}});
+        assert_eq!(
+            interpolate(
+                r#"{"name":"{item.nested.0.name}","value":{$data.value}}"#,
+                &scope,
+                Some(&item)
+            )
+            .unwrap(),
+            r#"{"name":"cli","value":2}"#
+        );
+        assert!(interpolate("{item.missing}", &scope, Some(&item)).is_err());
+        assert!(interpolate("{$data.missing}", &scope, None).is_err());
     }
 
     // --- end-to-end: the crates → tests → adversarial reviews → fix → loop
@@ -464,18 +526,16 @@ mod tests {
         let out = tokio::time::timeout(std::time::Duration::from_secs(10), fut)
             .await
             .expect("workflow deadlocked (timed out)");
+        assert!(out.error.is_none(), "{:?}", out.error);
         // All 3 branches × 3 items produced a result.
         for b in ["a", "b", "c"] {
-            assert_eq!(out["fan"][b].as_array().unwrap().len(), 3);
+            assert_eq!(out.output["fan"][b].as_array().unwrap().len(), 3);
         }
     }
 
     #[tokio::test]
     async fn crates_tests_reviews_fix_loop_pipeline() {
-        // The mock keys off distinctive words in each step's prompt. Coverage has no
-        // rule → it never produces a structured `pass`, so `$coverage.pass` stays
-        // Null (falsy) and the loop runs to its `max` — which lets us assert the
-        // full structure the pipeline builds each pass.
+        // A valid false condition exercises every iteration without hiding a failed check.
         let provider = MockProvider::new(vec![
             rule("list all crates", json!({ "list": ["core", "cli"] })),
             rule(
@@ -486,7 +546,7 @@ mod tests {
                 "adversarially review",
                 json!({ "feedback": "add an edge case" }),
             ),
-            rule("address this review", json!({ "done": true })),
+            rule("does coverage pass", json!({"pass": false})),
         ]);
 
         let spec: Spec = serde_json::from_value(json!({
@@ -517,9 +577,9 @@ mod tests {
         }))
         .unwrap();
 
-        // coverage never matches a rule → the loop runs to max=2. We assert the
-        // STRUCTURE the pipeline produced each pass.
-        let out = run(ctx_with(Arc::new(provider)), spec).await;
+        let result = run(ctx_with(Arc::new(provider)), spec).await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        let out = result.output;
 
         // crates discovered.
         assert_eq!(out["crates"]["list"], json!(["core", "cli"]));
@@ -530,12 +590,12 @@ mod tests {
         let reviews = improve["reviews"].as_array().unwrap();
         assert_eq!(reviews.len(), 2); // one group per test
         assert_eq!(reviews[0].as_array().unwrap().len(), 2); // repeat: 2
-                                                             // The loop ran (iteration count present).
-        assert!(improve["_iterations"].as_u64().unwrap() >= 1);
+        assert_eq!(improve["_iterations"], 2);
+        assert_eq!(improve["_stop_reason"], "max_rounds");
     }
 
     #[tokio::test]
-    async fn loop_stops_when_until_is_truthy() {
+    async fn loop_stops_when_condition_is_true() {
         // Coverage passes immediately → the loop runs exactly one pass.
         let provider = MockProvider::new(vec![rule("coverage", json!({ "pass": true }))]);
         let spec: Spec = serde_json::from_value(json!({
@@ -551,6 +611,8 @@ mod tests {
         }))
         .unwrap();
         let out = run(ctx_with(Arc::new(provider)), spec).await;
-        assert_eq!(out["improve"]["_iterations"], json!(1));
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert_eq!(out.output["improve"]["_iterations"], json!(1));
+        assert_eq!(out.output["improve"]["_stop_reason"], "condition_met");
     }
 }

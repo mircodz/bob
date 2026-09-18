@@ -61,6 +61,8 @@ pub enum AgentEvent {
     SubagentDone {
         agent_id: String,
         failed: bool,
+        #[serde(default)]
+        cancelled: bool,
     },
     /// A coordination message delivered from one team agent to another.
     AgentMessage {

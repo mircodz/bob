@@ -71,8 +71,11 @@ pub fn wire_for(provider: &str, model: &str) -> WireApi {
     let responses_family = m.contains("codex")
         || m.contains("-sol")
         || m.contains("-luna")
+        || m.contains("-terra")
+        || m.contains("-astra")
         || m.starts_with("gpt-5.")
-        || m == "gpt-5";
+        || m == "gpt-5"
+        || m.starts_with("gpt-6");
     if (provider == "openai" || provider == "copilot") && responses_family {
         WireApi::Responses
     } else {
@@ -108,6 +111,7 @@ mod tests {
         assert_eq!(wire_for("openai", "gpt-5.6-sol"), WireApi::Responses);
         assert_eq!(wire_for("openai", "gpt-5-codex"), WireApi::Responses);
         assert_eq!(wire_for("copilot", "gpt-5.6-luna"), WireApi::Responses);
+        assert_eq!(wire_for("copilot", "gpt-6-astra"), WireApi::Responses);
         // A plain chat model, and Anthropic, stay on chat.
         assert_eq!(wire_for("openai", "gpt-4o"), WireApi::Chat);
         assert_eq!(wire_for("anthropic", "claude-opus-4.8"), WireApi::Chat);

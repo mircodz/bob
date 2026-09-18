@@ -169,6 +169,7 @@ pub struct Agent {
     /// warning fires once per level as usage climbs (and re-arms after a compaction
     /// drops usage back down).
     warned_pct: u8,
+    turn_limit_summary: Option<String>,
 }
 
 impl Agent {
@@ -188,6 +189,7 @@ impl Agent {
             cancel,
             reasoning: crate::core::types::ReasoningEffort::default(),
             warned_pct: 0,
+            turn_limit_summary: None,
         }
     }
 
@@ -238,7 +240,7 @@ impl Agent {
     /// waiting to be processed, OR one of its own children still running (whose
     /// result will arrive later). A driver loop keeps the agent alive until this is
     /// false. (`has_pending_coordination` is the stricter "ready to wake NOW" gate;
-    /// this is the looser "not done yet" gate the remote host polls on.)
+    /// this is the looser "not done yet" gate used by a child-agent driver.)
     pub fn has_outstanding_coordination(&mut self) -> bool {
         let own_children_running = self
             .cfg
@@ -266,7 +268,7 @@ impl Agent {
         self.cfg.bus.clone()
     }
 
-    fn is_cancelled(&self) -> bool {
+    pub(crate) fn is_cancelled(&self) -> bool {
         cancel_requested(&self.cancel, self.cfg.parent_cancel.as_ref())
     }
 
@@ -294,8 +296,13 @@ impl Agent {
         self.cfg.provider.clone()
     }
 
+    pub(crate) fn turn_limit_summary(&self) -> Option<&str> {
+        self.turn_limit_summary.as_deref()
+    }
+
     /// Run the agent on a single user prompt, looping over tool calls.
     pub async fn run(&mut self, prompt: &str) -> anyhow::Result<String> {
+        self.turn_limit_summary = None;
         let ctx = ToolContext {
             cwd: self.cfg.cwd.clone(),
             files: self.files.clone(),
@@ -494,6 +501,17 @@ impl Agent {
                 .collect();
 
             if tool_uses.is_empty() {
+                // A steering message may have arrived during the final provider
+                // response. Give it a model step instead of dropping the inbox.
+                if !self.is_cancelled()
+                    && self
+                        .cfg
+                        .inbox
+                        .as_mut()
+                        .is_some_and(|inbox| inbox.has_pending())
+                {
+                    continue;
+                }
                 final_text = completion.message.text();
                 finished = true;
                 break;
@@ -545,6 +563,9 @@ impl Agent {
                 "[stopped after reaching the {}-turn limit without finishing]",
                 self.cfg.max_turns
             );
+        }
+        if !finished && !self.is_cancelled() {
+            self.turn_limit_summary = Some(final_text.clone());
         }
 
         self.cfg.bus.emit(AgentEvent::TurnEnd {
@@ -821,7 +842,11 @@ impl Agent {
         // One corrective retry if the model didn't call the tool (empty-prompt wake
         // turn — no new user message, just the nudge folded into history).
         let mut second = Ok(String::new());
-        if first.is_ok() && captured.is_none() && !self.is_cancelled() {
+        if first.is_ok()
+            && captured.is_none()
+            && !self.is_cancelled()
+            && self.turn_limit_summary.is_none()
+        {
             let nudge = "You did not record a result. Call the `structured_output` tool now \
                 with your final answer matching its schema.";
             second = self.run(nudge).await;
@@ -1249,6 +1274,45 @@ mod structured_tests {
             cancel: None,
             hooks: crate::agent::hooks::Hooks::default(),
         })
+    }
+
+    #[tokio::test]
+    async fn turn_limit_summary_is_retained_and_reset_on_the_next_run() {
+        let provider = MockProvider::new(vec![MockRule {
+            needle: "finish now".into(),
+            reply: MockReply::Text("complete".into()),
+        }])
+        .with_default(MockReply::ToolCall {
+            name: "missing".into(),
+            input: json!({}),
+        });
+        let mut agent = agent_with(Arc::new(provider.clone()));
+        agent.cfg.max_turns = 1;
+        let text = agent.run("keep going").await.unwrap();
+        assert_eq!(agent.turn_limit_summary(), Some(text.as_str()));
+        assert_eq!(provider.call_count(), 2);
+        assert_eq!(agent.run("finish now").await.unwrap(), "complete");
+        assert!(agent.turn_limit_summary().is_none());
+    }
+
+    #[tokio::test]
+    async fn structured_retry_does_not_restart_an_exhausted_budget() {
+        let provider = MockProvider::new(vec![]).with_default(MockReply::ToolCall {
+            name: "missing".into(),
+            input: json!({}),
+        });
+        let mut agent = agent_with(Arc::new(provider.clone()));
+        agent.cfg.max_turns = 1;
+        assert!(agent
+            .run_structured("keep going", json!({"type":"object"}))
+            .await
+            .is_err());
+        assert!(agent.turn_limit_summary().is_some());
+        assert_eq!(provider.call_count(), 2);
+        assert!(agent
+            .tool_specs()
+            .iter()
+            .all(|tool| tool.name != "structured_output"));
     }
 
     #[tokio::test]

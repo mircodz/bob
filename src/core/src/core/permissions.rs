@@ -55,7 +55,7 @@ pub struct PermissionOption {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Grant {
     /// Allow every future call to this tool (e.g. "always allow write_file").
-    Tool(String),
+    Tool { name: String },
     /// Allow a bash command name whose path-like args match `glob`.
     /// glob == "**" means "any args".
     BashCommand { name: String, glob: String },
@@ -275,7 +275,7 @@ fn base_name(cmd: &str) -> &str {
 
 fn grant_matches(grant: &Grant, req: &PermissionRequest) -> bool {
     match grant {
-        Grant::Tool(name) => &req.tool == name,
+        Grant::Tool { name } => &req.tool == name,
         Grant::BashCommand { name, glob } => {
             let Some(bash) = &req.bash else { return false };
             // Only ever match simple, single commands (see build_options).
@@ -378,7 +378,9 @@ fn build_options(req: &PermissionRequest) -> Vec<PermissionOption> {
         opts.push(PermissionOption {
             label: format!("Always allow {}", req.tool),
             allow: true,
-            grant: Some(Grant::Tool(req.tool.clone())),
+            grant: Some(Grant::Tool {
+                name: req.tool.clone(),
+            }),
         });
     }
 

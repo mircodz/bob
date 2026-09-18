@@ -113,7 +113,7 @@ impl Default for BobConfig {
             model: String::new(),
             reasoning: String::new(),
             system: None,
-            max_turns: Some(20),
+            max_turns: Some(crate::agent::agent::DEFAULT_MAX_TURNS),
             theme: None,
             permissions: PermissionsConfig {
                 default: "ask".to_string(),
@@ -533,6 +533,17 @@ pub fn set_theme_in_project(cwd: &Path, theme: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_turn_budget_matches_runtime_and_explicit_limits_still_win() {
+        let default = BobConfig::default();
+        assert_eq!(
+            default.max_turns,
+            Some(crate::agent::agent::DEFAULT_MAX_TURNS)
+        );
+        let explicit: PartialConfig = toml::from_str("max_turns = 12").unwrap();
+        assert_eq!(merge(default, explicit).max_turns, Some(12));
+    }
 
     #[test]
     fn parses_toml_config() {

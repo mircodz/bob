@@ -69,32 +69,6 @@ enum Command {
         #[command(subcommand)]
         action: LspAction,
     },
-    /// Host this session for phone control: dial the relay and wait for your
-    /// phone to pair. Prints a pairing QR the phone scans (once per device).
-    Remote {
-        /// Relay WebSocket URL (defaults to the configured/public relay).
-        #[arg(long)]
-        relay: Option<String>,
-        /// Pairing session id (default: auto-generated).
-        #[arg(long)]
-        session: Option<String>,
-        /// Provider spec, e.g. anthropic:claude-sonnet-4-5 (defaults to config).
-        #[arg(short = 'p', long)]
-        provider: Option<String>,
-        /// Debug: run a terminal controller instead of the agent host. Requires
-        /// --pair-url (the bobpair:// URL printed by a running host).
-        #[arg(long, hide = true)]
-        test_client: bool,
-        /// Debug: the bobpair:// URL for the test-client to pair with.
-        #[arg(long, hide = true)]
-        pair_url: Option<String>,
-    },
-    /// Run the public relay that pairs a `bob remote` host with your phone.
-    Relay {
-        /// Address to bind, e.g. 0.0.0.0:8787.
-        #[arg(long, default_value = "127.0.0.1:8787")]
-        addr: String,
-    },
 }
 
 #[derive(Subcommand)]
@@ -475,14 +449,6 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Config { action }) => return run_config(action),
         Some(Command::Mcp { action }) => return run_mcp(action).await,
         Some(Command::Lsp { action }) => return run_lsp(action),
-        Some(Command::Remote {
-            relay,
-            session,
-            provider,
-            test_client,
-            pair_url,
-        }) => return run_remote(relay, session, provider, test_client, pair_url).await,
-        Some(Command::Relay { addr }) => return run_relay(addr).await,
         None => {} // fall through to a chat
     }
 
@@ -916,114 +882,6 @@ fn run_lsp(action: LspAction) -> anyhow::Result<()> {
     }
 }
 
-/// Resolve remote settings and run the phone-control host (or the debug
-/// Host this session for phone control (or, with --test-client, run the debug
-/// controller). The host loads its long-term identity, generates a fresh pairing
-/// secret, and prints a `bobpair://` URL (as a scannable block) the phone uses
-/// once. After the Noise handshake the safety number is shown and the phone's
-/// key is remembered in ~/.bob/devices.toml, so future connects need no pairing.
-async fn run_remote(
-    relay: Option<String>,
-    session: Option<String>,
-    provider: Option<String>,
-    test_client: bool,
-    pair_url: Option<String>,
-) -> anyhow::Result<()> {
-    use bob_secure::{Device, DeviceBook, Identity, Pairing};
-
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("no home directory"))?;
-    let bob_dir = home.join(".bob");
-
-    // --- Debug test-client: pair from a bobpair:// URL and drive the host. ---
-    if test_client {
-        let url = pair_url
-            .ok_or_else(|| anyhow::anyhow!("--test-client requires --pair-url <bobpair://…>"))?;
-        let pairing = Pairing::from_url(&url)?;
-        let identity = Identity::generate(); // ephemeral identity for the debug client
-        let params = bob_remote::SecureParams {
-            identity: identity.secret(),
-            ephemeral: Identity::generate().secret(),
-            pairing_secret: pairing.secret.clone(),
-            peer_static: Some(pairing.static_key),
-            on_established: Box::new(|_| true),
-        };
-        return bob_remote::client::run(pairing.relay, pairing.session, params).await;
-    }
-
-    // --- Host: identity + pairing secret + QR, then run the agent host. ---
-    let relay = relay.unwrap_or_else(|| "ws://127.0.0.1:8787/ws".to_string());
-    let session = session.unwrap_or_else(make_id);
-    let identity = Identity::load_or_create(&bob_dir.join("identity.key"))?;
-
-    // A fresh pairing secret per run; the phone captures it from the QR.
-    let pairing_secret = make_id().replace('-', "").into_bytes();
-    let pairing = Pairing {
-        relay: relay.clone(),
-        session: session.clone(),
-        static_key: identity.public(),
-        secret: pairing_secret.clone(),
-    };
-    print_pairing(&pairing);
-
-    let devices_path = bob_dir.join("devices.toml");
-    let session_for_cb = session.clone();
-    let params = bob_remote::SecureParams {
-        identity: identity.secret(),
-        ephemeral: Identity::generate().secret(),
-        pairing_secret,
-        peer_static: None, // host learns the phone's key during the handshake
-        on_established: Box::new(move |est| {
-            println!(
-                "\n\x1b[32m✓ phone connected.\x1b[0m Safety number: \x1b[1m{:04}\x1b[0m",
-                est.safety_number
-            );
-            println!("  confirm it matches the number shown on your phone.");
-            // Trust-on-first-use, fail closed. The book must load; a load error
-            // means we can't verify trust, so we REJECT rather than admit blind.
-            let mut book = match DeviceBook::load(&devices_path) {
-                Ok(b) => b,
-                Err(e) => {
-                    eprintln!("[host] cannot load device book ({e}); rejecting");
-                    return false;
-                }
-            };
-            if book.is_trusted(&est.peer_static) {
-                return true;
-            }
-            // Unknown key, but it presented a valid admission proof and completed
-            // the Noise handshake — that IS the first-use pairing act. Record it and
-            // admit; subsequent unknown keys go through this same gate.
-            let name = format!("phone-{}", &session_for_cb[..8.min(session_for_cb.len())]);
-            match book.add(Device::new(name, &est.peer_static, now_stamp())) {
-                Ok(()) => true,
-                Err(e) => {
-                    eprintln!("[host] cannot persist paired device ({e}); rejecting");
-                    false
-                }
-            }
-        }),
-    };
-    bob_remote::host::run(relay, session, params, provider).await
-}
-
-/// Print the pairing bundle the phone scans — a `bobpair://` URL plus the
-/// human-readable parts, so it works whether the app scans a QR or you type it.
-fn print_pairing(pairing: &bob_secure::Pairing) {
-    println!("\n\x1b[1mPair your phone\x1b[0m — scan this in the Bob Remote app (once):");
-    println!("  \x1b[36m{}\x1b[0m", pairing.to_url());
-    println!("\nwaiting for your phone to connect…\n");
-}
-
-/// Run the public relay that pairs a `bob remote` host with a phone. The relay
-/// holds no secret: it pairs two peers that present matching admission proofs and
-/// forwards their end-to-end-encrypted frames without being able to read them.
-async fn run_relay(addr: String) -> anyhow::Result<()> {
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    println!("\x1b[32mrelay listening on\x1b[0m {}", addr);
-    axum::serve(listener, bob_relay::router()).await?;
-    Ok(())
-}
-
 fn print_onboarding() {
     println!("No usable provider. Get started with one of:");
     println!("  \x1b[36mbob login copilot\x1b[0m     use GitHub Copilot");
@@ -1050,7 +908,43 @@ fn done(pretty: &str, id: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::fuzzy_match;
+    use super::{fuzzy_match, Cli, Command};
+    use clap::Parser;
+
+    #[test]
+    fn cli_rejects_removed_subcommands() {
+        for command in ["remote", "relay"] {
+            let error = Cli::try_parse_from(["bob", command]).err().unwrap();
+            assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
+        }
+    }
+
+    #[test]
+    fn cli_accepts_core_subcommands() {
+        for args in [
+            vec!["bob", "login", "copilot"],
+            vec!["bob", "logout", "copilot"],
+            vec!["bob", "auth"],
+            vec!["bob", "config"],
+            vec!["bob", "config", "init"],
+            vec!["bob", "mcp", "list"],
+            vec!["bob", "lsp", "list"],
+        ] {
+            let cli = Cli::try_parse_from(&args).unwrap();
+            assert!(matches!(
+                cli.command,
+                Some(
+                    Command::Login { .. }
+                        | Command::Logout { .. }
+                        | Command::Auth
+                        | Command::Config { .. }
+                        | Command::Mcp { .. }
+                        | Command::Lsp { .. }
+                )
+            ));
+        }
+        assert!(Cli::try_parse_from(["bob"]).unwrap().command.is_none());
+    }
 
     #[test]
     fn fuzzy_match_is_case_insensitive_subsequence() {

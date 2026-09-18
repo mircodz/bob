@@ -41,8 +41,6 @@ pub enum Cell {
     /// A subagent spawn notice, with a running count of tools it has called.
     Subagent {
         agent_id: String,
-        /// Who spawned it ("root" or another agent's name), for nesting depth.
-        parent_id: String,
         task: String,
         tools: usize,
         done: bool,
@@ -137,20 +135,33 @@ impl WfStatus {
 }
 
 impl Cell {
+    pub fn is_visible(&self) -> bool {
+        match self {
+            Cell::Tool { name, status, .. } => {
+                !matches!(
+                    name.as_str(),
+                    "job_status" | "job_output" | "todo_write" | "workflow"
+                ) && (!matches!(name.as_str(), "task" | "explore" | "spawn_agent")
+                    || *status == ToolStatus::Error)
+            }
+            _ => true,
+        }
+    }
+
     /// A content fingerprint used to cache a cell's rendered lines. Two cells
     /// with the same fingerprint render identically, so the draw loop can reuse
     /// cached Lines instead of re-running markdown/syntax highlighting every
     /// frame. Only fields that affect rendering are hashed.
     pub fn fingerprint(&self) -> u64 {
         use std::hash::{Hash, Hasher};
+        if !self.is_visible() {
+            return 0;
+        }
         let mut h = std::collections::hash_map::DefaultHasher::new();
         std::mem::discriminant(self).hash(&mut h);
         match self {
             Cell::User(t) => t.hash(&mut h),
-            Cell::Assistant { text, open } => {
-                text.hash(&mut h);
-                open.hash(&mut h);
-            }
+            Cell::Assistant { text, .. } => text.hash(&mut h),
             Cell::Tool {
                 name,
                 input,
@@ -163,23 +174,17 @@ impl Cell {
                 // Value isn't Hash; its stable string form is good enough.
                 input.to_string().hash(&mut h);
                 (*status as u8).hash(&mut h);
-                output.hash(&mut h);
+                if *expanded || !matches!(name.as_str(), "read_file" | "list_dir") {
+                    output.hash(&mut h);
+                }
                 expanded.hash(&mut h);
             }
-            Cell::Subagent {
-                agent_id,
-                parent_id,
-                task,
-                tools,
-                done,
-                failed,
-            } => {
-                agent_id.hash(&mut h);
-                parent_id.hash(&mut h);
-                task.hash(&mut h);
-                tools.hash(&mut h);
-                done.hash(&mut h);
-                failed.hash(&mut h);
+            Cell::Subagent { agent_id, task, .. } => {
+                if task.trim().is_empty() {
+                    agent_id.hash(&mut h);
+                } else {
+                    task.hash(&mut h);
+                }
             }
             Cell::Compaction {
                 before,
@@ -680,10 +685,9 @@ impl ViewModel {
     /// call, so spawned agents still appear after a session is resumed. They're
     /// marked done (the work is in the past) with an unknown tool count.
     fn hydrate_subagents(&mut self, name: &str, input: &Value) {
-        let push = |cells: &mut Vec<Cell>, parent: &str, task: &str| {
+        let push = |cells: &mut Vec<Cell>, task: &str| {
             cells.push(Cell::Subagent {
                 agent_id: String::new(),
-                parent_id: parent.to_string(),
                 task: task.to_string(),
                 tools: 0,
                 done: true,
@@ -695,13 +699,13 @@ impl ViewModel {
                 if let Some(tasks) = input.get("tasks").and_then(|t| t.as_array()) {
                     for t in tasks {
                         let desc = t.get("description").and_then(|d| d.as_str()).unwrap_or("");
-                        push(&mut self.cells, "root", desc);
+                        push(&mut self.cells, desc);
                     }
                 }
             }
             "spawn_agent" => {
                 let desc = input.get("task").and_then(|t| t.as_str()).unwrap_or("");
-                push(&mut self.cells, "root", desc);
+                push(&mut self.cells, desc);
             }
             _ => {}
         }
@@ -848,7 +852,6 @@ impl ViewModel {
                 } else {
                     self.cells.push(Cell::Subagent {
                         agent_id: agent_id.clone(),
-                        parent_id: parent_id.clone(),
                         task: task.clone(),
                         tools: 0,
                         done: false,
@@ -856,7 +859,9 @@ impl ViewModel {
                     });
                 }
             }
-            AgentEvent::SubagentDone { agent_id, failed } => {
+            AgentEvent::SubagentDone {
+                agent_id, failed, ..
+            } => {
                 if let Some(a) = self.find_wf_agent(agent_id) {
                     a.status = if *failed {
                         WfStatus::Failed
@@ -1013,6 +1018,154 @@ fn subagent_id(event: &AgentEvent) -> Option<&str> {
 }
 
 #[cfg(test)]
+mod fingerprint_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn tool(name: &str, status: ToolStatus) -> Cell {
+        Cell::Tool {
+            id: "tool".into(),
+            name: name.into(),
+            input: json!({"path": "file.rs"}),
+            status,
+            output: None,
+            expanded: false,
+        }
+    }
+
+    #[test]
+    fn visibility_and_fingerprints_ignore_hidden_payloads() {
+        for name in [
+            "job_status",
+            "job_output",
+            "todo_write",
+            "workflow",
+            "task",
+            "explore",
+            "spawn_agent",
+        ] {
+            for status in [ToolStatus::Running, ToolStatus::Ok, ToolStatus::Error] {
+                let mut cell = tool(name, status);
+                let visible = matches!(name, "task" | "explore" | "spawn_agent")
+                    && status == ToolStatus::Error;
+                assert_eq!(cell.is_visible(), visible);
+                let before = cell.fingerprint();
+                if let Cell::Tool {
+                    input,
+                    output,
+                    expanded,
+                    ..
+                } = &mut cell
+                {
+                    *input = json!({"large": "hidden input".repeat(1000)});
+                    *output = Some("hidden output".repeat(1000));
+                    *expanded = true;
+                }
+                if visible {
+                    assert_ne!(cell.fingerprint(), before);
+                } else {
+                    assert_eq!(cell.fingerprint(), before);
+                    assert_eq!(before, 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn collapsed_read_and_list_fingerprints_ignore_output_only() {
+        for name in ["read_file", "list_dir"] {
+            let mut cell = tool(name, ToolStatus::Ok);
+            assert!(cell.is_visible());
+            let before = cell.fingerprint();
+            if let Cell::Tool { output, .. } = &mut cell {
+                *output = Some("huge output".repeat(1000));
+            }
+            assert_eq!(cell.fingerprint(), before);
+            if let Cell::Tool { input, .. } = &mut cell {
+                *input = json!({"path": "other.rs"});
+            }
+            assert_ne!(cell.fingerprint(), before);
+            let before = cell.fingerprint();
+            if let Cell::Tool { status, .. } = &mut cell {
+                *status = ToolStatus::Error;
+            }
+            assert_ne!(cell.fingerprint(), before);
+            let before = cell.fingerprint();
+            if let Cell::Tool { expanded, .. } = &mut cell {
+                *expanded = true;
+            }
+            assert_ne!(cell.fingerprint(), before);
+            let before = cell.fingerprint();
+            if let Cell::Tool { output, .. } = &mut cell {
+                *output = Some("visible changed output".into());
+            }
+            assert_ne!(cell.fingerprint(), before);
+        }
+        let mut cell = tool("bash", ToolStatus::Ok);
+        let before = cell.fingerprint();
+        if let Cell::Tool { output, .. } = &mut cell {
+            *output = Some("visible preview".into());
+        }
+        assert_ne!(cell.fingerprint(), before);
+    }
+
+    #[test]
+    fn static_launch_notice_fingerprints_ignore_lifecycle() {
+        let mut cell = Cell::Subagent {
+            agent_id: "agent".into(),
+            task: "Review parser".into(),
+            tools: 0,
+            done: false,
+            failed: false,
+        };
+        let before = cell.fingerprint();
+        if let Cell::Subagent {
+            agent_id,
+            tools,
+            done,
+            failed,
+            ..
+        } = &mut cell
+        {
+            *agent_id = "other".into();
+            *tools = 50;
+            *done = true;
+            *failed = true;
+        }
+        assert_eq!(cell.fingerprint(), before);
+        if let Cell::Subagent { task, .. } = &mut cell {
+            *task = "Review renderer".into();
+        }
+        assert_ne!(cell.fingerprint(), before);
+        if let Cell::Subagent { task, .. } = &mut cell {
+            *task = "  ".into();
+        }
+        let before = cell.fingerprint();
+        if let Cell::Subagent { agent_id, .. } = &mut cell {
+            *agent_id = "fallback label".into();
+        }
+        assert_ne!(cell.fingerprint(), before);
+    }
+
+    #[test]
+    fn assistant_fingerprint_tracks_text_not_streaming_state() {
+        let mut cell = Cell::Assistant {
+            text: "Hello".into(),
+            open: true,
+        };
+        let before = cell.fingerprint();
+        if let Cell::Assistant { open, .. } = &mut cell {
+            *open = false;
+        }
+        assert_eq!(cell.fingerprint(), before);
+        if let Cell::Assistant { text, .. } = &mut cell {
+            text.push_str(" world");
+        }
+        assert_ne!(cell.fingerprint(), before);
+    }
+}
+
+#[cfg(test)]
 mod workflow_view_tests {
     use super::*;
     use bob_core::core::events::AgentEvent;
@@ -1037,6 +1190,7 @@ mod workflow_view_tests {
         AgentEvent::SubagentDone {
             agent_id: agent.into(),
             failed,
+            cancelled: false,
         }
     }
 

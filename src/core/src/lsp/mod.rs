@@ -539,3 +539,126 @@ impl LspManager {
             .and_then(|s| s.client.lock().unwrap().clone())
     }
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::tools::builtin::{ReadFileTool, WriteFileTool};
+    use crate::tools::edit::{EditFileTool, MultiEditTool};
+    use crate::tools::registry::{Tool, ToolContext};
+
+    #[tokio::test]
+    async fn edits_sync_documents_without_returning_automatic_diagnostics() {
+        let dir = std::env::temp_dir().join(format!(
+            "bob-lsp-edit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let file = dir.join("sample.rs");
+        let mut child = tokio::process::Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let mut reader = BufReader::new(child.stdout.take().unwrap());
+        let client = LspClient {
+            inner: Arc::new(LspInner {
+                name: "fixture".into(),
+                stdin: tokio::sync::Mutex::new(stdin),
+                pending: Mutex::new(HashMap::new()),
+                next_id: AtomicI64::new(1),
+                diagnostics: Mutex::new(HashMap::from([(
+                    path_to_uri(&file),
+                    FileDiagnostics {
+                        diagnostics: vec![
+                            json!({"severity":1,"message":"cached diagnostic","range":{"start":{"line":0,"character":0}}}),
+                        ],
+                    },
+                )])),
+                versions: Mutex::new(HashMap::new()),
+                health: Mutex::new(Health::Ready),
+                code_action_kinds: Mutex::new(Vec::new()),
+                _child: tokio::sync::Mutex::new(child),
+            }),
+        };
+        let manager = Arc::new(LspManager {
+            servers: vec![ServerSlot {
+                cfg: LspServerConfig {
+                    name: "fixture".into(),
+                    command: "cat".into(),
+                    args: vec![],
+                    extensions: vec!["rs".into()],
+                    root: ".".into(),
+                },
+                client: Mutex::new(Some(client.clone())),
+                health: Mutex::new(Health::Ready),
+            }],
+            repo_root: dir.clone(),
+        });
+        let ctx = ToolContext {
+            cwd: dir.to_string_lossy().into_owned(),
+            files: Arc::new(crate::tools::file_tracker::FileTracker::new()),
+            todos: Arc::new(crate::tools::todo::TodoStore::new()),
+            jobs: crate::tools::jobs::JobRegistry::new(),
+            user_asker: None,
+            lsp: Some(manager),
+            coord: None,
+            permissions: None,
+        };
+        let written = WriteFileTool
+            .execute(
+                json!({"path":"sample.rs","content":"fn sample() { let n = 1; }"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        ReadFileTool
+            .execute(json!({"path":"sample.rs"}), &ctx)
+            .await
+            .unwrap();
+        let edited = EditFileTool
+            .execute(
+                json!({"path":"sample.rs","old_string":"n = 1","new_string":"n = 2"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let multi = MultiEditTool
+            .execute(
+                json!({"path":"sample.rs","edits":[{"old_string":"n = 2","new_string":"n = 3"}]}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        for result in [&written, &edited, &multi] {
+            assert!(!result.contains("<diagnostics>"));
+            assert!(!result.contains("cached diagnostic"));
+        }
+        for (version, number) in [(1, 1), (2, 2), (3, 3)] {
+            let message =
+                tokio::time::timeout(std::time::Duration::from_secs(2), read_frame(&mut reader))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(message["params"]["textDocument"]["version"], version);
+            let text = if version == 1 {
+                assert_eq!(message["method"], "textDocument/didOpen");
+                &message["params"]["textDocument"]["text"]
+            } else {
+                assert_eq!(message["method"], "textDocument/didChange");
+                &message["params"]["contentChanges"][0]["text"]
+            };
+            assert!(text.as_str().unwrap().contains(&format!("n = {number}")));
+        }
+        assert_eq!(client.diagnostics_for(&file).len(), 1);
+        client.inner._child.lock().await.kill().await.unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

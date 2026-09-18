@@ -4,20 +4,21 @@
 //! and branches on their **structured** results — the same shape every run.
 //!
 //! It is a thin layer over machinery that already exists:
-//!   - each workflow agent is a fire-and-forget subagent (`build_subagent`),
+//!   - each workflow agent is a normal subagent (`build_subagent`),
 //!   - schema-forced output comes from `Agent::run_structured`,
 //!   - concurrency is bounded by a `Semaphore` (cap = `MAX_TEAM_SIZE`),
 //!   - a `Cancel` still cascades via the shared `parent_cancel` flag (#5),
 //!   - progress is reported over the existing `EventBus` (+ two workflow events).
 //!
-//! v1 exposes the primitives to Rust-authored built-in workflows; file/script
-//! authoring is a later layer over this same engine.
+//! Parameterized shapes and the JSON steps interpreter share these primitives.
 
 use crate::agent::agent::{build_subagent, SubagentSpec, SUBAGENT_MAX_TURNS};
-use crate::agent::team::MAX_TEAM_SIZE;
+use crate::agent::team::{mailbox, AgentRegistry, AgentStatus, MAX_TEAM_SIZE};
 use crate::core::events::{AgentEvent, EventBus};
 use crate::providers::provider::Provider;
 use crate::tools::registry::ToolRegistry;
+use futures::FutureExt;
+use serde::Serialize;
 use serde_json::Value;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -39,6 +40,9 @@ pub struct WorkflowContext {
     pub system: Option<String>,
     pub lsp: Option<Arc<crate::lsp::LspManager>>,
     pub jobs: crate::tools::jobs::JobRegistry,
+    pub team: AgentRegistry,
+    cancelled_agents: Arc<std::sync::Mutex<Vec<String>>>,
+    outcomes: Arc<std::sync::Mutex<Vec<(usize, AgentOutcome)>>>,
     /// Shared cancel flag: set by the frontend on Cancel; threaded into every agent
     /// as `parent_cancel` so one Cancel stops the whole workflow (reuses #5).
     pub cancel: Arc<AtomicBool>,
@@ -74,20 +78,56 @@ impl WorkflowContext {
             system,
             lsp,
             jobs,
+            team: AgentRegistry::new(),
+            cancelled_agents: Arc::new(std::sync::Mutex::new(Vec::new())),
+            outcomes: Arc::new(std::sync::Mutex::new(Vec::new())),
             cancel,
             limiter: Arc::new(Semaphore::new(limit)),
             counter: Arc::new(AtomicUsize::new(0)),
         }
     }
 
-    fn next_agent_name(&self, label: &str) -> String {
+    pub fn with_team(mut self, team: AgentRegistry) -> Self {
+        self.team = team;
+        self
+    }
+
+    pub fn cancelled_agents(&self) -> Vec<String> {
+        self.cancelled_agents.lock().unwrap().clone()
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed) || !self.cancelled_agents.lock().unwrap().is_empty()
+    }
+
+    pub fn outcomes(&self) -> Vec<AgentOutcome> {
+        let mut outcomes = self.outcomes.lock().unwrap().clone();
+        outcomes.sort_by_key(|(sequence, _)| *sequence);
+        outcomes.into_iter().map(|(_, outcome)| outcome).collect()
+    }
+
+    fn record(&self, sequence: usize, outcome: AgentOutcome) -> AgentOutcome {
+        if outcome.status == OutcomeStatus::Cancelled {
+            self.cancelled_agents
+                .lock()
+                .unwrap()
+                .push(outcome.id.clone());
+        }
+        self.outcomes
+            .lock()
+            .unwrap()
+            .push((sequence, outcome.clone()));
+        outcome
+    }
+
+    fn next_agent_name(&self, label: &str) -> (usize, String) {
         let n = self.counter.fetch_add(1, Ordering::Relaxed) + 1;
         // A stable, readable id: "<workflow>.<n>-<label>", label slugged loosely.
         let slug: String = label
             .chars()
             .map(|c| if c.is_alphanumeric() { c } else { '-' })
             .collect();
-        format!("{}.{n}-{}", self.id, slug)
+        (n, format!("{}.{n}-{}", self.id, slug))
     }
 
     /// Announce a phase boundary; subsequent agents render under `title`.
@@ -136,10 +176,11 @@ pub fn is_handoff(text: &str) -> bool {
 pub struct AgentSpec {
     pub prompt: String,
     /// When set, the agent is forced to return a value matching this JSON Schema and
-    /// `agent()` yields that validated `Value`. When `None`, the agent's final text
+    /// the outcome carries that `Value`. When `None`, the agent's final text
     /// is wrapped as `{"text": "..."}`.
     pub schema: Option<Value>,
     pub label: String,
+    pub input: Option<Value>,
 }
 
 impl AgentSpec {
@@ -148,7 +189,13 @@ impl AgentSpec {
             prompt: prompt.into(),
             schema: None,
             label: label.into(),
+            input: None,
         }
+    }
+
+    pub fn with_input(mut self, input: Value) -> Self {
+        self.input = Some(input);
+        self
     }
 
     pub fn with_schema(mut self, schema: Value) -> Self {
@@ -157,24 +204,92 @@ impl AgentSpec {
     }
 }
 
-/// Run one agent to completion and return its (structured) result. Returns `None`
-/// on any failure so callers can `.flatten()` / `.filter(Option::is_some)` rather
-/// than aborting the whole workflow. Honors the concurrency limiter and the shared
-/// cancel flag. Emits `SubagentSpawn`/`SubagentDone` so the existing UI shows it.
-pub async fn agent(ctx: &WorkflowContext, spec: AgentSpec) -> Option<Value> {
-    // Bail early if the run was cancelled before we even acquired a slot.
-    if ctx.cancel.load(Ordering::Relaxed) {
-        return None;
-    }
-    let _permit = ctx.limiter.acquire().await.ok()?;
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutcomeStatus {
+    Success,
+    Failed,
+    Cancelled,
+}
 
-    let name = ctx.next_agent_name(&spec.label);
-    ctx.bus.emit(AgentEvent::SubagentSpawn {
-        parent_id: ctx.id.clone(),
-        agent_id: name.clone(),
-        task: spec.label.clone(),
-        prompt: spec.prompt.clone(),
-    });
+#[derive(Clone, Debug, Serialize)]
+pub struct AgentOutcome {
+    pub id: String,
+    pub label: String,
+    pub input: Option<Value>,
+    pub status: OutcomeStatus,
+    pub output: Option<Value>,
+    pub error: Option<String>,
+}
+
+impl AgentOutcome {
+    pub fn is_success(&self) -> bool {
+        self.status == OutcomeStatus::Success
+    }
+
+    pub fn failure_message(&self) -> String {
+        format!(
+            "{}: {}",
+            self.label,
+            self.error.as_deref().unwrap_or("agent failed")
+        )
+    }
+}
+
+#[derive(Debug)]
+pub struct WorkflowRun {
+    pub output: Value,
+    pub error: Option<String>,
+}
+
+impl WorkflowRun {
+    pub fn success(output: Value) -> Self {
+        Self {
+            output,
+            error: None,
+        }
+    }
+
+    pub fn failed(output: Value, error: impl Into<String>) -> Self {
+        Self {
+            output,
+            error: Some(error.into()),
+        }
+    }
+}
+
+pub async fn agent(ctx: &WorkflowContext, spec: AgentSpec) -> AgentOutcome {
+    let (sequence, name) = ctx.next_agent_name(&spec.label);
+    let mut result = AgentOutcome {
+        id: name.clone(),
+        label: spec.label.clone(),
+        input: spec.input.clone(),
+        status: OutcomeStatus::Cancelled,
+        output: None,
+        error: Some("cancelled before starting".into()),
+    };
+    if ctx.is_cancelled() {
+        return ctx.record(sequence, result);
+    }
+    let _permit = ctx
+        .limiter
+        .acquire()
+        .await
+        .expect("workflow semaphore remains open");
+    if ctx.is_cancelled() {
+        return ctx.record(sequence, result);
+    }
+
+    let (inbox, tx) = mailbox();
+    let handle = ctx.team.register(name.clone(), 1, "root".into(), tx);
+    let mut lifecycle = crate::agent::lifecycle::SubagentLifecycle::start(
+        ctx.bus.clone(),
+        ctx.id.clone(),
+        name.clone(),
+        spec.label.clone(),
+        spec.prompt.clone(),
+    )
+    .with_handle(handle.clone());
 
     let mut child = build_subagent(SubagentSpec {
         provider: ctx.provider.clone(),
@@ -184,44 +299,65 @@ pub async fn agent(ctx: &WorkflowContext, spec: AgentSpec) -> Option<Value> {
         cwd: ctx.cwd.clone(),
         jobs: ctx.jobs.clone(),
         lsp: ctx.lsp.clone(),
-        name: name.clone(),
+        name,
         max_turns: SUBAGENT_MAX_TURNS,
         depth: 1,
-        inbox: None,
-        team: None,
+        inbox: Some(inbox),
+        team: Some(ctx.team.clone()),
         parent_cancel: Some(ctx.cancel.clone()),
     });
 
-    let outcome: Option<Value> = match spec.schema.clone() {
-        Some(schema) => child.run_structured(&spec.prompt, schema).await.ok(),
-        None => child
-            .run(&spec.prompt)
-            .await
-            .ok()
-            .map(|text| serde_json::json!({ "text": text })),
+    let work = async {
+        match spec.schema.clone() {
+            Some(schema) => child.run_structured(&spec.prompt, schema).await,
+            None => child
+                .run(&spec.prompt)
+                .await
+                .map(|text| serde_json::json!({ "text": text })),
+        }
     };
-
-    ctx.bus.emit(AgentEvent::SubagentDone {
-        agent_id: name,
-        failed: outcome.is_none(),
-    });
-    outcome
+    let outcome = std::panic::AssertUnwindSafe(handle.run_until_stopped(ctx.cancel.clone(), work))
+        .catch_unwind()
+        .await;
+    let (mut output, mut error, cancelled) = match outcome {
+        Ok(Some(Ok(output))) => (Some(output), None, child.is_cancelled()),
+        Ok(Some(Err(error))) => (None, Some(error.to_string()), child.is_cancelled()),
+        Ok(None) => (None, Some("agent cancelled".into()), true),
+        Err(panic) => {
+            let message = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .unwrap_or("unknown panic");
+            (None, Some(format!("agent panicked: {message}")), false)
+        }
+    };
+    if let Some(summary) = child.turn_limit_summary() {
+        output.get_or_insert_with(|| serde_json::json!({"text": summary}));
+        error = Some(format!(
+            "agent reached its {SUBAGENT_MAX_TURNS}-turn limit without finishing"
+        ));
+    }
+    let status = lifecycle.finish(error.is_some() && !cancelled, cancelled);
+    result.status = match status {
+        AgentStatus::Cancelled => OutcomeStatus::Cancelled,
+        AgentStatus::Failed => OutcomeStatus::Failed,
+        _ => OutcomeStatus::Success,
+    };
+    if result.status == OutcomeStatus::Cancelled {
+        result.error = Some("agent cancelled".into());
+    } else {
+        result.output = output;
+        result.error = error;
+    }
+    ctx.record(sequence, result)
 }
 
-/// Run `thunks` concurrently and wait for ALL of them (a barrier). Each thunk that
-/// fails/panics resolves to `None`, so the call itself never fails — filter the
-/// result. Use only when you genuinely need every result together; prefer
-/// [`pipeline`] otherwise.
-pub async fn parallel<F>(thunks: Vec<F>) -> Vec<Option<Value>>
+pub async fn parallel<F>(thunks: Vec<F>) -> Vec<AgentOutcome>
 where
-    F: std::future::Future<Output = Option<Value>> + Send + 'static,
+    F: std::future::Future<Output = AgentOutcome> + Send,
 {
-    let handles: Vec<_> = thunks.into_iter().map(tokio::spawn).collect();
-    let mut out = Vec::with_capacity(handles.len());
-    for h in handles {
-        out.push(h.await.ok().flatten());
-    }
-    out
+    futures::future::join_all(thunks).await
 }
 
 /// Run each item through the full chain of `stages` INDEPENDENTLY — no barrier
@@ -267,7 +403,12 @@ pub type Stage<I> = Box<
 >;
 
 pub mod dsl;
+pub(crate) mod input;
 pub mod params;
+pub(crate) mod validation;
+
+#[cfg(test)]
+mod runtime_tests;
 
 #[cfg(test)]
 mod tests {
@@ -291,14 +432,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parallel_collects_all_and_maps_failure_to_none() {
-        let a: futures::future::BoxFuture<'static, Option<Value>> =
-            Box::pin(async { Some(json!(1)) });
-        let b: futures::future::BoxFuture<'static, Option<Value>> = Box::pin(async { None });
-        let c: futures::future::BoxFuture<'static, Option<Value>> =
-            Box::pin(async { Some(json!(3)) });
-        let out = parallel(vec![a, b, c]).await;
-        assert_eq!(out, vec![Some(json!(1)), None, Some(json!(3))]);
+    async fn parallel_preserves_failed_outcomes_and_input_order() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let ctx = ctx_with(provider, 2);
+        let specs = vec![
+            AgentSpec::new("first", "first"),
+            AgentSpec::new("no structured result", "failed").with_schema(json!({"type":"object"})),
+            AgentSpec::new("last", "last"),
+        ];
+        let out = parallel(specs.into_iter().map(|spec| agent(&ctx, spec)).collect()).await;
+        assert_eq!(
+            out.iter().map(|v| v.label.as_str()).collect::<Vec<_>>(),
+            ["first", "failed", "last"]
+        );
+        assert_eq!(
+            out.iter().map(|v| v.status).collect::<Vec<_>>(),
+            [
+                OutcomeStatus::Success,
+                OutcomeStatus::Failed,
+                OutcomeStatus::Success
+            ]
+        );
+        assert!(out[1].error.as_ref().unwrap().contains("structured"));
+        assert_eq!(ctx.outcomes().len(), 3);
     }
 
     #[tokio::test]
@@ -363,15 +519,20 @@ mod tests {
         let ctx = ctx_with(Arc::new(provider), 4);
         let schema = json!({"type": "object", "required": ["point"]});
         let out = agent(&ctx, AgentSpec::new("say a point", "p").with_schema(schema)).await;
-        assert_eq!(out, Some(json!({"point": "fast"})));
+        assert!(out.is_success());
+        assert_eq!(out.output, Some(json!({"point": "fast"})));
     }
 
     #[tokio::test]
-    async fn agent_returns_none_when_cancelled() {
-        let ctx = ctx_with(Arc::new(MockProvider::new(vec![])), 4);
+    async fn agent_reports_cancellation_before_starting() {
+        let provider = MockProvider::new(vec![]);
+        let ctx = ctx_with(Arc::new(provider.clone()), 4);
         ctx.cancel.store(true, Ordering::Relaxed);
         let out = agent(&ctx, AgentSpec::new("anything", "p")).await;
-        assert!(out.is_none());
+        assert_eq!(out.status, OutcomeStatus::Cancelled);
+        assert_eq!(provider.call_count(), 0);
+        assert!(ctx.team.roster().is_empty());
+        assert_eq!(ctx.outcomes().len(), 1);
     }
 
     #[tokio::test]
@@ -392,7 +553,7 @@ mod tests {
         let start = tokio::time::Instant::now();
         let out = parallel(thunks).await;
         let elapsed = start.elapsed();
-        assert_eq!(out.iter().filter(|v| v.is_some()).count(), 4);
+        assert_eq!(out.iter().filter(|v| v.is_success()).count(), 4);
         // 4 calls / 2 slots × 50ms = ~100ms floor; a no-cap run would be ~50ms.
         assert!(
             elapsed >= std::time::Duration::from_millis(90),

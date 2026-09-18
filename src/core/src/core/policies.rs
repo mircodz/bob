@@ -21,6 +21,7 @@ const READ_ONLY: &[&str] = &[
     "explore",
     "spawn_agent",
     "send_message",
+    "stop_agent",
     "list_agents",
     "lsp",
     "web_fetch",

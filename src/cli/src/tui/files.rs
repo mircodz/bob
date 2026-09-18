@@ -145,7 +145,7 @@ mod tests {
             "src/core/src/core/session.rs",
             "src/tui/src/tui/mod.rs",
             "src/tui/src/tui/files.rs",
-            "src/remote/src/host.rs",
+            "src/core/src/agent/agent.rs",
             "README.md",
             "Cargo.toml",
         ]

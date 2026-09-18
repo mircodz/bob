@@ -9,7 +9,7 @@
 
 use crate::core::types::*;
 use crate::providers::openai::TokenSource;
-use crate::providers::provider::Provider;
+use crate::providers::provider::{ModelEntry, Provider};
 use crate::providers::sse::parse_sse;
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -23,6 +23,7 @@ pub struct ResponsesProvider {
     base_url: String,
     client: reqwest::Client,
     context_window: Option<usize>,
+    model_catalog: Vec<ModelEntry>,
 }
 
 impl ResponsesProvider {
@@ -33,12 +34,18 @@ impl ResponsesProvider {
             base_url: base_url.trim_end_matches('/').to_string(),
             client: super::openai::http_client(),
             context_window: None,
+            model_catalog: Vec::new(),
         }
     }
 
     /// Set an authoritative context window, overriding the id-based heuristic.
     pub fn with_context_window(mut self, window: Option<usize>) -> Self {
         self.context_window = window;
+        self
+    }
+
+    pub fn with_model_catalog(mut self, models: Vec<ModelEntry>) -> Self {
+        self.model_catalog = models;
         self
     }
 
@@ -117,6 +124,18 @@ impl Provider for ResponsesProvider {
     fn context_window(&self) -> usize {
         self.context_window
             .unwrap_or_else(|| crate::providers::provider::context_window_for(&self.model))
+    }
+
+    async fn list_models(&self) -> anyhow::Result<Vec<String>> {
+        Ok(self
+            .model_catalog
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect())
+    }
+
+    async fn list_models_detailed(&self) -> anyhow::Result<Vec<ModelEntry>> {
+        Ok(self.model_catalog.clone())
     }
 
     async fn generate(&self, opts: GenerateOptions) -> anyhow::Result<Completion> {
@@ -443,5 +462,40 @@ fn to_input_items(m: &Message) -> Vec<Value> {
             items
         }
         Role::System => vec![],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::StaticKey;
+
+    #[tokio::test]
+    async fn injected_model_catalog_is_available_to_picker() {
+        let provider = ResponsesProvider::with_auth(
+            "gpt-5.6-luna".to_string(),
+            "https://example.invalid".to_string(),
+            Arc::new(StaticKey("test".to_string())),
+        )
+        .with_model_catalog(vec![
+            ModelEntry {
+                id: "gpt-5.6-luna".to_string(),
+                context_window: Some(400_000),
+            },
+            ModelEntry {
+                id: "gpt-5.6-sol".to_string(),
+                context_window: Some(400_000),
+            },
+        ]);
+
+        let detailed = provider.list_models_detailed().await.unwrap();
+        assert_eq!(detailed.len(), 2);
+        assert_eq!(detailed[0].id, "gpt-5.6-luna");
+        assert_eq!(detailed[0].context_window, Some(400_000));
+        assert_eq!(detailed[1].id, "gpt-5.6-sol");
+        assert_eq!(
+            provider.list_models().await.unwrap(),
+            vec!["gpt-5.6-luna", "gpt-5.6-sol"]
+        );
     }
 }

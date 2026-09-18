@@ -454,8 +454,8 @@ pub fn root_history_from_events(events: &[AgentEvent]) -> Vec<Message> {
 /// Choose the authoritative message history for a resumed session: the event-log
 /// reconstruction when it's at least as complete as the stored blob, else the
 /// blob. Centralizes the "a truncated/corrupt log must never lose history" guard
-/// that both the TUI and the remote host apply on resume, so the rule can't drift
-/// between them. `events` is `None` for a legacy (pre-log) session.
+/// shared by the CLI and headless session loaders. `events` is `None` for a
+/// legacy (pre-log) session.
 pub fn reconstructed_history(events: Option<&[AgentEvent]>, blob: &[Message]) -> Vec<Message> {
     match events {
         Some(evs) => {
@@ -814,6 +814,45 @@ mod tests {
         let t = &back.agent_threads[0];
         assert_eq!(t.name, "reviewer");
         assert_eq!(t.cells.len(), 3);
+    }
+
+    #[test]
+    fn grants_round_trip_with_session() {
+        let session = Session {
+            grants: vec![
+                Grant::Tool {
+                    name: "edit_file".into(),
+                },
+                Grant::BashCommand {
+                    name: "cargo".into(),
+                    glob: "**".into(),
+                },
+            ],
+            ..new_session("anthropic", "s1".into(), "now".into(), String::new())
+        };
+
+        let value = serde_json::to_value(&session).unwrap();
+        assert_eq!(
+            value["grants"][0],
+            serde_json::json!({"kind": "tool", "name": "edit_file"})
+        );
+        assert_eq!(
+            value["grants"][1],
+            serde_json::json!({"kind": "bash_command", "name": "cargo", "glob": "**"})
+        );
+
+        let back: Session = serde_json::from_value(value).unwrap();
+        match &back.grants[0] {
+            Grant::Tool { name } => assert_eq!(name, "edit_file"),
+            other => panic!("expected tool grant, got {other:?}"),
+        }
+        match &back.grants[1] {
+            Grant::BashCommand { name, glob } => {
+                assert_eq!(name, "cargo");
+                assert_eq!(glob, "**");
+            }
+            other => panic!("expected bash grant, got {other:?}"),
+        }
     }
 
     #[test]

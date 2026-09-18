@@ -15,20 +15,17 @@ impl Tool for BashTool {
         ToolSpec {
             name: "bash".to_string(),
             description:
-                "Run a shell command via `bash -c` and return its combined stdout/stderr. \
-                Use this to actually DO things: run builds, tests, linters, git, package managers, \
-                and scripts. Do NOT use it to read, search, or list files — use read_file, grep, \
-                glob, and list_dir instead (they're faster and cleaner). Guidance: commands run \
-                from the working directory, so don't `cd` unless asked; quote paths that contain \
-                spaces; chain related steps with `&&`; avoid destructive commands (`rm -rf`, \
-                `git push`, `git reset --hard`) unless explicitly requested; never commit or push \
-                unless the user asks. Set `timeout` (seconds) to bound a command that might hang; \
-                it's killed and reported if it exceeds that. Set `run_in_background: true` for \
-                long-running work (a dev server, a watch build) you don't want to block on — it \
-                returns a job id immediately; poll it with job_status / job_output. Output is \
-                capped at ~30k bytes — if a command exceeds that, the head and tail are kept and \
-                the middle is elided, so pipe noisy commands through a filter (grep, tail, wc) to \
-                get the part you need."
+                "Run a shell command with bash -c for builds, tests, git, package managers, \
+                or scripts. Prefer dedicated read/search tools for inspecting files. Commands \
+                start in the working directory; quote paths and keep commands non-interactive. \
+                Use a foreground timeout for bounded work. On timeout the shell is killed, but \
+                descendant processes may outlive it. Set run_in_background:true for a service \
+                or work you can collect later with job_output; timeout does not apply to \
+                background jobs. Do not repeatedly poll or run sleeps just to wait. \
+                Foreground output keeps the head and tail when it exceeds roughly 30k bytes. \
+                For verification, check an explicit exit status or test result rather than \
+                assuming returned text means success. Never commit, push, or run destructive \
+                actions without the user's authorization."
                     .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -50,17 +47,15 @@ impl Tool for BashTool {
         // model collects the result later via job_status / job_output.
         if input["run_in_background"].as_bool().unwrap_or(false) {
             let id = ctx.jobs.next_id();
-            let jobs = ctx.jobs.clone();
-            let job_id = id.clone();
             let bg_cmd = command.clone();
-            let handle = tokio::spawn(async move {
+            let work = async move {
                 let out = tokio::process::Command::new("bash")
                     .arg("-c")
                     .arg(&bg_cmd)
                     .current_dir(&cwd)
                     .output()
                     .await;
-                let (status, text) = match out {
+                match out {
                     Ok(o) => (
                         if o.status.success() {
                             JobStatus::Done
@@ -70,11 +65,10 @@ impl Tool for BashTool {
                         combine_output(&o.stdout, &o.stderr, o.status.code()),
                     ),
                     Err(e) => (JobStatus::Failed, format!("failed to run: {}", e)),
-                };
-                jobs.finish(&job_id, status, text);
-            });
+                }
+            };
             ctx.jobs
-                .register(id.clone(), "bash", truncate_desc(&command), handle);
+                .spawn(id.clone(), "bash", truncate_desc(&command), work);
             return Ok(format!(
                 "started background job {id}: {}\nPoll with job_status / job_output.",
                 truncate_desc(&command)

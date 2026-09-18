@@ -1,6 +1,6 @@
-//! Per-agent transcript capture + team-drawer state. Every spawned agent gets an
+//! Per-agent transcript capture + sidebar state. Every spawned agent gets an
 //! [`AgentThread`] — a mini transcript built from the same event stream and the
-//! same [`view::Cell`] reduction as the main view, so the drawer can show an
+//! same [`view::Cell`] reduction as the main view, so the main pane can show an
 //! agent's full live activity and (via the coordination team) let you message it.
 
 use super::view::{apply_content_event, Cell, ToolStatus};
@@ -17,7 +17,7 @@ pub struct AgentThread {
     pub task: String,
     pub status: ThreadStatus,
     pub cells: Vec<Cell>,
-    /// Content cells appended since the drawer last showed this thread.
+    /// Content cells appended since the main pane last showed this thread.
     pub unread: usize,
     /// Bumped on every transcript mutation, so a shared scrollback renderer can
     /// invalidate its per-cell cache exactly like the root `ViewModel.revision`.
@@ -27,7 +27,7 @@ pub struct AgentThread {
 }
 
 impl AgentThread {
-    /// The label shown in the drawer roster. `spawn_agent` children carry a
+    /// The label shown in the sidebar roster. `spawn_agent` children carry a
     /// semantic handle (e.g. "researcher") as their id, so `name` is meaningful.
     /// `task` children get an opaque auto-id (`task_7`); for those we prefer the
     /// human `task` description ("review src/core") the model supplied at spawn.
@@ -35,7 +35,8 @@ impl AgentThread {
         let looks_auto = self
             .name
             .strip_prefix("task_")
-            .is_some_and(|n| n.chars().all(|c| c.is_ascii_digit()));
+            .or_else(|| self.name.strip_prefix("job_"))
+            .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
         if looks_auto && !self.task.trim().is_empty() {
             &self.task
         } else {
@@ -49,6 +50,7 @@ pub enum ThreadStatus {
     Running,
     Done,
     Failed,
+    Cancelled,
 }
 
 impl AgentThread {
@@ -70,7 +72,7 @@ impl AgentThread {
 /// loop with every subagent event that the main transcript drops.
 #[derive(Default)]
 pub struct AgentTranscripts {
-    /// Insertion order of agent ids, so the drawer roster is stable.
+    /// Insertion order of agent ids, so the sidebar roster is stable.
     order: Vec<String>,
     threads: std::collections::HashMap<String, AgentThread>,
 }
@@ -80,16 +82,23 @@ impl AgentTranscripts {
         AgentTranscripts::default()
     }
 
+    pub fn replay(events: &[AgentEvent]) -> Self {
+        let mut threads = Self::new();
+        for event in events {
+            threads.apply(event, None);
+        }
+        for id in threads.running_ids() {
+            threads.finish_thread(&id, ThreadStatus::Cancelled);
+        }
+        threads
+    }
+
     pub fn is_empty(&self) -> bool {
         self.order.is_empty()
     }
 
-    pub fn len(&self) -> usize {
-        self.order.len()
-    }
-
     /// Ids in DISPLAY order: still-running agents first (in spawn order), then
-    /// finished ones (done/failed) at the bottom. The drawer navigates and renders
+    /// finished ones (done/failed) at the bottom. The sidebar navigates and renders
     /// through this so selection stays aligned with what's shown.
     pub fn display_order(&self) -> Vec<String> {
         let mut running: Vec<String> = Vec::new();
@@ -146,7 +155,19 @@ impl AgentTranscripts {
         self.threads.get(id)
     }
 
-    /// Clear the unread counter for an agent (called when the drawer shows it).
+    pub fn toggle_tool(&mut self, id: &str, cell_idx: usize) -> bool {
+        let Some(thread) = self.threads.get_mut(id) else {
+            return false;
+        };
+        let Some(Cell::Tool { expanded, .. }) = thread.cells.get_mut(cell_idx) else {
+            return false;
+        };
+        *expanded = !*expanded;
+        thread.revision += 1;
+        true
+    }
+
+    /// Clear the unread counter for an agent (called when the main pane shows it).
     pub fn mark_read(&mut self, id: &str) {
         if let Some(t) = self.threads.get_mut(id) {
             t.unread = 0;
@@ -167,16 +188,18 @@ impl AgentTranscripts {
     /// Record a spawn: register the thread with its label + parent up front so it
     /// appears in the roster even before it emits any content. `prompt` is the
     /// full instruction the parent gave; it's recorded as the first message cell
-    /// so the drawer shows exactly what was delegated (from the parent).
+    /// so the main pane shows exactly what was delegated (from the parent).
     pub fn on_spawn(&mut self, agent_id: &str, parent_id: &str, task: &str, prompt: &str) {
         let already = self.threads.contains_key(agent_id);
         let t = self.ensure(agent_id);
+        let restarting = t.status != ThreadStatus::Running;
+        t.status = ThreadStatus::Running;
         t.parent_id = parent_id.to_string();
         t.task = task.to_string();
         // Seed the transcript with the delegated instructions once, rendered the
         // same way as user input (a `Cell::User` band) so it reads like the opening
         // prompt of the conversation.
-        if !already && !prompt.trim().is_empty() {
+        if (!already || restarting) && !prompt.trim().is_empty() {
             t.cells.push(Cell::User(prompt.to_string()));
             t.revision += 1;
         }
@@ -184,17 +207,41 @@ impl AgentTranscripts {
 
     /// Record completion, setting the final status.
     pub fn on_done(&mut self, agent_id: &str, failed: bool) {
+        self.finish_thread(
+            agent_id,
+            if failed {
+                ThreadStatus::Failed
+            } else {
+                ThreadStatus::Done
+            },
+        );
+    }
+
+    fn finish_thread(&mut self, agent_id: &str, status: ThreadStatus) {
         let t = self.ensure(agent_id);
-        t.status = if failed {
-            ThreadStatus::Failed
-        } else {
-            ThreadStatus::Done
-        };
+        t.status = status;
+        for cell in &mut t.cells {
+            match cell {
+                Cell::Assistant { open, .. } => *open = false,
+                Cell::Tool {
+                    status: tool_status,
+                    output,
+                    ..
+                } if *tool_status == ToolStatus::Running => {
+                    *tool_status = ToolStatus::Error;
+                    output.get_or_insert_with(|| match status {
+                        ThreadStatus::Cancelled => "(cancelled)".into(),
+                        _ => "(agent stopped before the tool returned)".into(),
+                    });
+                }
+                _ => {}
+            }
+        }
         t.revision += 1;
     }
 
     /// Append a message line to an agent's thread (chat to/from it). `showing` is
-    /// the id the drawer is currently displaying, so unread isn't bumped for it.
+    /// the id the main pane is currently displaying, so unread isn't bumped for it.
     pub fn push_message(&mut self, agent_id: &str, from: &str, text: &str, showing: Option<&str>) {
         let is_showing = showing == Some(agent_id);
         let t = self.ensure(agent_id);
@@ -208,7 +255,7 @@ impl AgentTranscripts {
         }
     }
 
-    /// Feed one subagent event into its thread. `showing` is the id the drawer is
+    /// Feed one subagent event into its thread. `showing` is the id the main pane is
     /// currently displaying (its unread counter isn't bumped). Returns the agent
     /// id the event was routed to, if any.
     pub fn apply(&mut self, event: &AgentEvent, showing: Option<&str>) {
@@ -221,14 +268,22 @@ impl AgentTranscripts {
             } => {
                 self.on_spawn(agent_id, parent_id, task, prompt);
             }
-            AgentEvent::SubagentDone { agent_id, failed } => {
-                self.on_done(agent_id, *failed);
+            AgentEvent::SubagentDone {
+                agent_id,
+                failed,
+                cancelled,
+            } => {
+                if *cancelled {
+                    self.finish_thread(agent_id, ThreadStatus::Cancelled);
+                } else {
+                    self.on_done(agent_id, *failed);
+                }
             }
             AgentEvent::AgentMessage { .. } => {
-                // Inter-agent messages are NOT shown in the drawer: an agent's
+                // Inter-agent messages are NOT shown in the main pane: an agent's
                 // outgoing message just duplicates its own final assistant output,
-                // so the line is redundant. (A message YOU send via the drawer is
-                // appended directly by send_drawer_message, not through here.)
+                // so the line is redundant. (A message YOU send via the main pane is
+                // appended directly by send_agent_message, not through here.)
             }
             _ => {
                 if let Some(id) = event_agent_id(event) {
@@ -240,6 +295,16 @@ impl AgentTranscripts {
                     let after;
                     {
                         let t = self.ensure(id);
+                        // Older background tasks never emitted lifecycle events.
+                        if t.parent_id.is_empty() {
+                            match event {
+                                AgentEvent::TurnEnd { .. } if t.status == ThreadStatus::Running => {
+                                    t.status = ThreadStatus::Done
+                                }
+                                AgentEvent::Error { .. } => t.status = ThreadStatus::Failed,
+                                _ => {}
+                            }
+                        }
                         before = t.cells.len();
                         apply_content_event(&mut t.cells, event, true);
                         after = t.cells.len();
@@ -271,6 +336,7 @@ impl AgentTranscripts {
                     ThreadStatus::Running => "running",
                     ThreadStatus::Done => "done",
                     ThreadStatus::Failed => "failed",
+                    ThreadStatus::Cancelled => "cancelled",
                 }
                 .to_string(),
                 cells: t.cells.iter().filter_map(cell_to_persisted).collect(),
@@ -278,13 +344,14 @@ impl AgentTranscripts {
             .collect()
     }
 
-    /// Rebuild threads from persisted state (on resume). Restored threads that
-    /// were still "running" at save time are marked done — the work is over.
+    /// Rebuild threads from persisted state (on resume). Interrupted runs are
+    /// cancelled, not successful; completed outcomes retain their original state.
     pub fn from_persisted(threads: &[PersistedThread]) -> Self {
         let mut out = AgentTranscripts::new();
         for pt in threads {
             let status = match pt.status.as_str() {
                 "failed" => ThreadStatus::Failed,
+                "running" | "cancelled" => ThreadStatus::Cancelled,
                 _ => ThreadStatus::Done,
             };
             let thread = AgentThread {
@@ -303,7 +370,7 @@ impl AgentTranscripts {
     }
 }
 
-/// Map a live `Cell` to its persisted form. Returns None for cells the drawer
+/// Map a live `Cell` to its persisted form. Returns None for cells the main pane
 /// never produces in a thread (Subagent/Compaction/Event).
 fn cell_to_persisted(cell: &Cell) -> Option<PersistedCell> {
     match cell {
@@ -390,12 +457,12 @@ fn event_agent_id(event: &AgentEvent) -> Option<&str> {
 
 /// Full-screen workflow view state: a single scrollable pane showing a collapsible
 /// phase/agent tree. `sel` is a cursor into the flattened list of visible rows
-/// (phase headers + agents); the selected agent expands inline to show its detail.
+/// (phase headers + agents); selecting an agent opens its main-pane transcript.
 /// `None` on the App means the view is closed.
 pub struct WorkflowView {
     pub run_id: String,
     /// Cursor + scroll into the flattened row list (phase headers + agents), rebuilt
-    /// each draw. Enter on an agent expands its inline detail; on a phase toggles it.
+    /// each draw. Enter on an agent focuses its transcript; on a phase toggles it.
     pub list: super::widgets::SelectList,
     /// Phase indices the user has collapsed (their agents are hidden).
     pub collapsed: std::collections::HashSet<usize>,
@@ -407,32 +474,6 @@ impl Default for WorkflowView {
             run_id: String::new(),
             list: super::widgets::SelectList::new(),
             collapsed: std::collections::HashSet::new(),
-        }
-    }
-}
-
-/// Drawer UI state: which agent is selected, scroll offset, and (when chatting)
-/// the compose buffer. `None` on the App means the drawer is closed.
-pub struct TeamDrawer {
-    /// Roster selection cursor + scroll (the roster windows when the team is taller
-    /// than the pane). Distinct from `TeamDrawer::scroll` below, which is the
-    /// *detail-pane* transcript scroll.
-    pub list: super::widgets::SelectList,
-    pub scroll: u16,
-    /// Roster index the mouse is currently hovering (for a hover highlight), or
-    /// `None` when the cursor isn't over a roster row.
-    pub hovered: Option<usize>,
-    /// `Some` while composing a message to the selected agent.
-    pub composing: Option<String>,
-}
-
-impl Default for TeamDrawer {
-    fn default() -> Self {
-        TeamDrawer {
-            list: super::widgets::SelectList::new(),
-            scroll: 0,
-            hovered: None,
-            composing: None,
         }
     }
 }
@@ -475,6 +516,7 @@ mod tests {
             &AgentEvent::SubagentDone {
                 agent_id: "reviewer".into(),
                 failed: false,
+                cancelled: false,
             },
             None,
         );
@@ -495,10 +537,10 @@ mod tests {
     }
 
     #[test]
-    fn inter_agent_message_adds_no_drawer_cells() {
+    fn inter_agent_message_adds_no_thread_cells() {
         // Inter-agent messages are redundant with the sender's own output, so the
-        // drawer must NOT append cells for them (only user-sent messages, via
-        // send_drawer_message, appear).
+        // thread must NOT append cells for them (only user-sent messages, via
+        // send_agent_message, appear).
         let mut t = AgentTranscripts::new();
         t.on_spawn("a", "root", "task a", "");
         t.on_spawn("b", "root", "task b", "");
@@ -546,15 +588,163 @@ mod tests {
     #[test]
     fn display_label_prefers_description_for_auto_ids() {
         let mut t = AgentTranscripts::new();
-        // `task` child: opaque id + human description → drawer shows the description.
+        // `task` child: opaque id + human description → sidebar shows the description.
         t.on_spawn("task_7", "root", "review src/core", "audit it");
         assert_eq!(t.get("task_7").unwrap().display_label(), "review src/core");
+        t.on_spawn("job_3", "root", "check tests", "run tests");
+        assert_eq!(t.get("job_3").unwrap().display_label(), "check tests");
         // `spawn_agent` child: semantic handle as id → keep the handle.
         t.on_spawn("researcher", "root", "dig into perf", "profile it");
         assert_eq!(t.get("researcher").unwrap().display_label(), "researcher");
         // Auto-id with no description → fall back to the id, never blank.
         t.on_spawn("task_9", "root", "", "");
         assert_eq!(t.get("task_9").unwrap().display_label(), "task_9");
+    }
+
+    #[test]
+    fn terminal_states_survive_event_replay_and_persistence() {
+        let mut live = AgentTranscripts::new();
+        let mut replayed = AgentTranscripts::new();
+        for (id, failed, cancelled, expected) in [
+            ("job_1", false, false, ThreadStatus::Done),
+            ("job_2", true, false, ThreadStatus::Failed),
+            ("job_3", false, true, ThreadStatus::Cancelled),
+        ] {
+            for event in [
+                AgentEvent::SubagentSpawn {
+                    parent_id: "root".into(),
+                    agent_id: id.into(),
+                    task: "review".into(),
+                    prompt: "review code".into(),
+                },
+                AgentEvent::SubagentDone {
+                    agent_id: id.into(),
+                    failed,
+                    cancelled,
+                },
+            ] {
+                live.apply(&event, None);
+                let serialized = serde_json::to_string(&event).unwrap();
+                let restored = serde_json::from_str(&serialized).unwrap();
+                replayed.apply(&restored, None);
+            }
+            assert_eq!(live.get(id).unwrap().status, expected);
+            assert_eq!(replayed.get(id).unwrap().status, expected);
+        }
+        live.on_spawn("job_4", "root", "still working", "continue");
+        assert_eq!(
+            live.display_order(),
+            vec!["job_4", "job_1", "job_2", "job_3"]
+        );
+        let restored = AgentTranscripts::from_persisted(&live.to_persisted());
+        assert_eq!(restored.display_order().len(), 4);
+        assert_eq!(restored.get("job_1").unwrap().status, ThreadStatus::Done);
+        assert_eq!(restored.get("job_2").unwrap().status, ThreadStatus::Failed);
+        assert_eq!(
+            restored.get("job_3").unwrap().status,
+            ThreadStatus::Cancelled
+        );
+        assert_eq!(
+            restored.get("job_4").unwrap().status,
+            ThreadStatus::Cancelled
+        );
+    }
+
+    #[test]
+    fn replay_cancels_unfinished_agents_without_duplicating_their_transcripts() {
+        let events = vec![
+            AgentEvent::SubagentSpawn {
+                parent_id: "root".into(),
+                agent_id: "job_1".into(),
+                task: "review".into(),
+                prompt: "review code".into(),
+            },
+            tool_call("job_1", "tool_1", "read_file"),
+        ];
+        let threads = AgentTranscripts::replay(&events);
+        let thread = threads.get("job_1").unwrap();
+        assert_eq!(thread.status, ThreadStatus::Cancelled);
+        assert_eq!(thread.cells.len(), 2);
+        assert!(
+            matches!(&thread.cells[1], Cell::Tool { status: ToolStatus::Error, output: Some(output), .. } if output == "(cancelled)")
+        );
+    }
+
+    #[test]
+    fn cancelled_agent_closes_streaming_and_pending_cells() {
+        let mut threads = AgentTranscripts::new();
+        threads.on_spawn("job_1", "root", "review", "");
+        threads.apply(&tool_call("job_1", "tool_1", "read_file"), None);
+        threads.apply(
+            &AgentEvent::TextDelta {
+                agent_id: "job_1".into(),
+                text: "checking".into(),
+            },
+            None,
+        );
+        threads.apply(
+            &AgentEvent::SubagentDone {
+                agent_id: "job_1".into(),
+                failed: false,
+                cancelled: true,
+            },
+            None,
+        );
+        let thread = threads.get("job_1").unwrap();
+        assert_eq!(thread.status, ThreadStatus::Cancelled);
+        assert!(
+            matches!(&thread.cells[0], Cell::Tool { status: ToolStatus::Error, output: Some(output), .. } if output == "(cancelled)")
+        );
+        assert!(matches!(
+            &thread.cells[1],
+            Cell::Assistant { open: false, .. }
+        ));
+    }
+
+    #[test]
+    fn legacy_background_task_finishes_without_explicit_lifecycle_events() {
+        let mut threads = AgentTranscripts::new();
+        threads.apply(
+            &AgentEvent::TurnStart {
+                agent_id: "job_1".into(),
+            },
+            None,
+        );
+        threads.apply(
+            &AgentEvent::TurnEnd {
+                agent_id: "job_1".into(),
+                usage: Usage::default(),
+            },
+            None,
+        );
+        assert_eq!(threads.get("job_1").unwrap().status, ThreadStatus::Done);
+        threads.apply(
+            &AgentEvent::Error {
+                agent_id: "job_2".into(),
+                message: "failed".into(),
+            },
+            None,
+        );
+        threads.apply(
+            &AgentEvent::TurnEnd {
+                agent_id: "job_2".into(),
+                usage: Usage::default(),
+            },
+            None,
+        );
+        assert_eq!(threads.get("job_2").unwrap().status, ThreadStatus::Failed);
+    }
+
+    #[test]
+    fn reused_agent_name_becomes_running_again() {
+        let mut threads = AgentTranscripts::new();
+        threads.on_spawn("reviewer", "root", "first", "first prompt");
+        threads.on_done("reviewer", false);
+        threads.on_spawn("reviewer", "root", "second", "second prompt");
+        let thread = threads.get("reviewer").unwrap();
+        assert_eq!(thread.status, ThreadStatus::Running);
+        assert_eq!(thread.task, "second");
+        assert_eq!(thread.cells.len(), 2);
     }
 
     #[test]

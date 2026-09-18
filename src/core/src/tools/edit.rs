@@ -144,18 +144,8 @@ impl Tool for EditFileTool {
 
         std::fs::write(&full, &updated)?;
         ctx.files.record_write(&full_str);
-        let mut result = edit_result(path, &content, &updated);
-        if let Some(diags) = crate::tools::lsp::post_edit_diagnostics(
-            &ctx.lsp,
-            &ctx.cwd,
-            path,
-            std::time::Duration::from_millis(700),
-        )
-        .await
-        {
-            result.push_str(&diags);
-        }
-        Ok(result)
+        crate::tools::lsp::sync_after_edit(&ctx.lsp, &full, &updated).await;
+        Ok(edit_result(path, &content, &updated))
     }
 
     fn preview(&self, input: &Value, ctx: &ToolContext) -> Option<String> {
@@ -237,18 +227,8 @@ impl Tool for MultiEditTool {
 
         std::fs::write(&full, &content)?;
         ctx.files.record_write(&full_str);
-        let mut result = edit_result(path, &original, &content);
-        if let Some(diags) = crate::tools::lsp::post_edit_diagnostics(
-            &ctx.lsp,
-            &ctx.cwd,
-            path,
-            std::time::Duration::from_millis(700),
-        )
-        .await
-        {
-            result.push_str(&diags);
-        }
-        Ok(result)
+        crate::tools::lsp::sync_after_edit(&ctx.lsp, &full, &content).await;
+        Ok(edit_result(path, &original, &content))
     }
 
     fn preview(&self, input: &Value, ctx: &ToolContext) -> Option<String> {

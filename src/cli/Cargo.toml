@@ -2,7 +2,7 @@
 name = "bob-cli"
 version.workspace = true
 edition.workspace = true
-description = "The bob command-line app: TUI chat plus remote/relay and all subcommands. Produces the `bob` binary."
+description = "The bob coding-assistant CLI: terminal chat and local configuration. Produces the `bob` binary."
 
 [[bin]]
 name = "bob"
@@ -10,11 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 bob-core = { path = "../core" }
-bob-remote = { path = "../remote" }
-bob-relay = { path = "../relay" }
-bob-secure = { path = "../secure" }
 tokio.workspace = true
-axum.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 futures.workspace = true

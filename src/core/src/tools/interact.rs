@@ -190,12 +190,11 @@ impl Tool for EnterPlanTool {
         ToolSpec {
             name: "enter_plan".to_string(),
             description:
-                "Switch yourself into read-only PLAN mode before starting a large, risky, \
-                or ambiguous task. In plan mode all edits and shell commands are blocked, so you \
-                research and design first. When your plan is ready, call `exit_plan` to present it \
-                for the user's approval; only after they approve are edits unblocked. Use this \
-                proactively when a task clearly needs a plan first — don't start editing blind. \
-                Skip it for small, clear changes you can just make."
+                "Enter read-only Plan mode for a large, risky, or underspecified implementation, \
+                or when the user requests it. Edits and shell commands are blocked until approval \
+                through exit_plan. Research with permitted read/search tools and present concrete \
+                implementation steps. Skip this extra approval flow for a research-only question, \
+                a small clear change, or work whose plan the user already approved."
                     .to_string(),
             input_schema: json!({ "type": "object", "properties": {} }),
         }

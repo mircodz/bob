@@ -1,5 +1,5 @@
 [workspace]
-members = ["src/types", "src/core", "src/sdk", "src/cli", "src/protocol", "src/relay", "src/remote", "src/secure"]
+members = ["src/types", "src/core", "src/sdk", "src/cli"]
 default-members = ["src/cli"]
 resolver = "2"
 
@@ -22,9 +22,6 @@ anyhow = "1"
 uuid = { version = "1", features = ["v4"] }
 clap = { version = "4", features = ["derive"] }
 sha2 = "0.10"
-axum = { version = "0.7", features = ["ws"] }
-tokio-tungstenite = "0.24"
-dashmap = "6"
 
 [profile.release]
 lto = true

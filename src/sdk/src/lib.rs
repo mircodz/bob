@@ -1,10 +1,8 @@
 //! bob-sdk — the ergonomic, human-writable door to bob's agent engine.
 //!
-//! `bob-core` has all the power but a wide surface: to stand up an agent you wire
-//! a provider, a permission engine, MCP + LSP tools, a system prompt, a session
-//! store, and an 18-field `AgentConfig` by hand (which is exactly what the TUI and
-//! remote host each do). This crate collapses that into a builder with sane
-//! defaults:
+//! `bob-core` exposes providers, permissions, tools, prompts, and session stores.
+//! This crate wraps the same root-agent assembly used by the CLI with a headless
+//! builder and sane defaults:
 //!
 //! ```no_run
 //! use bob_sdk::prelude::*;

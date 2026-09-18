@@ -6,7 +6,7 @@
 
 use crate::auth::copilot as auth;
 use crate::providers::openai::{OpenAiProvider, TokenSource};
-use crate::providers::provider::Provider;
+use crate::providers::provider::{ModelEntry, Provider};
 use crate::providers::responses::ResponsesProvider;
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -67,9 +67,8 @@ impl TokenSource for CopilotAuth {
 }
 
 /// True if a Copilot model must be called via the Responses API rather than
-/// /chat/completions. The newer GPT-5.x families (sol/luna/terra/codex) and
-/// gpt-5.5 are Responses-only; classic chat models (gpt-4o, claude-*, gemini-*)
-/// use /chat/completions.
+/// /chat/completions. Newer GPT-5.x families and GPT-6 are Responses-only;
+/// classic chat models (gpt-4o, claude-*, gemini-*) use /chat/completions.
 fn is_responses_model(model: &str) -> bool {
     // gpt-5.4 and up on the Copilot backend speak Responses only.
     let m = model.to_ascii_lowercase();
@@ -79,6 +78,7 @@ fn is_responses_model(model: &str) -> bool {
         || m.starts_with("gpt-5.5")
         || m.starts_with("gpt-5.6")
         || m.starts_with("gpt-5.4")
+        || m.starts_with("gpt-6")
         || m.contains("gpt-5.3-codex")
         || m == "gpt-5-codex"
 }
@@ -113,21 +113,41 @@ pub async fn create(
     // Ask the backend for this model's real limits so compaction sizes against the
     // true input budget (Copilot advertises up to ~936k for Claude, not the 200k
     // the id-based heuristic assumes). Best-effort: None → heuristic fallback.
-    let window = auth::fetch_model_limits(&tok, &api_base)
-        .await
-        .into_iter()
+    let model_limits = auth::fetch_model_limits(&tok, &api_base).await;
+    let window = model_limits
+        .iter()
         .find(|m| m.id == model)
         .and_then(|m| m.max_prompt_tokens.or(m.max_context_window_tokens));
 
     let source: Arc<dyn TokenSource> = Arc::new(source);
 
     if is_responses_model(&model) {
+        let model_catalog = model_limits
+            .into_iter()
+            .map(|entry| ModelEntry {
+                id: entry.id,
+                context_window: entry.max_prompt_tokens.or(entry.max_context_window_tokens),
+            })
+            .collect();
         Ok(Arc::new(
-            ResponsesProvider::with_auth(model, api_base, source).with_context_window(window),
+            ResponsesProvider::with_auth(model, api_base, source)
+                .with_context_window(window)
+                .with_model_catalog(model_catalog),
         ))
     } else {
         Ok(Arc::new(
             OpenAiProvider::with_auth(model, api_base, source).with_context_window(window),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_responses_model;
+
+    #[test]
+    fn gpt_6_uses_responses_api() {
+        assert!(is_responses_model("gpt-6-astra"));
+        assert!(!is_responses_model("gpt-4o"));
     }
 }

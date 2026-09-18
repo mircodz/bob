@@ -54,6 +54,7 @@ pub struct AgentEnv {
     pub subagent_system: Option<String>,
     /// Shared job registry (same instance the root agent + UI use).
     pub jobs: JobRegistry,
+    pub team: crate::agent::team::AgentRegistry,
     /// Shared language servers, so subagents get diagnostics/nav too. `None` when
     /// no lsp_servers are configured.
     pub lsp: Option<Arc<LspManager>>,
@@ -84,12 +85,15 @@ impl AgentEnv {
                     names.join(", ")
                 )
             })?;
-            let tools = if def.read_only {
-                self.subagent_tools.read_only_subset()
-            } else if let Some(allow) = &def.tools {
+            let tools = if let Some(allow) = &def.tools {
                 self.subagent_tools.subset(allow)
             } else {
                 self.subagent_tools.clone()
+            };
+            let tools = if read_only || def.read_only {
+                tools.read_only_subset()
+            } else {
+                tools
             };
             return Ok((Some(def.prompt.clone()), tools));
         }
@@ -133,6 +137,7 @@ mod tests {
             cwd: ".".to_string(),
             subagent_system: Some("shared prompt".to_string()),
             jobs: JobRegistry::new(),
+            team: crate::agent::team::AgentRegistry::new(),
             lsp: None,
             parent_cancel: Arc::new(AtomicBool::new(false)),
             definitions: defs.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
@@ -157,6 +162,23 @@ mod tests {
         )]);
         let system = env.resolve_child(Some("reviewer"), false).ok().unwrap().0;
         assert_eq!(system.as_deref(), Some("you are a reviewer"));
+    }
+
+    #[test]
+    fn read_only_and_definition_allowlists_do_not_gain_control_tools() {
+        use crate::tools::builtin::ReadFileTool;
+        use crate::tools::coordinate::StopAgentTool;
+        let mut env = env_with(vec![("reviewer", def("review", "review", false))]);
+        env.subagent_tools.add(Arc::new(ReadFileTool));
+        env.subagent_tools.add(Arc::new(StopAgentTool {
+            team: env.team.clone(),
+        }));
+        let (_, tools) = env.resolve_child(Some("reviewer"), true).unwrap();
+        assert!(tools.get("read_file").is_some());
+        assert!(tools.get("stop_agent").is_none());
+        env.definitions.get_mut("reviewer").unwrap().tools = Some(vec!["read_file".into()]);
+        let (_, tools) = env.resolve_child(Some("reviewer"), false).unwrap();
+        assert!(tools.get("stop_agent").is_none());
     }
 
     #[test]
