@@ -1,16 +1,9 @@
-//! Render a unified-diff text block (as emitted by the edit tools inside a
-//! ```diff fence) into pretty ratatui lines: a sign + line-number gutter, the
-//! content syntax-highlighted, and add/remove rows tinted green/red.
-
 use super::highlight::highlight_line;
 use super::theme::Palette;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
-/// Turn the body of a ```diff fence into styled lines. Lines are expected in the
-/// `"± NNNN| text"` form emitted by `format_unified` (sign, right-aligned line
-/// number, `|`, then the content). Bare lines are tolerated. `lang` selects the
-/// syntax for highlighting the content (from the fence tag / file extension).
+/// Rows use `"± NNNN| text"` from `format_unified`; bare lines are also accepted.
 pub fn render_diff(body: &str, lang: &str) -> Vec<Line<'static>> {
     body.split('\n').map(|raw| render_row(raw, lang)).collect()
 }
@@ -18,7 +11,6 @@ pub fn render_diff(body: &str, lang: &str) -> Vec<Line<'static>> {
 fn render_row(raw: &str, lang: &str) -> Line<'static> {
     let (sign, num, content) = parse_row(raw);
 
-    // Gap marker ("..."): dim, centered-ish.
     if content == "..." && sign == ' ' {
         return Line::from(Span::styled(
             "     ...".to_string(),
@@ -33,7 +25,6 @@ fn render_row(raw: &str, lang: &str) -> Line<'static> {
     };
 
     let mut spans: Vec<Span<'static>> = Vec::new();
-    // Sign + line-number gutter.
     spans.push(Span::styled(
         format!("{} ", sign),
         Style::default().fg(sign_color).add_modifier(Modifier::BOLD),
@@ -43,7 +34,6 @@ fn render_row(raw: &str, lang: &str) -> Line<'static> {
         Style::default().fg(Palette::DIFF_GUTTER()),
     ));
 
-    // Content: syntax-highlighted, then tinted for add/remove via background.
     let mut content_spans = highlight_line(content, lang);
     if let Some(bg) = bg {
         for s in &mut content_spans {
@@ -54,8 +44,6 @@ fn render_row(raw: &str, lang: &str) -> Line<'static> {
     Line::from(spans)
 }
 
-/// Parse a `"± NNNN| text"` row into (sign, line-number-string, content).
-/// Falls back gracefully for rows that don't match the format.
 fn parse_row(raw: &str) -> (char, String, &str) {
     let mut chars = raw.chars();
     let sign = match chars.next() {
@@ -63,7 +51,6 @@ fn parse_row(raw: &str) -> (char, String, &str) {
         _ => return (' ', String::new(), raw),
     };
     let rest = chars.as_str().trim_start_matches(' ');
-    // Split "NNNN| content" on the first '|'.
     if let Some(bar) = rest.find('|') {
         let num = rest[..bar].trim().to_string();
         let content = rest[bar + 1..]
@@ -75,7 +62,6 @@ fn parse_row(raw: &str) -> (char, String, &str) {
     }
 }
 
-/// A header line like "edited greet.py (+1 -1)".
 pub fn diff_header(text: &str) -> Line<'static> {
     Line::from(Span::styled(
         text.to_string(),
@@ -83,4 +69,51 @@ pub fn diff_header(text: &str) -> Line<'static> {
             .fg(Palette::DIM())
             .add_modifier(Modifier::BOLD),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn row_parser_preserves_indentation_unicode_and_embedded_bars() {
+        for (raw, sign, number, content) in [
+            ("+   12|   日本 | value", '+', "12", "  日本 | value"),
+            ("-    7| old", '-', "7", "old"),
+            ("     8|same", ' ', "8", "same"),
+            ("+ bare addition", '+', "", "bare addition"),
+            ("-", '-', "", ""),
+            ("...", ' ', "", "..."),
+            ("日本", ' ', "", "日本"),
+            ("", ' ', "", ""),
+        ] {
+            assert_eq!(parse_row(raw), (sign, number.into(), content), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn diff_rows_keep_gutters_separate_from_content_backgrounds() {
+        let rows = render_diff(
+            "+   12| new\n-    7| old\n     8| same\n...",
+            "unknown-language",
+        );
+        assert_eq!(
+            rows.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            vec!["+   12 new", "-    7 old", "     8 same", "     ...",]
+        );
+        for (row, background) in rows[..3].iter().zip([
+            Some(Palette::DIFF_ADD_BG()),
+            Some(Palette::DIFF_REMOVE_BG()),
+            None,
+        ]) {
+            assert_eq!(row.spans[0].style.bg, None);
+            assert_eq!(row.spans[1].style.bg, None);
+            assert!(row.spans[0].style.add_modifier.contains(Modifier::BOLD));
+            assert!(row.spans[2..]
+                .iter()
+                .all(|span| span.style.bg == background));
+        }
+        assert_eq!(rows[3].spans.len(), 1);
+        assert_eq!(rows[3].spans[0].style.fg, Some(Palette::FAINT()));
+    }
 }

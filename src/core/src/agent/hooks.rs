@@ -1,42 +1,24 @@
-//! Tool-call hooks: interception points the SDK exposes so an embedder can gate,
-//! rewrite, or audit tool calls without touching the agent loop. This is bob's
-//! analog of the Claude Agent SDK's `PreToolUse` / `PostToolUse` hooks.
-//!
-//! Unlike the [`EventBus`](crate::core::events::EventBus) — which only *observes*
-//! — a hook runs INLINE in the tool-dispatch path and can change what happens: a
-//! `PreToolUse` hook may deny a call or rewrite its input before the tool runs; a
-//! `PostToolUse` hook may rewrite the result the model sees. Hooks are a root-agent
-//! concern (an embedder's guardrail); they default to empty (zero overhead).
-
+use crate::core::types::ToolOutput;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::Arc;
 
-/// A `PreToolUse` hook's decision about a pending tool call.
 pub enum PreToolDecision {
-    /// Let the call proceed with this (possibly rewritten) input.
     Proceed(Value),
-    /// Block the call. The tool is not run; this message becomes its error result,
-    /// so the model sees a real tool-error it can react to.
+    /// Skips execution; the reason becomes a tool error result.
     Deny(String),
 }
 
-/// Runs before a tool executes. Return `Proceed(input)` to allow (optionally with
-/// a rewritten input), or `Deny(reason)` to block it.
 #[async_trait]
 pub trait PreToolUse: Send + Sync {
     async fn on_pre_tool(&self, tool: &str, input: &Value) -> PreToolDecision;
 }
 
-/// Runs after a tool executes, with its `(name, output, is_error)`. Return the
-/// output to record — unchanged, or rewritten (e.g. redacted).
 #[async_trait]
 pub trait PostToolUse: Send + Sync {
-    async fn on_post_tool(&self, tool: &str, output: String, is_error: bool) -> String;
+    async fn on_post_tool(&self, tool: &str, output: ToolOutput, is_error: bool) -> ToolOutput;
 }
 
-/// The set of hooks an agent applies to every tool call. Empty by default, so an
-/// agent with no hooks pays nothing. Cheap to clone (shared `Arc`s).
 #[derive(Clone, Default)]
 pub struct Hooks {
     pub pre: Vec<Arc<dyn PreToolUse>>,
@@ -48,9 +30,7 @@ impl Hooks {
         self.pre.is_empty() && self.post.is_empty()
     }
 
-    /// Run the pre-tool hooks in registration order. The FIRST `Deny` short-circuits
-    /// (the tool won't run); otherwise each hook's `Proceed(input)` feeds the next,
-    /// so rewrites chain. Returns the final input to run with, or the deny reason.
+    /// Rewrites chain in registration order; the first denial short-circuits.
     pub async fn run_pre(&self, tool: &str, mut input: Value) -> Result<Value, String> {
         for hook in &self.pre {
             match hook.on_pre_tool(tool, &input).await {
@@ -62,10 +42,121 @@ impl Hooks {
     }
 
     /// Run the post-tool hooks in registration order, chaining output rewrites.
-    pub async fn run_post(&self, tool: &str, mut output: String, is_error: bool) -> String {
+    pub async fn run_post(&self, tool: &str, mut output: ToolOutput, is_error: bool) -> ToolOutput {
         for hook in &self.post {
             output = hook.on_post_tool(tool, output, is_error).await;
         }
         output
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::Mutex;
+
+    struct Pre {
+        seen: Arc<Mutex<Vec<(String, Value)>>>,
+        deny: bool,
+    }
+
+    #[async_trait]
+    impl PreToolUse for Pre {
+        async fn on_pre_tool(&self, tool: &str, input: &Value) -> PreToolDecision {
+            self.seen.lock().unwrap().push((tool.into(), input.clone()));
+            if self.deny {
+                PreToolDecision::Deny("policy denied the rewritten call".into())
+            } else {
+                PreToolDecision::Proceed(json!({"previous": input}))
+            }
+        }
+    }
+
+    struct Post {
+        seen: Arc<Mutex<Vec<(String, String, bool)>>>,
+        suffix: &'static str,
+    }
+
+    #[async_trait]
+    impl PostToolUse for Post {
+        async fn on_post_tool(&self, tool: &str, output: ToolOutput, is_error: bool) -> ToolOutput {
+            self.seen.lock().unwrap().push((
+                tool.into(),
+                output.as_text().unwrap().to_owned(),
+                is_error,
+            ));
+            format!("{}{}", output.as_text().unwrap(), self.suffix).into()
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_rewrites_chain_and_first_denial_stops_later_hooks() {
+        for deny in [false, true] {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let hooks = Hooks {
+                pre: vec![
+                    Arc::new(Pre {
+                        seen: seen.clone(),
+                        deny: false,
+                    }),
+                    Arc::new(Pre {
+                        seen: seen.clone(),
+                        deny,
+                    }),
+                    Arc::new(Pre {
+                        seen: seen.clone(),
+                        deny: false,
+                    }),
+                ],
+                post: vec![],
+            };
+            let input = json!({"path": "a.rs"});
+            let once = json!({"previous": input});
+            let twice = json!({"previous": once});
+            let result = hooks.clone().run_pre("read_file", input.clone()).await;
+            let mut expected = vec![("read_file".into(), input), ("read_file".into(), once)];
+            if deny {
+                assert_eq!(result, Err("policy denied the rewritten call".into()));
+            } else {
+                assert_eq!(result, Ok(json!({"previous": twice})));
+                expected.push(("read_file".into(), twice));
+            }
+            assert_eq!(*seen.lock().unwrap(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn post_rewrites_chain_without_changing_tool_identity_or_error_flag() {
+        for is_error in [false, true] {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let hooks = Hooks {
+                pre: vec![],
+                post: vec![
+                    Arc::new(Post {
+                        seen: seen.clone(),
+                        suffix: " first",
+                    }),
+                    Arc::new(Post {
+                        seen: seen.clone(),
+                        suffix: " second",
+                    }),
+                ],
+            };
+            assert_eq!(
+                hooks
+                    .run_post("write_file", "result".into(), is_error)
+                    .await
+                    .as_text(),
+                Some("result first second")
+            );
+            assert_eq!(
+                *seen.lock().unwrap(),
+                vec![
+                    ("write_file".into(), "result".into(), is_error),
+                    ("write_file".into(), "result first".into(), is_error),
+                ],
+            );
+        }
     }
 }

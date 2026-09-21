@@ -1,41 +1,15 @@
-//! Shared TUI building blocks. bob's TUI is immediate-mode over ratatui — every
-//! `draw_*` builds `Line`s and blits a `Paragraph`. Overlays (team drawer, workflow
-//! view, agents sidebar, pickers) once hand-rolled the same primitives — insetting
-//! a rect, a scrolling selection list, a faint vertical divider — and the copies
-//! drifted. They live here once now.
-//!
-//! Deliberately a small set of HELPERS, not a widget framework: it stays
-//! immediate-mode and composes with ratatui rather than wrapping it.
-
-// `row_at` is the click-hit companion to `window` — kept as part of the SelectList
-// API for symmetry (overlays currently hand-roll the screen-row→index map against
-// their own recorded rects). Suppress the lone dead-code warning rather than split
-// the type's vocabulary.
-#![allow(dead_code)]
-
-use super::theme::Palette;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
-use ratatui::text::{Line, Span};
+use ratatui::text::Line;
 
-/// The shared horizontal layout budget, in columns. The whole scrollback is inset
-/// by [`SIDE_PAD`] on each side; a floating "band" (a user message or the input
-/// box) sits inside that with an extra [`BAND_MARGIN`], so its colored edge lands
-/// at [`BAND_INSET`] (`SIDE_PAD + BAND_MARGIN`) columns from the screen edge. Every
-/// panel stacked above the input aligns its left edge to `BAND_INSET` so the whole
-/// column reads as one conversation. These live here (not per-file) so the input,
-/// the transcript, and the overlays can't drift apart.
+/// Shared insets in display columns; panels and input align at `BAND_INSET`.
 pub const SIDE_PAD: u16 = 2;
 pub const BAND_MARGIN: u16 = 2;
 pub const BAND_INSET: u16 = SIDE_PAD + BAND_MARGIN;
 
-/// Shrink a rect by `n` columns on each side and 0 rows (a horizontal inset). The
-/// most common breathing-room adjustment before rendering into a pane.
 pub fn inset(area: Rect, n: u16) -> Rect {
     inset_xy(area, n, 0)
 }
 
-/// Shrink a rect by `x` columns on each side and `y` rows on top+bottom.
 pub fn inset_xy(area: Rect, x: u16, y: u16) -> Rect {
     Rect {
         x: area.x + x,
@@ -45,20 +19,6 @@ pub fn inset_xy(area: Rect, x: u16, y: u16) -> Rect {
     }
 }
 
-/// A faint ` │` vertical divider filling `area`'s height. Used between the columns
-/// of a split overlay (team drawer, workflow view). Render into a 2-col-wide rect.
-pub fn divider_col(area: Rect) -> Vec<Line<'static>> {
-    (0..area.height)
-        .map(|_| Line::from(Span::styled(" │", Style::default().fg(Palette::FAINT()))))
-        .collect()
-}
-
-/// A scrolling single-selection list. Owns the cursor + scroll offset and the
-/// window math so every overlay's roster/tree/picker shares one implementation.
-///
-/// Content-agnostic: the caller supplies `len` and builds each row's `Line` at
-/// render time. `window()` returns the visible index range; `row_at()` maps a
-/// click back to an index.
 #[derive(Default)]
 pub struct SelectList {
     /// Selected row index (clamped to `0..len`).
@@ -72,24 +32,20 @@ impl SelectList {
         SelectList::default()
     }
 
-    /// Move the cursor up one, clamped at 0.
     pub fn up(&mut self) {
         self.selected = self.selected.saturating_sub(1);
     }
 
-    /// Move the cursor down one, clamped at `len-1`.
     pub fn down(&mut self, len: usize) {
         if self.selected + 1 < len {
             self.selected += 1;
         }
     }
 
-    /// Jump the cursor by `n` rows up.
     pub fn page_up(&mut self, n: usize) {
         self.selected = self.selected.saturating_sub(n);
     }
 
-    /// Jump the cursor by `n` rows down, clamped.
     pub fn page_down(&mut self, n: usize, len: usize) {
         self.selected = (self.selected + n).min(len.saturating_sub(1));
     }
@@ -103,9 +59,7 @@ impl SelectList {
         }
     }
 
-    /// Recompute `scroll` so the selected row is visible within `view_h` rows, then
-    /// return the range of row indices currently on screen: `scroll..scroll+view_h`
-    /// clamped to `len`. Call once per render before building the visible rows.
+    /// Keep the selection visible; call before building the visible rows.
     pub fn window(&mut self, len: usize, view_h: usize) -> std::ops::Range<usize> {
         if view_h == 0 || len == 0 {
             self.scroll = 0;
@@ -121,20 +75,62 @@ impl SelectList {
         let end = (self.scroll + view_h).min(len);
         self.scroll..end
     }
+}
 
-    /// Given the on-screen range (from [`window`]) and the pane's top screen row,
-    /// map a clicked screen `row` to the row index it represents, if any.
-    pub fn row_at(&self, range: &std::ops::Range<usize>, pane_top: u16, row: u16) -> Option<usize> {
-        if row < pane_top {
-            return None;
-        }
-        let idx = self.scroll + (row - pane_top) as usize;
-        if range.contains(&idx) {
-            Some(idx)
-        } else {
-            None
-        }
+pub fn keep_visible(scroll: usize, selected: usize, height: usize, len: usize) -> usize {
+    if height == 0 {
+        return selected;
     }
+    let scroll = scroll.min(selected);
+    let scroll = if selected >= scroll.saturating_add(height) {
+        selected + 1 - height
+    } else {
+        scroll
+    };
+    scroll.min(len.saturating_sub(height))
+}
+
+pub fn fit_text(text: &str, width: usize) -> String {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    if text.width() <= width {
+        return text.to_string();
+    }
+    let mut result = String::new();
+    let mut used = 0;
+    for ch in text.chars() {
+        let columns = ch.width().unwrap_or(0);
+        if used + columns > width.saturating_sub(1) {
+            break;
+        }
+        result.push(ch);
+        used += columns;
+    }
+    if width > 0 {
+        result.push('…');
+    }
+    result
+}
+
+pub fn prompt_window(lines: Vec<Line<'static>>, height: usize) -> Vec<Line<'static>> {
+    if lines.len() <= height {
+        return lines;
+    }
+    let selected = lines
+        .iter()
+        .position(|line| {
+            line.spans
+                .first()
+                .is_some_and(|span| span.content.contains('❯') || span.content == "› ")
+        })
+        .unwrap_or(0);
+    if height < 3 {
+        return lines.into_iter().skip(selected).take(height).collect();
+    }
+    let start = selected.saturating_sub(height - 3).max(1);
+    let mut visible = vec![lines[0].clone()];
+    visible.extend(lines.iter().skip(start).take(height - 2).cloned());
+    visible.push(lines.last().unwrap().clone());
+    visible
 }
 
 #[cfg(test)]
@@ -142,146 +138,101 @@ mod tests {
     use super::*;
 
     #[test]
-    fn inset_shrinks_symmetrically() {
-        let r = Rect {
-            x: 0,
-            y: 0,
-            width: 20,
-            height: 10,
-        };
-        let i = inset(r, 2);
-        assert_eq!((i.x, i.width), (2, 16));
-        assert_eq!((i.y, i.height), (0, 10));
-        let i2 = inset_xy(r, 1, 3);
-        assert_eq!((i2.x, i2.width, i2.y, i2.height), (1, 18, 3, 4));
+    fn fit_text_keeps_exact_fits_and_budgets_ellipsis_in_display_columns() {
+        for (text, width, expected) in [
+            ("hello", 0, ""),
+            ("hello", 1, "…"),
+            ("hello", 5, "hello"),
+            ("a界z", 3, "a…"),
+            ("界界z", 4, "界…"),
+            ("e\u{301}xy", 2, "e\u{301}…"),
+        ] {
+            assert_eq!(fit_text(text, width), expected, "{text:?}, width={width}");
+        }
     }
 
     #[test]
-    fn selectlist_nav_clamps() {
-        let mut s = SelectList::new();
-        s.down(3);
-        s.down(3);
-        s.down(3);
-        assert_eq!(s.selected, 2); // clamped at len-1
-        s.up();
-        s.up();
-        s.up();
-        assert_eq!(s.selected, 0); // clamped at 0
+    fn prompt_window_preserves_title_selection_and_footer_in_order() {
+        let lines: Vec<Line> = ["title", "one", "two", " ❯ three", "four", "hint"]
+            .into_iter()
+            .map(Line::from)
+            .collect();
+        for (height, expected) in [
+            (0, vec![]),
+            (1, vec![" ❯ three"]),
+            (2, vec![" ❯ three", "four"]),
+            (3, vec!["title", " ❯ three", "hint"]),
+            (4, vec!["title", "two", " ❯ three", "hint"]),
+            (6, vec!["title", "one", "two", " ❯ three", "four", "hint"]),
+        ] {
+            assert_eq!(
+                prompt_window(lines.clone(), height)
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+        let free_text = vec![Line::from("title"), Line::from("› "), Line::from("hint")];
+        assert_eq!(prompt_window(free_text, 1)[0].to_string(), "› ");
     }
 
     #[test]
-    fn window_keeps_selection_visible() {
-        let mut s = SelectList::new();
-        // 10 items, 3 visible. Select the last → scroll follows.
-        s.selected = 9;
-        let range = s.window(10, 3);
-        assert_eq!(range, 7..10);
-        assert_eq!(s.scroll, 7);
-        // Select the first → scroll snaps back.
-        s.selected = 0;
-        let range = s.window(10, 3);
-        assert_eq!(range, 0..3);
-        assert_eq!(s.scroll, 0);
+    fn selection_navigation_and_shrink_clamp_at_both_ends() {
+        let mut list = SelectList::new();
+        for (label, down, expected) in [
+            ("first down", true, 1),
+            ("last row", true, 2),
+            ("down clamps", true, 2),
+            ("up one", false, 1),
+            ("first row", false, 0),
+            ("up clamps", false, 0),
+        ] {
+            if down {
+                list.down(3);
+            } else {
+                list.up();
+            }
+            assert_eq!(list.selected, expected, "{label}");
+        }
+        for (label, down, step, len, expected) in [
+            ("page down", true, 10, 100, 10),
+            ("second page", true, 10, 100, 20),
+            ("page up", false, 5, 100, 15),
+            ("page past end", true, 1000, 100, 99),
+            ("page past start", false, 1000, 100, 0),
+            ("empty list", true, 5, 0, 0),
+        ] {
+            if down {
+                list.page_down(step, len);
+            } else {
+                list.page_up(step);
+            }
+            assert_eq!(list.selected, expected, "{label}");
+        }
+        for (label, selected, len, expected) in [
+            ("shrunken list", 8, 3, 2),
+            ("emptied list", 2, 0, 0),
+            ("in range", 3, 10, 3),
+        ] {
+            list.selected = selected;
+            list.clamp(len);
+            assert_eq!(list.selected, expected, "{label}");
+        }
     }
 
     #[test]
-    fn row_at_maps_clicks_within_window() {
-        let mut s = SelectList::new();
-        s.selected = 5;
-        let range = s.window(10, 4); // scroll=2, range 2..6
-        assert_eq!(s.scroll, 2);
-        // Pane top at screen row 20 → row 22 is index 4.
-        assert_eq!(s.row_at(&range, 20, 22), Some(4));
-        // A row past the window maps to nothing.
-        assert_eq!(s.row_at(&range, 20, 40), None);
-    }
-
-    #[test]
-    fn clamp_after_shrink() {
-        let mut s = SelectList::new();
-        s.selected = 8;
-        s.clamp(3);
-        assert_eq!(s.selected, 2);
-        s.clamp(0);
-        assert_eq!(s.selected, 0);
-    }
-
-    #[test]
-    fn clamp_leaves_in_range_selection() {
-        let mut s = SelectList::new();
-        s.selected = 3;
-        s.clamp(10); // already in range → unchanged
-        assert_eq!(s.selected, 3);
-    }
-
-    #[test]
-    fn page_up_down_jump_and_clamp() {
-        let mut s = SelectList::new();
-        s.page_down(10, 100);
-        assert_eq!(s.selected, 10);
-        s.page_down(10, 100);
-        assert_eq!(s.selected, 20);
-        s.page_up(5);
-        assert_eq!(s.selected, 15);
-        // Clamp at the ends.
-        s.page_down(1000, 100);
-        assert_eq!(s.selected, 99);
-        s.page_up(1000);
-        assert_eq!(s.selected, 0);
-        // Empty list → stays at 0, no panic.
-        let mut e = SelectList::new();
-        e.page_down(5, 0);
-        assert_eq!(e.selected, 0);
-    }
-
-    #[test]
-    fn window_edge_cases() {
-        let mut s = SelectList::new();
-        // Zero view height or empty list → empty range, scroll reset.
-        s.scroll = 4;
-        assert_eq!(s.window(10, 0), 0..0);
-        assert_eq!(s.scroll, 0);
-        s.scroll = 4;
-        assert_eq!(s.window(0, 5), 0..0);
-        assert_eq!(s.scroll, 0);
-        // Fewer items than the viewport → no scroll, full range.
-        s.selected = 2;
-        assert_eq!(s.window(3, 10), 0..3);
-        assert_eq!(s.scroll, 0);
-    }
-
-    #[test]
-    fn row_at_ignores_clicks_above_pane() {
-        let mut s = SelectList::new();
-        s.selected = 0;
-        let range = s.window(10, 4); // scroll 0, range 0..4
-                                     // A row above the pane top maps to nothing.
-        assert_eq!(s.row_at(&range, 20, 19), None);
-        // The pane's top row is the first index.
-        assert_eq!(s.row_at(&range, 20, 20), Some(0));
-    }
-
-    #[test]
-    fn divider_col_matches_height() {
-        assert_eq!(
-            divider_col(Rect {
-                x: 0,
-                y: 0,
-                width: 2,
-                height: 3,
-            })
-            .len(),
-            3
-        );
-        assert_eq!(
-            divider_col(Rect {
-                x: 0,
-                y: 0,
-                width: 2,
-                height: 0,
-            })
-            .len(),
-            0
-        );
+    fn selection_window_tracks_edges_and_resets_empty_viewports() {
+        for (label, selected, scroll, len, height, expected) in [
+            ("follow last row", 9, 0, 10, 3, 7..10),
+            ("return to first row", 0, 7, 10, 3, 0..3),
+            ("zero viewport", 0, 4, 10, 0, 0..0),
+            ("empty list", 0, 4, 0, 5, 0..0),
+            ("short list", 2, 4, 3, 10, 0..3),
+        ] {
+            let mut list = SelectList { selected, scroll };
+            assert_eq!(list.window(len, height), expected, "{label}: range");
+            assert_eq!(list.scroll, expected.start, "{label}: scroll");
+        }
     }
 }

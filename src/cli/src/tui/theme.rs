@@ -1,15 +1,7 @@
-//! Central color themes for the TUI. A `Theme` is a full set of colors including
-//! a base background (`bg`), which the draw loop paints across the whole screen —
-//! so a theme fully controls bob's look regardless of the terminal's own colors.
-//! One theme is active at a time (chosen from config or `/theme`), stored in a
-//! global; call sites read it via `Palette::TEXT()` etc.
-
 use ratatui::style::Color;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
-/// A complete color set. `bg` is the base background painted behind everything;
-/// the `*_bg` fields are for specific surfaces (input band, popups, diffs).
 #[derive(Clone, Copy)]
 pub struct Theme {
     pub bg: Color,
@@ -44,8 +36,7 @@ const fn rgb(r: u8, g: u8, b: u8) -> Color {
 }
 
 impl Theme {
-    /// Default dark theme — modeled on kitty's default: a true-black background
-    /// with kitty's bright, slightly saturated ANSI-ish accent set.
+    /// Based on kitty's default palette.
     pub const fn dark() -> Theme {
         Theme {
             bg: rgb(0x00, 0x00, 0x00),
@@ -76,8 +67,7 @@ impl Theme {
         }
     }
 
-    /// Default light theme — modeled on the macOS Terminal "Basic" profile:
-    /// near-black text on a white background, with muted, readable accents.
+    /// Based on macOS Terminal's Basic palette.
     pub const fn light() -> Theme {
         Theme {
             bg: rgb(0xff, 0xff, 0xff),
@@ -201,7 +191,7 @@ impl Theme {
         }
     }
 
-    /// Catppuccin Latte — official palette (catppuccin/palette). A light theme.
+    /// Catppuccin Latte — official palette (catppuccin/palette).
     pub const fn catppuccin_latte() -> Theme {
         Theme {
             bg: rgb(0xef, 0xf1, 0xf5),
@@ -232,9 +222,8 @@ impl Theme {
         }
     }
 
-    /// base16 Default Dark (Chris Kempson). A widely-recognized dark scheme.
+    /// base16 Default Dark (Chris Kempson).
     pub const fn base16_dark() -> Theme {
-        // base00 bg .. base07 text; base08-0F accents.
         let base00 = rgb(0x18, 0x18, 0x18);
         let base01 = rgb(0x28, 0x28, 0x28);
         let base02 = rgb(0x38, 0x38, 0x38);
@@ -318,7 +307,7 @@ impl Theme {
         }
     }
 
-    /// Solarized Dark (Ethan Schoonover) — canonical values.
+    /// Solarized Dark (Ethan Schoonover).
     pub const fn solarized_dark() -> Theme {
         let base03 = rgb(0x00, 0x2b, 0x36); // bg
         let base02 = rgb(0x07, 0x36, 0x42);
@@ -422,7 +411,6 @@ impl Theme {
         }
     }
 
-    /// Resolve a theme by name; unknown names fall back to dark.
     pub fn by_name(name: &str) -> Theme {
         match name.to_ascii_lowercase().as_str() {
             "light" => Theme::light(),
@@ -439,7 +427,6 @@ impl Theme {
         }
     }
 
-    /// The names offered by the `/theme` command and shown in help.
     pub const NAMES: &'static [&'static str] = &[
         "dark",
         "light",
@@ -459,8 +446,6 @@ static ACTIVE: RwLock<Theme> = RwLock::new(Theme::dark());
 /// Bumped on every theme change so render caches can invalidate cheaply.
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 
-/// Select the active theme. Safe at startup or at runtime (`/theme`); the next
-/// render picks it up.
 pub fn set_theme(theme: Theme) {
     if let Ok(mut w) = ACTIVE.write() {
         *w = theme;
@@ -468,8 +453,6 @@ pub fn set_theme(theme: Theme) {
     GENERATION.fetch_add(1, Ordering::Relaxed);
 }
 
-/// The current theme generation. Changes whenever `set_theme` is called; a
-/// render cache keyed on this value invalidates automatically on theme switch.
 pub fn generation() -> u64 {
     GENERATION.load(Ordering::Relaxed)
 }
@@ -478,10 +461,9 @@ fn active() -> Theme {
     ACTIVE.read().map(|t| *t).unwrap_or_else(|_| Theme::dark())
 }
 
-/// Accessor namespace: `Palette::TEXT()` reads the active theme's `text`, etc.
 pub struct Palette;
 
-#[allow(dead_code, non_snake_case)]
+#[allow(non_snake_case)]
 impl Palette {
     pub fn BG() -> Color {
         active().bg

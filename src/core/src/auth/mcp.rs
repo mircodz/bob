@@ -1,7 +1,4 @@
-//! OAuth (authorization-code + PKCE) login for remote MCP servers. Mirrors the
-//! Anthropic flow but is parameterized per server: the endpoints/client-id come
-//! from the server's config, and tokens are stored under the key `mcp:<name>`
-//! in the shared auth store so each remote server keeps its own credentials.
+//! MCP OAuth + PKCE; server credentials are isolated under `mcp:<name>`.
 
 use super::{
     authorize_url, exchange_code, now, pkce, refresh_token, store_tokens, wait_for_callback,
@@ -10,25 +7,16 @@ use super::{
 use crate::core::config::McpOAuthConfig;
 use serde_json::{json, Value};
 
-/// The auth-store key for a given MCP server's credentials.
 fn store_key(server: &str) -> String {
     format!("mcp:{}", server)
 }
 
-/// The localhost port bob listens on for the OAuth redirect during MCP login.
 const MCP_CALLBACK_PORT: u16 = 54546;
 
-/// Discover a server's OAuth configuration by probing its URL and following the
-/// MCP authorization spec: an unauthenticated request returns 401 with a
-/// `WWW-Authenticate` header pointing at protected-resource metadata (RFC 9728),
-/// which names the authorization server whose metadata (RFC 8414) gives the
-/// authorize/token/registration endpoints. If no static client id is known we do
-/// dynamic client registration (RFC 7591). Returns a ready-to-store config.
+/// Discover resource/server metadata (RFC 9728/8414) and register a client (RFC 7591).
 pub async fn discover(server: &str, url: &str) -> anyhow::Result<McpOAuthConfig> {
     let client = reqwest::Client::new();
 
-    // 1. Probe: an unauthenticated JSON-RPC POST should 401 (or point us to
-    //    metadata via WWW-Authenticate).
     let probe = client
         .post(url)
         .header("content-type", "application/json")
@@ -37,8 +25,7 @@ pub async fn discover(server: &str, url: &str) -> anyhow::Result<McpOAuthConfig>
         .send()
         .await?;
 
-    // Find the protected-resource metadata URL: from WWW-Authenticate if present,
-    // else the well-known path derived from the resource URL (RFC 9728 §3.1).
+    // Fall back to the resource's well-known URL per RFC 9728 §3.1.
     let prm_url = probe
         .headers()
         .get("www-authenticate")
@@ -46,7 +33,6 @@ pub async fn discover(server: &str, url: &str) -> anyhow::Result<McpOAuthConfig>
         .and_then(parse_resource_metadata)
         .unwrap_or_else(|| well_known(url, "oauth-protected-resource"));
 
-    // 2. Protected-resource metadata → authorization server(s).
     let prm: Value = client
         .get(&prm_url)
         .send()
@@ -67,7 +53,6 @@ pub async fn discover(server: &str, url: &str) -> anyhow::Result<McpOAuthConfig>
         .ok_or_else(|| anyhow::anyhow!("no authorization_servers in resource metadata"))?
         .to_string();
 
-    // 3. Authorization-server metadata (RFC 8414).
     let asm_url = well_known(&as_base, "oauth-authorization-server");
     let asm: Value = client
         .get(&asm_url)
@@ -100,7 +85,6 @@ pub async fn discover(server: &str, url: &str) -> anyhow::Result<McpOAuthConfig>
         })
         .unwrap_or_default();
 
-    // 4. Dynamic client registration (RFC 7591), if the AS advertises it.
     let redirect_uri = format!("http://localhost:{}/callback", MCP_CALLBACK_PORT);
     let client_id = if let Some(reg) = asm["registration_endpoint"].as_str() {
         let body = json!({
@@ -150,10 +134,8 @@ fn parse_resource_metadata(header: &str) -> Option<String> {
     Some(after[..end].to_string())
 }
 
-/// Build a `.well-known` metadata URL from a base URL, inserting the well-known
-/// segment between the authority and any path component (RFC 8414 §3).
+/// Insert `.well-known/<kind>` before the resource path (RFC 8414 §3).
 fn well_known(base: &str, kind: &str) -> String {
-    // Split scheme://authority from the path.
     let (scheme_authority, path) = match base.find("://") {
         Some(i) => {
             let after = &base[i + 3..];
@@ -184,8 +166,6 @@ fn auth_config(cfg: &McpOAuthConfig) -> AuthCodeConfig {
     }
 }
 
-/// The in-flight login: the URL to open in a browser plus the PKCE/state to
-/// complete with once the redirect arrives.
 pub struct LoginHandle {
     pub url: String,
     pkce: Pkce,
@@ -194,7 +174,7 @@ pub struct LoginHandle {
     server: String,
 }
 
-/// Step 1: build the authorize URL. Caller opens it in a browser.
+/// Open the returned URL in a browser before finishing login.
 pub fn begin_login(server: &str, oauth: &McpOAuthConfig) -> LoginHandle {
     let cfg = auth_config(oauth);
     let pkce = pkce();
@@ -209,8 +189,6 @@ pub fn begin_login(server: &str, oauth: &McpOAuthConfig) -> LoginHandle {
     }
 }
 
-/// Step 2: wait for the browser redirect, exchange the code, store tokens under
-/// `mcp:<server>`.
 pub async fn finish_login(handle: LoginHandle) -> anyhow::Result<()> {
     let code = wait_for_callback(handle.cfg.callback_port, &handle.state).await?;
     let tokens = exchange_code(&handle.cfg, &handle.pkce, &code).await?;
@@ -218,8 +196,7 @@ pub async fn finish_login(handle: LoginHandle) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Store a static bearer token (e.g. a GitHub Personal Access Token) for a
-/// server. It has no expiry and is never refreshed.
+/// Static bearer tokens have no expiry and are never refreshed.
 pub fn store_static_token(server: &str, token: &str) -> anyhow::Result<()> {
     let mut store = AuthStore::load();
     store.set(
@@ -233,8 +210,7 @@ pub fn store_static_token(server: &str, token: &str) -> anyhow::Result<()> {
     store.save()
 }
 
-/// The stored bearer token for a server, if any (used when the server has no
-/// OAuth config — e.g. a Personal Access Token). Returns None if not present.
+/// Bearer token for servers without OAuth configuration.
 pub fn stored_token(server: &str) -> Option<String> {
     AuthStore::load()
         .get(&store_key(server))
@@ -242,8 +218,7 @@ pub fn stored_token(server: &str) -> Option<String> {
         .filter(|t| !t.is_empty())
 }
 
-/// Return a valid access token for the server, refreshing via the token endpoint
-/// if the stored one has expired.
+/// Refresh expired tokens through the server's token endpoint.
 pub async fn access_token(server: &str, oauth: &McpOAuthConfig) -> anyhow::Result<String> {
     let key = store_key(server);
     let store = AuthStore::load();
@@ -258,7 +233,7 @@ pub async fn access_token(server: &str, oauth: &McpOAuthConfig) -> anyhow::Resul
         })?
         .clone();
 
-    // If we have a non-expired token, use it. 60s of slack for clock skew.
+    // Allow 60 seconds for clock skew.
     let expires_at: u64 = cred
         .extra
         .get("expires_at")
@@ -268,7 +243,6 @@ pub async fn access_token(server: &str, oauth: &McpOAuthConfig) -> anyhow::Resul
         return Ok(cred.token);
     }
 
-    // Otherwise refresh, if we can.
     let refresh = cred.refresh_token.ok_or_else(|| {
         anyhow::anyhow!(
             "session for MCP server '{}' expired and no refresh token; run `bob mcp login {}`",
@@ -282,4 +256,89 @@ pub async fn access_token(server: &str, oauth: &McpOAuthConfig) -> anyhow::Resul
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("no access_token in refresh response"))?
         .to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn credential_keys_keep_servers_separate_from_provider_logins() {
+        assert_eq!(store_key("github"), "mcp:github");
+        assert_eq!(store_key("anthropic"), "mcp:anthropic");
+        assert_ne!(store_key("github"), store_key("github-enterprise"));
+        assert_ne!(store_key("anthropic"), "anthropic");
+    }
+
+    #[test]
+    fn quoted_resource_metadata_is_extracted_without_neighboring_parameters() {
+        for header in [
+            "Bearer resource_metadata=\"https://example.invalid/metadata\"",
+            "Bearer realm=\"service\", resource_metadata= \"https://example.invalid/metadata\", error=\"invalid_token\"",
+        ] {
+            assert_eq!(parse_resource_metadata(header).as_deref(), Some("https://example.invalid/metadata"));
+        }
+        for header in [
+            "",
+            "Bearer",
+            "Bearer realm=\"service\"",
+            "Bearer resource_metadata",
+        ] {
+            assert_eq!(parse_resource_metadata(header), None, "{header}");
+        }
+    }
+
+    #[test]
+    fn well_known_metadata_keeps_authority_and_inserts_before_resource_path() {
+        for (base, expected) in [
+            (
+                "https://example.invalid",
+                "https://example.invalid/.well-known/oauth-protected-resource",
+            ),
+            (
+                "https://example.invalid/",
+                "https://example.invalid/.well-known/oauth-protected-resource",
+            ),
+            (
+                "https://example.invalid/mcp/team/",
+                "https://example.invalid/.well-known/oauth-protected-resource/mcp/team",
+            ),
+            (
+                "http://localhost:1234/mcp",
+                "http://localhost:1234/.well-known/oauth-protected-resource/mcp",
+            ),
+            (
+                "http://[::1]:1234/mcp",
+                "http://[::1]:1234/.well-known/oauth-protected-resource/mcp",
+            ),
+        ] {
+            assert_eq!(well_known(base, "oauth-protected-resource"), expected);
+        }
+        assert_eq!(
+            well_known(
+                "https://example.invalid/tenant",
+                "oauth-authorization-server"
+            ),
+            "https://example.invalid/.well-known/oauth-authorization-server/tenant"
+        );
+    }
+
+    #[test]
+    fn oauth_config_preserves_server_settings_and_uses_its_callback_port() {
+        let oauth = McpOAuthConfig {
+            authorize_url: "https://example.invalid/authorize".into(),
+            token_url: "https://example.invalid/token".into(),
+            client_id: "server-client".into(),
+            scope: "read write".into(),
+            callback_port: 12345,
+        };
+        let cfg = auth_config(&oauth);
+        assert_eq!(cfg.client_id, "server-client");
+        assert_eq!(cfg.authorize_url, "https://example.invalid/authorize");
+        assert_eq!(cfg.token_url, "https://example.invalid/token");
+        assert_eq!(cfg.scope, "read write");
+        assert_eq!(cfg.redirect_uri, "http://localhost:12345/callback");
+        assert_eq!(cfg.callback_port, 12345);
+        assert!(cfg.extra_authorize_params.is_empty());
+    }
 }

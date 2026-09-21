@@ -1,24 +1,17 @@
-//! OpenAI-compatible provider (chat/completions). Works against OpenAI itself
-//! and any compatible gateway — the GitHub Copilot proxy, native Copilot,
-//! Ollama, vLLM, etc. Auth is pluggable: a static bearer key, or a dynamic
-//! token source (used by native Copilot, which mints short-lived tokens).
+//! OpenAI-compatible Chat Completions with static or refreshed bearer tokens.
 
 use crate::core::types::*;
-use crate::providers::provider::Provider;
-use crate::providers::sse::parse_sse;
+use crate::providers::provider::{Provider, StreamTimeouts};
+use crate::providers::sse::{parse_sse_control, SseEvent};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-/// The auth seam for the OpenAI-family providers. This is now just the canonical
-/// [`crate::auth::AuthProvider`] — kept as a re-export under the old name so the
-/// existing `TokenSource` call sites (copilot, responses, this module) don't have
-/// to change while the whole workspace converges on one auth trait.
 pub use crate::auth::AuthProvider as TokenSource;
 
-/// The ChatGPT-subscription (Codex) OAuth token source.
 struct OpenAiOauth;
 
 #[async_trait]
@@ -28,45 +21,48 @@ impl TokenSource for OpenAiOauth {
     }
 }
 
-/// Registry constructor for the "openai" provider. Uniform
-/// `async fn create(model, auth)` shape shared by every provider family. A
-/// caller-supplied `ProviderAuth::ApiKey` is used as a `Bearer` token against the
-/// standard `/chat/completions` endpoint. With no explicit auth it routes:
-///   - Logged in with ChatGPT (OAuth) → the **Responses API** against the Codex
-///     backend (chatgpt.com/backend-api/codex), which speaks only /responses.
-///   - Otherwise → the classic /chat/completions provider with an API key.
+/// Explicit API keys select Chat Completions. Otherwise, stored ChatGPT OAuth
+/// selects Codex Responses before falling back to `OPENAI_API_KEY` for chat.
 pub async fn create(
     model: Option<String>,
     auth: Option<crate::auth::ProviderAuth>,
+) -> anyhow::Result<Arc<dyn Provider>> {
+    create_with_options(model, auth, StreamTimeouts::default()).await
+}
+
+pub(crate) async fn create_with_options(
+    model: Option<String>,
+    auth: Option<crate::auth::ProviderAuth>,
+    timeouts: StreamTimeouts,
 ) -> anyhow::Result<Arc<dyn Provider>> {
     use crate::providers::responses::ResponsesProvider;
     if let Some(crate::auth::ProviderAuth::ApiKey(key)) = auth {
         let base = std::env::var("OPENAI_BASE_URL")
             .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
         let source: Arc<dyn TokenSource> = Arc::new(crate::auth::StaticKey(key));
-        return Ok(Arc::new(OpenAiProvider::with_auth(
-            model.unwrap_or_else(|| "gpt-4o".to_string()),
-            base,
-            source,
-        )));
+        return Ok(Arc::new(
+            OpenAiProvider::with_auth(model.unwrap_or_else(|| "gpt-4o".to_string()), base, source)
+                .with_stream_timeouts(timeouts),
+        ));
     }
     if crate::auth::openai::is_logged_in() {
         let source: Arc<dyn TokenSource> = Arc::new(OpenAiOauth);
-        Ok(Arc::new(ResponsesProvider::with_auth(
-            model.unwrap_or_else(|| "gpt-5".to_string()),
-            "https://chatgpt.com/backend-api/codex".to_string(),
-            source,
-        )))
+        Ok(Arc::new(
+            ResponsesProvider::with_auth(
+                model.unwrap_or_else(|| "gpt-5".to_string()),
+                "https://chatgpt.com/backend-api/codex".to_string(),
+                source,
+            )
+            .with_stream_timeouts(timeouts),
+        ))
     } else {
-        Ok(Arc::new(OpenAiProvider::new(model, None)))
+        Ok(Arc::new(
+            OpenAiProvider::new(model, None).with_stream_timeouts(timeouts),
+        ))
     }
 }
 
-/// Shared HTTP client with sane timeouts. A connect timeout prevents hanging on
-/// an unreachable endpoint; we deliberately do NOT set an overall read timeout,
-/// since legitimate streamed generations can run for minutes.
-/// Shared reqwest client builder for the OpenAI-family providers (Chat
-/// Completions + Responses), with a bounded connect timeout.
+/// Bound connection setup, not total read time: streamed generations can take minutes.
 pub(crate) fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(20))
@@ -74,15 +70,15 @@ pub(crate) fn http_client() -> reqwest::Client {
         .unwrap_or_else(|_| reqwest::Client::new())
 }
 
+#[derive(Clone)]
 pub struct OpenAiProvider {
     auth: Arc<dyn TokenSource>,
     model: String,
     base_url: String,
     client: reqwest::Client,
-    /// Explicit context window (input-token budget) for the active model, when a
-    /// caller knows it from an authoritative source (e.g. the Copilot /models
-    /// limits). None → fall back to the id-based heuristic in `context_window_for`.
+    /// Authoritative input-token budget; `None` uses model-name heuristics.
     context_window: Option<usize>,
+    timeouts: StreamTimeouts,
 }
 
 impl OpenAiProvider {
@@ -100,11 +96,10 @@ impl OpenAiProvider {
             base_url,
             client: http_client(),
             context_window: None,
+            timeouts: StreamTimeouts::default(),
         }
     }
 
-    /// Build an OpenAI-compatible provider with a custom auth source + base_url
-    /// (used by the native Copilot provider).
     pub fn with_auth(model: String, base_url: String, auth: Arc<dyn TokenSource>) -> Self {
         OpenAiProvider {
             auth,
@@ -112,14 +107,17 @@ impl OpenAiProvider {
             base_url: base_url.trim_end_matches('/').to_string(),
             client: http_client(),
             context_window: None,
+            timeouts: StreamTimeouts::default(),
         }
     }
 
-    /// Set an authoritative context window (input-token budget), overriding the
-    /// id-based heuristic. Used by the Copilot provider once it has fetched the
-    /// model's real `max_prompt_tokens` limit.
     pub fn with_context_window(mut self, window: Option<usize>) -> Self {
         self.context_window = window;
+        self
+    }
+
+    pub fn with_stream_timeouts(mut self, timeouts: StreamTimeouts) -> Self {
+        self.timeouts = timeouts;
         self
     }
 
@@ -136,29 +134,21 @@ impl OpenAiProvider {
             "stream": stream,
             "messages": messages,
         });
-        // Output cap: omit it unless the caller explicitly pins one, so the server
-        // enforces the model's TRUE maximum. A hardcoded 4096 used to truncate large
-        // tool-call arguments mid-stream (a workflow subagent's `structured_output`),
-        // which the agent loop then retried forever. Only wind-down/compaction pin a
-        // small cap, and those are honored here.
+        // Let the server enforce its output limit unless the caller pins one.
         if let Some(max) = opts.max_tokens {
             body["max_tokens"] = json!(max);
         }
-        // Ask for usage in the streaming case (arrives in a final chunk).
         if stream {
             body["stream_options"] = json!({ "include_usage": true });
         }
         if let Some(t) = opts.temperature {
             body["temperature"] = json!(t);
         }
-        // Reasoning-capable chat models (o-series, gpt-5 family) accept
-        // `reasoning_effort`. Sending it to a non-reasoning model (gpt-4o) is
-        // rejected, so gate on a capability check. Off → omit.
+        // Non-reasoning models reject reasoning_effort; Off omits it.
         if chat_supports_reasoning(&self.model) {
             if let Some(effort) = opts.reasoning.as_str() {
                 body["reasoning_effort"] = json!(effort);
-                // These models don't accept an explicit temperature alongside
-                // reasoning; drop it to avoid a 400.
+                // Reasoning models reject an explicit temperature.
                 body.as_object_mut().map(|o| o.remove("temperature"));
             }
         }
@@ -179,7 +169,6 @@ impl OpenAiProvider {
         body
     }
 
-    /// Apply auth + extra headers to a request builder.
     async fn authed(
         &self,
         mut req: reqwest::RequestBuilder,
@@ -215,10 +204,22 @@ impl Provider for OpenAiProvider {
             .unwrap_or_else(|| crate::providers::provider::context_window_for(&self.model))
     }
     async fn generate(&self, opts: GenerateOptions) -> anyhow::Result<Completion> {
+        crate::providers::provider::generate_with_retry(self, opts, &|_| {}).await
+    }
+
+    async fn generate_once(&self, opts: GenerateOptions) -> anyhow::Result<Completion> {
         let body = self.build_body(&opts, false);
-        let res = crate::providers::provider::send_with_retry(self.request(body).await?, "openai")
-            .await?;
-        let data: Value = res.json().await?;
+        let res = tokio::time::timeout(self.timeouts.startup, async {
+            crate::providers::provider::send_once(self.request(body).await?, "openai").await
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("openai startup deadline exceeded"))??;
+        let data: Value = tokio::time::timeout(
+            self.timeouts.idle,
+            crate::providers::provider::response_json(res),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("openai response body deadline exceeded"))??;
         let choice = &data["choices"][0];
         let cached = data["usage"]["prompt_tokens_details"]["cached_tokens"]
             .as_u64()
@@ -228,9 +229,7 @@ impl Provider for OpenAiProvider {
             message: from_api_message(&choice["message"]),
             stop_reason: map_finish(choice["finish_reason"].as_str().unwrap_or("stop")),
             usage: Usage {
-                // OpenAI's prompt_tokens INCLUDES cached tokens; subtract them so
-                // `input_tokens` means "fresh input" (the Anthropic convention) and
-                // total_input() doesn't double-count the cache read.
+                // prompt_tokens includes cache reads; input_tokens counts fresh input only.
                 input_tokens: prompt.saturating_sub(cached),
                 output_tokens: data["usage"]["completion_tokens"].as_u64().unwrap_or(0),
                 cache_read_input_tokens: cached,
@@ -244,103 +243,115 @@ impl Provider for OpenAiProvider {
         opts: GenerateOptions,
     ) -> anyhow::Result<mpsc::UnboundedReceiver<StreamEvent>> {
         let body = self.build_body(&opts, true);
-        let res = crate::providers::provider::send_with_retry(self.request(body).await?, "openai")
-            .await
-            .map_err(|e| {
-                // Newer models only work over the Responses API. Give an actionable
-                // hint instead of the raw 4xx body.
-                if e.to_string().contains("unsupported_api_for_model") {
-                    anyhow::anyhow!(
-                        "model '{}' needs the Responses API — log in with `bob login openai` \
-                         to use it on a ChatGPT subscription, or pick a chat model (gpt-4o).",
-                        self.model
-                    )
-                } else {
-                    e
-                }
-            })?;
-
+        let provider = self.clone();
         let (tx, rx) = mpsc::unbounded_channel();
         tokio::spawn(async move {
+            let Some(res) = crate::providers::provider::start_stream(
+                &tx, provider.timeouts.startup, async {
+                    crate::providers::provider::send_once(provider.request(body).await?, "openai")
+                        .await.map_err(|error| {
+                            if error.to_string().contains("unsupported_api_for_model") {
+                                anyhow::anyhow!("model '{}' needs the Responses API — log in with `bob login openai` or pick a chat model", provider.model)
+                            } else { error }
+                        })
+                },
+            ).await else { return; };
             let mut text = String::new();
-            let mut finish = "stop".to_string();
+            let mut finish = None;
+            let mut protocol_error = None;
             let mut usage = Usage::default();
             // Tool calls arrive incrementally, keyed by index (ordered).
             let mut tool_acc: BTreeMap<i64, (String, String, String)> = BTreeMap::new();
 
-            let sse = parse_sse(res, |evt| {
-                // The final chunk carries usage with an empty choices array.
-                if let Some(u) = evt.get("usage") {
-                    if !u.is_null() {
-                        let prompt = u["prompt_tokens"].as_u64().unwrap_or(usage.input_tokens);
-                        let cached = u["prompt_tokens_details"]["cached_tokens"]
-                            .as_u64()
-                            .unwrap_or(usage.cache_read_input_tokens);
-                        // prompt_tokens includes cached; store fresh input only so
-                        // total_input() doesn't double-count (Anthropic convention).
-                        usage.input_tokens = prompt.saturating_sub(cached);
-                        usage.output_tokens = u["completion_tokens"]
-                            .as_u64()
-                            .unwrap_or(usage.output_tokens);
-                        usage.cache_read_input_tokens = cached;
+            let consume = parse_sse_control(
+                res,
+                |event| {
+                    let SseEvent::Json(evt) = event else {
+                        return ControlFlow::Break(());
+                    };
+                    if let Some(error) = evt.get("error") {
+                        protocol_error = Some(format!("openai: {error}"));
+                        return ControlFlow::Break(());
                     }
-                }
-                let choice = &evt["choices"][0];
-                if choice.is_null() {
-                    return;
-                }
-                let delta = &choice["delta"];
-
-                if let Some(c) = delta["content"].as_str() {
-                    if !c.is_empty() {
-                        text.push_str(c);
-                        let _ = tx.send(StreamEvent::TextDelta {
-                            text: c.to_string(),
-                        });
-                    }
-                }
-                if let Some(calls) = delta["tool_calls"].as_array() {
-                    for tc in calls {
-                        let idx = tc["index"].as_i64().unwrap_or(0);
-                        let entry = tool_acc.entry(idx).or_insert_with(|| {
-                            let id = tc["id"]
-                                .as_str()
-                                .map(|s| s.to_string())
-                                .unwrap_or_else(|| format!("call_{}", idx));
-                            let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
-                            if !name.is_empty() {
-                                let _ = tx.send(StreamEvent::ToolUseStart {
-                                    id: id.clone(),
-                                    name: name.clone(),
-                                });
-                            }
-                            (id, name, String::new())
-                        });
-                        if entry.1.is_empty() {
-                            if let Some(n) = tc["function"]["name"].as_str() {
-                                entry.1 = n.to_string();
-                            }
+                    // The final chunk carries usage with an empty choices array.
+                    if let Some(u) = evt.get("usage") {
+                        if !u.is_null() {
+                            let prompt = u["prompt_tokens"].as_u64().unwrap_or(
+                                usage
+                                    .input_tokens
+                                    .saturating_add(usage.cache_read_input_tokens),
+                            );
+                            let cached = u["prompt_tokens_details"]["cached_tokens"]
+                                .as_u64()
+                                .unwrap_or(usage.cache_read_input_tokens);
+                            // Exclude cache reads from fresh input tokens.
+                            usage.input_tokens = prompt.saturating_sub(cached);
+                            usage.output_tokens = u["completion_tokens"]
+                                .as_u64()
+                                .unwrap_or(usage.output_tokens);
+                            usage.cache_read_input_tokens = cached;
                         }
-                        if let Some(args) = tc["function"]["arguments"].as_str() {
-                            entry.2.push_str(args);
-                            let _ = tx.send(StreamEvent::ToolUseInputDelta {
-                                id: entry.0.clone(),
-                                partial_json: args.to_string(),
+                    }
+                    let choice = &evt["choices"][0];
+                    if choice.is_null() {
+                        return ControlFlow::Continue(());
+                    }
+                    let delta = &choice["delta"];
+
+                    if let Some(c) = delta["content"].as_str() {
+                        if !c.is_empty() {
+                            text.push_str(c);
+                            let _ = tx.send(StreamEvent::TextDelta {
+                                text: c.to_string(),
                             });
                         }
                     }
-                }
-                if let Some(fr) = choice["finish_reason"].as_str() {
-                    finish = fr.to_string();
-                }
-            })
-            .await;
+                    if let Some(calls) = delta["tool_calls"].as_array() {
+                        for tc in calls {
+                            let idx = tc["index"].as_i64().unwrap_or(0);
+                            let entry = tool_acc.entry(idx).or_insert_with(|| {
+                                let id =
+                                    tc["id"].as_str().map(|s| s.to_string()).unwrap_or_default();
+                                let name =
+                                    tc["function"]["name"].as_str().unwrap_or("").to_string();
+                                if !name.is_empty() {
+                                    let _ = tx.send(StreamEvent::ToolUseStart {
+                                        id: id.clone(),
+                                        name: name.clone(),
+                                    });
+                                }
+                                (id, name, String::new())
+                            });
+                            if let Some(id) = tc["id"].as_str() {
+                                entry.0 = id.to_string();
+                            }
+                            if entry.1.is_empty() {
+                                if let Some(n) = tc["function"]["name"].as_str() {
+                                    entry.1 = n.to_string();
+                                }
+                            }
+                            if let Some(args) = tc["function"]["arguments"].as_str() {
+                                entry.2.push_str(args);
+                                let _ = tx.send(StreamEvent::ToolUseInputDelta {
+                                    id: entry.0.clone(),
+                                    partial_json: args.to_string(),
+                                });
+                            }
+                        }
+                    }
+                    if let Some(fr) = choice["finish_reason"].as_str() {
+                        finish = Some(fr.to_string());
+                    }
+                    ControlFlow::Continue(())
+                },
+                provider.timeouts.idle,
+            );
+            let sse = tokio::select! {
+                biased;
+                _ = tx.closed() => return,
+                result = consume => result,
+            };
 
-            // A transport failure (dropped connection, truncated SSE frame) must NOT
-            // be fabricated into a successful turn: emit a typed stream error so the
-            // agent loop can retry or fail, instead of returning partial text labeled
-            // as a complete answer. (OpenAI Chat has no terminal SSE event, so a clean
-            // EOF is a normal completion — only a parse_sse error is a real failure.)
             if let Err(e) = sse {
                 let _ = tx.send(StreamEvent::Error {
                     message: format!("openai stream ended: {e}"),
@@ -348,13 +359,34 @@ impl Provider for OpenAiProvider {
                 return;
             }
 
+            if let Some(message) = protocol_error {
+                let _ = tx.send(StreamEvent::Error { message });
+                return;
+            }
+            let Some(finish) = finish else {
+                let _ = tx.send(StreamEvent::Error {
+                    message: "openai stream ended without finish_reason".into(),
+                });
+                return;
+            };
             let mut content: Vec<ContentBlock> = Vec::new();
             if !text.is_empty() {
                 content.push(ContentBlock::Text { text });
             }
-            for (_, (id, name, args)) in tool_acc {
-                let input = crate::providers::codec::parse_tool_input(&args);
-                content.push(ContentBlock::ToolUse { id, name, input });
+            if finish != "length" {
+                for (_, (id, name, args)) in tool_acc {
+                    let input =
+                        match crate::providers::codec::complete_tool_input(&id, &name, &args) {
+                            Ok(input) => input,
+                            Err(error) => {
+                                let _ = tx.send(StreamEvent::Error {
+                                    message: format!("openai: {error}"),
+                                });
+                                return;
+                            }
+                        };
+                    content.push(ContentBlock::ToolUse { id, name, input });
+                }
             }
             let completion = Completion {
                 message: Message {
@@ -414,9 +446,7 @@ impl Provider for OpenAiProvider {
                 arr.iter()
                     .filter_map(|m| {
                         let id = m["id"].as_str()?.to_string();
-                        // Prefer the backend's real input budget; some backends
-                        // (OpenAI-proper) omit limits, so fall back to the
-                        // id-based heuristic.
+                        // Backend input-token limits override model-name heuristics.
                         let limits = &m["capabilities"]["limits"];
                         let window = limits["max_prompt_tokens"]
                             .as_u64()
@@ -442,7 +472,6 @@ impl Provider for OpenAiProvider {
 /// false for classic chat models (gpt-4o, gpt-4, gpt-3.5) which reject it.
 pub(crate) fn chat_supports_reasoning(model: &str) -> bool {
     let m = model.to_ascii_lowercase();
-    // o1 / o3 / o4 reasoning models, and the gpt-5 family.
     m.starts_with("o1")
         || m.starts_with("o3")
         || m.starts_with("o4")
@@ -458,12 +487,7 @@ fn map_finish(reason: &str) -> StopReason {
     crate::providers::codec::map_stop_reason(reason)
 }
 
-/// One of our messages may become several OpenAI messages (tool results split).
-///
-/// Every `ContentBlock` is classified by [`classify_block`] with an EXHAUSTIVE
-/// match, so a block this format can't represent is skipped *on purpose* (with a
-/// stated reason) rather than silently dropped by a `_ => None` — the bug this
-/// replaced. A new `ContentBlock` variant won't compile until it's handled.
+/// Tool results split into separate Chat Completions messages.
 fn to_api_messages(m: &Message) -> Vec<Value> {
     if m.role == Role::Tool {
         return m
@@ -489,9 +513,7 @@ fn to_api_messages(m: &Message) -> Vec<Value> {
         match classify_block(b) {
             OpenAiBlock::Text(t) => text.push_str(&t),
             OpenAiBlock::ToolCall(v) => tool_calls.push(v),
-            // A tool_result on a non-Tool message, or a reasoning/thinking block:
-            // chat/completions has no field for these, so they're intentionally
-            // not sent. (Thinking is Anthropic-only; ReasoningItem is Responses-only.)
+            // Tool results require Role::Tool; reasoning blocks have no chat representation.
             OpenAiBlock::ToolResult { .. } | OpenAiBlock::SkipUnsupported => {}
         }
     }
@@ -512,9 +534,6 @@ fn to_api_messages(m: &Message) -> Vec<Value> {
     vec![msg]
 }
 
-/// The chat/completions role a `ContentBlock` maps to. Exhaustive by construction:
-/// the match in [`classify_block`] must cover every `ContentBlock` variant, so a
-/// newly added variant is a compile error here — never a silent drop.
 enum OpenAiBlock {
     Text(String),
     ToolCall(Value),
@@ -522,7 +541,6 @@ enum OpenAiBlock {
         tool_use_id: String,
         content: String,
     },
-    /// Deliberately unsupported by chat/completions (thinking / reasoning items).
     SkipUnsupported,
 }
 
@@ -540,10 +558,9 @@ fn classify_block(b: &ContentBlock) -> OpenAiBlock {
             ..
         } => OpenAiBlock::ToolResult {
             tool_use_id: tool_use_id.clone(),
-            content: content.clone(),
+            content: content.model_text().into_owned(),
         },
-        // No chat/completions representation — thinking is Anthropic's, reasoning
-        // items are the Responses API's. Omitted deliberately, not by accident.
+        // Anthropic thinking and Responses reasoning have no chat representation.
         ContentBlock::Thinking { .. }
         | ContentBlock::RedactedThinking { .. }
         | ContentBlock::ReasoningItem { .. } => OpenAiBlock::SkipUnsupported,
@@ -577,75 +594,348 @@ fn from_api_message(msg: &Value) -> Message {
 
 #[cfg(test)]
 mod tests {
-    use super::chat_supports_reasoning;
+    use super::*;
 
-    #[test]
-    fn reasoning_capability_gate() {
-        assert!(chat_supports_reasoning("o1"));
-        assert!(chat_supports_reasoning("o3-mini"));
-        assert!(chat_supports_reasoning("gpt-5.1"));
-        assert!(chat_supports_reasoning("copilot/gpt-5"));
-        assert!(!chat_supports_reasoning("gpt-4o"));
-        assert!(!chat_supports_reasoning("claude-sonnet-4-5"));
-        assert!(!chat_supports_reasoning("gpt-3.5-turbo"));
+    mod requests {
+        use super::*;
+        use crate::test_support::http::{all_content_blocks, assert_workflow_tool, workflow_spec};
+
+        #[tokio::test]
+        async fn workflow_request_preserves_details_without_root_combiners() {
+            use crate::auth::StaticKey;
+
+            let spec = workflow_spec();
+            let provider = OpenAiProvider::with_auth(
+                "gpt-4o".into(),
+                "https://example.invalid".into(),
+                Arc::new(StaticKey("test".into())),
+            );
+            for stream in [false, true] {
+                let opts = GenerateOptions {
+                    messages: vec![Message {
+                        role: Role::User,
+                        content: vec![ContentBlock::Text {
+                            text: "Hello".into(),
+                        }],
+                    }],
+                    tools: vec![spec.clone()],
+                    ..Default::default()
+                };
+                let request = provider
+                    .request(provider.build_body(&opts, stream))
+                    .await
+                    .unwrap()
+                    .build()
+                    .unwrap();
+                assert_eq!(
+                    request.url().as_str(),
+                    "https://example.invalid/chat/completions"
+                );
+                assert_eq!(request.headers()["authorization"], "Bearer test");
+                assert_eq!(request.headers()["content-type"], "application/json");
+                let payload: Value =
+                    serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap();
+                assert_eq!(payload["tools"][0]["type"], "function");
+                let tool = &payload["tools"][0]["function"];
+                assert_workflow_tool(tool, "parameters", &spec);
+            }
+        }
+
+        #[test]
+        fn reasoning_capability_gate() {
+            assert!(chat_supports_reasoning("o1"));
+            assert!(chat_supports_reasoning("o3-mini"));
+            assert!(chat_supports_reasoning("gpt-5.1"));
+            assert!(chat_supports_reasoning("copilot/gpt-5"));
+            assert!(!chat_supports_reasoning("gpt-4o"));
+            assert!(!chat_supports_reasoning("claude-sonnet-4-5"));
+            assert!(!chat_supports_reasoning("gpt-3.5-turbo"));
+        }
+
+        #[test]
+        fn every_content_block_has_an_explicit_wire_or_skip_expectation() {
+            for block in all_content_blocks() {
+                let (role, expected) = match &block {
+                    ContentBlock::Text { .. } => {
+                        (Role::Assistant, json!({"role":"assistant","content":"hi"}))
+                    }
+                    ContentBlock::ToolUse { .. } => {
+                        let call = json!({
+                            "id":"t1","type":"function",
+                            "function":{"name":"read_file","arguments":"{\"path\":\"a.rs\"}"}
+                        });
+                        (
+                            Role::Assistant,
+                            json!({"role":"assistant","content":null,"tool_calls":[call]}),
+                        )
+                    }
+                    ContentBlock::ToolResult { .. } => (
+                        Role::Tool,
+                        json!({"role":"tool","tool_call_id":"t1","content":"ok"}),
+                    ),
+                    ContentBlock::Thinking { .. }
+                    | ContentBlock::RedactedThinking { .. }
+                    | ContentBlock::ReasoningItem { .. } => {
+                        (Role::Assistant, json!({"role":"assistant","content":null}))
+                    }
+                };
+                let message = Message {
+                    role,
+                    content: vec![block],
+                };
+                assert_eq!(to_api_messages(&message), vec![expected], "{message:?}");
+            }
+        }
+        #[test]
+        fn request_options_gate_reasoning_temperature_and_stream_usage() {
+            for (model, effort, expected_effort, expected_temperature) in [
+                ("gpt-4o", ReasoningEffort::High, None, Some(0.5)),
+                ("o3-mini", ReasoningEffort::Off, None, Some(0.5)),
+                ("o3-mini", ReasoningEffort::Low, Some("low"), None),
+                ("COPILOT/GPT-5", ReasoningEffort::Max, Some("high"), None),
+            ] {
+                let provider = OpenAiProvider::with_auth(
+                    model.into(),
+                    "https://example.invalid/".into(),
+                    Arc::new(crate::auth::StaticKey("test".into())),
+                );
+                for stream in [false, true] {
+                    let options = GenerateOptions {
+                        system: Some("Be precise".into()),
+                        messages: vec![Message::user_text("日本語 😀")],
+                        temperature: Some(0.5),
+                        reasoning: effort,
+                        ..Default::default()
+                    };
+                    let body = provider.build_body(&options, stream);
+                    assert_eq!(
+                        body["messages"],
+                        json!([
+                            {"role":"system","content":"Be precise"},
+                            {"role":"user","content":"日本語 😀"}
+                        ])
+                    );
+                    assert_eq!(body["model"], model);
+                    assert_eq!(body["stream"], stream);
+                    assert_eq!(
+                        body.get("reasoning_effort"),
+                        expected_effort.map(|v| json!(v)).as_ref()
+                    );
+                    assert_eq!(
+                        body.get("temperature"),
+                        expected_temperature.map(|v| json!(v)).as_ref()
+                    );
+                    assert_eq!(
+                        body.get("stream_options"),
+                        stream.then(|| json!({"include_usage":true})).as_ref()
+                    );
+                    assert!(body.get("tools").is_none());
+                    assert!(body.get("max_tokens").is_none());
+                    let pinned = GenerateOptions {
+                        max_tokens: Some(123),
+                        ..options
+                    };
+                    assert_eq!(provider.build_body(&pinned, stream)["max_tokens"], 123);
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn tool_outputs_remain_strings_in_serialized_requests() {
+            let provider = OpenAiProvider::with_auth(
+                "gpt-4o".into(),
+                "https://example.invalid".into(),
+                Arc::new(crate::auth::StaticKey("test".into())),
+            );
+            let (message, shell) = crate::test_support::http::tool_output_fixture();
+            let options = GenerateOptions {
+                messages: vec![message],
+                ..Default::default()
+            };
+            for stream in [false, true] {
+                let request = provider
+                    .request(provider.build_body(&options, stream))
+                    .await
+                    .unwrap()
+                    .build()
+                    .unwrap();
+                let body: Value =
+                    serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap();
+                let content = &body["messages"][0]["content"];
+                let decoded: ShellOutput = serde_json::from_str(content.as_str().unwrap()).unwrap();
+                assert_eq!(decoded, shell);
+                assert_eq!(
+                    body["messages"],
+                    json!([
+                        {"role":"tool","tool_call_id":"shell-call","content":content},
+                        {"role":"tool","tool_call_id":"text-call","content":"plain \"text\"\n日本語"}
+                    ])
+                );
+            }
+        }
+
+        #[test]
+        fn assistant_text_and_multiple_call_ids_and_arguments_are_preserved() {
+            let message = Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Text {
+                        text: "日本語 ".into(),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "call-b".into(),
+                        name: "read_file".into(),
+                        input: json!({"path":"a\nb.rs"}),
+                    },
+                    ContentBlock::Text {
+                        text: "😀".into()
+                    },
+                    ContentBlock::ToolUse {
+                        id: "call-a".into(),
+                        name: "list_agents".into(),
+                        input: json!({}),
+                    },
+                ],
+            };
+            assert_eq!(
+                to_api_messages(&message),
+                vec![json!({
+                    "role":"assistant","content":"日本語 😀","tool_calls":[
+                        {"id":"call-b","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a\\nb.rs\"}"}},
+                        {"id":"call-a","type":"function","function":{"name":"list_agents","arguments":"{}"}}
+                    ]
+                })]
+            );
+            let results = Message {
+                role: Role::Tool,
+                content: vec![
+                    ContentBlock::ToolResult {
+                        tool_use_id: "call-b".into(),
+                        content: "not found".into(),
+                        is_error: Some(true),
+                    },
+                    ContentBlock::ToolResult {
+                        tool_use_id: "call-a".into(),
+                        content: "[]".into(),
+                        is_error: Some(false),
+                    },
+                ],
+            };
+            assert_eq!(
+                to_api_messages(&results),
+                vec![
+                    json!({"role":"tool","tool_call_id":"call-b","content":"not found"}),
+                    json!({"role":"tool","tool_call_id":"call-a","content":"[]"}),
+                ]
+            );
+        }
+
+        #[test]
+        fn response_decoding_keeps_call_identity_and_tags_only_broken_arguments() {
+            let message = from_api_message(&json!({"content":"日本語 😀","tool_calls":[
+                {"id":"call-1","function":{"name":"read_file","arguments":"{\"path\":\"日本語.rs\"}"}},
+                {"id":"call-2","function":{"name":"read_file","arguments":"{\"path\":"}}
+            ]}));
+            assert_eq!(message.role, Role::Assistant);
+            assert_eq!(message.content.len(), 3);
+            assert!(
+                matches!(&message.content[0], ContentBlock::Text { text } if text == "日本語 😀")
+            );
+            assert!(
+                matches!(&message.content[1], ContentBlock::ToolUse { id, name, input }
+                if id == "call-1" && name == "read_file" && input == &json!({"path":"日本語.rs"}))
+            );
+            let ContentBlock::ToolUse { id, name, input } = &message.content[2] else {
+                panic!("missing malformed call: {message:?}");
+            };
+            assert_eq!(id, "call-2");
+            assert_eq!(name, "read_file");
+            assert_eq!(
+                input[crate::providers::codec::TOOL_ARGS_PARSE_ERROR_KEY]["raw"],
+                "{\"path\":"
+            );
+            assert!(crate::providers::codec::tool_input_parse_error(input).is_some());
+        }
     }
 
-    #[test]
-    fn text_and_tool_use_survive_conversion() {
+    mod streams {
         use super::*;
-        // The regression that motivated the codec seam: text + tool_use in one
-        // assistant message must BOTH appear on the wire (previously two separate
-        // filter_maps, now one exhaustive classify_block).
-        let m = Message {
-            role: Role::Assistant,
-            content: vec![
-                ContentBlock::Text {
-                    text: "let me look".into(),
-                },
-                ContentBlock::ToolUse {
-                    id: "t1".into(),
-                    name: "read_file".into(),
-                    input: json!({"path": "a.rs"}),
-                },
-            ],
-        };
-        let out = to_api_messages(&m);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0]["content"], json!("let me look"));
-        assert_eq!(
-            out[0]["tool_calls"][0]["function"]["name"],
-            json!("read_file")
-        );
-    }
+        use crate::auth::StaticKey;
+        use crate::test_support::http::*;
 
-    #[test]
-    fn tool_result_message_maps_to_tool_role() {
-        use super::*;
-        let m = Message {
-            role: Role::Tool,
-            content: vec![ContentBlock::ToolResult {
-                tool_use_id: "t1".into(),
-                content: "42".into(),
-                is_error: Some(false),
-            }],
-        };
-        let out = to_api_messages(&m);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0]["role"], json!("tool"));
-        assert_eq!(out[0]["tool_call_id"], json!("t1"));
-        assert_eq!(out[0]["content"], json!("42"));
-    }
+        fn chat(base: String, timeouts: StreamTimeouts) -> Arc<dyn Provider> {
+            Arc::new(
+                OpenAiProvider::with_auth("test".into(), base, Arc::new(StaticKey("test".into())))
+                    .with_stream_timeouts(timeouts),
+            )
+        }
 
-    #[test]
-    fn every_content_block_is_classified_not_dropped() {
-        use super::*;
-        use crate::providers::codec::conformance::all_content_blocks;
-        // The anti-silent-drop guarantee: classify_block covers EVERY ContentBlock
-        // variant. Unsupported ones (thinking/reasoning) are SkipUnsupported by
-        // intent — never an accidental fall-through. If a new variant is added
-        // without a classify_block arm, this file won't compile.
-        for b in all_content_blocks() {
-            let _ = classify_block(&b); // exhaustive match — compile-time proof
+        #[tokio::test]
+        async fn chat_terminal_eof_deadlines_and_cancellation() {
+            lifecycle_checks(
+                chat,
+                "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn chat_requires_finish_reason_even_after_done() {
+            let (base, server) = serve("data: [DONE]\n\n", false).await;
+            assert_error(&collect(chat(base, deadlines())).await);
+            server.await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn chat_finish_at_eof_preserves_final_usage() {
+            let body = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":5,\"prompt_tokens_details\":{\"cached_tokens\":40}}}\n\n";
+            let (base, server) = serve(body, false).await;
+            let events = collect(chat(base, deadlines())).await;
+            let completion = events
+                .iter()
+                .find_map(|event| match event {
+                    StreamEvent::MessageStop { completion } => Some(completion),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(completion.usage.input_tokens, 60);
+            assert_eq!(completion.usage.cache_read_input_tokens, 40);
+            assert_eq!(completion.usage.output_tokens, 5);
+            assert_eq!(completion.message.role, Role::Assistant);
+            assert_eq!(completion.stop_reason, StopReason::EndTurn);
+            assert_eq!(completion.usage.cache_creation_input_tokens, 0);
+            assert_eq!(
+                serde_json::to_value(&completion.message.content).unwrap(),
+                json!([{"type":"text","text":"ok"}])
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| matches!(e, StreamEvent::MessageStop { .. }))
+                    .count(),
+                1
+            );
+            assert!(!events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::Error { .. })));
+            server.await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn chat_requires_complete_tool_arguments_and_real_ids() {
+            for (id, args) in [
+                ("call1", "{\"path\":"),
+                ("call1", ""),
+                ("", "{}"),
+                ("call1", "[]"),
+            ] {
+                let delta = json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":id,"function":{"name":"read_file","arguments":args}}]},"finish_reason":"tool_calls"}]});
+                let body = format!("data: {delta}\n\ndata: [DONE]\n\n");
+                let (base, server) = serve(&body, false).await;
+                assert_error(&collect(chat(base, deadlines())).await);
+                server.await.unwrap();
+            }
         }
     }
 }

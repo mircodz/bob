@@ -1,8 +1,3 @@
-//! Markdown → ratatui Lines pre-renderer. Mirrors the TS markdown_render pivot:
-//! parse the whole block with pulldown-cmark, emit styled `Line`s once, rather
-//! than using a live widget. Code fences go through syntect; ```diff fences go
-//! through the diff renderer.
-
 use super::diffview::render_diff;
 use super::highlight::highlight;
 use super::render::{safe_display_text, sanitize_display_lines};
@@ -11,7 +6,6 @@ use pulldown_cmark::{Alignment, Event, HeadingLevel, Options, Parser, Tag, TagEn
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
-/// Render a markdown string into styled lines.
 pub fn render_markdown(md: &str) -> Vec<Line<'static>> {
     let md = safe_display_text(md);
     let mut r = Renderer::default();
@@ -28,19 +22,15 @@ pub fn render_markdown(md: &str) -> Vec<Line<'static>> {
 #[derive(Default)]
 struct Renderer {
     lines: Vec<Line<'static>>,
-    /// Spans accumulated for the current line.
     cur: Vec<Span<'static>>,
-    /// Active inline style stack (bold/italic/etc combine).
     style: Style,
     style_stack: Vec<Style>,
     /// List nesting: each entry is Some(next_number) for ordered, None for bullet.
     list_stack: Vec<Option<u64>>,
     blockquote_depth: usize,
-    // Code fence state.
     in_code: bool,
     code_lang: String,
     code_buf: String,
-    // Table state.
     in_table: bool,
     aligns: Vec<Alignment>,
     table_rows: Vec<Vec<String>>,
@@ -51,9 +41,7 @@ struct Renderer {
 
 impl Renderer {
     fn push_span(&mut self, text: impl Into<String>, style: Style) {
-        // Default any span without an explicit foreground to the theme's body
-        // text color, so plain text is never left to inherit the terminal's own
-        // foreground (which would be unreadable on a forced light/dark bg).
+        // Explicit foreground preserves contrast against the theme background.
         let style = if style.fg.is_none() {
             style.fg(Palette::TEXT())
         } else {
@@ -62,7 +50,6 @@ impl Renderer {
         self.cur.push(Span::styled(text.into(), style));
     }
 
-    /// Commit the current spans as a line (prefixing blockquote bars).
     fn flush_line(&mut self) {
         let mut spans = Vec::new();
         for _ in 0..self.blockquote_depth {
@@ -76,7 +63,6 @@ impl Renderer {
     }
 
     fn blank(&mut self) {
-        // Avoid stacking multiple blank lines.
         if matches!(self.lines.last(), Some(l) if l.width() == 0) {
             return;
         }
@@ -144,8 +130,7 @@ impl Renderer {
                 self.blank();
                 self.in_code = true;
                 self.code_buf.clear();
-                // Keep the full info string ("diff", "rust", or "diff src/x.rs")
-                // so the diff renderer can pick a syntax from the tagged path.
+                // Preserve the tagged path so diff content gets the correct syntax.
                 self.code_lang = match kind {
                     pulldown_cmark::CodeBlockKind::Fenced(info) => info.to_string(),
                     _ => String::new(),
@@ -224,8 +209,6 @@ impl Renderer {
                 self.in_code = false;
                 let code = std::mem::take(&mut self.code_buf);
                 let code = code.strip_suffix('\n').unwrap_or(&code).to_string();
-                // Split the info string into first token + remainder, e.g.
-                // "diff src/x.rs" → ("diff", "src/x.rs"); "rust" → ("rust", "").
                 let mut parts = self.code_lang.splitn(2, char::is_whitespace);
                 let kind = parts.next().unwrap_or("");
                 let arg = parts.next().unwrap_or("").trim();
@@ -273,7 +256,6 @@ impl Renderer {
         }
     }
 
-    /// Draw the accumulated table with box borders and column alignment.
     fn render_table(&mut self) {
         let rows = std::mem::take(&mut self.table_rows);
         if rows.is_empty() {
@@ -332,7 +314,6 @@ impl Renderer {
         if !self.cur.is_empty() {
             self.flush_line();
         }
-        // Trim a trailing blank line.
         while matches!(self.lines.last(), Some(l) if l.width() == 0) {
             self.lines.pop();
         }
@@ -370,6 +351,42 @@ fn heading_num(level: HeadingLevel) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::style::Modifier;
+
+    #[test]
+    fn nested_inline_styles_restore_outer_and_plain_styles() {
+        let lines = render_markdown("**bold *both* bold** plain ~~gone~~ end");
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].to_string(), "bold both bold plain gone end");
+        let spans = &lines[0].spans;
+        for (text, modifiers) in [
+            ("bold ", Modifier::BOLD),
+            ("both", Modifier::BOLD | Modifier::ITALIC),
+            (" bold", Modifier::BOLD),
+            (" plain ", Modifier::empty()),
+            ("gone", Modifier::CROSSED_OUT),
+            (" end", Modifier::empty()),
+        ] {
+            let span = spans
+                .iter()
+                .find(|span| span.content == text)
+                .expect("expected inline segment");
+            assert_eq!(span.style.add_modifier, modifiers, "{text}");
+        }
+    }
+
+    #[test]
+    fn table_cell_padding_distributes_odd_center_space_without_truncation() {
+        for (alignment, expected) in [
+            (Alignment::None, "ab   "),
+            (Alignment::Left, "ab   "),
+            (Alignment::Right, "   ab"),
+            (Alignment::Center, " ab  "),
+        ] {
+            assert_eq!(pad_cell("ab", 5, alignment), expected);
+            assert_eq!(pad_cell("already long", 3, alignment), "already long");
+        }
+    }
 
     #[test]
     fn markdown_strips_controls_before_parsing_and_preserves_styles() {
@@ -380,9 +397,7 @@ mod tests {
             "| heading |\n| --- |\n| 日本語 |",
         ] {
             let raw = format!("\u{1b}[31m{clean}\u{1b}[0m\u{1b}]52;c;payload\u{7}");
-            let original = raw.clone();
             assert_eq!(render_markdown(&raw), render_markdown(clean));
-            assert_eq!(raw, original);
         }
     }
 

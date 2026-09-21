@@ -1,17 +1,19 @@
-//! The ratatui TUI: retained view model + async draw loop. Wires the same
-//! bob-core the CLI uses, but renders events into a pretty scrollback with
-//! markdown, syntax-highlighted code, diffs, and pretty tool cells.
-
 mod clipboard;
 mod diffview;
 mod draw;
+mod exploration;
 mod files;
 mod highlight;
 mod input;
 mod markdown;
+mod prompts;
 mod render;
 mod scrollback;
+mod session_ui;
 mod team;
+mod terminal;
+use terminal::restore_terminal;
+pub(super) use terminal::TerminalGuard;
 mod theme;
 mod view;
 mod widgets;
@@ -27,20 +29,16 @@ use bob_core::core::policies::{
     flag_dangerous_bash, flag_out_of_workspace_paths,
 };
 use bob_core::core::session::Session;
-use bob_core::providers::create_provider;
+use bob_core::providers::create_provider_with_options;
 use bob_core::providers::provider::Provider;
 
 use async_trait::async_trait;
 use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event as CtEvent, EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseButton,
-    MouseEventKind,
+    EnableBracketedPaste, EnableMouseCapture, Event as CtEvent, EventStream, KeyCode, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEventKind,
 };
 use crossterm::execute;
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, BeginSynchronizedUpdate, EndSynchronizedUpdate,
-    EnterAlternateScreen, LeaveAlternateScreen,
-};
+use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen};
 use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
@@ -51,29 +49,22 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot, Mutex};
-use view::ViewModel;
+use view::{Cell, ViewModel};
 
-/// Build a "shimmer" version of `text`: a bright band sweeps across the glyphs as
-/// a working indicator. `tick` advances the wave; each glyph's brightness is its
-/// distance from the moving crest, lerped between a dim base and a bright peak.
 pub(super) fn shimmer_spans(text: &str, tick: usize) -> Vec<Span<'static>> {
-    // Base (dim) and peak (bright) endpoints of the gradient.
     const BASE: (f32, f32, f32) = (0x66 as f32, 0x66 as f32, 0x66 as f32);
     const PEAK: (f32, f32, f32) = (0xf0 as f32, 0xf0 as f32, 0xf0 as f32);
     let chars: Vec<char> = text.chars().collect();
     let n = chars.len().max(1) as f32;
-    // The crest travels across the text and a bit beyond, then wraps, so there's
-    // a brief "rest" before the next sweep. Period is a touch longer than n.
+    // Travel beyond the text for a pause between sweeps.
     let span = n + 6.0;
     let pos = (tick as f32 * 0.6) % span;
-    // Width of the bright band, in characters.
     let width = 3.0_f32;
     chars
         .into_iter()
         .enumerate()
         .map(|(i, c)| {
             let d = (i as f32 - pos).abs();
-            // Smooth falloff: 1.0 at the crest, 0.0 past `width`.
             let t = if d >= width { 0.0 } else { 1.0 - d / width };
             let t = t * t * (3.0 - 2.0 * t); // smoothstep
             let lerp = |a: f32, b: f32| (a + (b - a) * t) as u8;
@@ -87,8 +78,6 @@ pub(super) fn shimmer_spans(text: &str, tick: usize) -> Vec<Span<'static>> {
         .collect()
 }
 
-/// Payload sent from the asker to the UI loop: what's being requested plus the
-/// choices, and a channel to return the chosen index.
 struct PermPrompt {
     title: String,
     detail: String,
@@ -97,7 +86,6 @@ struct PermPrompt {
     resp: oneshot::Sender<Option<usize>>,
 }
 
-/// A pending permission ask surfaced to the UI, plus its live selection cursor.
 struct PendingPerm {
     title: String,
     detail: String,
@@ -107,18 +95,15 @@ struct PendingPerm {
     resp: oneshot::Sender<Option<usize>>,
 }
 
-/// Asker that hands the request to the UI loop and awaits the chosen option.
 struct TuiAsker {
     tx: mpsc::UnboundedSender<PermPrompt>,
 }
 
-/// A user question posed by ask_user / exit_plan, sent to the UI loop.
 struct QueryPrompt {
     query: bob_core::tools::registry::UserQuery,
     resp: oneshot::Sender<Option<String>>,
 }
 
-/// The UI-side asker for user questions (ask_user / exit_plan).
 struct TuiUserAsker {
     tx: mpsc::UnboundedSender<QueryPrompt>,
 }
@@ -141,28 +126,24 @@ impl bob_core::tools::registry::UserAsker for TuiUserAsker {
     }
 }
 
-/// What a pending question is for — routes how the answer is handled.
 enum QueryPurpose {
-    /// From a tool (ask_user / exit_plan): answer goes back via the oneshot.
+    /// Return tool answers over the oneshot; UI picker answers become actions.
     Tool(oneshot::Sender<Option<String>>),
-    /// UI-initiated model picker: the answer is a model spec to switch to.
     ModelPicker,
-    /// Reasoning-effort picker (chained after the model picker): the answer is
-    /// an effort label (off/low/medium/high/max).
     ReasoningPicker,
-    /// Theme picker: moving the selection live-previews that theme; Enter
-    /// persists it, Esc reverts to the theme active when the picker opened.
-    ThemePicker { original: String },
+    /// Enter persists the live preview; Esc restores the original theme.
+    ThemePicker {
+        original: String,
+    },
 }
 
-/// A pending user question in the UI, with its live selection + optional
-/// free-text ("Other…") entry buffer.
 struct PendingQuery {
     query: bob_core::tools::registry::UserQuery,
     /// Selection cursor over the options (+ the "Other" row when allowed).
     list: widgets::SelectList,
     /// When the user picks "Other", this holds the typed answer (Some = typing).
     other_text: Option<String>,
+    inspection: prompts::QueryScroll,
     purpose: QueryPurpose,
 }
 
@@ -172,12 +153,10 @@ impl Asker for TuiAsker {
         let (title, detail, preview) = if req.tool == "bash" {
             let bash = req.bash.as_ref();
             let raw = bash.map(|b| b.raw.clone()).unwrap_or_default();
-            // Surface exactly what the line will run. With the AST parser a piped or
-            // substituted command may run several programs the raw string hides;
-            // list them so the user sees the real footprint before approving.
+            // Include programs inside pipelines and substitutions in the approval preview.
             let preview = bash.and_then(|b| {
                 if !b.analyzable {
-                    Some("⚠ couldn't fully parse this command — review it carefully.".to_string())
+                    Some("[!] couldn't fully parse this command — review it carefully.".to_string())
                 } else {
                     let names = b.program_names();
                     if names.len() > 1 {
@@ -195,8 +174,6 @@ impl Asker for TuiAsker {
                 req.preview.clone(),
             )
         };
-        // When a spawned/workflow agent is the requester, name it so a fan-out's
-        // prompts make clear WHO wants the permission.
         let title = match &req.agent {
             Some(name) => format!("{title}  — for {name}"),
             None => title,
@@ -216,7 +193,6 @@ impl Asker for TuiAsker {
     }
 }
 
-/// A short human description of a non-bash tool's key argument.
 fn describe_input(tool: &str, input: &serde_json::Value) -> String {
     let arg = |k: &str| {
         input
@@ -248,7 +224,6 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// Compact token count: 1234 → "1.2k", 2_000_000 → "2.0M".
 fn fmt_tokens(n: u64) -> String {
     if n >= 1_000_000 {
         format!("{:.1}M", n as f64 / 1_000_000.0)
@@ -259,7 +234,6 @@ fn fmt_tokens(n: u64) -> String {
     }
 }
 
-/// Format a whole-second duration compactly: "12s", "1m23s", "45m".
 pub(super) fn fmt_duration(secs: u64) -> String {
     if secs < 60 {
         format!("{secs}s")
@@ -275,8 +249,6 @@ pub(super) fn fmt_duration(secs: u64) -> String {
     }
 }
 
-/// Compact context-window label for the model picker, e.g. 1_000_000 → "1M ctx",
-/// 400_000 → "400k ctx". Trailing ".0" is trimmed so 1M reads as "1M", not "1.0M".
 fn fmt_ctx_window(tokens: usize) -> String {
     let n = tokens as f64;
     let mag = if tokens >= 1_000_000 {
@@ -291,13 +263,11 @@ fn fmt_ctx_window(tokens: usize) -> String {
     format!("{} ctx", mag)
 }
 
-/// Format a float with one decimal, dropping a trailing ".0" (1.0 → "1", 1.5 → "1.5").
 fn trim_dot(v: f64) -> String {
     let s = format!("{:.1}", v);
     s.trim_end_matches(".0").to_string()
 }
 
-/// Display path with $HOME collapsed to `~`.
 fn abbreviate_home(path: &std::path::Path) -> String {
     let full = path.to_string_lossy().to_string();
     if let Some(home) = dirs::home_dir() {
@@ -309,18 +279,9 @@ fn abbreviate_home(path: &std::path::Path) -> String {
     full
 }
 
-/// Current git branch name, if `path` is inside a git repo. Best-effort.
-fn git_branch(path: &std::path::Path) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+async fn git_branch(path: &std::path::Path) -> Option<String> {
+    let out = files::git_output(path, &["rev-parse", "--abbrev-ref", "HEAD"], 4096).await?;
+    let name = String::from_utf8_lossy(&out).trim().to_string();
     if name.is_empty() {
         None
     } else {
@@ -328,14 +289,11 @@ fn git_branch(path: &std::path::Path) -> Option<String> {
     }
 }
 
-/// Spawn a turn: lock the agent, run the prompt to completion, then signal done
-/// with the error message (if any) so the UI can surface failures instead of
-/// silently ending the turn.
 fn spawn_turn(
     agent: &Arc<Mutex<Agent>>,
     done_tx: &mpsc::UnboundedSender<Option<String>>,
     text: String,
-) {
+) -> tokio::task::JoinHandle<()> {
     let agent = agent.clone();
     let done_tx = done_tx.clone();
     tokio::spawn(async move {
@@ -345,102 +303,60 @@ fn spawn_turn(
             Err(e) => Some(e.to_string()),
         };
         let _ = done_tx.send(err);
-    });
+    })
 }
 
-/// The result of a piece of work run off the event loop, applied back on the
-/// loop thread via [`App::apply_bg`]. To offload any new expensive feature: add
-/// a variant here, call [`spawn_bg`] with a future that produces it, and handle
-/// it in `apply_bg`. No other plumbing — the select loop already drains these.
+/// Off-loop work delivered back to the UI through `apply_bg`.
 enum BgOutcome {
-    /// A provider was (re)built for a model switch (slow: network/auth). Ok holds
-    /// the resolved `provider_id` + the ready provider; Err is a message.
     ProviderSwitched(Result<(String, Arc<dyn Provider>), String>),
-    /// A provider's model list came back for the `/models` picker.
     ModelList(Result<Vec<String>, String>),
-    /// The `@file` candidate list finished gathering (git ls-files / walk).
     FileList(Vec<String>),
-    /// A `/compact` finished off the event loop (summarization is a network call,
-    /// so it must not run inline or it freezes the UI). Carries the live indicator
-    /// cell index to finalize, whether anything was compacted, and the before/after
-    /// token estimate.
     Compacted {
         cell: usize,
-        did: bool,
-        before: usize,
-        after: usize,
+        result: Result<(bool, usize, usize), String>,
     },
-    /// An off-thread session blob save failed. Carries the error to notice.
     SessionSaveFailed(String),
 }
 
-/// Run `fut` off the event loop and deliver its [`BgOutcome`] back to the UI.
-/// This is the single seam for keeping the render/input loop responsive: the
-/// expensive work happens on a Tokio worker, the cheap UI update happens on the
-/// loop when the outcome arrives.
-fn spawn_bg<F>(tx: &mpsc::UnboundedSender<BgOutcome>, fut: F)
+fn spawn_bg<F>(tx: &mpsc::UnboundedSender<BgOutcome>, fut: F) -> tokio::task::JoinHandle<()>
 where
     F: std::future::Future<Output = BgOutcome> + Send + 'static,
 {
     let tx = tx.clone();
     tokio::spawn(async move {
         let _ = tx.send(fut.await);
-    });
+    })
 }
 
-/// Entry point: assemble core with a TUI asker and run the loop.
 pub async fn run(
     config: BobConfig,
     provider: Arc<dyn Provider>,
     provider_spec: String,
     cwd: PathBuf,
     mut session: Session,
-) -> anyhow::Result<()> {
-    // Select the color theme from config before anything renders.
+) -> anyhow::Result<String> {
     theme::set_theme(theme::Theme::by_name(
         config.theme.as_deref().unwrap_or("dark"),
     ));
 
     let bus = EventBus::new();
 
-    // Bridge bus events → an async channel the UI loop drains. Subagent chatter
-    // (tool calls/results/text from spawned `task_*` agents) is suppressed to
-    // avoid noise; only the root agent's stream and subagent *spawn* notices
-    // reach the UI. The task tool feeds each subagent's final result back to the
-    // root as a normal tool result, so nothing important is lost.
     let (evt_tx, mut evt_rx) = mpsc::unbounded_channel::<AgentEvent>();
     {
         let evt_tx = evt_tx.clone();
         bus.on(Arc::new(move |e: &AgentEvent| {
-            // Every event is forwarded to the UI channel; the apply site routes each
-            // to the main transcript or a agent thread by agent id.
+            // Route by agent id when applying events, not when forwarding them.
             let _ = evt_tx.send(e.clone());
         }));
     }
 
-    // Shadow-write every event to the append-only log (Stage 1). A dedicated
-    // writer thread owns the DB connection, so this listener only enqueues and
-    // never blocks the agent's async task on a SQLite write. The blob save at
-    // turn-end is still authoritative until replay-on-load lands (Stage 2).
-    // The session store (default: the shared SQLite DB). Owns the background
-    // event-log writer thread; a single instance serializes all event appends and
-    // is the seam the SDK builder will accept. Non-blocking append keeps the
-    // agent's async task off the SQLite write path.
+    // The store's writer thread keeps event appends off the async task.
     let store: Arc<dyn bob_core::core::store::SessionStore> =
-        Arc::new(bob_core::core::store::SqliteStore::default());
-    {
-        let store = store.clone();
-        let session_id = session.id.clone();
-        bus.on(Arc::new(move |e: &AgentEvent| {
-            store.append_event(&session_id, e);
-        }));
-    }
+        Arc::new(tokio::task::spawn_blocking(bob_core::core::store::SqliteStore::default).await?);
 
-    // Permission asker → UI channel.
     let (perm_tx, mut perm_rx) = mpsc::unbounded_channel::<PermPrompt>();
     let asker = Arc::new(TuiAsker { tx: perm_tx });
 
-    // User-question asker (ask_user / exit_plan) → UI channel.
     let (query_tx, mut query_rx) = mpsc::unbounded_channel::<QueryPrompt>();
     let user_asker = Arc::new(TuiUserAsker { tx: query_tx });
 
@@ -450,45 +366,34 @@ pub async fn run(
         _ => Decision::Ask,
     };
     let mut engine = PermissionEngine::new(default_decision, Some(asker));
+    engine.add(deny_tools(config.permissions.deny.clone()));
     engine.add(flag_out_of_workspace_paths());
+    engine.add(flag_dangerous_bash());
     engine.add(allow_read_only());
     engine.add(allow_code_action_list());
-    engine.add(flag_dangerous_bash());
     engine.add(allow_bash_commands(config.permissions.allow_bash.clone()));
     engine.add(allow_tools(config.permissions.allow.clone()));
-    engine.add(deny_tools(config.permissions.deny.clone()));
     let permissions = Arc::new(engine);
-    // Restore any "always allow" grants saved with this session.
     if !session.grants.is_empty() {
         permissions.import_grants(session.grants.clone());
     }
 
-    // Shared background-job registry: the same instance is handed to the root
-    // agent, the task tool, and the UI panel so all three see the same jobs.
     let jobs = bob_core::tools::jobs::JobRegistry::new();
 
-    // Shared team roster for agent coordination (spawn_agent/send_message/
-    // list_agents). Root + every spawned agent share this instance.
     let team = bob_core::agent::team::AgentRegistry::new();
 
-    // Connect to any configured MCP servers (bob is the MCP *client*). Their
-    // tools are namespaced `<server>.<tool>` and handed to root + subagents.
     let (mcp_tools, mcp_notices) = bob_core::mcp::connect_all(&config.mcp_servers).await;
 
-    // Start any configured language servers in the background. This returns
-    // immediately; servers initialize + index without blocking the session.
     let lsp = if config.lsp_servers.is_empty() {
         None
     } else {
         Some(bob_core::lsp::LspManager::start(&config.lsp_servers, &cwd))
     };
 
-    // Compose the system prompt: the base bob prompt (or a config override) plus
-    // a live environment block and any AGENTS.md/CLAUDE.md project context.
     let system_prompt =
         bob_core::agent::prompt::build_system_prompt(config.system.as_deref(), &cwd);
+    let memory = store.memory_repository();
 
-    // Build the fully-wired root agent (tools + coordination + team mailbox).
     let mut agent =
         bob_core::agent::assembly::build_root_agent(bob_core::agent::assembly::RootAgentParams {
             provider: provider.clone(),
@@ -505,33 +410,35 @@ pub async fn run(
             max_turns: config.max_turns,
             definitions: std::collections::HashMap::new(),
             hooks: bob_core::agent::hooks::Hooks::default(),
+            memory,
         });
-    if !session.messages.is_empty() {
-        // Seed the agent from the event log when it's authoritative (blob fallback
-        // via the shared guard), matching what the view replays below.
-        let history = store.history_for(&session);
-        agent.load_history(history);
+    let history = store.history_for(&session)?;
+    let working = store.working_history_for(&session)?;
+    let archived_events = store.load_events(&session.id)?.unwrap_or_default();
+    let epoch = bob_core::core::session::context_epoch(&archived_events);
+    if epoch > session.context_epoch {
+        session.context_epoch = epoch;
+        session.todos.clear();
+        session.subagent_runs.clear();
+        session.agent_threads.clear();
+        session.workflows.clear();
     }
-    // Grab the cancel handle before moving the agent behind the mutex, so the UI
-    // can interrupt a running turn without needing to lock the (busy) agent.
+    session.messages = history.clone();
+    bob_core::core::session_runtime::reserve_runtime_ids(&session, &archived_events, &jobs);
+    agent.load_histories(history, working);
+    // Cancellation must not need the mutex held by the running turn.
     let cancel = agent.cancel_handle();
     let todos = agent.todos();
-    // Restore the persisted todo list so the panel survives a resume.
     if !session.todos.is_empty() {
         todos.set(session.todos.clone());
     }
-    // Apply the saved reasoning effort (config `reasoning`), so a level chosen in a
-    // prior session is in force from the first turn. Empty/unknown → Off.
     let startup_reasoning = bob_core::core::types::ReasoningEffort::parse(&config.reasoning)
         .unwrap_or(bob_core::core::types::ReasoningEffort::Off);
     agent.set_reasoning(startup_reasoning);
     let agent = Arc::new(Mutex::new(agent));
 
-    // --- terminal setup ---
-    // Restore the terminal from a single place (RAII + panic hook) so a panic in
-    // the draw path or any `?`-propagated error can't leave the user's shell in
-    // raw mode / the alternate screen.
-    enable_raw_mode()?;
+    // Activate the restore guard before any fallible terminal setup.
+    let _guard = TerminalGuard::activate()?;
     let mut stdout = std::io::stdout();
     execute!(
         stdout,
@@ -539,11 +446,7 @@ pub async fn run(
         EnableBracketedPaste,
         EnableMouseCapture
     )?;
-    // A guard whose Drop restores the terminal, covering both the normal return
-    // and any early `?`/unwind out of `run`.
-    let _guard = TerminalGuard;
-    // On panic, restore the terminal *before* the default hook prints the panic
-    // message, so the backtrace is readable and the shell isn't wrecked.
+    // Restore before the panic hook prints the backtrace.
     {
         let default_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
@@ -560,38 +463,33 @@ pub async fn run(
         cancel.clone(),
         team.clone(),
     );
+    let owner = bob_core::core::session_runtime::SessionOwner::new(store.clone(), &session);
+    let mut session_subscription = owner.subscribe(&bus);
     app.provider_id = provider_spec.split(':').next().unwrap_or("").to_string();
     app.model_label = provider.model().to_string();
-    // Reflect the saved reasoning effort in the status bar from launch.
     app.reasoning = startup_reasoning;
     app.cwd_label = abbreviate_home(&cwd);
-    app.branch = git_branch(&cwd);
+    app.branch = git_branch(&cwd).await;
+    app.context_usage = agent.try_lock().ok().map(|agent| agent.context_usage());
     app.lsp = lsp.clone();
     app.bus = bus.clone();
     app.system_prompt = system_prompt.clone();
     app.todos = Some(todos);
-    // Load user-defined slash commands from .bob/commands/*.md (global + project).
     app.custom_commands = bob_core::core::commands::load_custom_commands(&cwd);
-    // Restore per-agent transcripts from a resumed session.
     if !session.agent_threads.is_empty() {
         app.teams = team::AgentTranscripts::from_persisted(&session.agent_threads);
     }
     app.theme_name = config.theme.clone().unwrap_or_else(|| "dark".to_string());
-    // Seed usage totals: this session's prior usage + the global ledger.
     app.session_usage = bob_core::core::usage::total_of(&session.usage);
     app.global_usage = bob_core::core::usage::global_total();
-    if !session.messages.is_empty() {
-        // Prefer replay from the event log (the emerging single source of truth):
-        // feed each logged event through the SAME view + team reducers the live
-        // loop uses, so a resumed transcript is built identically to a live one —
-        // including notices and other cells that never existed in the message
-        // history. GUARD: only trust replay if the reconstructed root history is at
-        // least as long as the blob's — a truncated/corrupt log must never render
-        // LESS than we safely have. Otherwise fall back to blob hydration.
+    if !session.messages.is_empty() || !archived_events.is_empty() {
+        // Replay must not lose history or revive an older context epoch.
         let replayed = match store.load_events(&session.id) {
-            Some(events) => {
+            Ok(Some(events)) => {
                 let rebuilt = bob_core::core::session::root_history_from_events(&events);
-                if rebuilt.len() >= session.messages.len() {
+                if bob_core::core::session::context_epoch(&events) >= session.context_epoch
+                    && rebuilt.len() >= session.messages.len()
+                {
                     app.teams = team::AgentTranscripts::replay(&events);
                     for evt in &events {
                         app.view.apply(evt);
@@ -602,7 +500,12 @@ pub async fn run(
                     false
                 }
             }
-            _ => false,
+            Err(error) => {
+                app.view
+                    .push_notice(format!("could not replay session events: {error}"));
+                false
+            }
+            Ok(None) => false,
         };
         if !replayed {
             app.view.hydrate(&session.messages, &session.workflows);
@@ -617,32 +520,33 @@ pub async fn run(
         app.jobs.reserve_id(&id);
         bob_core::tools::task::reserve_subagent_id(&id);
     }
-    // Surface MCP connection results.
     for note in &mcp_notices {
         app.view.push_event(note.clone());
     }
 
     let mut keys = EventStream::new();
     let mut ticker = tokio::time::interval(Duration::from_millis(100));
-    // Frame-rate–capped redraw. Input and agent events set `dirty`; the loop
-    // repaints at most once per `FRAME`. A trackpad flick emits a burst of scroll
-    // events arriving milliseconds apart — drawing once per event makes repaints
-    // queue behind real time ("runoff"). Coalescing every event within a frame
-    // window into ONE repaint keeps scrolling locked to your fingers.
+    // Coalesce input bursts into one repaint per frame to avoid scroll backlog.
     const FRAME: Duration = Duration::from_millis(16);
     draw_frame(&mut terminal, &mut app)?;
     let mut last_draw = tokio::time::Instant::now();
     let mut dirty = false;
+    let mut root_turn: Option<tokio::task::JoinHandle<()>> = None;
+    let timeouts = bob_core::providers::provider::StreamTimeouts {
+        startup: Duration::from_secs(config.provider_timeouts.startup_secs),
+        idle: Duration::from_secs(config.provider_timeouts.idle_secs),
+    };
 
-    let result = 'outer: loop {
+    let result: anyhow::Result<()> = 'outer: loop {
         dirty |= app.clear_closed_prompts();
         if dirty && last_draw.elapsed() >= FRAME {
-            draw_frame(&mut terminal, &mut app)?;
+            if let Err(error) = draw_frame(&mut terminal, &mut app) {
+                break 'outer Err(error.into());
+            }
             last_draw = tokio::time::Instant::now();
             dirty = false;
         }
-        // If a repaint is pending but the frame budget hasn't elapsed, wake exactly
-        // at the deadline; otherwise sleep far out (real events/ticker still wake us).
+        // Wake at the frame deadline only while a repaint is pending.
         let redraw_deadline = if dirty {
             last_draw + FRAME
         } else {
@@ -656,35 +560,40 @@ pub async fn run(
             maybe_key = keys.next() => {
                 match maybe_key {
                     Some(Ok(event)) => {
-                        match app.on_terminal_event(event, &mut dirty) {
+                        let outcome = app.on_terminal_event(event, &mut dirty);
+                        if matches!(outcome, KeyOutcome::ClearContext | KeyOutcome::NewSession) {
+                            while let Ok(event) = evt_rx.try_recv() {
+                                app.apply_session_event(&mut session, &event);
+                            }
+                            app.transition_session(
+                                matches!(outcome, KeyOutcome::NewSession), &agent, &owner,
+                                &mut session, &mut session_subscription, &cwd,
+                            ).await;
+                            continue 'outer;
+                        }
+                        match outcome {
                             KeyOutcome::Quit => break 'outer Ok(()),
                             KeyOutcome::Submit(text) => {
                                 if let Some(id) = app.focused_agent.clone() {
                                     app.send_agent_message(&id, &text);
                                 } else if app.running {
-                                    // A turn is in flight — queue this as a pinned
-                                    // chip above the input (NOT the transcript). It's
-                                    // pushed to the transcript + dispatched when the
-                                    // turn ends. Alt+Enter steers instead of queueing.
+                                    // Queued prompts enter the transcript only when dispatched.
                                     app.queue.push_back(text);
                                 } else {
-                                    // The user line is rendered from the UserPrompt
-                                    // event that run() emits — no direct push here, so
-                                    // the live path and replay build it identically.
+                                    // UserPrompt owns rendering for both live turns and replay.
                                     app.stick_to_bottom();
                                     app.running = true;
                                     app.current_prompt = Some(text.clone());
                                     app.turn_started = Some(std::time::Instant::now());
-                                    spawn_turn(&agent, &app.turn_done_tx, text);
+                                    root_turn = Some(spawn_turn(&agent, &app.turn_done_tx, text));
                                 }
                             }
                             KeyOutcome::Steer(text) => {
-                                // Deliver into the root agent's inbox now, so the
-                                // running turn folds it in at its next step (mid-turn
-                                // course-correction). Shown in the transcript as a
-                                // user line so there's a record of what was said.
+                                // Steering goes to the running turn's inbox, not the prompt queue.
                                 if app.agent_team.send("root", "user", &text) {
-                                    app.view.push_user(text);
+                                    app.bus.emit(AgentEvent::UserMessageQueued {
+                                        to: "root".into(), text,
+                                    });
                                     app.stick_to_bottom();
                                 } else {
                                     app.notify("couldn't steer — no running agent");
@@ -694,20 +603,16 @@ pub async fn run(
                                 if app.running {
                                     app.notify("finish the current turn first");
                                 } else {
-                                    // A bare model id (no "provider:" prefix) uses
-                                    // the current provider; a full spec switches both.
                                     let full = if spec.contains(':') {
                                         spec.clone()
                                     } else {
                                         format!("{}:{}", app.provider_id, spec)
                                     };
-                                    // Building a provider does network/auth work —
-                                    // run it off the loop so the UI stays live.
                                     app.notify("switching model…");
                                     spawn_bg(&app.bg_tx, async move {
                                         let id = full.split(':').next().unwrap_or("").to_string();
                                         BgOutcome::ProviderSwitched(
-                                            create_provider(&full)
+                                            create_provider_with_options(&full, None, timeouts)
                                                 .await
                                                 .map(|p| (id, p))
                                                 .map_err(|e| e.to_string()),
@@ -722,12 +627,9 @@ pub async fn run(
                             KeyOutcome::SetReasoning(label) => {
                                 let effort = bob_core::core::types::ReasoningEffort::parse(&label)
                                     .unwrap_or(bob_core::core::types::ReasoningEffort::Off);
-                                // Never block the loop: if a turn holds the agent
-                                // lock, apply on the next idle boundary via a toast.
                                 if let Ok(mut a) = agent.try_lock() {
                                     a.set_reasoning(effort);
                                     app.reasoning = effort;
-                                    // Remember for next launch (best-effort).
                                     if let Err(e) = bob_core::core::config::set_default_reasoning(
                                         effort.label(),
                                     ) {
@@ -746,8 +648,6 @@ pub async fn run(
                                 }
                             }
                             KeyOutcome::ListModels => {
-                                // Fetch the current provider's models off the loop,
-                                // then open the picker when the list arrives.
                                 let prov = match agent.try_lock() {
                                     Ok(a) => a.provider(),
                                     Err(_) => {
@@ -757,9 +657,6 @@ pub async fn run(
                                 };
                                 app.notify("fetching models…");
                                 spawn_bg(&app.bg_tx, async move {
-                                    // Prefer the detailed listing (id + context
-                                    // window) so the picker can show each model's
-                                    // window; format as "id\t(N ctx)" labels.
                                     let res = prov.list_models_detailed().await.map(|entries| {
                                         entries
                                             .into_iter()
@@ -775,13 +672,11 @@ pub async fn run(
                                 });
                             }
                             KeyOutcome::ShowContext => {
-                                // Reading history needs the lock; skip cleanly if a
-                                // turn holds it rather than freezing the UI.
                                 if let Ok(a) = agent.try_lock() {
-                                    let used = bob_core::agent::compaction::estimate_history_tokens(a.messages());
-                                    let msgs = a.messages().len();
+                                    let (used, window) = a.context_usage();
+                                    let msgs = a.working_messages().len();
                                     drop(a);
-                                    app.show_context(used, msgs);
+                                    app.show_context(used, msgs, window);
                                 } else {
                                     app.notify("busy — try again after this turn");
                                 }
@@ -793,74 +688,20 @@ pub async fn run(
                                     );
                                     app.stick_to_bottom();
                                 } else {
-                                    // Summarization is a network round-trip; run it
-                                    // off the event loop so the UI stays responsive.
-                                    // Show a live "Compacting…" cell now; the result
-                                    // flips it to "Compacted" via BgOutcome::Compacted.
+                                    // The persisted event renders success; the outcome ends the operation.
                                     let cell = app.view.begin_compaction();
+                                    app.running = true;
+                                    app.turn_started = Some(std::time::Instant::now());
                                     app.stick_to_bottom();
                                     let agent = agent.clone();
-                                    spawn_bg(&app.bg_tx, async move {
+                                    root_turn = Some(spawn_bg(&app.bg_tx, async move {
                                         let mut a = agent.lock().await;
-                                        let (did, before, after) = a.compact().await;
-                                        BgOutcome::Compacted {
-                                            cell,
-                                            did,
-                                            before,
-                                            after,
-                                        }
-                                    });
+                                        let result = a.compact().await.map_err(|error| format!("{error:#}"));
+                                        BgOutcome::Compacted { cell, result }
+                                    }));
                                 }
                             }
-                            KeyOutcome::ClearContext => {
-                                // Reset the conversation context: the agent forgets
-                                // all history, but we stay in the same session id.
-                                if app.running {
-                                    app.notify("finish the current turn first");
-                                } else if let Ok(mut a) = agent.try_lock() {
-                                    a.load_history(Vec::new());
-                                    drop(a);
-                                    session.messages.clear();
-                                    session.updated_at = now_stamp();
-                                    // Force-save the shrink so it lands past the
-                                    // anti-clobber guard AND resets the on-disk
-                                    // message_count — otherwise the next (shorter)
-                                    // end-of-turn save would be silently dropped.
-                                    if let Err(e) = bob_core::core::session::save_session_force(&session) {
-                                        app.notify(format!("couldn't save cleared context: {e}"));
-                                    }
-                                    app.view.clear();
-                                    app.view.push_notice("context cleared — the agent has forgotten the conversation.".into());
-                                    app.stick_to_bottom();
-                                } else {
-                                    app.notify("busy — try again after this turn");
-                                }
-                            }
-                            KeyOutcome::NewSession => {
-                                // Start a brand-new session: fresh history + a new id
-                                // scoped to this cwd. The old session stays saved.
-                                if app.running {
-                                    app.notify("finish the current turn first");
-                                } else if let Ok(mut a) = agent.try_lock() {
-                                    a.load_history(Vec::new());
-                                    drop(a);
-                                    session = bob_core::core::session::new_session(
-                                        provider.name(),
-                                        uuid::Uuid::new_v4().to_string(),
-                                        now_stamp(),
-                                        cwd.to_string_lossy().to_string(),
-                                    );
-                                    app.teams = team::AgentTranscripts::new();
-                                    if let Some(todos) = &app.todos {
-                                        todos.set(Vec::new());
-                                    }
-                                    app.view.clear();
-                                    app.view.push_notice(format!("started a fresh session ({}).", session.id));
-                                    app.stick_to_bottom();
-                                } else {
-                                    app.notify("busy — try again after this turn");
-                                }
-                            }
+                            KeyOutcome::ClearContext | KeyOutcome::NewSession => unreachable!("session actions handled before dispatch"),
                             KeyOutcome::None => {}
                         }
                     }
@@ -869,38 +710,15 @@ pub async fn run(
             }
             Some(evt) = evt_rx.recv() => {
                 dirty = true;
-                // Intercept usage accounting before handing the event to the view.
-                if let AgentEvent::Completion { agent_id, model, usage } = &evt {
-                    let entry = bob_core::core::usage::UsageEntry {
-                        ts: unix_now(),
-                        session_id: session.id.clone(),
-                        provider: provider.name().to_string(),
-                        model: model.clone(),
-                        agent_id: agent_id.clone(),
-                        usage: *usage,
-                    };
-                    session.usage.push(entry.clone());
-                    app.session_usage.add(usage);
-                    // Append to the global ledger OFF the event-loop thread: a
-                    // workflow fan-out fires a burst of Completion events, and doing
-                    // synchronous file IO here per event would stall rendering (look
-                    // like a freeze). spawn_blocking keeps the loop responsive.
-                    tokio::task::spawn_blocking(move || {
-                        let _ = bob_core::core::usage::append_global(&entry);
-                    });
-                }
-                app.apply_agent_event(&evt);
-                // Follow new output only when already pinned to the bottom. If the
-                // user has scrolled up to read, don't yank them back down on every
-                // streamed token.
+                app.apply_session_event(&mut session, &evt);
+                // Streaming must not pull a scrolled-up reader back to the bottom.
                 if app.scrollback.at_bottom() {
                     app.stick_to_bottom();
                 }
             }
             Some(prompt) = perm_rx.recv() => {
                 dirty = true;
-                // Queue behind any prompt already showing (don't clobber it — that
-                // would drop its response channel and silently deny that agent).
+                // Keep queued response channels alive; replacing one silently denies its agent.
                 app.perm_queue.push_back(PendingPerm {
                     title: prompt.title,
                     detail: prompt.detail,
@@ -912,11 +730,7 @@ pub async fn run(
             }
             Some(q) = query_rx.recv() => {
                 dirty = true;
-                // exit_plan carries the full plan as Markdown. The approval modal is a
-                // fixed, non-scrollable band, so render the WHOLE plan into the
-                // scrollable transcript (full markdown) and keep the modal to the
-                // decision — otherwise a long plan would push the Yes/No options
-                // off-screen. ask_user's shorter detail still shows inline in the modal.
+                // Long plans belong in scrollback so the fixed approval modal stays visible.
                 let mut query = q.query;
                 if query.title == "Ready to code?" && !query.detail.is_empty() {
                     app.view.push_plan(std::mem::take(&mut query.detail));
@@ -924,23 +738,26 @@ pub async fn run(
                         app.stick_to_bottom();
                     }
                 }
-                app.pending_query = Some(PendingQuery {
+                app.enqueue_query(PendingQuery {
                     query,
                     list: widgets::SelectList::new(),
                     other_text: None,
+                    inspection: Default::default(),
                     purpose: QueryPurpose::Tool(q.resp),
                 });
             }
             Some(err) = app.turn_done_rx.recv() => {
                 dirty = true;
-                // Surface a failed turn (provider error, etc.) instead of
-                // silently ending.
+                app.view.busy = false;
                 if let Some(msg) = err {
                     app.view.push_notice(format!("error: {}", msg));
                     app.stick_to_bottom();
                 }
-                // Persist after each completed turn (messages + session grants).
+                while let Ok(event) = evt_rx.try_recv() {
+                    app.apply_session_event(&mut session, &event);
+                }
                 let a = agent.lock().await;
+                app.context_usage = Some(a.context_usage());
                 session.messages = a.messages().to_vec();
                 session.grants = permissions.export_grants();
                 if let Some(todos) = &app.todos {
@@ -949,19 +766,16 @@ pub async fn run(
                 session.agent_threads = app.teams.to_persisted();
                 session.workflows = app.view.to_persisted_workflows();
                 session.updated_at = now_stamp();
-                // Persist the blob off the event-loop thread: save_session runs a
-                // full synchronous SQLite pipeline (open, PRAGMA WAL, schema, UPSERT,
-                // fsync) and with busy_timeout a contended WAL write can stall the
-                // whole TUI for seconds. Do it on the blocking pool (the event log
-                // already uses a dedicated writer thread for the same reason). Clone
-                // the blob for the task; `session` stays for the next turn.
+                // SQLite contention must not block the event loop.
                 {
                     let snapshot = session.clone();
                     let tx = app.bg_tx.clone();
-                    let store = store.clone();
+                    let owner = owner.clone();
+                    let token = owner.token();
                     tokio::spawn(async move {
-                        let res =
-                            tokio::task::spawn_blocking(move || store.save(&snapshot)).await;
+                        let res = tokio::task::spawn_blocking(move || {
+                            owner.checkpoint(token, snapshot).map(|_| ())
+                        }).await;
                         let err = match res {
                             Ok(Ok(())) => None,
                             Ok(Err(e)) => Some(e.to_string()),
@@ -973,22 +787,17 @@ pub async fn run(
                     });
                 }
                 drop(a);
-                // If this turn had been detached (Ctrl+B), close out its job.
                 if let Some(job_id) = app.detached_job.take() {
                     app.jobs.finish(&job_id, bob_core::tools::jobs::JobStatus::Done, "turn finished".to_string());
                 }
                 app.current_prompt = None;
-                // Dispatch the next queued prompt, if any. Queued chips weren't in
-                // the transcript, so push it as a user turn now that it's actually
-                // being sent.
                 match app.queue.pop_front() {
                     Some(next) => {
-                        // The user line comes from run()'s UserPrompt event, same as
-                        // a fresh submit — no direct push (would duplicate it).
+                        // UserPrompt renders the queued turn; a direct push would duplicate it.
                         app.stick_to_bottom();
                         app.current_prompt = Some(next.clone());
                         app.turn_started = Some(std::time::Instant::now());
-                        spawn_turn(&agent, &app.turn_done_tx, next);
+                        root_turn = Some(spawn_turn(&agent, &app.turn_done_tx, next));
                     }
                     None => {
                         app.running = false;
@@ -1002,22 +811,12 @@ pub async fn run(
             }
             _ = ticker.tick() => {
                 dirty |= app.refresh_job_panel();
-                // Only the animated states (spinner/Working line) need a periodic
-                // repaint. When fully idle, leave `dirty` false so the loop parks in
-                // sleep_until instead of repainting 10×/s for nothing.
-                if app.running || app.view.busy {
+                if app.focused_activity().0 {
                     app.spinner = app.spinner.wrapping_add(1);
                     dirty = true;
                 }
-                // Coordination wake: if idle but a spawned agent has reported back,
-                // drive a fresh empty-prompt turn so the root folds the result into
-                // history and acts on it — an idle agent is re-driven by a new turn
-                // rather than blocking.
+                // Resume idle work for completion notices, but never revive a cancelled turn.
                 if !app.running && !app.cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                    // Job-completion wake: a background job (e.g. a benchmark run)
-                    // that finished while the agent was idle would otherwise just
-                    // sit there until the user nudged it. Inject a turn naming the
-                    // finished job(s) so the agent collects the result and continues.
                     let finished = app.jobs.take_finished();
                     if !finished.is_empty() {
                         let list = finished
@@ -1032,16 +831,11 @@ pub async fn run(
                         app.view.push_event(format!("Resumed — {list} finished"));
                         app.running = true;
                         app.turn_started = Some(std::time::Instant::now());
-                        spawn_turn(&agent, &app.turn_done_tx, prompt);
+                        root_turn = Some(spawn_turn(&agent, &app.turn_done_tx, prompt));
                         dirty = true;
                     } else {
                         let pending = {
-                            // try_lock: an in-flight turn holds this; we'll re-check
-                            // on the next tick. Never block the render loop. Don't
-                            // re-drive a wake while a cancel is in flight — a
-                            // cancelled team's children may still be reporting back,
-                            // and waking here would resurrect the turn the user just
-                            // stopped. The flag clears at the next real user prompt.
+                            // Cancelled children may still report back. Only a user prompt clears cancellation.
                             if app.cancel.load(std::sync::atomic::Ordering::Relaxed) {
                                 false
                             } else {
@@ -1054,7 +848,7 @@ pub async fn run(
                         if pending {
                             app.running = true;
                             app.turn_started = Some(std::time::Instant::now());
-                            spawn_turn(&agent, &app.turn_done_tx, String::new());
+                            root_turn = Some(spawn_turn(&agent, &app.turn_done_tx, String::new()));
                             dirty = true;
                         }
                     }
@@ -1063,20 +857,36 @@ pub async fn run(
         }
     };
 
-    // Final save on exit: the per-turn save only runs when a turn completes, so a
-    // quit (Quit/​/exit/Ctrl+C) or a stream error would otherwise drop everything
-    // since the last completed turn. Snapshot the agent's full history + state now.
+    // Save partial turns as well as completed ones on exit.
     {
-        // If a turn is still running, its task holds the agent lock across the whole
-        // `run()` — a plain `lock().await` here would block until the turn finishes
-        // (and a busy multi-tool turn can run for minutes), which looked like a
-        // freeze on quit. Signal cancel first so `run()` breaks out cooperatively
-        // and releases the lock; bound the wait with a timeout so a wedged turn
-        // can't hold exit hostage — we still persist whatever history we can read.
-        // The run loop polls its cancel flag on a 100ms interval even while parked on
-        // the provider stream, so a clean stop is fast; the timeout only bites if a
-        // tool call itself is wedged.
+        // Cancel before acquiring the turn's mutex; bounded waits keep wedged tools from blocking exit.
         cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        app.agent_team.stop_descendants("root");
+        app.perm_queue.clear();
+        app.pending_query = None;
+        app.query_queue.clear();
+        if !app.jobs.shutdown().await {
+            eprintln!("bob: warning: background jobs exceeded shutdown deadline");
+        }
+        if let Some(mut turn) = root_turn.take() {
+            if tokio::time::timeout(Duration::from_secs(2), &mut turn)
+                .await
+                .is_err()
+            {
+                turn.abort();
+                let _ = turn.await;
+            }
+        }
+        if tokio::time::timeout(Duration::from_secs(2), async {
+            while app.agent_team.has_unsettled_descendants("root") {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_err()
+        {
+            eprintln!("bob: warning: agents exceeded shutdown deadline");
+        }
         let locked = tokio::time::timeout(std::time::Duration::from_secs(2), agent.lock()).await;
         match locked {
             Ok(a) => {
@@ -1084,42 +894,29 @@ pub async fn run(
                 drop(a);
             }
             Err(_) => {
-                // Turn didn't yield in time; fall back to the last-saved messages
-                // rather than hang. The event log below still has the full stream.
+                // Fall back to the last snapshot; the event log retains the full stream.
                 eprintln!(
                     "bob: warning: turn didn't stop in time on quit; \
                      saved history may be one turn stale"
                 );
             }
         }
-        session.grants = permissions.export_grants();
-        if let Some(todos) = &app.todos {
-            session.todos = todos.items();
+        while let Ok(event) = evt_rx.try_recv() {
+            app.apply_session_event(&mut session, &event);
         }
-        session.agent_threads = app.teams.to_persisted();
-        session.workflows = app.view.to_persisted_workflows();
-        session.updated_at = now_stamp();
-        // Terminal is being torn down here, so there's no view to notice into —
-        // log to stderr so a final-save failure isn't completely silent.
-        if let Err(e) = store.save(&session) {
+        app.snapshot_session(&mut session);
+        if let Err(e) = owner.checkpoint(owner.token(), session.clone()) {
             eprintln!("bob: warning: couldn't save session on exit: {e}");
         }
-        // Ensure every shadow-written event is durable before we exit.
-        store.flush();
+        if let Err(error) = owner.flush() {
+            eprintln!("bob: warning: couldn't flush session events on exit: {error}");
+        }
     }
 
-    // Terminal restore is handled by `_guard` (Drop) — covers the normal return,
-    // the `?` error paths above, and panics (via the hook). Nothing to do here.
-    result
+    result.map(|()| session.id)
 }
 
-/// Render one frame wrapped in a *synchronized update* (DEC private mode 2026).
-/// The terminal buffers every byte between Begin/End and paints the frame
-/// atomically, so partial frames and a flickering cursor are impossible — this is
-/// what fixes the flicker on Windows Terminal/conhost and the same technique the
-/// harness renderer uses. Terminals that don't support 2026 ignore the sequence,
-/// so it's safe everywhere. `terminal.draw` already diffs cells, so combined with
-/// this each frame is one atomic, minimal write.
+/// DEC mode 2026 batches frame output; unsupported terminals ignore it.
 fn draw_frame(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     app: &mut App,
@@ -1130,51 +927,18 @@ fn draw_frame(
     res.map(|_| ())
 }
 
-/// Best-effort restore of the terminal to its pre-TUI state. Safe to call more
-/// than once (idempotent) and from a panic hook — every step ignores errors.
-fn restore_terminal() {
-    let mut stdout = std::io::stdout();
-    let _ = execute!(
-        stdout,
-        LeaveAlternateScreen,
-        DisableBracketedPaste,
-        DisableMouseCapture,
-        crossterm::cursor::Show,
-    );
-    let _ = disable_raw_mode();
-}
-
-/// RAII guard: restores the terminal on Drop, so an early return or unwind out
-/// of `run` can never leave the shell in raw mode / the alternate screen.
-struct TerminalGuard;
-
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        restore_terminal();
-    }
-}
-
 enum KeyOutcome {
     None,
     Submit(String),
-    /// Steer the RUNNING turn: deliver this text to the root agent's inbox now
-    /// (Alt+Enter), instead of queueing it for after the turn.
+    /// Deliver to the running root's inbox instead of queueing another turn.
     Steer(String),
-    /// Switch the active provider/model to this spec (e.g. "anthropic:claude...").
     SwitchModel(String),
-    /// Open the reasoning-effort picker.
     ListReasoning,
-    /// Set the reasoning effort (label: off/low/medium/high/max).
     SetReasoning(String),
-    /// Fetch the current provider's model list and open a picker.
     ListModels,
-    /// Show context-window usage (needs the agent's history, handled in loop).
     ShowContext,
-    /// Reset the conversation context (agent forgets), staying in this session.
     ClearContext,
-    /// Start a brand-new session (fresh history + new id), handled in the loop.
     NewSession,
-    /// Force a history compaction now (the `/compact` command).
     Compact,
     Quit,
 }
@@ -1183,112 +947,72 @@ struct App {
     view: ViewModel,
     input: input::Input,
     spinner: usize,
-    /// Pending permission prompts, oldest first. The FRONT is the one shown; the
-    /// rest wait their turn (their response channels stay alive so their agents
-    /// stay blocked rather than being silently denied). Concurrent fan-outs — a
-    /// workflow or `task` spawning many agents — can each raise a prompt at once,
-    /// so they queue instead of clobbering one another.
+    /// FIFO; waiting response channels stay alive until their prompt is answered.
     perm_queue: std::collections::VecDeque<PendingPerm>,
-    /// Filtered slash-command menu, when the input starts with '/'. Owned strings
-    /// so built-in and user-defined (custom) commands can share one list.
     menu: Vec<(String, String)>,
     menu_sel: usize,
-    /// User-defined slash commands loaded from `.bob/commands/*.md`.
     custom_commands: Vec<bob_core::core::commands::CustomCommand>,
-    /// `@file` completion: the full project file list (gathered lazily), the
-    /// current filtered matches, and the selected index. `file_at` is the byte
-    /// offset of the active `@` in the input buffer while completing.
     all_files: Vec<String>,
     /// True while a background `@file` gather is in flight (so we kick it off once).
     files_loading: bool,
     file_menu: Vec<String>,
     file_sel: usize,
+    /// Char index of the active `@`, not a byte offset.
     file_at: Option<usize>,
     /// Prompts submitted while a turn is running, sent in order once it frees.
     queue: std::collections::VecDeque<String>,
-    /// Whether a turn is currently executing (drives the queue + input hint).
     running: bool,
+    compaction_completion: Option<usize>,
     /// If the running turn has been detached (Ctrl+B), the job id tracking it.
     detached_job: Option<String>,
     /// The prompt of the running turn (used as the job label on detach).
     current_prompt: Option<String>,
-    /// Running token total for this session (sum of all completions).
     session_usage: bob_core::core::types::Usage,
-    /// Grand total across all prior sessions, loaded from the global ledger.
     global_usage: bob_core::core::types::Usage,
-    /// Shared background-job registry (for the pinned panel + Ctrl+B detach).
     jobs: bob_core::tools::jobs::JobRegistry,
     running_shell_jobs: Vec<String>,
-    /// Permission engine handle (for mode switching via Shift+Tab).
     permissions: Arc<PermissionEngine>,
-    /// Cancel flag for the running turn (set on Esc to interrupt).
     cancel: Arc<std::sync::atomic::AtomicBool>,
-    /// A pending ask_user / exit_plan question.
     pending_query: Option<PendingQuery>,
-    /// Human-readable current model spec (for /models and status).
+    query_queue: std::collections::VecDeque<PendingQuery>,
+    input_scroll: usize,
+    context_usage: Option<(usize, usize)>,
     model_label: String,
-    /// Current reasoning effort (shown next to the model, like "gpt-5.5 medium").
     reasoning: bob_core::core::types::ReasoningEffort,
-    /// The config-registry provider id (e.g. "copilot", "openai", "anthropic").
-    /// Distinct from the trait's name() — copilot and openai both report "openai".
+    /// Config provider id; Copilot and OpenAI both report "openai" through the trait.
     provider_id: String,
     turn_done_tx: mpsc::UnboundedSender<Option<String>>,
     turn_done_rx: mpsc::UnboundedReceiver<Option<String>>,
-    /// Channel for background work (model switch/list, file gathering, …). The
-    /// select loop drains `bg_rx` and applies each outcome via `apply_bg`.
     bg_tx: mpsc::UnboundedSender<BgOutcome>,
     bg_rx: mpsc::UnboundedReceiver<BgOutcome>,
-    /// When the current turn started (for the "Working (Ns)" line).
     turn_started: Option<std::time::Instant>,
-    /// Working directory (shown in the status line, abbreviated with ~).
     cwd_label: String,
-    /// Current git branch, if any (refreshed lazily; shown in the status line).
     branch: Option<String>,
-    /// Language servers for this project, for the status-line health indicator.
     lsp: Option<Arc<bob_core::lsp::LspManager>>,
-    /// The agent's todo list, rendered as a sticky panel above the input.
     todos: Option<Arc<bob_core::tools::todo::TodoStore>>,
-    /// Active theme name (for the /theme picker's current-selection + direct set).
     theme_name: String,
-    /// The main transcript viewport: render caches, scroll position, click map.
     scrollback: scrollback::ScrollbackRenderer,
-    /// A second scrollback renderer used when viewing a focused subagent's
-    /// transcript, so it gets the SAME padding, wrapping, caching, and scroll
-    /// behavior as the root conversation (one renderer, two transcripts). Reset
-    /// when the focused agent changes.
+    /// Independent from root scrollback; reset when the focused agent changes.
     focused_scrollback: scrollback::ScrollbackRenderer,
-    /// Per-agent transcripts for the sidebar (fed by subagent events).
     teams: team::AgentTranscripts,
-    /// Full-screen workflow view overlay; `None` when closed.
     workflow_view: Option<team::WorkflowView>,
-    /// The workflow view's per-selectable-row (screen row, agent id), set each
-    /// draw, so key-nav and clicks map to an agent. `None` when the view is closed.
+    /// Screen row → agent id hit map, rebuilt each draw.
     wf_view_agents: Option<Vec<(u16, String)>>,
-    /// Whether the sticky todo panel is shown (toggled with Ctrl+L).
     show_todos: bool,
-    /// Shared team roster, so the input can message agents (send_message path).
     agent_team: bob_core::agent::team::AgentRegistry,
     agent_control_notice: Option<(String, String)>,
-    /// Event bus + composed system prompt, kept so `/workflow` can build a
-    /// `WorkflowContext` (agents + progress events route through the same bus).
     bus: EventBus,
     system_prompt: String,
-    /// The collapsible right info sidebar. `open` = shown (Ctrl+T toggles it,
-    /// manual-open only). `sidebar.selected` indexes the AGENTS tree (0 = "main").
-    /// The viewport follows selection through running and terminal agents.
     sidebar_open: bool,
+    /// Index 0 is main; subsequent entries follow `display_order`.
     sidebar: widgets::SelectList,
-    /// The agent whose conversation the LEFT transcript is currently showing, and
-    /// which the input box talks to. `None` = the root conversation ("main").
+    /// Both the displayed transcript and input recipient; None means root.
     focused_agent: Option<String>,
-    /// Screen-row → agent id hit map for the sidebar's AGENTS rows (set each draw),
-    /// so clicks select an agent. "main" maps to an empty id.
+    /// Screen row → agent id hit map; an empty id means main.
     sidebar_rows: Option<Vec<(u16, String)>>,
     sidebar_rect: Option<Rect>,
 }
 
-/// The turn `/init` submits: asks the agent to survey the project and write an
-/// AGENTS.md the way Claude Code's /init does.
 const INIT_PROMPT: &str = "Create an AGENTS.md file in the project root that will help future \
     coding assistants work effectively here. Explore the codebase first (build files, README, \
     directory layout, existing conventions), then write a concise AGENTS.md covering: what the \
@@ -1306,7 +1030,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/compact", "summarize & free up context now"),
     (
         "/yolo",
-        "toggle bypassing ALL permission prompts (dangerous)",
+        "bypass permission prompts (denials and plan mode still apply)",
     ),
     ("/model", "show the current model"),
     ("/models", "list & switch models"),
@@ -1347,6 +1071,7 @@ impl App {
             file_at: None,
             queue: std::collections::VecDeque::new(),
             running: false,
+            compaction_completion: None,
             detached_job: None,
             current_prompt: None,
             session_usage: bob_core::core::types::Usage::default(),
@@ -1356,6 +1081,9 @@ impl App {
             permissions,
             cancel,
             pending_query: None,
+            query_queue: std::collections::VecDeque::new(),
+            input_scroll: 0,
+            context_usage: None,
             model_label: String::new(),
             reasoning: bob_core::core::types::ReasoningEffort::default(),
             provider_id: String::new(),
@@ -1412,8 +1140,6 @@ impl App {
         self.scrollback.stick_to_bottom();
     }
 
-    /// Surface a transient status message inline in the transcript (a dim notice)
-    /// and pin the view to the bottom so it's seen. Replaces the old corner toast.
     fn notify(&mut self, text: impl Into<String>) {
         self.view.push_notice(text.into());
         self.stick_to_bottom();
@@ -1426,7 +1152,6 @@ impl App {
                 .iter()
                 .map(|(c, d)| (c.to_string(), d.to_string()))
                 .collect();
-            // Merge user-defined commands (prefixed with '/').
             for cc in &self.custom_commands {
                 all.push((format!("/{}", cc.name), cc.description.clone()));
             }
@@ -1442,30 +1167,24 @@ impl App {
         self.refresh_file_menu();
     }
 
-    /// Apply a completed [`BgOutcome`] on the event-loop thread. All the slow
-    /// work already happened off-loop; here we only touch UI state (and the
-    /// agent via `try_lock`, which never blocks — a switch is disallowed mid-turn
-    /// anyway, so the lock is free).
     fn apply_bg(&mut self, outcome: BgOutcome, agent: &Arc<Mutex<Agent>>) {
         match outcome {
             BgOutcome::ProviderSwitched(Ok((id, provider))) => {
                 let model = provider.model().to_string();
                 if let Ok(mut a) = agent.try_lock() {
                     a.set_provider(provider);
+                    self.context_usage = Some(a.context_usage());
                 } else {
                     self.notify("busy — try switching again");
                     return;
                 }
                 self.provider_id = id;
                 self.model_label = model;
-                // Remember this choice for the next launch. Best-effort: a config
-                // write failure shouldn't abort the (already-applied) switch.
                 if let Err(e) =
                     bob_core::core::config::set_default_model(&self.provider_id, &self.model_label)
                 {
                     self.notify(format!("switched, but couldn't save default: {e}"));
                 }
-                // Chain into the reasoning picker so model + effort are set together.
                 let cur = self.reasoning;
                 self.open_reasoning_picker(cur);
                 self.stick_to_bottom();
@@ -1475,8 +1194,6 @@ impl App {
                 self.stick_to_bottom();
             }
             BgOutcome::ModelList(Ok(models)) => {
-                // Backends that don't list (ChatGPT/Codex Responses) fall back to
-                // the known set.
                 let options: Vec<String> = if models.is_empty() {
                     if self.provider_id == "openai" {
                         bob_core::providers::RESPONSES_MODELS
@@ -1494,17 +1211,7 @@ impl App {
                         .push_notice("provider returned no models; use `/models <spec>`".into());
                     self.stick_to_bottom();
                 } else {
-                    self.pending_query = Some(PendingQuery {
-                        query: bob_core::tools::registry::UserQuery {
-                            title: format!("Select a model (current: {})", self.model_label),
-                            detail: String::new(),
-                            options,
-                            allow_other: true,
-                        },
-                        list: widgets::SelectList::new(),
-                        other_text: None,
-                        purpose: QueryPurpose::ModelPicker,
-                    });
+                    self.open_model_picker(options);
                 }
             }
             BgOutcome::ModelList(Err(e)) => {
@@ -1515,19 +1222,10 @@ impl App {
             BgOutcome::FileList(files) => {
                 self.all_files = files;
                 self.files_loading = false;
-                // Re-filter now that candidates are available (the user may have
-                // typed more since the gather started).
+                // The query may have changed while candidates were loading.
                 self.refresh_file_menu();
             }
-            BgOutcome::Compacted {
-                cell,
-                did,
-                before,
-                after,
-            } => {
-                self.view.finish_compaction(cell, before, after, did);
-                self.stick_to_bottom();
-            }
+            BgOutcome::Compacted { cell, result } => self.finish_compaction(cell, result),
             BgOutcome::SessionSaveFailed(e) => {
                 self.view
                     .push_notice(format!("warning: couldn't save session: {e}"));
@@ -1535,27 +1233,35 @@ impl App {
         }
     }
 
-    /// Update the `@file` completion menu from the token under the cursor.
+    fn finish_compaction(&mut self, cell: usize, result: Result<(bool, usize, usize), String>) {
+        self.view.finish_compaction(cell, result);
+        self.stick_to_bottom();
+        self.compaction_completion = Some(cell);
+        self.settle_compaction();
+    }
+
+    fn settle_compaction(&mut self) {
+        if let Some(cell) = self.compaction_completion {
+            if !matches!(
+                self.view.cells.get(cell),
+                Some(Cell::Compaction { done: false, .. })
+            ) {
+                self.compaction_completion = None;
+                let _ = self.turn_done_tx.send(None);
+            }
+        }
+    }
+
     fn refresh_file_menu(&mut self) {
         match self.input.at_token() {
             Some((start, query)) => {
                 self.file_at = Some(start);
-                // Gather the project file list lazily and OFF the keystroke path —
-                // `git ls-files` / a filesystem walk can take real time on a big
-                // repo. Kick it off once; `BgOutcome::FileList` fills `all_files`
-                // and re-filters. Until then we just show whatever we have (empty).
                 if self.all_files.is_empty() && !self.files_loading {
                     self.files_loading = true;
                     let bg_tx = self.bg_tx.clone();
                     spawn_bg(&bg_tx, async move {
-                        // Blocking fs/subprocess work → a blocking-safe worker.
-                        let files = tokio::task::spawn_blocking(|| {
-                            let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-                            files::gather_files(&cwd)
-                        })
-                        .await
-                        .unwrap_or_default();
-                        BgOutcome::FileList(files)
+                        let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+                        BgOutcome::FileList(files::gather_files(&cwd).await)
                     });
                 }
                 self.file_menu = files::fuzzy_rank(&self.all_files, &query, 8)
@@ -1572,7 +1278,6 @@ impl App {
         }
     }
 
-    /// Accept the selected `@file` completion, replacing the token in the input.
     fn accept_file(&mut self) {
         if let (Some(start), Some(path)) =
             (self.file_at, self.file_menu.get(self.file_sel).cloned())
@@ -1627,25 +1332,34 @@ impl App {
         false
     }
 
-    /// Handle keys while a user question (ask_user / exit_plan) is open.
     fn handle_query_key(&mut self, code: KeyCode) -> KeyOutcome {
         let Some(q) = &mut self.pending_query else {
             return KeyOutcome::None;
         };
         let n = q.query.options.len() + if q.query.allow_other { 1 } else { 0 };
+        if matches!(code, KeyCode::PageUp | KeyCode::PageDown) {
+            q.inspection.page(code == KeyCode::PageDown);
+            return KeyOutcome::None;
+        }
 
-        // Free-text "Other" entry mode routes typing into the buffer.
         if let Some(buf) = &mut q.other_text {
             match code {
                 KeyCode::Enter => {
                     let answer = buf.clone();
                     return self.answer_query(answer);
                 }
-                KeyCode::Esc => q.other_text = None,
+                KeyCode::Esc => {
+                    q.other_text = None;
+                    q.inspection.offset = None;
+                }
                 KeyCode::Backspace => {
                     buf.pop();
+                    q.inspection.offset = None;
                 }
-                KeyCode::Char(c) => buf.push(c),
+                KeyCode::Char(c) => {
+                    buf.push(c);
+                    q.inspection.offset = None;
+                }
                 _ => {}
             }
             return KeyOutcome::None;
@@ -1654,10 +1368,12 @@ impl App {
         match code {
             KeyCode::Up | KeyCode::Char('k') => {
                 q.list.up();
+                q.inspection.offset = None;
                 self.preview_theme_if_picking();
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 q.list.down(n);
+                q.inspection.offset = None;
                 self.preview_theme_if_picking();
             }
             KeyCode::Char(c @ '1'..='9') => {
@@ -1676,7 +1392,6 @@ impl App {
                         QueryPurpose::Tool(resp) => {
                             let _ = resp.send(None);
                         }
-                        // Revert the live preview to the theme active on open.
                         QueryPurpose::ThemePicker { original } => {
                             theme::set_theme(theme::Theme::by_name(&original));
                         }
@@ -1689,7 +1404,6 @@ impl App {
         KeyOutcome::None
     }
 
-    /// Select option `idx`; the "Other" row enters free-text mode.
     fn pick_query_option(&mut self, idx: usize) -> KeyOutcome {
         let Some(q) = &mut self.pending_query else {
             return KeyOutcome::None;
@@ -1699,12 +1413,11 @@ impl App {
             self.answer_query(answer)
         } else {
             q.other_text = Some(String::new());
+            q.inspection.offset = None;
             KeyOutcome::None
         }
     }
 
-    /// Finalize the pending query. Tool questions send the answer back over the
-    /// oneshot; the model picker turns the answer into a SwitchModel outcome.
     fn answer_query(&mut self, answer: String) -> KeyOutcome {
         let Some(q) = self.pending_query.take() else {
             return KeyOutcome::None;
@@ -1727,8 +1440,6 @@ impl App {
             }
             QueryPurpose::ReasoningPicker => KeyOutcome::SetReasoning(answer),
             QueryPurpose::ThemePicker { .. } => {
-                // `answer` is the chosen theme name. It's already live (applied on
-                // hover); persist it to the project config, silently.
                 self.theme_name = answer.clone();
                 theme::set_theme(theme::Theme::by_name(&answer));
                 if let Ok(cwd) = std::env::current_dir() {
@@ -1739,8 +1450,6 @@ impl App {
         }
     }
 
-    /// While the theme picker is open, apply the hovered theme so the whole UI
-    /// previews it live. No-op for any other picker.
     fn preview_theme_if_picking(&mut self) {
         let Some(q) = &self.pending_query else { return };
         if !matches!(q.purpose, QueryPurpose::ThemePicker { .. }) {
@@ -1751,13 +1460,10 @@ impl App {
         }
     }
 
-    /// Open the theme picker: a list of theme names that live-previews on hover,
-    /// persists on Enter, and reverts on Esc. Selection starts on the current
-    /// theme so opening the picker doesn't change anything until you move.
     fn open_theme_picker(&mut self, current: &str) {
         let options: Vec<String> = theme::Theme::NAMES.iter().map(|s| s.to_string()).collect();
         let selected = options.iter().position(|n| n == current).unwrap_or(0);
-        self.pending_query = Some(PendingQuery {
+        self.enqueue_query(PendingQuery {
             query: bob_core::tools::registry::UserQuery {
                 title: "Theme (↑↓ to preview, Enter to keep)".to_string(),
                 detail: String::new(),
@@ -1769,52 +1475,55 @@ impl App {
                 scroll: 0,
             },
             other_text: None,
+            inspection: Default::default(),
             purpose: QueryPurpose::ThemePicker {
                 original: current.to_string(),
             },
         });
     }
 
-    /// Open the reasoning-effort picker (chained after a model switch, or via
-    /// `/reasoning`).
     fn open_reasoning_picker(&mut self, current: bob_core::core::types::ReasoningEffort) {
         let options: Vec<String> = ["off", "low", "medium", "high", "max"]
             .iter()
             .map(|s| s.to_string())
             .collect();
-        self.pending_query = Some(PendingQuery {
+        let selected = options
+            .iter()
+            .position(|label| label == current.label())
+            .unwrap_or(0);
+        self.enqueue_query(PendingQuery {
             query: bob_core::tools::registry::UserQuery {
                 title: format!("Reasoning effort (current: {})", current.label()),
                 detail: String::new(),
                 options,
                 allow_other: false,
             },
-            list: widgets::SelectList::new(),
+            list: widgets::SelectList {
+                selected,
+                scroll: 0,
+            },
             other_text: None,
+            inspection: Default::default(),
             purpose: QueryPurpose::ReasoningPicker,
         });
     }
 
-    /// Toggle a tool cell's expanded state when the scrollback is clicked at
-    /// `row`. Maps the row → cell via the scrollback's hit-test; only `Cell::Tool`
-    /// cells toggle. Returns true if something toggled (so the caller marks dirty).
     fn click_scrollback(&mut self, _col: u16, row: u16) -> bool {
+        if self.active_scrollback().click_exploration(row) {
+            return true;
+        }
         let Some((cell_idx, offset)) = self.active_scrollback().hit_test_offset(row) else {
             return false;
         };
         if let Some(id) = self.focused_agent.as_deref() {
             return self.teams.toggle_tool(id, cell_idx);
         }
-        // A click on a workflow cell: an agent row drills into that agent's
-        // transcript; the header/phase rows open the full-screen
-        // workflow view. Anything else falls back to the tool-expand toggle.
         if let Some(cell) = self.view.cells.get(cell_idx) {
             if let view::Cell::Workflow { id, .. } = cell {
                 if let Some(agent_id) = cell.workflow_agent_at(offset) {
                     let id = agent_id.to_string();
                     return self.open_sidebar_on(&id);
                 }
-                // Header or phase row → open the full-screen view for this run.
                 let run_id = id.clone();
                 self.open_workflow_view(run_id);
                 return true;
@@ -1823,7 +1532,6 @@ impl App {
         self.view.toggle_tool_expanded(cell_idx)
     }
 
-    /// Open the full-screen workflow view for `run_id`.
     fn open_workflow_view(&mut self, run_id: String) {
         self.workflow_view = Some(team::WorkflowView {
             run_id,
@@ -1844,9 +1552,6 @@ impl App {
         true
     }
 
-    /// Key handling for the collapsible workflow view. ↑↓ move the cursor over the
-    /// flattened phase/agent rows; Enter toggles a phase or opens an agent's
-    /// transcript; Esc closes. PgUp/PgDn jump the cursor.
     fn handle_workflow_view_key(&mut self, code: KeyCode) -> KeyOutcome {
         use draw::{workflow_rows, WfRow};
         // Rebuild the current row list so the cursor clamps to what's visible.
@@ -1897,20 +1602,16 @@ impl App {
                 None => {}
             },
             KeyCode::Right | KeyCode::Char('l') => {
-                // Expand a collapsed phase.
                 if let Some(WfRow::Phase(pi)) = rows.get(vw.list.selected) {
                     vw.collapsed.remove(pi);
                 }
             }
-            KeyCode::Left | KeyCode::Char('h') => {
-                // Collapse the phase under (or containing) the cursor.
-                match rows.get(vw.list.selected) {
-                    Some(WfRow::Phase(pi)) | Some(WfRow::Agent(pi, _)) => {
-                        vw.collapsed.insert(*pi);
-                    }
-                    None => {}
+            KeyCode::Left | KeyCode::Char('h') => match rows.get(vw.list.selected) {
+                Some(WfRow::Phase(pi)) | Some(WfRow::Agent(pi, _)) => {
+                    vw.collapsed.insert(*pi);
                 }
-            }
+                None => {}
+            },
             _ => {}
         }
         KeyOutcome::None
@@ -1928,10 +1629,22 @@ impl App {
     }
 
     fn apply_agent_event(&mut self, event: &AgentEvent) {
+        if let AgentEvent::ContextWarning {
+            agent_id,
+            used_tokens,
+            context_window,
+            ..
+        } = event
+        {
+            if agent_id == "root" {
+                self.context_usage = Some((*used_tokens, *context_window));
+            }
+        }
         self.teams.apply(event, self.focused_agent.as_deref());
         let order = self.teams.display_order();
         self.sync_sidebar_selection(&order);
         self.view.apply(event);
+        self.settle_compaction();
     }
 
     fn sync_sidebar_selection(&mut self, order: &[String]) {
@@ -1943,7 +1656,6 @@ impl App {
             .unwrap_or(0);
     }
 
-    /// Set `focused_agent` from the current sidebar selection: index 0 = "main".
     fn apply_sidebar_focus(&mut self) {
         if self.sidebar.selected == 0 {
             self.set_focused_agent(None);
@@ -1954,9 +1666,6 @@ impl App {
         self.set_focused_agent(id);
     }
 
-    /// The scrollback renderer for whatever transcript is currently on screen —
-    /// the focused subagent's when one is selected, else the root conversation.
-    /// So scroll input drives the view the user is actually looking at.
     fn active_scrollback(&mut self) -> &mut scrollback::ScrollbackRenderer {
         if self.focused_agent.is_some() {
             &mut self.focused_scrollback
@@ -1965,9 +1674,6 @@ impl App {
         }
     }
 
-    /// Switch the focused agent, resetting the shared focused-scrollback so the new
-    /// transcript opens pinned to the bottom instead of inheriting the previous
-    /// agent's scroll offset.
     fn set_focused_agent(&mut self, id: Option<String>) {
         if self.focused_agent != id {
             self.focused_scrollback = scrollback::ScrollbackRenderer::new();
@@ -1980,7 +1686,10 @@ impl App {
 
     fn send_agent_message(&mut self, id: &str, text: &str) {
         if self.agent_team.send(id, "user", text) {
-            self.teams.push_message(id, "user", text, Some(id));
+            self.bus.emit(AgentEvent::UserMessageQueued {
+                to: id.into(),
+                text: text.into(),
+            });
             self.agent_control_notice = None;
             self.focused_scrollback.stick_to_bottom();
         } else {
@@ -1995,8 +1704,6 @@ impl App {
             .is_some_and(|r| col >= r.x && col < r.right() && row >= r.y && row < r.bottom())
     }
 
-    /// A click in the sidebar selects that agent row (and focuses it). An empty id
-    /// is the "main" row → back to the root conversation.
     fn click_sidebar(&mut self, col: u16, row: u16) {
         if !self.sidebar_contains(col, row) {
             return;
@@ -2024,7 +1731,7 @@ impl App {
                 return self.on_key(key.code, key.modifiers);
             }
             CtEvent::Paste(text) => {
-                self.input.paste(&text);
+                self.paste_active(&text);
                 *dirty = true;
             }
             CtEvent::Resize(_, _) => {
@@ -2072,21 +1779,20 @@ impl App {
         true
     }
 
-    fn clear_closed_prompts(&mut self) -> bool {
-        let count = self.perm_queue.len();
-        self.perm_queue.retain(|prompt| !prompt.resp.is_closed());
-        let permissions_changed = self.perm_queue.len() != count;
-        let query_closed = self
-            .pending_query
-            .as_ref()
-            .is_some_and(|q| matches!(&q.purpose, QueryPurpose::Tool(resp) if resp.is_closed()));
-        if query_closed {
-            self.pending_query = None;
-        }
-        permissions_changed || query_closed
-    }
-
     fn on_key(&mut self, code: KeyCode, mods: KeyModifiers) -> KeyOutcome {
+        self.clear_closed_prompts();
+        if code == KeyCode::Char('c') && mods.contains(KeyModifiers::CONTROL) {
+            return KeyOutcome::Quit;
+        }
+        if code == KeyCode::Esc
+            && self.active_prompt() == prompts::ActivePrompt::Composer
+            && (!self.menu.is_empty() || !self.file_menu.is_empty())
+        {
+            self.menu.clear();
+            self.file_menu.clear();
+            self.file_at = None;
+            return KeyOutcome::None;
+        }
         if code == KeyCode::Char('x') && mods.contains(KeyModifiers::CONTROL) {
             if let Some(id) = self.stop_target() {
                 let message = match self.agent_team.stop("root", &id) {
@@ -2098,7 +1804,6 @@ impl App {
             }
             return KeyOutcome::None;
         }
-        // Shift+Tab cycles the interaction mode (normal → auto-accept → plan).
         if code == KeyCode::BackTab {
             let next = self.permissions.mode().next();
             self.permissions.set_mode(next);
@@ -2116,9 +1821,7 @@ impl App {
         if code == KeyCode::Char('g') && mods.contains(KeyModifiers::CONTROL) {
             return KeyOutcome::None;
         }
-        // With the sidebar open, ↑/↓ move its selection and Enter/Esc switch the
-        // focused conversation — but ONLY when the input is empty, so typing is
-        // unaffected. Esc always returns to main when focused.
+        // Sidebar navigation must not consume composer or modal input.
         if self.sidebar_open
             && self.workflow_view.is_none()
             && self.pending_query.is_none()
@@ -2145,19 +1848,16 @@ impl App {
                 _ => {}
             }
         }
-        // 0a'') The full-screen workflow view owns the keyboard while open.
         if self.workflow_view.is_some() {
             return self.handle_workflow_view_key(code);
         }
 
-        // 0b) A pending user question (ask_user / exit_plan) takes priority.
-        if self.pending_query.is_some() {
-            return self.handle_query_key(code);
+        if self.active_prompt() == prompts::ActivePrompt::Query {
+            let outcome = self.handle_query_key(code);
+            self.advance_queries();
+            return outcome;
         }
 
-        // Permission prompt takes priority — a select driven by arrows, digits
-        // (1-9), Enter (confirm), or Esc/Ctrl+C (deny). The FRONT of the queue is
-        // shown; answering it pops it and reveals the next.
         if let Some(p) = self.perm_queue.front_mut() {
             let n = p.options.len();
             match code {
@@ -2180,7 +1880,6 @@ impl App {
                     let _ = p.resp.send(Some(sel));
                 }
                 KeyCode::Esc => {
-                    // Esc denies (send None → treated as deny).
                     let _ = self.perm_queue.pop_front().unwrap().resp.send(None);
                 }
                 _ => {}
@@ -2188,7 +1887,6 @@ impl App {
             return KeyOutcome::None;
         }
 
-        // Global shortcuts.
         match (code, mods) {
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => return KeyOutcome::Quit,
             (KeyCode::Char('o'), KeyModifiers::CONTROL) => {
@@ -2200,13 +1898,10 @@ impl App {
                 return KeyOutcome::None;
             }
             (KeyCode::Char('l'), KeyModifiers::CONTROL) => {
-                // Toggle the sticky todo (work items) panel.
                 self.show_todos = !self.show_todos;
                 return KeyOutcome::None;
             }
             (KeyCode::Esc, _) => {
-                // Esc interrupts a running turn (cooperative). Only meaningful
-                // while busy — otherwise it's ignored (prompts handle Esc above).
                 if self.focused_agent.is_some() {
                     self.set_focused_agent(None);
                     self.sidebar.selected = 0;
@@ -2226,13 +1921,11 @@ impl App {
             _ => {}
         }
 
-        // 2b) Emacs / readline editing bindings.
         if self.handle_emacs(code, mods) {
             self.refresh_menu();
             return KeyOutcome::None;
         }
 
-        // 2c) `@file` completion menu navigation (takes precedence).
         if !self.file_menu.is_empty() {
             match code {
                 KeyCode::Up => {
@@ -2261,7 +1954,6 @@ impl App {
             }
         }
 
-        // 3) Slash-command menu navigation.
         if !self.menu.is_empty() {
             match code {
                 KeyCode::Up => {
@@ -2283,9 +1975,7 @@ impl App {
                     return KeyOutcome::None;
                 }
                 KeyCode::Enter if !mods.contains(KeyModifiers::SHIFT) => {
-                    // Enter on the highlighted command fills it in and runs it — so
-                    // arrowing to `/compact` + Enter executes that command, not the
-                    // raw text the user half-typed (e.g. `/comp`).
+                    // Execute the highlighted completion, not the partially typed command.
                     let pick = self.menu[self.menu_sel].0.to_string();
                     self.input.set(&pick);
                     self.input.submit();
@@ -2299,12 +1989,8 @@ impl App {
             }
         }
 
-        // 4) Input editing.
         match code {
             KeyCode::Enter => {
-                // Shift+Enter inserts a newline (multi-line prompts). Alt+Enter is
-                // "steer": deliver the text to the running turn immediately; when
-                // idle it falls through to a normal submit.
                 if mods.contains(KeyModifiers::SHIFT) {
                     self.input.insert_newline();
                     return KeyOutcome::None;
@@ -2313,7 +1999,6 @@ impl App {
                 if display.is_empty() {
                     return KeyOutcome::None;
                 }
-                // Resolve collapsed pastes into the real text before sending.
                 let text = self.input.resolved_text().trim().to_string();
                 self.input.submit();
                 self.menu.clear();
@@ -2337,8 +2022,6 @@ impl App {
                 KeyOutcome::None
             }
             KeyCode::Backspace if self.input.text().is_empty() && !self.queue.is_empty() => {
-                // Backspace on an empty prompt pops the LAST queued chip back into
-                // the input, so you can edit or delete a message you queued.
                 if let Some(last) = self.queue.pop_back() {
                     self.input.set(&last);
                 }
@@ -2366,7 +2049,7 @@ impl App {
                 let on = self.permissions.toggle_bypass();
                 if on {
                     self.notify(
-                        "YOLO on — every tool call runs with NO permission prompt. /yolo to stop.",
+                        "YOLO on — permission prompts bypassed; explicit denials and plan mode still apply. /yolo to stop.",
                     );
                 } else {
                     self.notify("YOLO off — permission prompts restored.");
@@ -2394,7 +2077,6 @@ impl App {
                 Some(KeyOutcome::None)
             }
             "/model" => {
-                // Print the current model + effort (or switch, if given an arg).
                 if arg.is_empty() {
                     self.view.push_notice(format!(
                         "model: {} {}",
@@ -2408,7 +2090,6 @@ impl App {
                 }
             }
             "/reasoning" => {
-                // Set reasoning effort directly, or open the picker.
                 if arg.is_empty() {
                     Some(KeyOutcome::ListReasoning)
                 } else {
@@ -2416,7 +2097,6 @@ impl App {
                 }
             }
             "/models" => {
-                // Open the live picker (or switch directly with an argument).
                 if arg.is_empty() {
                     Some(KeyOutcome::ListModels)
                 } else {
@@ -2434,7 +2114,6 @@ impl App {
                 if arg.is_empty() {
                     self.open_theme_picker(&self.theme_name.clone());
                 } else {
-                    // Direct switch: apply + persist silently.
                     self.theme_name = arg.to_string();
                     theme::set_theme(theme::Theme::by_name(arg));
                     if let Ok(cwd) = std::env::current_dir() {
@@ -2444,8 +2123,6 @@ impl App {
                 Some(KeyOutcome::None)
             }
             _ => {
-                // A user-defined command (/name from .bob/commands/name.md):
-                // expand its template with the args and submit it as a turn.
                 let name = cmd.strip_prefix('/').unwrap_or(cmd);
                 if let Some(c) = self.custom_commands.iter().find(|c| c.name == name) {
                     return Some(KeyOutcome::Submit(c.expand(arg)));
@@ -2455,7 +2132,6 @@ impl App {
         }
     }
 
-    /// Show saved memories: the project AGENTS.md (cwd) + the global ~/.bob/AGENTS.md.
     fn show_memory(&mut self) {
         let mut shown = false;
         let project = std::env::current_dir().map(|c| c.join("AGENTS.md")).ok();
@@ -2490,7 +2166,6 @@ impl App {
         self.stick_to_bottom();
     }
 
-    /// Print the language servers + their live health as notice cells.
     fn show_lsp(&mut self) {
         match &self.lsp {
             None => {
@@ -2521,7 +2196,6 @@ impl App {
         self.stick_to_bottom();
     }
 
-    /// Print the configured MCP servers as notice cells.
     fn show_mcp(&mut self) {
         match bob_core::core::config::list_mcp_servers() {
             Ok(servers) if servers.is_empty() => {
@@ -2549,7 +2223,6 @@ impl App {
         self.stick_to_bottom();
     }
 
-    /// Print the background-job list as notice cells.
     fn show_jobs(&mut self) {
         use bob_core::tools::jobs::JobStatus;
         let jobs = self.jobs.list();
@@ -2571,7 +2244,6 @@ impl App {
         self.stick_to_bottom();
     }
 
-    /// Print a token-usage summary (session + all-time) as notice cells.
     fn show_usage(&mut self) {
         let s = self.session_usage;
         let mut all = self.global_usage;
@@ -2593,13 +2265,9 @@ impl App {
         self.stick_to_bottom();
     }
 
-    /// Print context-window usage: estimated tokens in the live history vs the
-    /// window, with a simple bar. `used` is a chars/4 estimate from the agent.
-    fn show_context(&mut self, used: usize, msgs: usize) {
-        const WINDOW: usize = 200_000;
-        const COMPACT_AT: f64 = 0.8; // matches the agent's compact threshold
-        let pct = (used as f64 / WINDOW as f64 * 100.0).min(100.0);
-        let filled = ((pct / 100.0) * 24.0).round() as usize;
+    fn show_context(&mut self, used: usize, msgs: usize, window: usize) {
+        let pct = used as f64 / window.max(1) as f64 * 100.0;
+        let filled = ((pct.min(100.0) / 100.0) * 24.0).round() as usize;
         let bar: String = "█".repeat(filled) + &"░".repeat(24usize.saturating_sub(filled));
         self.view.push_notice("context".to_string());
         self.view.push_notice(format!(
@@ -2607,23 +2275,17 @@ impl App {
             bar,
             pct,
             fmt_tokens(used as u64),
-            fmt_tokens(WINDOW as u64),
+            fmt_tokens(window as u64),
             msgs,
         ));
         self.view.push_notice(format!(
-            "  auto-compacts at {:.0}% (~{} tokens)",
-            COMPACT_AT * 100.0,
-            fmt_tokens((WINDOW as f64 * COMPACT_AT) as u64),
+            "  auto-compaction enabled (at most {:.0}%, reserving room for output)",
+            bob_core::agent::agent::COMPACT_THRESHOLD * 100.0,
         ));
         self.stick_to_bottom();
     }
 
-    /// Ctrl+B: detach the in-flight turn into the background-job registry so it
-    /// shows in the panel and the input is freed. The turn keeps running (its
-    /// completion is still handled by the turn_done channel, which closes out the
-    /// job). Note: because the root agent is single-locked, a *new* prompt still
-    /// waits for the detached turn to release the agent — detach frees the UI,
-    /// not true root-level concurrency.
+    /// Detach tracks the turn but does not release the root agent's mutex.
     fn detach_current_turn(&mut self) {
         if !self.running || self.detached_job.is_some() {
             self.notify("nothing to detach");
@@ -2640,9 +2302,7 @@ impl App {
         self.notify(format!("detached as {}", id));
     }
 
-    /// Esc: cooperatively interrupt the running turn. Sets the cancel flag (the
-    /// agent unwinds at its next safe point, keeping history valid) and clears
-    /// any queued prompts so they don't fire after the interrupt.
+    /// Cancel cooperatively and discard queued prompts so they cannot restart work.
     fn interrupt(&mut self) {
         self.cancel
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -2653,9 +2313,6 @@ impl App {
     }
 
     fn copy_last(&mut self) {
-        // Copy the last assistant message to the clipboard via OSC 52 — we let the
-        // terminal own the clipboard rather than talking to X11/Wayland directly
-        // (arboard can block/hang inside the draw loop). Works over SSH too.
         let text = self.view.cells.iter().rev().find_map(|c| match c {
             view::Cell::Assistant { text, .. } => Some(text.clone()),
             _ => None,
@@ -2670,16 +2327,12 @@ impl App {
     }
 }
 
-/// Word-aware wrap of a styled Line into <= width display lines, splitting
-/// spans at boundaries and preserving each span's style. Over-long single
-/// tokens are hard-broken.
+/// Wrap by display columns, preserving span styles.
 pub(super) fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
     wrap_line_hanging(line, width, 0)
 }
 
-/// Like [`wrap_line`], but continuation rows are prefixed with `indent` spaces so
-/// wrapped body text stays aligned under its first row instead of falling back to
-/// column 0. Used by panes that render indented sections (the workflow detail).
+/// Prefix continuation rows with `indent` spaces.
 pub(super) fn wrap_line_hanging(
     line: Line<'static>,
     width: usize,
@@ -2705,7 +2358,6 @@ pub(super) fn wrap_line_hanging(
                     cur.push(Span::styled(std::mem::take(&mut chunk), style));
                 }
                 out.push(Line::from(std::mem::take(&mut cur)));
-                // Start the continuation row with the hanging indent.
                 if indent > 0 {
                     cur.push(cont_lead());
                 }
@@ -2733,7 +2385,6 @@ pub(super) fn truncate_mid(s: &str, max: usize) -> String {
     format!("{}...", head)
 }
 
-/// Indent a rendered line by 3 columns (for the permission preview block).
 pub(super) fn indent_line(line: Line<'static>) -> Line<'static> {
     let mut spans = vec![Span::raw("   ")];
     spans.extend(line.spans);
@@ -2741,344 +2392,781 @@ pub(super) fn indent_line(line: Line<'static>) -> Line<'static> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use ratatui::text::{Line, Span};
+mod test_support;
 
-    pub(super) fn test_app() -> App {
-        App::new(
-            bob_core::tools::jobs::JobRegistry::new(),
-            Arc::new(PermissionEngine::new(Decision::Allow, None)),
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            bob_core::agent::team::AgentRegistry::new(),
+#[cfg(all(test, unix))]
+mod pty_tests {
+    use bob_core::core::config::BobConfig;
+    use bob_core::core::session::new_session;
+    use bob_core::providers::mock::{MockProvider, MockReply};
+    use std::fs::{self, File};
+    use std::io::{self, Read, Write};
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::CommandExt;
+    use std::path::{Path, PathBuf};
+    use std::process::{Child, Command, ExitStatus, Stdio};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    const CHILD_FILTER: &str = "tui::pty_tests::child_fixture";
+    const FIXTURE_ENV: &str = "BOB_PTY_TEST_FIXTURE";
+    const STEP_TIMEOUT: Duration = Duration::from_secs(10);
+    const MOCK_DELAY: Duration = Duration::from_secs(120);
+    const IDLE_TEXT: &[u8] = b"send a message...";
+    const CHILD_DONE: &[u8] = b"BOB_PTY_FIXTURE_RETURNED";
+
+    fn repo_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("canonical repository root")
+    }
+
+    struct Fixture(PathBuf);
+
+    impl Fixture {
+        fn new() -> Self {
+            let repo = repo_root();
+            let target = repo.join("target");
+            fs::create_dir_all(&target).expect("create repository target directory");
+            let target = target.canonicalize().expect("canonical target directory");
+            assert!(
+                target.starts_with(&repo),
+                "target must stay inside repository"
+            );
+            let root = target.join(format!("tui-pty-{}", uuid::Uuid::new_v4()));
+            fs::create_dir(&root).expect("create isolated PTY fixture");
+            let fixture = Self(root);
+            for name in [
+                "work", "home", "appdata", "config", "cache", "data", "state", "runtime", "tmp",
+                "bin",
+            ] {
+                fs::create_dir(fixture.0.join(name)).expect("create fixture directory");
+            }
+            fs::set_permissions(fixture.0.join("runtime"), fs::Permissions::from_mode(0o700))
+                .expect("set XDG runtime permissions");
+            fs::create_dir(fixture.0.join("work/.git")).expect("bound project discovery");
+            fixture
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct Pty {
+        master: File,
+        slave: File,
+    }
+
+    impl Pty {
+        fn new() -> io::Result<Self> {
+            let (mut master, mut slave) = (-1, -1);
+            let mut size = libc::winsize {
+                ws_row: 28,
+                ws_col: 100,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+            if unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &raw mut size,
+                )
+            } == -1
+            {
+                return Err(io::Error::last_os_error());
+            }
+            // Own both descriptors immediately, including all subsequent error paths.
+            let pty = Self {
+                master: unsafe { File::from_raw_fd(master) },
+                slave: unsafe { File::from_raw_fd(slave) },
+            };
+            for fd in [master, slave] {
+                let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+                if flags == -1
+                    || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1
+                {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            let flags = unsafe { libc::fcntl(master, libc::F_GETFL) };
+            if flags == -1
+                || unsafe { libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
+            {
+                return Err(io::Error::last_os_error());
+            }
+            let mut mode = pty.termios()?;
+            mode.c_lflag |= libc::ICANON | libc::ECHO | libc::ISIG;
+            mode.c_oflag |= libc::OPOST;
+            if unsafe { libc::tcsetattr(slave, libc::TCSANOW, &mode) } == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(pty)
+        }
+
+        fn termios(&self) -> io::Result<libc::termios> {
+            let mut mode = std::mem::MaybeUninit::uninit();
+            if unsafe { libc::tcgetattr(self.slave.as_raw_fd(), mode.as_mut_ptr()) } == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(unsafe { mode.assume_init() })
+        }
+
+        fn resize(&self, rows: u16, columns: u16) -> io::Result<()> {
+            let mut size = libc::winsize {
+                ws_row: rows,
+                ws_col: columns,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+            if unsafe { libc::ioctl(self.slave.as_raw_fd(), libc::TIOCSWINSZ as _, &mut size) }
+                == -1
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
+    }
+
+    struct RunningChild(Child);
+
+    impl Drop for RunningChild {
+        fn drop(&mut self) {
+            if !matches!(self.0.try_wait(), Ok(Some(_))) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+
+    struct Driver {
+        child: RunningChild,
+        pty: Pty,
+        output: Vec<u8>,
+    }
+
+    impl Driver {
+        fn spawn(fixture: &Fixture) -> io::Result<Self> {
+            let pty = Pty::new()?;
+            let mut command = Command::new(std::env::current_exe()?);
+            command
+                .args([CHILD_FILTER, "--ignored", "--exact", "--nocapture"])
+                .env_clear()
+                .env(FIXTURE_ENV, &fixture.0)
+                .env("HOME", fixture.0.join("home"))
+                .env("APPDATA", fixture.0.join("appdata"))
+                .env("XDG_CONFIG_HOME", fixture.0.join("config"))
+                .env("XDG_CACHE_HOME", fixture.0.join("cache"))
+                .env("XDG_DATA_HOME", fixture.0.join("data"))
+                .env("XDG_STATE_HOME", fixture.0.join("state"))
+                .env("XDG_RUNTIME_DIR", fixture.0.join("runtime"))
+                .env("TMPDIR", fixture.0.join("tmp"))
+                .env("PATH", fixture.0.join("bin"))
+                .env("TERM", "xterm-256color")
+                .env("LANG", "C")
+                .current_dir(fixture.0.join("work"))
+                .stdin(Stdio::from(pty.slave.try_clone()?))
+                .stdout(Stdio::from(pty.slave.try_clone()?))
+                .stderr(Stdio::from(pty.slave.try_clone()?));
+            // Only async-signal-safe syscalls between fork and exec. A controlling
+            // terminal makes crossterm's /dev/tty and SIGWINCH work on macOS and Linux.
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            Ok(Self {
+                child: RunningChild(command.spawn()?),
+                pty,
+                output: Vec::new(),
+            })
+        }
+
+        fn drain(&mut self) {
+            let mut bytes = [0; 8192];
+            for _ in 0..64 {
+                match self.pty.master.read(&mut bytes) {
+                    Ok(0) => break,
+                    Ok(n) => self.output.extend_from_slice(&bytes[..n]),
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
+                    Err(error) => panic!("read PTY: {error}"),
+                }
+                assert!(
+                    self.output.len() <= 4 * 1024 * 1024,
+                    "unexpected PTY output flood"
+                );
+            }
+        }
+
+        fn diagnostics(&self) -> String {
+            let start = self.output.len().saturating_sub(8000);
+            format!("{:?}", String::from_utf8_lossy(&self.output[start..]))
+        }
+
+        fn wait_for(&mut self, label: &str, mut ready: impl FnMut(&Self) -> bool) {
+            let deadline = Instant::now() + STEP_TIMEOUT;
+            loop {
+                self.drain();
+                assert!(
+                    self.child
+                        .0
+                        .try_wait()
+                        .expect("poll fixture child")
+                        .is_none(),
+                    "fixture exited before {label}; PTY: {}",
+                    self.diagnostics()
+                );
+                if ready(self) {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for {label}; PTY: {}",
+                    self.diagnostics()
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn wait_text(&mut self, start: usize, text: &[u8], label: &str) {
+            self.wait_for(label, |driver| {
+                driver.output[start..]
+                    .windows(text.len())
+                    .any(|part| part == text)
+            });
+        }
+
+        fn send(&mut self, mut bytes: &[u8]) {
+            let deadline = Instant::now() + STEP_TIMEOUT;
+            while !bytes.is_empty() {
+                match self.pty.master.write(bytes) {
+                    Ok(0) => panic!("PTY closed while sending input"),
+                    Ok(n) => bytes = &bytes[n..],
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        self.drain();
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("write PTY: {error}"),
+                }
+                assert!(Instant::now() < deadline, "timed out writing PTY input");
+            }
+        }
+
+        fn wait_exit(&mut self) -> ExitStatus {
+            let deadline = Instant::now() + STEP_TIMEOUT;
+            loop {
+                self.drain();
+                if let Some(status) = self.child.0.try_wait().expect("poll fixture exit") {
+                    self.drain();
+                    return status;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "fixture exceeded quit deadline; PTY: {}",
+                    self.diagnostics()
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    #[test]
+    fn real_pty_startup_resize_interrupt_quit_restores_termios() {
+        let fixture = Fixture::new();
+        let mut driver = Driver::spawn(&fixture).expect("launch real TUI in PTY");
+        // The child can enter raw mode immediately after spawn; capture the baseline
+        // in the child before run(), rather than racing it from the parent.
+        driver.wait_text(0, IDLE_TEXT, "initial TUI prompt");
+        driver.wait_text(0, b"\x1b[?2026l", "completed startup frame");
+        let raw = driver.pty.termios().expect("read active terminal mode");
+        assert_eq!(
+            raw.c_lflag & (libc::ICANON | libc::ECHO | libc::ISIG),
+            0,
+            "TUI must enter raw mode"
+        );
+
+        driver.drain();
+        let resized = driver.output.len();
+        driver.pty.resize(34, 112).expect("resize PTY");
+        // This checks a completed frame after the resize, not its pixel layout.
+        driver.wait_text(resized, b"\x1b[?2026l", "completed frame after resize");
+        driver.send(b"Harmless PTY smoke prompt. Do not use tools.\r");
+        driver.wait_for("mock generation to start", |_| {
+            fixture.0.join("provider-started").is_file()
+        });
+        driver.drain();
+        let interrupted = driver.output.len();
+        driver.send(b"\x1b");
+        driver.wait_text(
+            interrupted,
+            b"interrupting",
+            "Escape interrupt acknowledgement",
+        );
+        // Busy mode suppresses this placeholder. Its return before the 120-second
+        // mock response proves the interrupted turn settled while the TUI stayed up.
+        driver.wait_text(interrupted, IDLE_TEXT, "idle prompt after cancellation");
+        driver.send(b"\x03");
+        let status = driver.wait_exit();
+        assert!(
+            status.success(),
+            "fixture failed: {status}; PTY: {}",
+            driver.diagnostics()
+        );
+        assert!(
+            driver
+                .output
+                .windows(CHILD_DONE.len())
+                .any(|part| part == CHILD_DONE),
+            "helper must actually run and return"
+        );
+        assert!(
+            driver.output.windows(8).any(|part| part == b"\x1b[?1049l"),
+            "TUI must leave alternate screen"
+        );
+        let restored = fs::read_to_string(fixture.0.join("termios-after"))
+            .expect("fixture restored termios before PTY hangup");
+        let expected =
+            fs::read_to_string(fixture.0.join("termios-before")).expect("fixture baseline termios");
+        assert_eq!(
+            restored, expected,
+            "terminal flags, control characters and speeds must be restored"
+        );
+    }
+
+    fn termios_state(mode: &libc::termios) -> String {
+        // Compare semantic fields, never struct padding (which differs by platform).
+        format!(
+            "{} {} {} {} {:?} {} {}",
+            mode.c_iflag,
+            mode.c_oflag,
+            mode.c_cflag,
+            mode.c_lflag,
+            mode.c_cc,
+            unsafe { libc::cfgetispeed(mode) },
+            unsafe { libc::cfgetospeed(mode) },
         )
     }
 
     #[test]
-    fn redraw_requests_survive_noop_input_until_the_frame_is_drawn() {
-        use crossterm::event::{KeyEvent, MouseEvent};
-        let mut app = test_app();
-        let mouse = |kind| {
-            CtEvent::Mouse(MouseEvent {
-                kind,
-                column: 0,
-                row: 0,
-                modifiers: KeyModifiers::NONE,
-            })
-        };
-        let release = CtEvent::Key(KeyEvent::new_with_kind(
-            KeyCode::Char('a'),
-            KeyModifiers::NONE,
-            KeyEventKind::Release,
-        ));
-        let noops = [
-            mouse(MouseEventKind::Moved),
-            mouse(MouseEventKind::Up(MouseButton::Left)),
-            release,
-            CtEvent::FocusLost,
-        ];
-        for trigger in [mouse(MouseEventKind::ScrollUp), CtEvent::Resize(90, 20)] {
-            let mut dirty = false;
-            app.on_terminal_event(trigger, &mut dirty);
-            assert!(dirty);
-            // All inputs arrive inside the same frame budget: none may consume it.
-            for event in noops.clone() {
-                app.on_terminal_event(event, &mut dirty);
-                assert!(dirty);
-            }
-            dirty = false;
-            for event in noops.clone() {
-                app.on_terminal_event(event, &mut dirty);
-                assert!(!dirty);
-            }
+    #[ignore = "launched only by the parent PTY smoke test in an isolated process"]
+    fn child_fixture() {
+        let root =
+            PathBuf::from(std::env::var_os(FIXTURE_ENV).expect("PTY parent must supply isolation"));
+        let root = root.canonicalize().expect("canonical fixture root");
+        assert!(root.starts_with(repo_root().join("target")));
+        assert_eq!(std::env::current_dir().unwrap(), root.join("work"));
+        assert!(root.join("work/.git").is_dir());
+        for name in [
+            "HOME",
+            "APPDATA",
+            "XDG_CONFIG_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_DATA_HOME",
+            "XDG_STATE_HOME",
+            "XDG_RUNTIME_DIR",
+            "TMPDIR",
+            "PATH",
+        ] {
+            let path = PathBuf::from(std::env::var_os(name).expect("isolated child environment"));
+            assert!(
+                path.canonicalize().unwrap().starts_with(&root),
+                "{name} must be isolated"
+            );
         }
+        let mut mode = std::mem::MaybeUninit::uninit();
+        assert_eq!(unsafe { libc::tcgetattr(0, mode.as_mut_ptr()) }, 0);
+        let mode = unsafe { mode.assume_init() };
+        fs::write(root.join("termios-before"), termios_state(&mode))
+            .expect("record baseline terminal mode");
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("fixture Tokio runtime");
+        runtime.block_on(async {
+            let provider = Arc::new(
+                MockProvider::new(vec![])
+                    .with_default(MockReply::Text("delayed response must not complete".into()))
+                    .with_delay(MOCK_DELAY),
+            );
+            let observed = provider.clone();
+            let marker = root.join("provider-started");
+            let observer = tokio::spawn(async move {
+                while observed.call_count() == 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                fs::write(marker, b"started").expect("record mock generation start");
+            });
+            let config = BobConfig::default();
+            assert!(config.lsp_servers.is_empty() && config.mcp_servers.is_empty());
+            let cwd = root.join("work");
+            let session = new_session(
+                "mock:mock-model",
+                "pty-smoke".into(),
+                "0".into(),
+                cwd.to_string_lossy().into_owned(),
+            );
+            super::run(
+                config,
+                provider.clone(),
+                "mock:mock-model".into(),
+                cwd,
+                session,
+            )
+            .await
+            .expect("real TUI run");
+            observer.abort();
+            assert_eq!(provider.call_count(), 1, "exactly one harmless generation");
+        });
+        drop(runtime);
+        let mut restored = std::mem::MaybeUninit::uninit();
+        assert_eq!(unsafe { libc::tcgetattr(0, restored.as_mut_ptr()) }, 0);
+        fs::write(
+            root.join("termios-after"),
+            termios_state(&unsafe { restored.assume_init() }),
+        )
+        .expect("record restored terminal mode before PTY hangup");
+        println!("{}", std::str::from_utf8(CHILD_DONE).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::test_app;
+    use super::*;
+
+    fn question(
+        title: &str,
+        allow_other: bool,
+    ) -> (PendingQuery, oneshot::Receiver<Option<String>>) {
+        let (resp, rx) = oneshot::channel();
+        (
+            PendingQuery {
+                query: bob_core::tools::registry::UserQuery {
+                    title: title.into(),
+                    detail: String::new(),
+                    options: vec!["Yes, proceed".into(), "No, revise".into()],
+                    allow_other,
+                },
+                list: widgets::SelectList::new(),
+                other_text: None,
+                inspection: Default::default(),
+                purpose: QueryPurpose::Tool(resp),
+            },
+            rx,
+        )
     }
 
     #[test]
-    fn ctrl_x_targets_only_selected_agents_and_preserves_composition() {
-        use bob_core::agent::team::mailbox;
+    fn terminal_key_kind_controls_editing_and_resize_invalidates_hit_maps() {
         let mut app = test_app();
-        let (_root_inbox, root_tx) = mailbox();
-        let root = app
-            .agent_team
-            .register("root".into(), 0, String::new(), root_tx);
-        let (_a_inbox, a_tx) = mailbox();
-        let a = app.agent_team.register("a".into(), 1, "root".into(), a_tx);
-        let (_b_inbox, b_tx) = mailbox();
-        let b = app.agent_team.register("b".into(), 1, "root".into(), b_tx);
-        app.teams.on_spawn("a", "root", "review a", "");
-        app.teams.on_spawn("b", "root", "review b", "");
+        for (kind, expected, expected_dirty) in [
+            (KeyEventKind::Release, "", false),
+            (KeyEventKind::Press, "界", true),
+            (KeyEventKind::Repeat, "界界", true),
+        ] {
+            let mut dirty = false;
+            let key = crossterm::event::KeyEvent::new_with_kind(
+                KeyCode::Char('界'),
+                KeyModifiers::NONE,
+                kind,
+            );
+            assert!(matches!(
+                app.on_terminal_event(CtEvent::Key(key), &mut dirty),
+                KeyOutcome::None
+            ));
+            assert_eq!(app.input.text(), expected);
+            assert_eq!(dirty, expected_dirty);
+        }
+        app.sidebar_rect = Some(Rect::new(10, 0, 10, 20));
+        app.sidebar_rows = Some(vec![(2, "worker".into())]);
+        app.wf_view_agents = Some(vec![(3, "worker".into())]);
+        app.focused_agent = Some("worker".into());
+        let mut dirty = false;
+        app.on_terminal_event(CtEvent::Resize(80, 24), &mut dirty);
+        assert!(dirty);
+        assert!(app.sidebar_rect.is_none());
+        assert!(app.sidebar_rows.is_none());
+        assert!(app.wf_view_agents.is_none());
+        assert_eq!(app.focused_agent.as_deref(), Some("worker"));
+        assert_eq!(app.input.text(), "界界");
+    }
+
+    #[test]
+    fn enter_resolves_paste_and_steers_only_a_running_root_turn() {
+        for (running, focused, modifiers, steer) in [
+            (false, None, KeyModifiers::NONE, false),
+            (false, None, KeyModifiers::ALT, false),
+            (true, None, KeyModifiers::NONE, false),
+            (true, None, KeyModifiers::ALT, true),
+            (true, Some("worker"), KeyModifiers::ALT, false),
+        ] {
+            let mut app = test_app();
+            app.running = running;
+            app.focused_agent = focused.map(String::from);
+            app.input.paste("  first\n日本  ");
+            let outcome = app.on_key(KeyCode::Enter, modifiers);
+            match outcome {
+                KeyOutcome::Steer(text) if steer => assert_eq!(text, "first\n日本"),
+                KeyOutcome::Submit(text) if !steer => assert_eq!(text, "first\n日本"),
+                _ => panic!("wrong outcome for running={running}, focused={focused:?}, modifiers={modifiers:?}"),
+            }
+            assert_eq!(app.input.text(), "");
+            assert!(app.queue.is_empty(), "queueing belongs to the event loop");
+        }
+        let mut app = test_app();
+        app.input.set("é");
+        assert!(matches!(
+            app.on_key(KeyCode::Enter, KeyModifiers::SHIFT),
+            KeyOutcome::None
+        ));
+        assert_eq!(app.input.text(), "é\n");
+        app.input.set("  ");
+        assert!(matches!(
+            app.on_key(KeyCode::Enter, KeyModifiers::NONE),
+            KeyOutcome::None
+        ));
+        assert_eq!(app.input.text(), "  ");
+    }
+
+    #[test]
+    fn escape_dismisses_completion_before_interrupting_and_backspace_recalls_last_queue_item() {
+        let mut app = test_app();
         app.running = true;
-        app.sidebar_open = true;
-        app.on_key(KeyCode::Char('x'), KeyModifiers::CONTROL);
-        assert!(!root.cancellation_requested());
-        assert!(!a.cancellation_requested());
-        assert!(app.agent_control_notice.is_none());
-
-        app.open_sidebar_on("a");
-        app.input.set("draft");
-        app.on_key(KeyCode::Char('x'), KeyModifiers::CONTROL);
-        assert_eq!(app.input.text(), "draft");
-        assert!(a.cancellation_requested());
-        assert!(!b.cancellation_requested());
-        assert!(app
-            .control_notice("a")
-            .unwrap()
-            .contains("cancellation requested"));
-        app.set_focused_agent(Some("b".into()));
-        app.sidebar_open = false;
-        app.input.set("keep this message");
-        app.on_key(KeyCode::Char('x'), KeyModifiers::CONTROL);
-        assert!(b.cancellation_requested());
-        assert_eq!(app.input.text(), "keep this message");
-        assert!(!root.cancellation_requested());
+        app.input.set("/co");
+        app.refresh_menu();
+        assert!(!app.menu.is_empty());
+        app.on_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.menu.is_empty());
         assert!(!app.cancel.load(std::sync::atomic::Ordering::Relaxed));
-    }
-
-    #[test]
-    fn ctrl_x_surfaces_unreachable_agent_errors_without_changing_status() {
-        let mut app = test_app();
-        app.teams.on_spawn("old", "root", "review old", "");
-        app.teams.on_done("old", false);
-        app.open_sidebar_on("old");
-        app.on_key(KeyCode::Char('x'), KeyModifiers::CONTROL);
-        assert!(app.control_notice("old").is_some());
-        assert!(!app
-            .control_notice("old")
-            .unwrap()
-            .contains("cancellation requested"));
+        assert_eq!(app.input.text(), "/co");
+        app.on_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.cancel.load(std::sync::atomic::Ordering::Relaxed));
+        app.input.set("");
+        app.queue.extend(["first".into(), "last 界".into()]);
+        app.on_key(KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(app.input.text(), "last 界");
         assert_eq!(
-            app.teams.get("old").unwrap().status,
-            team::ThreadStatus::Done
+            app.queue.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec!["first"]
         );
-        app.set_focused_agent(Some("old".into()));
-        assert_eq!(app.stop_target().as_deref(), Some("old"));
+        app.on_key(KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(app.input.text(), "last ");
+        assert_eq!(app.queue.len(), 1);
     }
 
     #[test]
-    fn closed_worker_prompts_are_removed_without_dropping_live_requests() {
+    fn query_selection_replies_once_then_advances_without_editing_composer() {
         let mut app = test_app();
+        app.input.set("draft");
+        let (first, mut first_rx) = question("first", false);
+        let (second, mut second_rx) = question("second", true);
+        app.enqueue_query(first);
+        app.enqueue_query(second);
+        app.on_key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.pending_query.as_ref().unwrap().list.selected, 0);
+        for _ in 0..3 {
+            app.on_key(KeyCode::Down, KeyModifiers::NONE);
+        }
+        assert_eq!(app.pending_query.as_ref().unwrap().list.selected, 1);
+        app.on_key(KeyCode::Char('9'), KeyModifiers::NONE);
+        assert!(matches!(
+            first_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        app.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(first_rx.try_recv().unwrap(), Some("No, revise".into()));
+        assert_eq!(app.pending_query.as_ref().unwrap().query.title, "second");
+        app.on_key(KeyCode::Char('3'), KeyModifiers::NONE);
+        assert_eq!(
+            app.pending_query.as_ref().unwrap().other_text.as_deref(),
+            Some("")
+        );
+        for ch in ['é', '界'] {
+            app.on_key(KeyCode::Char(ch), KeyModifiers::NONE);
+        }
+        app.on_key(KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(
+            app.pending_query.as_ref().unwrap().other_text.as_deref(),
+            Some("é")
+        );
+        app.on_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.pending_query.as_ref().unwrap().other_text.is_none());
+        assert!(matches!(
+            second_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        app.on_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(second_rx.try_recv().unwrap(), None);
+        assert!(app.pending_query.is_none());
+        assert_eq!(app.input.text(), "draft");
+    }
+
+    #[test]
+    fn permission_selection_answers_fifo_before_pending_questions() {
+        let mut app = test_app();
+        app.input.set("draft");
+        let (query, mut query_rx) = question("question", false);
+        app.enqueue_query(query);
         let mut receivers = Vec::new();
-        for id in ["closed-front", "live", "closed-back"] {
+        for title in ["first permission", "second permission"] {
             let (resp, rx) = oneshot::channel();
+            receivers.push(rx);
             app.perm_queue.push_back(PendingPerm {
-                title: id.into(),
+                title: title.into(),
                 detail: String::new(),
                 preview: None,
-                options: Vec::new(),
+                options: vec![
+                    PermissionOption {
+                        label: "allow".into(),
+                        allow: true,
+                        grant: None,
+                    },
+                    PermissionOption {
+                        label: "deny".into(),
+                        allow: false,
+                        grant: None,
+                    },
+                ],
                 list: widgets::SelectList::new(),
                 resp,
             });
-            if id == "live" {
-                receivers.push(rx);
-            }
         }
-        let (resp, rx) = oneshot::channel();
-        app.pending_query = Some(PendingQuery {
-            query: bob_core::tools::registry::UserQuery {
-                title: "question".into(),
-                detail: String::new(),
-                options: vec![],
-                allow_other: true,
-            },
-            list: widgets::SelectList::new(),
-            other_text: Some("draft".into()),
-            purpose: QueryPurpose::Tool(resp),
-        });
-        assert!(app.clear_closed_prompts());
-        assert_eq!(app.perm_queue.len(), 1);
-        assert_eq!(app.perm_queue.front().unwrap().title, "live");
-        assert!(app.pending_query.is_some());
-        app.sidebar_open = true;
-        app.set_focused_agent(Some("live".into()));
-        assert!(
-            app.stop_target().is_none(),
-            "free-text answers are compose mode"
-        );
-        app.pending_query.as_mut().unwrap().other_text = None;
-        assert_eq!(app.stop_target().as_deref(), Some("live"));
-        assert!(!app.clear_closed_prompts());
-        drop(rx);
-        assert!(app.clear_closed_prompts());
-        assert!(app.pending_query.is_none());
-        app.open_reasoning_picker(bob_core::core::types::ReasoningEffort::Off);
-        assert!(!app.clear_closed_prompts());
-        assert!(app.pending_query.is_some());
-        drop(receivers);
-        assert!(app.clear_closed_prompts());
+        for _ in 0..3 {
+            app.on_key(KeyCode::Down, KeyModifiers::NONE);
+        }
+        assert_eq!(app.perm_queue.front().unwrap().list.selected, 1);
+        app.on_key(KeyCode::Char('9'), KeyModifiers::NONE);
+        assert_eq!(app.perm_queue.len(), 2);
+        app.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(receivers[0].try_recv().unwrap(), Some(1));
+        assert_eq!(app.perm_queue.front().unwrap().title, "second permission");
+        assert_eq!(app.perm_queue.front().unwrap().list.selected, 0);
+        app.on_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(receivers[1].try_recv().unwrap(), None);
         assert!(app.perm_queue.is_empty());
+        assert!(matches!(
+            query_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert_eq!(app.pending_query.as_ref().unwrap().list.selected, 0);
+        app.on_key(KeyCode::Char('1'), KeyModifiers::NONE);
+        assert_eq!(query_rx.try_recv().unwrap(), Some("Yes, proceed".into()));
+        assert_eq!(app.input.text(), "draft");
     }
 
     #[test]
-    fn sidebar_keeps_agent_identity_when_status_reorders_rows() {
+    fn plan_mode_exits_only_for_approved_plan_question() {
+        for (title, key, expected) in [
+            ("Ready to code?", '1', Mode::Normal),
+            ("Ready to code?", '2', Mode::Plan),
+            ("Continue?", '1', Mode::Plan),
+        ] {
+            let mut app = test_app();
+            app.permissions.set_mode(Mode::Plan);
+            let (query, mut rx) = question(title, false);
+            app.enqueue_query(query);
+            app.on_key(KeyCode::Char(key), KeyModifiers::NONE);
+            assert_eq!(app.permissions.mode(), expected, "{title}, {key}");
+            assert_eq!(
+                rx.try_recv().unwrap(),
+                Some(
+                    if key == '1' {
+                        "Yes, proceed"
+                    } else {
+                        "No, revise"
+                    }
+                    .into()
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn model_choice_strips_metadata_and_ctrl_c_quits_without_answering() {
         let mut app = test_app();
-        app.sidebar_open = true;
-        for id in ["task_1", "job_2", "reviewer"] {
+        app.open_model_picker(vec!["openai:model\t128k ctx".into()]);
+        assert!(matches!(
+            app.on_key(KeyCode::Enter, KeyModifiers::NONE),
+            KeyOutcome::SwitchModel(id) if id == "openai:model"
+        ));
+        assert!(app.pending_query.is_none());
+        let (query, mut rx) = question("still pending", true);
+        app.enqueue_query(query);
+        assert!(matches!(
+            app.on_key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            KeyOutcome::Quit
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(app.pending_query.is_some());
+    }
+
+    #[test]
+    fn agent_completion_reorders_sidebar_without_changing_focused_identity() {
+        let mut app = test_app();
+        for id in ["first", "second"] {
             app.apply_agent_event(&AgentEvent::SubagentSpawn {
                 agent_id: id.into(),
                 parent_id: "root".into(),
-                task: format!("Review {id}"),
+                task: "review".into(),
                 prompt: String::new(),
             });
         }
-        app.on_key(KeyCode::Down, KeyModifiers::NONE);
-        app.open_sidebar_on("task_1");
+        app.set_focused_agent(Some("first".into()));
         app.apply_agent_event(&AgentEvent::SubagentDone {
-            agent_id: "task_1".into(),
+            agent_id: "first".into(),
             failed: false,
             cancelled: false,
         });
-        assert_eq!(app.teams.display_order(), ["job_2", "reviewer", "task_1"]);
-        assert_eq!(app.focused_agent.as_deref(), Some("task_1"));
-        assert_eq!(app.sidebar.selected, 3);
-        app.on_key(KeyCode::Up, KeyModifiers::NONE);
-        assert_eq!(app.focused_agent.as_deref(), Some("reviewer"));
-        app.on_key(KeyCode::Down, KeyModifiers::NONE);
-        assert_eq!(app.focused_agent.as_deref(), Some("task_1"));
-        app.apply_agent_event(&AgentEvent::SubagentSpawn {
-            agent_id: "new-reviewer".into(),
-            parent_id: "root".into(),
-            task: "Check tests".into(),
-            prompt: String::new(),
-        });
-        assert_eq!(app.sidebar.selected, 4);
-        assert_eq!(app.focused_agent.as_deref(), Some("task_1"));
+        assert_eq!(app.teams.display_order(), vec!["second", "first"]);
+        assert_eq!(app.focused_agent.as_deref(), Some("first"));
+        assert_eq!(app.sidebar.selected, 2);
+        assert_eq!(
+            app.teams.get("first").unwrap().status,
+            team::ThreadStatus::Done
+        );
     }
 
     #[test]
-    fn ctrl_t_is_the_only_sidebar_shortcut_and_preserves_focus() {
-        let mut app = test_app();
-        app.input.set("draft");
-        app.on_key(KeyCode::Char('g'), KeyModifiers::CONTROL);
-        assert!(!app.sidebar_open);
-        assert_eq!(app.input.text(), "draft");
-        app.input.set("");
-        app.on_key(KeyCode::Char('t'), KeyModifiers::CONTROL);
-        assert!(app.sidebar_open);
-        app.on_key(KeyCode::Char('g'), KeyModifiers::CONTROL);
-        assert!(app.sidebar_open);
-        assert_eq!(app.input.text(), "");
-        app.on_key(KeyCode::Char('t'), KeyModifiers::CONTROL);
-        assert!(!app.sidebar_open);
-        app.teams.on_spawn("a", "root", "review a", "");
-        app.on_key(KeyCode::Char('t'), KeyModifiers::CONTROL);
-        app.on_key(KeyCode::Down, KeyModifiers::NONE);
-        assert_eq!(app.focused_agent.as_deref(), Some("a"));
-        app.input.set("draft");
-        app.on_key(KeyCode::Char('g'), KeyModifiers::CONTROL);
-        assert!(app.sidebar_open);
-        assert_eq!(app.input.text(), "draft");
-        app.on_key(KeyCode::Char('t'), KeyModifiers::CONTROL);
-        assert!(!app.sidebar_open);
-        assert_eq!(app.focused_agent.as_deref(), Some("a"));
-        assert_eq!(app.input.text(), "draft");
-        app.running = true;
-        app.on_key(KeyCode::Esc, KeyModifiers::NONE);
-        assert!(app.focused_agent.is_none());
-        assert_eq!(app.sidebar.selected, 0);
-        assert!(!app.cancel.load(std::sync::atomic::Ordering::Relaxed));
-    }
-
-    #[test]
-    fn focused_input_messages_the_agent_even_with_alt_enter_while_root_runs() {
-        use bob_core::agent::team::mailbox;
-        for mods in [KeyModifiers::NONE, KeyModifiers::ALT] {
-            let mut app = test_app();
-            let (mut root_inbox, root_tx) = mailbox();
-            app.agent_team
-                .register("root".into(), 0, String::new(), root_tx);
-            let (mut inbox, tx) = mailbox();
-            app.agent_team.register("a".into(), 1, "root".into(), tx);
-            app.teams.on_spawn("a", "root", "review", "");
-            app.open_sidebar_on("a");
-            app.running = true;
-            app.input.set("check the tests");
-            let KeyOutcome::Submit(text) = app.on_key(KeyCode::Enter, mods) else {
-                panic!("focused input must submit to the selected agent");
-            };
-            app.send_agent_message("a", &text);
-            let messages = inbox.drain();
-            assert_eq!(messages.len(), 1);
-            assert_eq!(messages[0].from, "user");
-            assert_eq!(messages[0].text, "check the tests");
-            assert!(root_inbox.drain().is_empty());
-            assert!(app.queue.is_empty());
-            assert!(app.view.cells.is_empty());
-            assert!(matches!(&app.teams.get("a").unwrap().cells[0],
-                view::Cell::AgentMsg { from, text } if from == "user" && text == "check the tests"));
-            assert_eq!(app.teams.get("a").unwrap().unread, 0);
+    fn truncation_preserves_short_text_and_unicode_character_boundaries() {
+        for (label, text, max, expected) in [
+            ("under cap", "hi", 8, "hi"),
+            ("no room for ellipsis", "abcdef", 3, "abcdef"),
+            ("ascii head", "hello world", 8, "hello w..."),
+            ("unicode head", "héllo wörld", 6, "héllo..."),
+        ] {
+            assert_eq!(truncate_mid(text, max), expected, "{label}");
         }
     }
 
     #[test]
-    fn unreachable_agent_message_is_not_echoed_as_delivered() {
-        let mut app = test_app();
-        app.teams.on_spawn("old", "root", "review", "");
-        app.teams.on_done("old", false);
-        app.open_sidebar_on("old");
-        app.send_agent_message("old", "hello");
-        assert!(app.teams.get("old").unwrap().cells.is_empty());
-        assert_eq!(app.control_notice("old"), Some("old is not reachable"));
-    }
-
-    #[test]
-    fn ctx_window_labels() {
-        assert_eq!(fmt_ctx_window(1_000_000), "1M ctx");
-        assert_eq!(fmt_ctx_window(936_000), "936k ctx");
-        assert_eq!(fmt_ctx_window(400_000), "400k ctx");
-        assert_eq!(fmt_ctx_window(1_050_000), "1.1M ctx");
-        assert_eq!(fmt_ctx_window(128_000), "128k ctx");
-        assert_eq!(fmt_ctx_window(512), "512 ctx");
-    }
-
-    #[test]
-    fn trim_dot_drops_trailing_zero() {
-        assert_eq!(trim_dot(1.0), "1");
-        assert_eq!(trim_dot(1.5), "1.5");
-    }
-
-    #[test]
-    fn fmt_duration_units() {
-        assert_eq!(fmt_duration(0), "0s");
-        assert_eq!(fmt_duration(59), "59s");
-        assert_eq!(fmt_duration(60), "1m");
-        assert_eq!(fmt_duration(83), "1m23s"); // seconds zero-padded
-        assert_eq!(fmt_duration(605), "10m05s");
-        assert_eq!(fmt_duration(3600), "1h0m");
-        assert_eq!(fmt_duration(3661), "1h1m");
-    }
-
-    #[test]
-    fn fmt_tokens_scales() {
-        assert_eq!(fmt_tokens(0), "0");
-        assert_eq!(fmt_tokens(999), "999");
-        assert_eq!(fmt_tokens(1_000), "1.0k");
-        assert_eq!(fmt_tokens(1_234), "1.2k");
-        assert_eq!(fmt_tokens(1_000_000), "1.0M");
-    }
-
-    #[test]
-    fn truncate_mid_head_and_ellipsis() {
-        // Under the cap → unchanged.
-        assert_eq!(truncate_mid("hi", 8), "hi");
-        // max < 4 → never truncates (no room for "x...").
-        assert_eq!(truncate_mid("abcdef", 3), "abcdef");
-        // Keeps max-1 chars + "..." (counts chars, not bytes).
-        assert_eq!(truncate_mid("hello world", 8), "hello w...");
-        assert_eq!(truncate_mid("héllo wörld", 6), "héllo...");
-    }
-
-    #[test]
-    fn wrap_line_splits_on_display_width() {
-        let line = Line::from(vec![Span::raw("aaaa")]);
-        let wrapped = wrap_line(line, 2);
-        let text: Vec<String> = wrapped
-            .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
-            .collect();
-        assert_eq!(text, vec!["aa".to_string(), "aa".to_string()]);
-        // width 0 is a no-op (can't wrap into nothing).
-        let line = Line::from(vec![Span::raw("abc")]);
-        assert_eq!(wrap_line(line, 0).len(), 1);
+    fn line_wrapping_uses_display_columns_and_preserves_zero_width_input() {
+        for (label, text, width, expected) in [
+            ("ascii", "aaaa", 2, vec!["aa", "aa"]),
+            ("wide glyphs", "a界b", 2, vec!["a", "界", "b"]),
+            ("combining mark", "e\u{301}xy", 2, vec!["e\u{301}x", "y"]),
+            ("zero width", "abc", 0, vec!["abc"]),
+        ] {
+            let wrapped = wrap_line(Line::from(vec![Span::raw(text)]), width);
+            let rows: Vec<String> = wrapped.iter().map(ToString::to_string).collect();
+            assert_eq!(rows, expected, "{label}");
+        }
     }
 }

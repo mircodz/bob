@@ -1,47 +1,56 @@
-//! LSP client + manager. bob acts as an LSP *client*, driving one or more
-//! language servers over stdio (JSON-RPC 2.0 with Content-Length framing — the
-//! LSP wire format, distinct from MCP's newline-delimited variant). We don't use
-//! an off-the-shelf framework (async-lsp's tower stack fights a multi-server
-//! manager); the transport is ~150 lines and gives us full control over
-//! background spawning, per-server health, and notification handling
-//! (publishDiagnostics + $/progress).
-//!
-//! Servers are configured per-project (see LspServerConfig). The manager routes
-//! a file to the right server by the longest-matching `root` whose `extensions`
-//! contains the file's extension — this is how monorepos work.
+//! LSP over stdio uses Content-Length framing, unlike MCP's newline-delimited stdio.
+
+mod positions;
+pub(crate) mod transport;
+pub(crate) mod workspace_edit;
+pub use positions::PositionEncoding;
 
 use crate::core::config::LspServerConfig;
+use crate::core::process::ManagedProcess;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout};
-use tokio::sync::oneshot;
+use tokio::io::{AsyncRead, AsyncReadExt, BufReader};
+use transport::RpcConnection;
 
-/// Lifecycle/health of a single language server, surfaced in the status bar.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Health {
     /// Process spawned, initialize handshake in flight.
     Starting,
-    /// Initialized; still indexing the workspace. Optional percent from
-    /// `$/progress` (rust-analyzer reports "Indexing" with a percentage).
+    /// Initialized; indexing progress from `$/progress`.
     Indexing(Option<u8>),
-    /// Indexed and ready to answer requests.
     Ready,
-    /// Failed to start or crashed. Carries a short reason.
     Failed(String),
 }
 
-/// Diagnostics for one file.
 #[derive(Clone, Default)]
 struct FileDiagnostics {
     diagnostics: Vec<Value>,
+    generation: u64,
+    version: Option<i64>,
 }
 
-/// A live connection to one language server.
+#[derive(Clone)]
+pub struct DocumentSnapshot {
+    pub version: i64,
+    pub text: String,
+}
+
+#[derive(Debug)]
+pub struct DiagnosticPublication {
+    pub diagnostics: Vec<Value>,
+    pub version_confirmed: bool,
+}
+
+#[derive(Clone, Copy)]
+pub struct SyncStamp {
+    pub version: i64,
+    pub generation: u64,
+}
+
 #[derive(Clone)]
 pub struct LspClient {
     inner: Arc<LspInner>,
@@ -49,18 +58,14 @@ pub struct LspClient {
 
 struct LspInner {
     name: String,
-    stdin: tokio::sync::Mutex<ChildStdin>,
-    pending: Mutex<HashMap<i64, oneshot::Sender<Value>>>,
-    next_id: AtomicI64,
-    /// Latest publishDiagnostics per file URI.
+    connection: Arc<RpcConnection>,
     diagnostics: Mutex<HashMap<String, FileDiagnostics>>,
-    /// Doc versions we've sent per file URI (for didOpen/didChange).
-    versions: Mutex<HashMap<String, i64>>,
+    generation: AtomicU64,
+    documents: Mutex<HashMap<String, DocumentSnapshot>>,
+    sync_lock: tokio::sync::Mutex<()>,
+    encoding: Mutex<PositionEncoding>,
     health: Mutex<Health>,
-    /// codeActionKinds the server advertised at initialize (e.g. "quickfix",
-    /// "refactor", "source.organizeImports"). Empty if it didn't specify.
     code_action_kinds: Mutex<Vec<String>>,
-    _child: tokio::sync::Mutex<Child>,
 }
 
 impl LspClient {
@@ -69,12 +74,13 @@ impl LspClient {
     }
 
     pub fn health(&self) -> Health {
+        if self.inner.connection.is_closed() {
+            return Health::Failed("connection closed".into());
+        }
         self.inner.health.lock().unwrap().clone()
     }
 
-    /// Spawn the server and run the initialize handshake. Returns as soon as the
-    /// server acknowledges `initialize`; workspace indexing continues in the
-    /// background and is reflected via `health()`.
+    /// Returns after initialization; indexing continues in the background.
     pub async fn start(cfg: &LspServerConfig, repo_root: &Path) -> anyhow::Result<LspClient> {
         let server_root = repo_root.join(&cfg.root);
         let root_uri = path_to_uri(&server_root);
@@ -87,7 +93,7 @@ impl LspClient {
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
 
-        let mut child = command.spawn().map_err(|e| {
+        let mut child = ManagedProcess::spawn(&mut command).map_err(|e| {
             anyhow::anyhow!(
                 "failed to start LSP '{}' (command '{}'): {}. \
                  Ensure it's installed and on PATH — if it lives in ~/.cargo/bin or \
@@ -98,38 +104,41 @@ impl LspClient {
             )
         })?;
         let stdin = child
-            .stdin
-            .take()
+            .take_stdin()
             .ok_or_else(|| anyhow::anyhow!("no stdin"))?;
         let stdout = child
-            .stdout
-            .take()
+            .take_stdout()
             .ok_or_else(|| anyhow::anyhow!("no stdout"))?;
 
         let inner = Arc::new(LspInner {
             name: cfg.name.clone(),
-            stdin: tokio::sync::Mutex::new(stdin),
-            pending: Mutex::new(HashMap::new()),
-            next_id: AtomicI64::new(1),
+            connection: RpcConnection::new(
+                stdin,
+                Some(child),
+                true,
+                std::time::Duration::from_secs(15),
+            ),
             diagnostics: Mutex::new(HashMap::new()),
-            versions: Mutex::new(HashMap::new()),
+            generation: AtomicU64::new(0),
+            documents: Mutex::new(HashMap::new()),
+            sync_lock: tokio::sync::Mutex::new(()),
+            encoding: Mutex::new(PositionEncoding::Utf16),
             health: Mutex::new(Health::Starting),
             code_action_kinds: Mutex::new(Vec::new()),
-            _child: tokio::sync::Mutex::new(child),
         });
 
-        spawn_reader(inner.clone(), stdout);
+        spawn_reader(&inner, stdout);
 
         let client = LspClient { inner };
 
-        // initialize handshake.
         #[allow(clippy::disallowed_names)]
         let init = json!({
             "processId": std::process::id(),
             "rootUri": root_uri,
             "capabilities": {
+                "general": { "positionEncodings": ["utf-8", "utf-16", "utf-32"] },
                 "textDocument": {
-                    "publishDiagnostics": { "relatedInformation": true },
+                    "publishDiagnostics": { "relatedInformation": true, "versionSupport": true },
                     "hover": { "contentFormat": ["plaintext", "markdown"] },
                     "definition": {},
                     "references": {},
@@ -149,8 +158,6 @@ impl LspClient {
             }
         });
         let init_result = client.request("initialize", init).await?;
-        // Record the code-action kinds the server advertises, so `code_action`
-        // can tell the model what this server can do without a round-trip.
         if let Some(kinds) =
             init_result["capabilities"]["codeActionProvider"]["codeActionKinds"].as_array()
         {
@@ -160,51 +167,113 @@ impl LspClient {
                 .collect();
             *client.inner.code_action_kinds.lock().unwrap() = kinds;
         }
-        client.notify("initialized", json!({})).await;
+        *client.inner.encoding.lock().unwrap() =
+            PositionEncoding::negotiate(init_result["capabilities"]["positionEncoding"].as_str())?;
+        client
+            .inner
+            .connection
+            .notify("initialized", json!({}))
+            .await?;
         *client.inner.health.lock().unwrap() = Health::Indexing(None);
         Ok(client)
     }
 
-    /// The code-action kinds this server advertised at initialize (may be empty
-    /// if it didn't specify — many servers still support actions dynamically).
+    /// Advertised kinds; an empty list does not rule out dynamic actions.
     pub fn code_action_kinds(&self) -> Vec<String> {
         self.inner.code_action_kinds.lock().unwrap().clone()
     }
 
-    /// Notify the server a file is open (or its content changed). Bumps the doc
-    /// version. Call before requesting diagnostics/nav so the server sees the
-    /// latest on-disk (or in-flight) text.
-    pub async fn sync_file(&self, path: &Path, text: &str) {
+    /// Call before document requests so the server sees the latest text and version.
+    pub async fn sync_file(&self, path: &Path, text: &str) -> anyhow::Result<SyncStamp> {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let _sync = self.inner.sync_lock.lock().await;
+            let uri = path_to_uri(path);
+            let version = self.document_snapshot(path).map_or(1, |doc| doc.version + 1);
+            let generation = self.inner.generation.load(Ordering::Acquire);
+            let (method, params) = if version == 1 {
+                ("textDocument/didOpen", json!({"textDocument": {
+                    "uri": uri, "languageId": language_id_for(path), "version": version, "text": text
+                }}))
+            } else {
+                ("textDocument/didChange", json!({
+                    "textDocument": {"uri":uri,"version":version},
+                    "contentChanges":[{"text":text}]
+                }))
+            };
+            self.inner.connection.notify(method, params).await?;
+            self.inner.documents.lock().unwrap().insert(uri, DocumentSnapshot {
+                version, text: text.to_string(),
+            });
+            Ok(SyncStamp { version, generation })
+        }).await.map_err(|_| anyhow::anyhow!("document synchronization timed out"))?
+    }
+
+    pub(crate) async fn lock_documents(&self) -> anyhow::Result<tokio::sync::MutexGuard<'_, ()>> {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            self.inner.sync_lock.lock(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("document lock timed out"))
+    }
+
+    pub fn document_snapshot(&self, path: &Path) -> Option<DocumentSnapshot> {
+        self.inner
+            .documents
+            .lock()
+            .unwrap()
+            .get(&path_to_uri(path))
+            .cloned()
+    }
+
+    pub fn document_snapshots(&self) -> HashMap<String, DocumentSnapshot> {
+        self.inner.documents.lock().unwrap().clone()
+    }
+
+    pub fn position_encoding(&self) -> PositionEncoding {
+        *self.inner.encoding.lock().unwrap()
+    }
+
+    pub async fn fresh_diagnostics(
+        &self,
+        path: &Path,
+        stamp: SyncStamp,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<DiagnosticPublication> {
         let uri = path_to_uri(path);
-        let version = {
-            let mut versions = self.inner.versions.lock().unwrap();
-            let v = versions.entry(uri.clone()).or_insert(0);
-            *v += 1;
-            *v
-        };
-        let language_id = language_id_for(path);
-        if version == 1 {
-            self.notify(
-                "textDocument/didOpen",
-                json!({ "textDocument": {
-                    "uri": uri, "languageId": language_id,
-                    "version": version, "text": text
-                }}),
-            )
-            .await;
-        } else {
-            self.notify(
-                "textDocument/didChange",
-                json!({
-                    "textDocument": { "uri": uri, "version": version },
-                    "contentChanges": [ { "text": text } ]
-                }),
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            anyhow::ensure!(
+                !self.inner.connection.is_closed(),
+                "language server disconnected before fresh diagnostics"
+            );
+            anyhow::ensure!(
+                self.document_snapshot(path)
+                    .is_some_and(|doc| doc.version == stamp.version),
+                "document changed while waiting for diagnostics"
+            );
+            if let Some(publication) = self.inner.diagnostics.lock().unwrap().get(&uri) {
+                if publication.generation > stamp.generation
+                    && publication
+                        .version
+                        .is_none_or(|version| version == stamp.version)
+                {
+                    return Ok(DiagnosticPublication {
+                        diagnostics: publication.diagnostics.clone(),
+                        version_confirmed: publication.version.is_some(),
+                    });
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                anyhow::bail!("timed out waiting for fresh diagnostics; cached diagnostics may be stale (document version {})", stamp.version);
+            }
+            tokio::time::sleep_until(
+                (tokio::time::Instant::now() + std::time::Duration::from_millis(20)).min(deadline),
             )
             .await;
         }
     }
 
-    /// The latest diagnostics for a file (empty if none / not opened).
     pub fn diagnostics_for(&self, path: &Path) -> Vec<Value> {
         let uri = path_to_uri(path);
         self.inner
@@ -216,60 +285,24 @@ impl LspClient {
             .unwrap_or_default()
     }
 
-    /// Send a textDocument request (definition/references/hover/etc.) at a
-    /// position, returning the raw `result`.
     pub async fn request(&self, method: &str, params: Value) -> anyhow::Result<Value> {
-        let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = oneshot::channel();
-        self.inner.pending.lock().unwrap().insert(id, tx);
-        let msg = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-        self.send(&msg).await?;
-        let resp = tokio::time::timeout(std::time::Duration::from_secs(15), rx)
-            .await
-            .map_err(|_| anyhow::anyhow!("LSP request '{}' timed out", method))?
-            .map_err(|_| anyhow::anyhow!("LSP connection closed"))?;
-        if let Some(err) = resp.get("error") {
-            anyhow::bail!("LSP error: {}", err);
-        }
-        Ok(resp.get("result").cloned().unwrap_or(Value::Null))
-    }
-
-    async fn notify(&self, method: &str, params: Value) {
-        let msg = json!({ "jsonrpc": "2.0", "method": method, "params": params });
-        let _ = self.send(&msg).await;
-    }
-
-    /// Write one framed JSON-RPC message (Content-Length header + body).
-    async fn send(&self, msg: &Value) -> anyhow::Result<()> {
-        let body = serde_json::to_string(msg)?;
-        let frame = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
-        let mut stdin = self.inner.stdin.lock().await;
-        stdin.write_all(frame.as_bytes()).await?;
-        stdin.flush().await?;
-        Ok(())
+        self.inner.connection.request(method, params).await
     }
 }
 
-/// Resolve an LSP server command to an executable path. If `command` already
-/// contains a path separator, or bob's inherited `PATH` can find it, it's used
-/// verbatim (the OS resolves it). Otherwise we probe common install dirs that a
-/// GUI/non-login launch often misses — most importantly `~/.cargo/bin`, where
-/// rustup places the `rust-analyzer` shim. Returns the original name if nothing
-/// matches, so the spawn still surfaces a clear "not found" error.
+/// Preserve explicit paths and PATH precedence; probe install dirs missed by GUI launches.
 fn resolve_command(command: &str) -> std::path::PathBuf {
     let as_path = Path::new(command);
     if as_path.is_absolute() || command.contains('/') {
         return as_path.to_path_buf();
     }
-    // Already resolvable via the inherited PATH? Trust it.
     if let Ok(path_var) = std::env::var("PATH") {
         for dir in std::env::split_paths(&path_var) {
             if is_executable(&dir.join(command)) {
-                return as_path.to_path_buf(); // let the OS resolve it normally
+                return as_path.to_path_buf();
             }
         }
     }
-    // Fall back to common install locations the launch env may have dropped.
     let home = dirs::home_dir();
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
     if let Some(h) = &home {
@@ -288,7 +321,6 @@ fn resolve_command(command: &str) -> std::path::PathBuf {
     as_path.to_path_buf()
 }
 
-/// Whether `path` is an existing file we can execute.
 #[cfg(unix)]
 fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
@@ -297,57 +329,57 @@ fn is_executable(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// On non-unix, treat any existing file as runnable (the OS handles the rest).
+/// Non-Unix executability is deferred to process creation.
 #[cfg(not(unix))]
 fn is_executable(path: &Path) -> bool {
     path.is_file()
 }
 
-/// Background task: read framed messages, correlate responses to pending
-/// requests, and fold notifications (publishDiagnostics, $/progress) into state.
-fn spawn_reader(inner: Arc<LspInner>, stdout: ChildStdout) {
+/// Correlate replies and update diagnostic/progress state without owning the client.
+fn spawn_reader(inner: &Arc<LspInner>, stdout: impl AsyncRead + Send + Unpin + 'static) {
+    let weak = Arc::downgrade(inner);
     tokio::spawn(async move {
         let mut reader = BufReader::new(stdout);
         loop {
             let msg = match read_frame(&mut reader).await {
                 Ok(m) => m,
                 Err(_) => {
-                    // stdout closed → server died. Mark failed unless it was a
-                    // clean shutdown (Ready stays Ready is fine; a crash mid-run
-                    // is surfaced).
-                    let mut h = inner.health.lock().unwrap();
-                    if !matches!(*h, Health::Failed(_)) {
-                        *h = Health::Failed("server exited".into());
+                    if let Some(inner) = weak.upgrade() {
+                        inner.connection.disconnect();
+                        *inner.health.lock().unwrap() = Health::Failed("server exited".into());
                     }
                     break;
                 }
             };
 
-            // Response to one of our requests?
-            if let Some(id) = msg.get("id").and_then(|v| v.as_i64()) {
-                if let Some(tx) = inner.pending.lock().unwrap().remove(&id) {
-                    let _ = tx.send(msg);
-                    continue;
-                }
-                // Server-to-client request (e.g. workspace/configuration). We
-                // don't implement these; ignore. (A robust client would reply.)
+            let Some(inner) = weak.upgrade() else { break };
+            if msg.get("method").is_none() {
+                inner.connection.receive(msg);
                 continue;
             }
 
-            // Notification.
             match msg.get("method").and_then(|v| v.as_str()) {
                 Some("textDocument/publishDiagnostics") => {
                     let params = &msg["params"];
                     if let Some(uri) = params["uri"].as_str() {
-                        let diags = params["diagnostics"]
-                            .as_array()
-                            .cloned()
-                            .unwrap_or_default();
-                        inner
-                            .diagnostics
-                            .lock()
-                            .unwrap()
-                            .insert(uri.to_string(), FileDiagnostics { diagnostics: diags });
+                        let Some(diags) = params["diagnostics"].as_array().cloned() else {
+                            continue;
+                        };
+                        if params
+                            .get("version")
+                            .is_some_and(|version| !version.is_null() && version.as_i64().is_none())
+                        {
+                            continue;
+                        }
+                        let generation = inner.generation.fetch_add(1, Ordering::AcqRel) + 1;
+                        inner.diagnostics.lock().unwrap().insert(
+                            uri.to_string(),
+                            FileDiagnostics {
+                                diagnostics: diags,
+                                generation,
+                                version: params["version"].as_i64(),
+                            },
+                        );
                     }
                     // First diagnostics push implies the server is answering.
                     let mut h = inner.health.lock().unwrap();
@@ -364,15 +396,12 @@ fn spawn_reader(inner: Arc<LspInner>, stdout: ChildStdout) {
     });
 }
 
-/// Fold a `$/progress` notification into health. rust-analyzer emits a WorkDone
-/// progress with a percentage during indexing and an `end` when done.
 fn update_progress(inner: &Arc<LspInner>, params: &Value) {
     let value = &params["value"];
     match value["kind"].as_str() {
         Some("begin") | Some("report") => {
             let pct = value["percentage"].as_u64().map(|p| p as u8);
             let mut h = inner.health.lock().unwrap();
-            // Only downgrade Ready->Indexing if a real indexing pass restarts.
             *h = Health::Indexing(pct);
         }
         Some("end") => {
@@ -382,8 +411,7 @@ fn update_progress(inner: &Arc<LspInner>, params: &Value) {
     }
 }
 
-/// Read one Content-Length-framed JSON-RPC message from the stream.
-async fn read_frame(reader: &mut BufReader<ChildStdout>) -> anyhow::Result<Value> {
+async fn read_frame<R: AsyncRead + Unpin>(reader: &mut BufReader<R>) -> anyhow::Result<Value> {
     let mut content_length: Option<usize> = None;
     let mut line = Vec::new();
     loop {
@@ -395,6 +423,7 @@ async fn read_frame(reader: &mut BufReader<ChildStdout>) -> anyhow::Result<Value
                 anyhow::bail!("server closed stdout");
             }
             line.push(b[0]);
+            anyhow::ensure!(line.len() <= 8192, "LSP header too large");
             if line.ends_with(b"\r\n") {
                 break;
             }
@@ -408,19 +437,19 @@ async fn read_frame(reader: &mut BufReader<ChildStdout>) -> anyhow::Result<Value
         }
     }
     let len = content_length.ok_or_else(|| anyhow::anyhow!("no Content-Length"))?;
+    anyhow::ensure!(len <= 16 * 1024 * 1024, "LSP frame too large");
     let mut body = vec![0u8; len];
     reader.read_exact(&mut body).await?;
     Ok(serde_json::from_slice(&body)?)
 }
 
-/// Map a filesystem path to a `file://` URI. Best-effort; assumes UTF-8 paths.
-/// Paths handed to the LSP layer are already absolute (the manager resolves them
-/// against cwd), so there's a single format here.
-fn path_to_uri(path: &Path) -> String {
-    format!("file://{}", path.to_string_lossy())
+/// Requires an absolute path; URI escaping is handled by `Url`.
+pub fn path_to_uri(path: &Path) -> String {
+    reqwest::Url::from_file_path(path)
+        .expect("LSP paths must be absolute")
+        .to_string()
 }
 
-/// Guess an LSP languageId from a file extension.
 fn language_id_for(path: &Path) -> String {
     match path.extension().and_then(|e| e.to_str()) {
         Some("rs") => "rust",
@@ -439,10 +468,7 @@ fn language_id_for(path: &Path) -> String {
     .to_string()
 }
 
-/// Manages every configured language server for a session: starts them in the
-/// background, routes files to the right one, and exposes health for the UI.
 pub struct LspManager {
-    /// Config paired with a lazily-populated client (None until started/failed).
     servers: Vec<ServerSlot>,
     repo_root: std::path::PathBuf,
 }
@@ -455,8 +481,7 @@ struct ServerSlot {
 }
 
 impl LspManager {
-    /// Build a manager and kick off background start for every server. Returns
-    /// immediately — servers initialize concurrently without blocking startup.
+    /// Returns immediately; servers initialize concurrently.
     pub fn start(configs: &[LspServerConfig], repo_root: &Path) -> Arc<LspManager> {
         let servers = configs
             .iter()
@@ -488,9 +513,7 @@ impl LspManager {
         mgr
     }
 
-    /// Find the client responsible for a file: the server whose `extensions`
-    /// contains the file's extension and whose resolved root is the longest
-    /// prefix of the file path (monorepo disambiguation).
+    /// Route by extension and deepest matching root among started clients.
     pub fn client_for(&self, path: &Path) -> Option<LspClient> {
         let ext = path.extension().and_then(|e| e.to_str())?;
         let mut best: Option<(usize, LspClient)> = None;
@@ -513,7 +536,6 @@ impl LspManager {
         best.map(|(_, c)| c)
     }
 
-    /// A (name, health) snapshot for every configured server, for the status bar.
     pub fn statuses(&self) -> Vec<(String, Health)> {
         self.servers
             .iter()
@@ -530,8 +552,7 @@ impl LspManager {
             .collect()
     }
 
-    /// Look up a started client by its configured name (for workspace/symbol,
-    /// which isn't file-scoped so can't be routed by path).
+    /// Name-based routing for requests without a file, such as `workspace/symbol`.
     pub fn client_by_name(&self, name: &str) -> Option<LspClient> {
         self.servers
             .iter()
@@ -540,78 +561,161 @@ impl LspManager {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestDir;
     use crate::tools::builtin::{ReadFileTool, WriteFileTool};
     use crate::tools::edit::{EditFileTool, MultiEditTool};
+    use crate::tools::lsp_actions::RenameSymbolTool;
     use crate::tools::registry::{Tool, ToolContext};
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+
+    fn fixture_client() -> (LspClient, tokio::io::DuplexStream) {
+        let (pipe, server) = tokio::io::duplex(64 * 1024);
+        let (reader, writer) = tokio::io::split(pipe);
+        let inner = Arc::new(LspInner {
+            name: "fixture".into(),
+            connection: RpcConnection::new(writer, None, true, Duration::from_secs(1)),
+            diagnostics: Mutex::new(HashMap::new()),
+            generation: AtomicU64::new(0),
+            documents: Mutex::new(HashMap::new()),
+            sync_lock: tokio::sync::Mutex::new(()),
+            encoding: Mutex::new(PositionEncoding::Utf16),
+            health: Mutex::new(Health::Ready),
+            code_action_kinds: Mutex::new(Vec::new()),
+        });
+        spawn_reader(&inner, reader);
+        (LspClient { inner }, server)
+    }
+
+    async fn send_frame(writer: &mut (impl tokio::io::AsyncWrite + Unpin), message: Value) {
+        let body = message.to_string();
+        writer
+            .write_all(format!("Content-Length: {}\r\n\r\n{}", body.len(), body).as_bytes())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn reader_does_not_keep_client_alive() {
+        let (client, _server) = fixture_client();
+        let weak = Arc::downgrade(&client.inner);
+        drop(client);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn eof_releases_lsp_request_and_marks_failed() {
+        let (client, server) = fixture_client();
+        let mut request = Box::pin(client.request("fixture", Value::Null));
+        assert!(futures::poll!(&mut request).is_pending());
+        drop(server);
+        let result = tokio::time::timeout(Duration::from_millis(200), request)
+            .await
+            .unwrap();
+        assert!(result.unwrap_err().to_string().contains("closed"));
+        assert!(matches!(client.health(), Health::Failed(_)));
+    }
+
+    #[tokio::test]
+    async fn diagnostic_freshness_uses_publication_and_document_version() {
+        let (client, _server) = fixture_client();
+        let directory = TestDir::new();
+        let file = directory.join("fixture.rs");
+        let uri = path_to_uri(&file);
+        let stamp = client.sync_file(&file, "x").await.unwrap();
+        for (generation, version) in [
+            (stamp.generation, Some(stamp.version)),
+            (stamp.generation + 1, Some(stamp.version - 1)),
+            (stamp.generation + 2, Some(stamp.version + 1)),
+        ] {
+            client.inner.diagnostics.lock().unwrap().insert(
+                uri.clone(),
+                FileDiagnostics {
+                    diagnostics: vec![json!({"message":"stale"})],
+                    generation,
+                    version,
+                },
+            );
+            assert!(client
+                .fresh_diagnostics(&file, stamp, Duration::ZERO)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("stale"));
+        }
+        client.inner.diagnostics.lock().unwrap().insert(
+            uri.clone(),
+            FileDiagnostics {
+                diagnostics: vec![json!({"message":"new same count"})],
+                generation: stamp.generation + 3,
+                version: Some(stamp.version),
+            },
+        );
+        assert_eq!(
+            client
+                .fresh_diagnostics(&file, stamp, Duration::ZERO)
+                .await
+                .unwrap()
+                .diagnostics[0]["message"],
+            "new same count"
+        );
+        client.inner.diagnostics.lock().unwrap().insert(
+            uri,
+            FileDiagnostics {
+                diagnostics: vec![],
+                generation: stamp.generation + 4,
+                version: Some(stamp.version),
+            },
+        );
+        assert!(client
+            .fresh_diagnostics(&file, stamp, Duration::ZERO)
+            .await
+            .unwrap()
+            .diagnostics
+            .is_empty());
+        client.inner.connection.disconnect();
+        assert!(client
+            .fresh_diagnostics(&file, stamp, Duration::ZERO)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("disconnected"));
+    }
+
+    #[tokio::test]
+    async fn fresh_empty_publication_is_not_a_timeout() {
+        let (client, mut server) = fixture_client();
+        let directory = TestDir::new();
+        let file = directory.join("fixture.rs");
+        let stamp = client.sync_file(&file, "x").await.unwrap();
+        send_frame(
+            &mut server,
+            json!({"method":"textDocument/publishDiagnostics","params":{
+                "uri":path_to_uri(&file),"version":stamp.version,"diagnostics":[]
+            }}),
+        )
+        .await;
+        assert!(client
+            .fresh_diagnostics(&file, stamp, Duration::from_secs(1))
+            .await
+            .unwrap()
+            .diagnostics
+            .is_empty());
+    }
 
     #[tokio::test]
     async fn edits_sync_documents_without_returning_automatic_diagnostics() {
-        let dir = std::env::temp_dir().join(format!(
-            "bob-lsp-edit-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir(&dir).unwrap();
-        let file = dir.join("sample.rs");
-        let mut child = tokio::process::Command::new("cat")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-        let stdin = child.stdin.take().unwrap();
-        let mut reader = BufReader::new(child.stdout.take().unwrap());
-        let client = LspClient {
-            inner: Arc::new(LspInner {
-                name: "fixture".into(),
-                stdin: tokio::sync::Mutex::new(stdin),
-                pending: Mutex::new(HashMap::new()),
-                next_id: AtomicI64::new(1),
-                diagnostics: Mutex::new(HashMap::from([(
-                    path_to_uri(&file),
-                    FileDiagnostics {
-                        diagnostics: vec![
-                            json!({"severity":1,"message":"cached diagnostic","range":{"start":{"line":0,"character":0}}}),
-                        ],
-                    },
-                )])),
-                versions: Mutex::new(HashMap::new()),
-                health: Mutex::new(Health::Ready),
-                code_action_kinds: Mutex::new(Vec::new()),
-                _child: tokio::sync::Mutex::new(child),
-            }),
-        };
-        let manager = Arc::new(LspManager {
-            servers: vec![ServerSlot {
-                cfg: LspServerConfig {
-                    name: "fixture".into(),
-                    command: "cat".into(),
-                    args: vec![],
-                    extensions: vec!["rs".into()],
-                    root: ".".into(),
-                },
-                client: Mutex::new(Some(client.clone())),
-                health: Mutex::new(Health::Ready),
-            }],
-            repo_root: dir.clone(),
+        let (directory, client, server, ctx) = fixture_context();
+        let file = directory.join("sample.rs");
+        let mut reader = BufReader::new(server);
+        client.inner.diagnostics.lock().unwrap().insert(path_to_uri(&file), FileDiagnostics {
+            diagnostics: vec![json!({"severity":1,"message":"cached diagnostic","range":{"start":{"line":0,"character":0}}})],
+            generation: 0,
+            version: Some(0),
         });
-        let ctx = ToolContext {
-            cwd: dir.to_string_lossy().into_owned(),
-            files: Arc::new(crate::tools::file_tracker::FileTracker::new()),
-            todos: Arc::new(crate::tools::todo::TodoStore::new()),
-            jobs: crate::tools::jobs::JobRegistry::new(),
-            user_asker: None,
-            lsp: Some(manager),
-            coord: None,
-            permissions: None,
-        };
         let written = WriteFileTool
             .execute(
                 json!({"path":"sample.rs","content":"fn sample() { let n = 1; }"}),
@@ -638,8 +742,8 @@ mod tests {
             .await
             .unwrap();
         for result in [&written, &edited, &multi] {
-            assert!(!result.contains("<diagnostics>"));
-            assert!(!result.contains("cached diagnostic"));
+            assert!(!result.as_text().unwrap().contains("<diagnostics>"));
+            assert!(!result.as_text().unwrap().contains("cached diagnostic"));
         }
         for (version, number) in [(1, 1), (2, 2), (3, 3)] {
             let message =
@@ -658,7 +762,275 @@ mod tests {
             assert!(text.as_str().unwrap().contains(&format!("n = {number}")));
         }
         assert_eq!(client.diagnostics_for(&file).len(), 1);
-        client.inner._child.lock().await.kill().await.unwrap();
-        std::fs::remove_dir_all(&dir).unwrap();
+        client.inner.connection.disconnect();
+    }
+
+    fn fixture_context() -> (TestDir, LspClient, tokio::io::DuplexStream, ToolContext) {
+        let dir = TestDir::new();
+        for file in ["a.rs", "b.rs", "c.rs"] {
+            dir.write(file, "old");
+        }
+        let (client, server) = fixture_client();
+        let manager = Arc::new(LspManager {
+            servers: vec![ServerSlot {
+                cfg: LspServerConfig {
+                    name: "fixture".into(),
+                    command: "unused-fixture".into(),
+                    args: vec![],
+                    extensions: vec!["rs".into()],
+                    root: ".".into(),
+                },
+                client: Mutex::new(Some(client.clone())),
+                health: Mutex::new(Health::Ready),
+            }],
+            repo_root: dir.path().to_path_buf(),
+        });
+        let ctx = ToolContext {
+            cwd: dir.to_string_lossy().into_owned(),
+            files: Arc::new(crate::tools::file_tracker::FileTracker::new()),
+            todos: Arc::new(crate::tools::todo::TodoStore::new()),
+            jobs: crate::tools::jobs::JobRegistry::new(),
+            user_asker: None,
+            lsp: Some(manager),
+            coord: None,
+            permissions: None,
+        };
+        (dir, client, server, ctx)
+    }
+
+    async fn rename_scenario(scenario: &'static str) {
+        let (directory, client, server, ctx) = fixture_context();
+        let root = directory.0.clone();
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = requests.clone();
+        let task = tokio::spawn(async move {
+            let mut server = BufReader::new(server);
+            while let Ok(message) = read_frame(&mut server).await {
+                if message["method"] != "textDocument/rename" {
+                    continue;
+                }
+                let count = seen.fetch_add(1, Ordering::SeqCst) + 1;
+                let second = if scenario == "new_target" && count == 2 {
+                    "c.rs"
+                } else {
+                    "b.rs"
+                };
+                if scenario == "stale_disk" && count == 2 {
+                    std::fs::write(root.join("b.rs"), "concurrent user edit").unwrap();
+                }
+                let replacement = |end| json!({"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":end}},"newText":"new"});
+                let result = if scenario == "resource" {
+                    json!({"documentChanges":[{"kind":"delete","uri":path_to_uri(&root.join("b.rs"))}]})
+                } else {
+                    json!({"documentChanges":[
+                        {"textDocument":{"uri":path_to_uri(&root.join("a.rs")),"version":if scenario=="stale_version" {0} else {1}},"edits":[replacement(3)]},
+                        {"textDocument":{"uri":path_to_uri(&root.join(second)),"version":if count==1 || scenario=="new_target" {Value::Null} else {json!(1)}},"edits":[replacement(if scenario=="bad_range" {30} else {3})]}
+                    ]})
+                };
+                send_frame(
+                    server.get_mut(),
+                    json!({"id":message["id"],"result":result}),
+                )
+                .await;
+            }
+        });
+        let tool = RenameSymbolTool::new(ctx.lsp.clone().unwrap());
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(2),
+            tool.execute(
+                json!({
+                    "filePath":"a.rs","line":1,"character":1,"newName":"new"
+                }),
+                &ctx,
+            ),
+        )
+        .await
+        .unwrap();
+        if scenario == "success" {
+            assert!(outcome
+                .unwrap()
+                .as_text()
+                .unwrap()
+                .contains("changed 2 file(s)"));
+            for file in ["a.rs", "b.rs"] {
+                let path = directory.0.join(file);
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+                assert_eq!(client.document_snapshot(&path).unwrap().text, "new");
+            }
+        } else {
+            assert!(outcome.is_err(), "{scenario} must not report success");
+            assert_eq!(
+                std::fs::read_to_string(directory.0.join("a.rs")).unwrap(),
+                "old"
+            );
+            assert_eq!(
+                std::fs::read_to_string(directory.0.join("b.rs")).unwrap(),
+                if scenario == "stale_disk" {
+                    "concurrent user edit"
+                } else {
+                    "old"
+                }
+            );
+        }
+        assert!(requests.load(Ordering::SeqCst) <= 2);
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn unversioned_empty_diagnostics_never_claim_clean() {
+        let (_directory, _client, server, ctx) = fixture_context();
+        let task = tokio::spawn(async move {
+            let mut server = BufReader::new(server);
+            while let Ok(message) = read_frame(&mut server).await {
+                if message["method"] == "textDocument/didOpen" {
+                    send_frame(server.get_mut(), json!({
+                        "method":"textDocument/publishDiagnostics",
+                        "params":{"uri":message["params"]["textDocument"]["uri"],"diagnostics":[]}
+                    })).await;
+                }
+            }
+        });
+        let tool = crate::tools::lsp::LspTool::new(ctx.lsp.clone().unwrap());
+        let output = tokio::time::timeout(
+            Duration::from_secs(1),
+            tool.execute(json!({"operation":"diagnostics","filePath":"a.rs"}), &ctx),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(output.as_text().unwrap().contains("freshness unconfirmed"));
+        assert!(!output.as_text().unwrap().contains("No diagnostics"));
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn unopened_targets_use_one_bounded_preparation_pass() {
+        rename_scenario("success").await;
+    }
+
+    #[tokio::test]
+    async fn stale_files_versions_ranges_and_new_targets_fail_before_writes() {
+        for scenario in [
+            "stale_disk",
+            "stale_version",
+            "bad_range",
+            "new_target",
+            "resource",
+        ] {
+            rename_scenario(scenario).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn framed_parser_reads_unicode_and_back_to_back_messages_without_overread() {
+        let first = json!({"id":1,"result":"é😀\ntext"});
+        let second = json!({"id":2,"error":{"code":-32601,"message":"unknown"}});
+        let body = first.to_string();
+        let next = second.to_string();
+        let bytes = format!(
+            "Content-Type: application/vscode-jsonrpc; charset=utf-8\r\nContent-Length: {}\r\n\r\n{}Content-Length: {}\r\n\r\n{}",
+            body.len(), body, next.len(), next
+        );
+        let mut reader = BufReader::with_capacity(1, bytes.as_bytes());
+        assert_eq!(read_frame(&mut reader).await.unwrap(), first);
+        assert_eq!(read_frame(&mut reader).await.unwrap(), second);
+        assert_eq!(
+            read_frame(&mut reader).await.unwrap_err().to_string(),
+            "server closed stdout"
+        );
+    }
+
+    #[tokio::test]
+    async fn framed_parser_distinguishes_header_body_and_json_failures() {
+        for (bytes, expected) in [
+            (
+                "Content-Type: application/json\r\n\r\n{}",
+                "no Content-Length",
+            ),
+            ("Content-Length: 16777217\r\n\r\n", "LSP frame too large"),
+            ("Content-Length: 2\r", "server closed stdout"),
+        ] {
+            let error = read_frame(&mut BufReader::new(bytes.as_bytes()))
+                .await
+                .unwrap_err();
+            assert_eq!(error.to_string(), expected);
+        }
+        let header = format!("{}\r\n", "x".repeat(8193));
+        assert_eq!(
+            read_frame(&mut BufReader::new(header.as_bytes()))
+                .await
+                .unwrap_err()
+                .to_string(),
+            "LSP header too large"
+        );
+        for length in ["-1", "two"] {
+            let bytes = format!("Content-Length: {length}\r\n\r\n{{}}");
+            let error = read_frame(&mut BufReader::new(bytes.as_bytes()))
+                .await
+                .unwrap_err();
+            assert!(error.downcast_ref::<std::num::ParseIntError>().is_some());
+        }
+        let error = read_frame(&mut BufReader::new(
+            b"Content-Length: 5\r\n\r\n{}".as_slice(),
+        ))
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+        let error = read_frame(&mut BufReader::new(
+            b"Content-Length: 1\r\n\r\n{".as_slice(),
+        ))
+        .await
+        .unwrap_err();
+        assert!(error.downcast_ref::<serde_json::Error>().is_some());
+    }
+
+    #[tokio::test]
+    async fn failed_sync_does_not_advance_the_document_snapshot() {
+        let (client, _server) = fixture_client();
+        let directory = TestDir::new();
+        let path = directory.join("sample.rs");
+        let stamp = client.sync_file(&path, "original").await.unwrap();
+        client.inner.connection.disconnect();
+        assert!(client.sync_file(&path, "replacement").await.is_err());
+        let snapshot = client.document_snapshot(&path).unwrap();
+        assert_eq!(snapshot.version, stamp.version);
+        assert_eq!(snapshot.text, "original");
+        assert!(client
+            .sync_file(&directory.join("new.rs"), "new")
+            .await
+            .is_err());
+        assert!(client
+            .document_snapshot(&directory.join("new.rs"))
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn changed_document_invalidates_diagnostic_stamp_even_with_matching_publication() {
+        let (client, _server) = fixture_client();
+        let directory = TestDir::new();
+        let path = directory.join("sample.rs");
+        let stamp = client.sync_file(&path, "original").await.unwrap();
+        client.inner.diagnostics.lock().unwrap().insert(
+            path_to_uri(&path),
+            FileDiagnostics {
+                diagnostics: vec![],
+                generation: stamp.generation + 1,
+                version: Some(stamp.version),
+            },
+        );
+        client.sync_file(&path, "changed").await.unwrap();
+        assert_eq!(
+            client
+                .fresh_diagnostics(&path, stamp, Duration::ZERO)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "document changed while waiting for diagnostics"
+        );
     }
 }

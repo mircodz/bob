@@ -1,14 +1,8 @@
-//! User-interaction tools: `ask_user` (pose a question with options) and
-//! `exit_plan` (present a plan for approval). Both delegate to the UI via the
-//! `UserAsker` hook on the ToolContext.
-
 use crate::core::types::ToolSpec;
 use crate::tools::registry::{Tool, ToolContext, ToolError, ToolResult, UserQuery};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-/// `ask_user`: pose a question to the user with a few options. Use when a
-/// decision is genuinely the user's to make and you can't resolve it yourself.
 pub struct AskUserTool;
 
 #[async_trait]
@@ -58,8 +52,8 @@ impl Tool for AskUserTool {
         };
         match &ctx.user_asker {
             Some(asker) => match asker.ask(&query).await {
-                Some(answer) => Ok(format!("user answered: {}", answer)),
-                None => Ok("user dismissed the question without answering".to_string()),
+                Some(answer) => Ok(format!("user answered: {}", answer).into()),
+                None => Ok("user dismissed the question without answering".into()),
             },
             None => Err(ToolError::unavailable(
                 "no interactive UI available to ask the user",
@@ -68,18 +62,11 @@ impl Tool for AskUserTool {
     }
 }
 
-/// `exit_plan`: save the plan bob has formed as a markdown document under
-/// `~/.bob/plans/`, then ask the user to approve it (or request changes). Called
-/// at the end of plan mode. Returns the user's decision plus the saved path so
-/// bob knows whether to proceed and can reference/refine the artifact.
 pub struct ExitPlanTool;
 
-/// Turn a plan into a stable, filesystem-safe file stem: a slug of its first
-/// markdown heading (or "plan"), plus a short content hash so distinct plans
-/// never collide. Deterministic — no wall-clock or RNG (core avoids both).
+/// Filesystem-safe title with a content hash to distinguish plan revisions.
 fn plan_slug(plan: &str) -> String {
     use sha2::{Digest, Sha256};
-    // First `# heading` line, else the first non-empty line, else "plan".
     let title = plan
         .lines()
         .map(str::trim)
@@ -109,8 +96,7 @@ fn plan_slug(plan: &str) -> String {
     format!("{slug}-{suffix}")
 }
 
-/// Write the plan to `~/.bob/plans/<slug>.md`, returning the path on success.
-/// Best-effort: a failure returns None so the approval flow still proceeds.
+/// Persistence is best-effort; failure must not block approval.
 fn save_plan(plan: &str) -> Option<std::path::PathBuf> {
     let dir = crate::core::config::plans_dir().ok()?;
     std::fs::create_dir_all(&dir).ok()?;
@@ -143,7 +129,6 @@ impl Tool for ExitPlanTool {
 
     async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
         let plan = input["plan"].as_str().unwrap_or("").to_string();
-        // Persist the plan as a document first (best-effort).
         let saved = save_plan(&plan);
         let query = UserQuery {
             title: "Ready to code?".to_string(),
@@ -157,19 +142,18 @@ impl Tool for ExitPlanTool {
         match &ctx.user_asker {
             Some(asker) => match asker.ask(&query).await {
                 Some(answer) => {
-                    // The UI approves by switching the mode out of Plan; here we
-                    // relay the user's words back to the model, plus where the plan
-                    // was saved so the model can reference or refine the artifact.
+                    // The UI owns the mode switch; this tool only relays the answer.
                     match saved {
                         Some(path) => Ok(format!(
                             "user responded: {}\n(plan saved to {})",
                             answer,
                             path.display()
-                        )),
-                        None => Ok(format!("user responded: {}", answer)),
+                        )
+                        .into()),
+                        None => Ok(format!("user responded: {}", answer).into()),
                     }
                 }
-                None => Ok("user dismissed the plan approval".to_string()),
+                None => Ok("user dismissed the plan approval".into()),
             },
             None => Err(ToolError::unavailable(
                 "no interactive UI available to present the plan",
@@ -178,10 +162,6 @@ impl Tool for ExitPlanTool {
     }
 }
 
-/// `enter_plan`: the agent puts ITSELF into read-only plan mode. Use when a task
-/// is large, risky, or ambiguous enough to warrant researching and proposing a
-/// plan before touching anything. Switching to Plan mode blocks all mutating tools
-/// until the plan is approved via `exit_plan`.
 pub struct EnterPlanTool;
 
 #[async_trait]
@@ -207,14 +187,14 @@ impl Tool for EnterPlanTool {
                 if perms.mode() == Mode::Plan {
                     return Ok(
                         "already in plan mode. Research, then call exit_plan with your plan."
-                            .to_string(),
+                            .into(),
                     );
                 }
                 perms.set_mode(Mode::Plan);
                 Ok(
                     "entered plan mode (read-only). Research the code, then call exit_plan with \
                     your proposed plan for approval. Edits stay blocked until then."
-                        .to_string(),
+                        .into(),
                 )
             }
             None => Err(ToolError::unavailable(
@@ -226,34 +206,195 @@ impl Tool for EnterPlanTool {
 
 #[cfg(test)]
 mod tests {
-    use super::plan_slug;
+    use super::*;
+    use crate::test_support::{files::tool_context, TestDir};
+    use crate::tools::registry::UserAsker;
+    use std::sync::{Arc, Mutex};
 
     #[test]
-    fn slug_uses_first_heading() {
-        let s = plan_slug("# Add web search tool\n\nSome body");
-        assert!(s.starts_with("add-web-search-tool-"), "got {s}");
+    fn plan_filenames_use_heading_fallback_and_empty_title_with_fixed_hashes() {
+        for (plan, expected) in [
+            (
+                "# Add web search tool\n\nSome body",
+                "add-web-search-tool-90c5e26c.md",
+            ),
+            (
+                "preamble\n## First Heading\n# Second",
+                "first-heading-2dc2df48.md",
+            ),
+            (
+                "just some text, no heading",
+                "just-some-text-no-heading-94876bd9.md",
+            ),
+            ("", "plan-e3b0c442.md"),
+            ("###   ", "plan-29e6ee3d.md"),
+            ("\n  \n", "plan-294f590e.md"),
+            ("# ../Ä__Safe / name!?", "safe-name-0dd9aca6.md"),
+        ] {
+            assert_eq!(format!("{}.md", plan_slug(plan)), expected, "{plan:?}");
+        }
     }
 
     #[test]
-    fn slug_is_stable_for_same_plan() {
-        let plan = "# Refactor\n\nstep 1";
-        assert_eq!(plan_slug(plan), plan_slug(plan));
+    fn plan_filename_identity_includes_body_not_only_title() {
+        assert_eq!(
+            format!("{}.md", plan_slug("# Same\n\nA")),
+            "same-555ebb1f.md"
+        );
+        assert_eq!(
+            format!("{}.md", plan_slug("# Same\n\nB")),
+            "same-643c07ca.md"
+        );
+    }
+
+    struct RecordingAsker {
+        answer: Option<String>,
+        queries: Mutex<Vec<UserQuery>>,
+    }
+
+    #[async_trait]
+    impl UserAsker for RecordingAsker {
+        async fn ask(&self, query: &UserQuery) -> Option<String> {
+            self.queries.lock().unwrap().push(query.clone());
+            self.answer.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn ask_user_routes_query_and_distinguishes_answer_dismissal_and_no_ui() {
+        let dir = TestDir::new();
+        let mut ctx = tool_context(dir.path());
+        let input = json!({"question": "Which?", "detail": "Context", "options": ["One", "Two"]});
+        assert_eq!(
+            AskUserTool
+                .execute(input.clone(), &ctx)
+                .await
+                .unwrap_err()
+                .kind,
+            crate::tools::registry::ToolErrorKind::Unavailable
+        );
+        for (answer, expected) in [
+            (
+                Some("custom answer".to_string()),
+                "user answered: custom answer",
+            ),
+            (None, "user dismissed the question without answering"),
+        ] {
+            let asker = Arc::new(RecordingAsker {
+                answer,
+                queries: Mutex::new(Vec::new()),
+            });
+            ctx.user_asker = Some(asker.clone());
+            assert_eq!(
+                AskUserTool
+                    .execute(input.clone(), &ctx)
+                    .await
+                    .unwrap()
+                    .as_text()
+                    .unwrap(),
+                expected
+            );
+            let queries = asker.queries.lock().unwrap();
+            assert_eq!(queries.len(), 1);
+            assert_eq!(queries[0].title, "Which?");
+            assert_eq!(queries[0].detail, "Context");
+            assert_eq!(queries[0].options, ["One", "Two"]);
+            assert!(queries[0].allow_other);
+        }
+    }
+
+    #[tokio::test]
+    async fn registered_question_rejects_malformed_input_before_asking() {
+        use crate::tools::registry::{ToolErrorKind, ToolRegistry};
+
+        let dir = TestDir::new();
+        let mut ctx = tool_context(dir.path());
+        let asker = Arc::new(RecordingAsker {
+            answer: Some("One".into()),
+            queries: Mutex::new(Vec::new()),
+        });
+        ctx.user_asker = Some(asker.clone());
+        let mut registry = ToolRegistry::new(None);
+        registry.add(Arc::new(AskUserTool));
+        for input in [
+            json!({"options":["One", "Two"]}),
+            json!({"question":"Which?"}),
+            json!({"question":null, "options":["One", "Two"]}),
+            json!({"question":"Which?", "options":["One", 2]}),
+            json!({"question":"Which?", "options":"One"}),
+            json!({"question":"Which?", "options":["One", "Two"], "detail":false}),
+        ] {
+            assert_eq!(
+                registry
+                    .execute("ask_user", input, &ctx)
+                    .await
+                    .unwrap_err()
+                    .kind,
+                ToolErrorKind::InvalidInput
+            );
+            assert!(asker.queries.lock().unwrap().is_empty());
+        }
+        assert_eq!(
+            registry
+                .execute(
+                    "ask_user",
+                    json!({"question":"Which?", "options":["One", "Two"]}),
+                    &ctx
+                )
+                .await
+                .unwrap()
+                .as_text()
+                .unwrap(),
+            "user answered: One"
+        );
+        let queries = asker.queries.lock().unwrap();
+        assert_eq!(queries.len(), 1);
+        assert!(queries[0].detail.is_empty());
+    }
+
+    #[tokio::test]
+    async fn enter_plan_changes_mode_and_is_idempotent() {
+        use crate::core::permissions::{Decision, Mode, PermissionEngine};
+        use crate::tools::registry::ToolErrorKind;
+
+        let dir = TestDir::new();
+        let mut ctx = tool_context(dir.path());
+        assert_eq!(
+            EnterPlanTool
+                .execute(json!({}), &ctx)
+                .await
+                .unwrap_err()
+                .kind,
+            ToolErrorKind::Unavailable
+        );
+        let permissions = Arc::new(PermissionEngine::new(Decision::Allow, None));
+        ctx.permissions = Some(permissions.clone());
+        assert!(EnterPlanTool
+            .execute(json!({}), &ctx)
+            .await
+            .unwrap()
+            .as_text()
+            .unwrap()
+            .starts_with("entered plan mode"));
+        assert_eq!(permissions.mode(), Mode::Plan);
+        assert!(EnterPlanTool
+            .execute(json!({}), &ctx)
+            .await
+            .unwrap()
+            .as_text()
+            .unwrap()
+            .starts_with("already in plan mode"));
+        assert_eq!(permissions.mode(), Mode::Plan);
     }
 
     #[test]
-    fn slug_differs_when_body_differs() {
-        assert_ne!(plan_slug("# Same\n\nA"), plan_slug("# Same\n\nB"));
-    }
-
-    #[test]
-    fn slug_falls_back_without_heading() {
-        let s = plan_slug("just some text, no heading");
-        assert!(s.starts_with("just-some-text-"), "got {s}");
-    }
-
-    #[test]
-    fn slug_handles_empty_and_symbol_only() {
-        assert!(plan_slug("").starts_with("plan-"));
-        assert!(plan_slug("###   ").starts_with("plan-"));
+    fn long_plan_titles_are_bounded_without_a_trailing_separator() {
+        let plan = format!("# {} rest", "a".repeat(47));
+        let slug = plan_slug(&plan);
+        let (title, hash) = slug.rsplit_once('-').unwrap();
+        assert_eq!(title, "a".repeat(47));
+        assert_eq!(hash.len(), 8);
+        assert!(hash.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(slug, plan_slug(&plan));
     }
 }

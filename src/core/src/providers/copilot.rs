@@ -1,26 +1,20 @@
-//! Native GitHub Copilot provider: an OpenAI-compatible client against the
-//! Copilot API, authenticated with a short-lived Copilot token minted from the
-//! stored GitHub OAuth token (and refreshed transparently). The API base is
-//! discovered from the token response's `endpoints.api` — Enterprise accounts
-//! use api.enterprise.githubcopilot.com, individuals api.githubcopilot.com.
+//! Copilot tokens discover the API base through `endpoints.api`, including
+//! Enterprise-specific endpoints.
 
 use crate::auth::copilot as auth;
 use crate::providers::openai::{OpenAiProvider, TokenSource};
-use crate::providers::provider::{ModelEntry, Provider};
+use crate::providers::provider::{ModelEntry, Provider, StreamTimeouts};
 use crate::providers::responses::ResponsesProvider;
 use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-/// Client-identity headers so the provider is trackable as this project.
 const CLIENT_ID: &str = "mircodz/bob";
 const CLIENT_VERSION: &str = concat!("mircodz/bob/", env!("CARGO_PKG_VERSION"));
 
-/// Caches the short-lived Copilot API token + discovered API base, refreshing
-/// before expiry.
 struct CopilotAuth {
     github_token: String,
-    cached: Mutex<Option<(String, u64, String)>>, // (token, expires_at, api_base)
+    cached: Mutex<Option<(String, u64, String)>>, // (token, Unix expiry seconds, api_base)
 }
 
 impl CopilotAuth {
@@ -66,11 +60,8 @@ impl TokenSource for CopilotAuth {
     }
 }
 
-/// True if a Copilot model must be called via the Responses API rather than
-/// /chat/completions. Newer GPT-5.x families and GPT-6 are Responses-only;
-/// classic chat models (gpt-4o, claude-*, gemini-*) use /chat/completions.
+/// Copilot's newer GPT families require `/responses`, not `/chat/completions`.
 fn is_responses_model(model: &str) -> bool {
-    // gpt-5.4 and up on the Copilot backend speak Responses only.
     let m = model.to_ascii_lowercase();
     m.contains("-sol")
         || m.contains("-luna")
@@ -83,16 +74,18 @@ fn is_responses_model(model: &str) -> bool {
         || m == "gpt-5-codex"
 }
 
-/// Registry constructor for the "copilot" provider (uniform
-/// `async fn create(model, auth)` shape shared by every provider family). Builds
-/// the native Copilot provider, or an error if not logged in.
-///
-/// Copilot authenticates only via its device-flow login (`bob login copilot`), so
-/// a programmatic `ProviderAuth` is rejected explicitly rather than silently
-/// ignored — there's no API-key path here.
+/// Copilot requires device-flow login; explicit API keys are rejected.
 pub async fn create(
     model: Option<String>,
     auth: Option<crate::auth::ProviderAuth>,
+) -> anyhow::Result<Arc<dyn Provider>> {
+    create_with_options(model, auth, StreamTimeouts::default()).await
+}
+
+pub(crate) async fn create_with_options(
+    model: Option<String>,
+    auth: Option<crate::auth::ProviderAuth>,
+    timeouts: StreamTimeouts,
 ) -> anyhow::Result<Arc<dyn Provider>> {
     if auth.is_some() {
         anyhow::bail!(
@@ -106,13 +99,10 @@ pub async fn create(
         github_token,
         cached: Mutex::new(None),
     };
-    // Prime the cache + discover the endpoint.
     let (tok, api_base) = source.ensure().await?;
     let model = model.unwrap_or_else(|| "gpt-4o".to_string());
 
-    // Ask the backend for this model's real limits so compaction sizes against the
-    // true input budget (Copilot advertises up to ~936k for Claude, not the 200k
-    // the id-based heuristic assumes). Best-effort: None → heuristic fallback.
+    // Backend input-token limits take precedence over model-name heuristics.
     let model_limits = auth::fetch_model_limits(&tok, &api_base).await;
     let window = model_limits
         .iter()
@@ -131,19 +121,22 @@ pub async fn create(
             .collect();
         Ok(Arc::new(
             ResponsesProvider::with_auth(model, api_base, source)
+                .with_stream_timeouts(timeouts)
                 .with_context_window(window)
                 .with_model_catalog(model_catalog),
         ))
     } else {
         Ok(Arc::new(
-            OpenAiProvider::with_auth(model, api_base, source).with_context_window(window),
+            OpenAiProvider::with_auth(model, api_base, source)
+                .with_stream_timeouts(timeouts)
+                .with_context_window(window),
         ))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::is_responses_model;
+    use super::*;
 
     #[test]
     fn gpt_6_uses_responses_api() {

@@ -1,16 +1,13 @@
-//! Session persistence, backed by SQLite at $HOME/.bob/bob.db. Each session is
-//! stored as a JSON blob in a row, with id/updated_at/title/provider/message
-//! count pulled out as columns for fast listing. `--resume` loads one (or the
-//! most recent) so a conversation can continue.
+//! SQLite session persistence with JSON snapshots, indexed metadata, and event logs.
 
 use crate::core::events::AgentEvent;
 use crate::core::permissions::Grant;
-use crate::core::types::{Message, Role};
+use crate::core::types::{Message, Role, ToolOutput};
 use crate::core::usage::UsageEntry;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Session {
@@ -18,40 +15,32 @@ pub struct Session {
     pub created_at: String,
     pub updated_at: String,
     pub provider: String,
-    /// The working directory this session was started in. Used to scope
-    /// `--resume`/`--continue` to the current project. Empty for old sessions
-    /// saved before this field existed.
+    /// Scopes resume/continue to the project; empty in legacy sessions.
     #[serde(default)]
     pub cwd: String,
     pub messages: Vec<Message>,
+    /// Monotonic logical context; older checkpoints cannot undo a reset.
+    #[serde(default)]
+    pub context_epoch: u64,
     /// "Always allow" grants the user made during this session.
     #[serde(default)]
     pub grants: Vec<Grant>,
     /// Per-completion token usage recorded during this session.
     #[serde(default)]
     pub usage: Vec<UsageEntry>,
-    /// Subagent runs (the `task` tool's children), keyed by the task tool_use_id.
-    /// Subagent tool calls aren't part of the root message history, so they're
-    /// stored separately here to survive a restart.
+    /// Keyed by task tool_use_id; absent from root message history.
     #[serde(default)]
     pub subagent_runs: Vec<SubagentRun>,
-    /// The agent's todo list, persisted so the sticky panel survives a resume.
     #[serde(default)]
     pub todos: Vec<crate::tools::todo::TodoItem>,
-    /// Per-agent drawer transcripts (the team drawer), so they survive a resume.
     #[serde(default)]
     pub agent_threads: Vec<PersistedThread>,
-    /// Workflow runs (the `/workflow` tree cells in the main transcript). Stored
-    /// separately because they're built from live events, not the message history,
-    /// so they'd otherwise vanish on resume. Anchored to their hand-off message.
+    /// Event-built workflow trees, anchored to their hand-off messages on resume.
     #[serde(default)]
     pub workflows: Vec<PersistedWorkflow>,
 }
 
-/// A persisted workflow run: its id/title and phases + agents. On resume the tree
-/// is re-inserted just before its `[workflow result]` hand-off message; runs are
-/// matched to hand-off messages in order, so no explicit index is stored. `done`
-/// is implied — a persisted run is always finished.
+/// Resumed runs are finished and matched to `[workflow result]` messages in order.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PersistedWorkflow {
     pub id: String,
@@ -82,7 +71,6 @@ pub struct PersistedWfAgent {
     pub duration_secs: Option<u64>,
 }
 
-/// One spawned agent's persisted transcript for the team drawer.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PersistedThread {
     pub id: String,
@@ -94,12 +82,9 @@ pub struct PersistedThread {
     pub cells: Vec<PersistedCell>,
 }
 
-/// A render-agnostic transcript cell (the persisted form of the drawer's `Cell`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PersistedCell {
-    /// A user-style input line (the delegated prompt seeded into a subagent's
-    /// thread), rendered like the main view's user input.
     User {
         text: String,
     },
@@ -109,7 +94,7 @@ pub enum PersistedCell {
     Tool {
         name: String,
         input: Value,
-        output: String,
+        output: ToolOutput,
         is_error: bool,
     },
     Message {
@@ -129,56 +114,49 @@ pub struct SubagentRun {
     pub subagents: Vec<PersistedSubagent>,
 }
 
-/// A single persisted subagent and the tools it invoked.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PersistedSubagent {
-    pub id: String,   // "task_N"
-    pub task: String, // description
+    pub id: String,
+    pub task: String,
     pub tools: Vec<PersistedTool>,
 }
 
-/// A persisted subagent tool call with its input and output.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PersistedTool {
     pub id: String, // tool_use_id
     pub name: String,
     pub input: Value,
-    #[serde(default)]
-    pub output: String,
+    pub output: ToolOutput,
     #[serde(default)]
     pub is_error: bool,
 }
 
-/// Path to the SQLite database file ($HOME/.bob/bob.db).
-fn db_path() -> PathBuf {
+pub(crate) fn db_path() -> PathBuf {
     let base = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
     base.join(".bob").join("bob.db")
 }
 
-/// Open the database, creating the directory + schema if needed.
 fn open_db() -> anyhow::Result<Connection> {
-    let path = db_path();
-    if let Some(parent) = path.parent() {
+    open_db_at(&db_path())
+}
+
+pub(crate) fn open_db_at(path: &Path) -> anyhow::Result<Connection> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)?;
     }
-    let conn = Connection::open(&path)?;
-    // Concurrency hardening: multiple `bob` instances (a TUI + `bob remote`, or two
-    // `--continue` in the same dir) can hold the same session id. WAL lets readers
-    // and a writer coexist; busy_timeout makes a contended write wait rather than
-    // fail with SQLITE_BUSY. synchronous=NORMAL is the safe WAL pairing.
-    let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
+    let conn = Connection::open(path)?;
+    // WAL lets readers and a writer coexist; busy_timeout makes contended writes
+    // wait rather than fail with SQLITE_BUSY. synchronous=NORMAL is the WAL pairing.
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
     conn.execute_batch(
         "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA synchronous=NORMAL;",
-    )
-    .ok();
+    )?;
     init_schema(&conn)?;
     Ok(conn)
 }
 
-/// Create the `sessions` table + index if absent, and migrate the `cwd` column onto
-/// pre-existing databases. Split out of [`open_db`] so tests can build the same
-/// schema on an in-memory connection.
 fn init_schema(conn: &Connection) -> anyhow::Result<()> {
+    let transaction = conn.unchecked_transaction()?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS sessions (
             id           TEXT PRIMARY KEY,
@@ -191,16 +169,19 @@ fn init_schema(conn: &Connection) -> anyhow::Result<()> {
          );
          CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC);",
     )?;
-    // Migration: add the `cwd` column to pre-existing databases (a fresh CREATE
-    // above doesn't include it). Ignore the error if it already exists.
-    let _ = conn.execute(
-        "ALTER TABLE sessions ADD COLUMN cwd TEXT NOT NULL DEFAULT ''",
-        [],
-    );
-    // Append-only event log: the emerging single source of truth for a session's
-    // transcript. Each row is one serialized `AgentEvent` in a versioned envelope,
-    // ordered by a per-session monotonic `seq`. Stage 1 only shadow-writes here; the
-    // blob in `sessions.data` is still authoritative until replay is proven.
+    let columns = {
+        let mut stmt = conn.prepare("PRAGMA table_info(sessions)")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    if !columns.iter().any(|name| name == "cwd") {
+        conn.execute(
+            "ALTER TABLE sessions ADD COLUMN cwd TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+    // Append-only event log: versioned AgentEvent envelopes ordered by a
+    // per-session monotonic `seq`.
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS events (
             session_id TEXT NOT NULL,
@@ -211,14 +192,23 @@ fn init_schema(conn: &Connection) -> anyhow::Result<()> {
             PRIMARY KEY (session_id, seq)
          ) WITHOUT ROWID;",
     )?;
-    // Reserved header cursor (−1 = none). Not currently read — seq is derived from
-    // MAX(seq) over the log so a new session's pre-blob events don't collide — but
-    // kept as a cheap future cursor (dropping a deployed SQLite column is
-    // migration-hostile). Left unwritten on purpose.
-    let _ = conn.execute(
-        "ALTER TABLE sessions ADD COLUMN last_seq INTEGER NOT NULL DEFAULT -1",
-        [],
-    );
+    // Retain the deployed cursor column for compatibility; sequences come from MAX(seq).
+    if !columns.iter().any(|name| name == "last_seq") {
+        conn.execute(
+            "ALTER TABLE sessions ADD COLUMN last_seq INTEGER NOT NULL DEFAULT -1",
+            [],
+        )?;
+    }
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS memories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scope TEXT NOT NULL CHECK(scope IN ('project', 'global')),
+            scope_key TEXT NOT NULL,
+            content TEXT NOT NULL,
+            UNIQUE(scope, scope_key, content)
+         );",
+    )?;
+    transaction.commit()?;
     Ok(())
 }
 
@@ -230,6 +220,7 @@ pub fn new_session(provider: &str, id: String, now: String, cwd: String) -> Sess
         provider: provider.to_string(),
         cwd,
         messages: vec![],
+        context_epoch: 0,
         grants: vec![],
         usage: vec![],
         subagent_runs: vec![],
@@ -239,17 +230,14 @@ pub fn new_session(provider: &str, id: String, now: String, cwd: String) -> Sess
     }
 }
 
-/// Persist a session. Refuses to let a SHORTER history overwrite a longer one for
-/// the same id — the exact stale-clobber that erased a user's MCP turns (a second
-/// `bob` on the same id saving its older, pre-MCP snapshot over the newer row).
-/// Growing or same-length writes always win; shrinking writes are dropped. Use
-/// [`save_session_force`] for intentional truncation (context-clear / new session).
+/// Within an epoch, growing or same-length writes win and shrinking writes are
+/// dropped. A newer context epoch may shrink; an older epoch can never overwrite it.
+/// [`save_session_force`] also allows intentional truncation within the same epoch.
 pub fn save_session(s: &Session) -> anyhow::Result<()> {
     write_session(s, false)
 }
 
-/// Persist a session, ALLOWING the message count to shrink. Only for intentional
-/// resets (ClearContext) where a shorter history is the desired state.
+/// Allows intentional truncation within an epoch; older epochs are still rejected.
 pub fn save_session_force(s: &Session) -> anyhow::Result<()> {
     write_session(s, true)
 }
@@ -259,17 +247,19 @@ fn write_session(s: &Session, allow_shrink: bool) -> anyhow::Result<()> {
     write_session_to(&conn, s, allow_shrink)
 }
 
-/// The UPSERT itself, taking an explicit connection so it can be exercised against
-/// an in-memory DB in tests. The UPDATE's WHERE clause is the anti-clobber guard:
-/// unless forced, only overwrite when the incoming history is at least as long as
-/// what's on disk. Evaluated inside the single UPSERT, so it's atomic against a
-/// concurrent writer.
-fn write_session_to(conn: &Connection, s: &Session, allow_shrink: bool) -> anyhow::Result<()> {
+/// The UPSERT guard rejects stale snapshots atomically against concurrent writers.
+pub(crate) fn write_session_to(
+    conn: &Connection,
+    s: &Session,
+    allow_shrink: bool,
+) -> anyhow::Result<()> {
     let data = serde_json::to_string(s)?;
     let guard = if allow_shrink {
-        ""
+        "WHERE COALESCE(json_extract(excluded.data, '$.context_epoch'), 0) >= COALESCE(json_extract(sessions.data, '$.context_epoch'), 0)"
     } else {
-        "WHERE excluded.message_count >= sessions.message_count"
+        "WHERE COALESCE(json_extract(excluded.data, '$.context_epoch'), 0) > COALESCE(json_extract(sessions.data, '$.context_epoch'), 0)
+         OR (COALESCE(json_extract(excluded.data, '$.context_epoch'), 0) = COALESCE(json_extract(sessions.data, '$.context_epoch'), 0)
+             AND excluded.message_count >= sessions.message_count)"
     };
     let sql = format!(
         "INSERT INTO sessions (id, updated_at, created_at, title, provider, message_count, cwd, data)
@@ -299,14 +289,9 @@ fn write_session_to(conn: &Connection, s: &Session, allow_shrink: bool) -> anyho
     Ok(())
 }
 
-/// Current schema version for the event envelope. Bumped only when a *payload*
-/// shape changes in a way replay must migrate; additive fields don't need it
-/// (serde defaults handle those).
+/// Bump for payload changes requiring migration, not additive fields with defaults.
 const EVENT_ENVELOPE_VERSION: u32 = 1;
 
-/// The on-disk form of one logged event: a version tag wrapping the flattened
-/// `AgentEvent` (itself internally-tagged with `kind`). The `v` gives future
-/// builds a hook to transform old payloads before deserializing.
 #[derive(Serialize, Deserialize)]
 struct EventEnvelope {
     v: u32,
@@ -314,46 +299,35 @@ struct EventEnvelope {
     event: AgentEvent,
 }
 
-/// Append one event to a session's log, assigning it the next monotonic `seq`.
-/// `ts` is supplied by the caller (unix millis) so this stays pure/testable.
-/// Returns the assigned seq.
-///
-/// Callers append here in addition to the blob save (the log is the source of
-/// truth on resume; the blob is a derived read-model). The single writer task
-/// owns the connection, so `seq` assignment races nothing.
+/// `ts` is Unix milliseconds. Returns the next per-session sequence number.
+/// Assignment and insertion are atomic across independent store instances.
 pub fn append_event_to(
     conn: &Connection,
     session_id: &str,
     ts: i64,
     event: &AgentEvent,
 ) -> anyhow::Result<i64> {
-    // Derive the next seq from the log itself: a new session logs its first events
-    // BEFORE the blob save creates its sessions row, so a header-based cursor would
-    // make every event collide on seq 0. MAX(seq) over the events table is always
-    // correct regardless of row/write ordering.
-    let last: i64 = conn
-        .query_row(
-            "SELECT COALESCE(MAX(seq), -1) FROM events WHERE session_id = ?1",
-            [session_id],
-            |r| r.get(0),
-        )
-        .unwrap_or(-1);
-    let seq = last + 1;
     let envelope = EventEnvelope {
         v: EVENT_ENVELOPE_VERSION,
         event: event.clone(),
     };
     let data = serde_json::to_string(&envelope)?;
-    conn.execute(
-        "INSERT INTO events (session_id, seq, ts, kind, data) VALUES (?1, ?2, ?3, ?4, ?5)",
-        rusqlite::params![session_id, seq, ts, event.kind(), data],
+    let mut stmt = conn.prepare(
+        "INSERT INTO events (session_id, seq, ts, kind, data)
+         SELECT ?1, COALESCE(MAX(seq), -1) + 1, ?2, ?3, ?4
+         FROM events WHERE session_id = ?1 RETURNING seq",
     )?;
+    let mut rows = stmt.query(rusqlite::params![session_id, ts, event.kind(), data])?;
+    let seq = rows
+        .next()?
+        .ok_or(rusqlite::Error::QueryReturnedNoRows)?
+        .get(0)?;
+    // RETURNING yields a row before commit; step to completion to observe write errors.
+    rows.next()?;
     Ok(seq)
 }
 
-/// Replay a session's event log in order, returning the reconstructed events.
-/// Rows that fail to decode (a corrupt or far-future payload) are skipped rather
-/// than aborting the whole replay — a resumed session should degrade, never fail.
+/// Replay in sequence order, skipping undecodable payloads.
 pub fn replay_events(conn: &Connection, session_id: &str) -> anyhow::Result<Vec<AgentEvent>> {
     let mut stmt =
         conn.prepare("SELECT data FROM events WHERE session_id = ?1 ORDER BY seq ASC")?;
@@ -368,47 +342,80 @@ pub fn replay_events(conn: &Connection, session_id: &str) -> anyhow::Result<Vec<
     Ok(out)
 }
 
-/// Whether a session has any events logged yet (used to choose replay vs. the
-/// legacy blob path on load).
 pub fn has_events(conn: &Connection, session_id: &str) -> bool {
-    conn.query_row(
-        "SELECT 1 FROM events WHERE session_id = ?1 LIMIT 1",
-        [session_id],
-        |_| Ok(()),
-    )
-    .is_ok()
+    has_events_in(conn, session_id).unwrap_or(false)
 }
 
-/// Load a session's full event log, opening the database. Returns `None` when the
-/// session has no events yet (a legacy blob-only session), so callers can fall
-/// back to blob hydration. This is the resume entry point for the replay path.
+fn has_events_in(conn: &Connection, session_id: &str) -> anyhow::Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM events WHERE session_id = ?1 LIMIT 1",
+            [session_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+/// `None` marks a legacy blob-only session, allowing snapshot fallback.
 pub fn load_events(session_id: &str) -> anyhow::Result<Option<Vec<AgentEvent>>> {
-    let conn = open_db()?;
-    if !has_events(&conn, session_id) {
+    load_events_from(&open_db()?, session_id)
+}
+
+pub(crate) fn load_events_from(
+    conn: &Connection,
+    session_id: &str,
+) -> anyhow::Result<Option<Vec<AgentEvent>>> {
+    if !has_events_in(conn, session_id)? {
         return Ok(None);
     }
-    Ok(Some(replay_events(&conn, session_id)?))
+    Ok(Some(replay_events(conn, session_id)?))
 }
 
-/// Reconstruct the ROOT agent's full message history from its event log, mirroring
-/// exactly what [`crate::agent::Agent::run`] pushes into `full_history`:
-///
-/// - `UserPrompt` → a user text message
-/// - `AgentMessage` delivered to root → a folded coordination user message
-/// - `Message` (root) → the assistant turn verbatim (carries any tool_use blocks)
-/// - consecutive root `ToolResult`s → one `Role::Tool` message bundling them
-///
-/// Subagent events (agent_id != "root") never touch root history — they're the
-/// team-drawer's concern. This is the seed the provider needs on resume, derived
-/// from the log instead of the separately-stored `messages` blob.
+pub(crate) fn load_working_events_from(
+    conn: &Connection,
+    session_id: &str,
+) -> anyhow::Result<Option<Vec<AgentEvent>>> {
+    let mut stmt =
+        conn.prepare("SELECT seq, data FROM events WHERE session_id = ?1 ORDER BY seq ASC")?;
+    let rows = stmt.query_map([session_id], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut events = Vec::new();
+    for row in rows {
+        let (seq, json) = row?;
+        let Ok(envelope) = serde_json::from_str::<EventEnvelope>(&json) else {
+            return Ok(None);
+        };
+        if seq != events.len() as i64 || envelope.v != EVENT_ENVELOPE_VERSION {
+            return Ok(None);
+        }
+        events.push(envelope.event);
+    }
+    Ok(Some(events))
+}
+
+/// Reconstruct root history, folding coordination messages and bundling tool results
+/// in request order. Subagent events never enter root history.
 pub fn root_history_from_events(events: &[AgentEvent]) -> Vec<Message> {
     let mut msgs: Vec<Message> = Vec::new();
     let mut pending_results: Vec<crate::core::types::ContentBlock> = Vec::new();
 
-    // Flush any buffered tool_results as a single Role::Tool message. Called before
-    // appending a non-result message so ordering matches the live turn loop.
     fn flush(msgs: &mut Vec<Message>, pending: &mut Vec<crate::core::types::ContentBlock>) {
         if !pending.is_empty() {
+            if let Some(calls) = msgs.iter().rev().find(|message| {
+                message
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, crate::core::types::ContentBlock::ToolUse { .. }))
+            }) {
+                pending.sort_by_key(|block| match block {
+                    crate::core::types::ContentBlock::ToolResult { tool_use_id, .. } => calls
+                        .content.iter().position(|call| matches!(call, crate::core::types::ContentBlock::ToolUse { id, .. } if id == tool_use_id))
+                        .unwrap_or(usize::MAX),
+                    _ => usize::MAX,
+                });
+            }
             msgs.push(Message {
                 role: Role::Tool,
                 content: std::mem::take(pending),
@@ -418,6 +425,10 @@ pub fn root_history_from_events(events: &[AgentEvent]) -> Vec<Message> {
 
     for e in events {
         match e {
+            AgentEvent::ContextReset { agent_id, .. } if agent_id == "root" => {
+                msgs.clear();
+                pending_results.clear();
+            }
             AgentEvent::UserPrompt { agent_id, text } if agent_id == "root" => {
                 flush(&mut msgs, &mut pending_results);
                 msgs.push(Message::user_text(text.clone()));
@@ -451,16 +462,13 @@ pub fn root_history_from_events(events: &[AgentEvent]) -> Vec<Message> {
     msgs
 }
 
-/// Choose the authoritative message history for a resumed session: the event-log
-/// reconstruction when it's at least as complete as the stored blob, else the
-/// blob. Centralizes the "a truncated/corrupt log must never lose history" guard
-/// shared by the CLI and headless session loaders. `events` is `None` for a
-/// legacy (pre-log) session.
+/// Prefer replay unless an incomplete log would lose snapshot history.
+/// A logged reset permits shorter history; `None` marks a legacy blob-only session.
 pub fn reconstructed_history(events: Option<&[AgentEvent]>, blob: &[Message]) -> Vec<Message> {
     match events {
         Some(evs) => {
             let rebuilt = root_history_from_events(evs);
-            if rebuilt.len() >= blob.len() {
+            if context_epoch(evs) > 0 || rebuilt.len() >= blob.len() {
                 rebuilt
             } else {
                 blob.to_vec()
@@ -470,12 +478,175 @@ pub fn reconstructed_history(events: Option<&[AgentEvent]>, blob: &[Message]) ->
     }
 }
 
-/// A single-writer sink for the event log. One background thread owns a DB
-/// connection and drains a channel; callers (a bus listener on the async runtime)
-/// only `send`, so appends never block the runtime on a SQLite fsync. Being the
-/// sole writer also means `seq` assignment races nothing.
+pub fn context_epoch(events: &[AgentEvent]) -> u64 {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ContextReset { agent_id, epoch } if agent_id == "root" => Some(*epoch),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+pub fn active_context_events(events: &[AgentEvent]) -> &[AgentEvent] {
+    let start = events.iter().rposition(|event| {
+        matches!(event, AgentEvent::ContextReset { agent_id, .. } if agent_id == "root")
+    }).map_or(0, |index| index + 1);
+    &events[start..]
+}
+
+pub(crate) fn reconstructed_session_history(
+    events: Option<&[AgentEvent]>,
+    session: &Session,
+) -> Vec<Message> {
+    match events {
+        Some(events) if context_epoch(events) > session.context_epoch => {
+            root_history_from_events(events)
+        }
+        Some(events) if context_epoch(events) < session.context_epoch => session.messages.clone(),
+        Some(events) => {
+            reconstructed_history(Some(active_context_events(events)), &session.messages)
+        }
+        None => session.messages.clone(),
+    }
+}
+
+/// Repair provider context only; unknown outcomes must never trigger a tool rerun.
+pub fn repair_interrupted_tool_calls(mut messages: Vec<Message>) -> Vec<Message> {
+    use crate::core::types::ContentBlock;
+    let mut index = 0;
+    while index < messages.len() {
+        let calls: Vec<String> = messages[index]
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        if calls.is_empty() {
+            index += 1;
+            continue;
+        }
+        let completed: std::collections::HashSet<String> = messages[index + 1..]
+            .iter()
+            .take_while(|message| message.role != Role::Assistant)
+            .flat_map(|message| &message.content)
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+                _ => None,
+            })
+            .collect();
+        let missing: Vec<_> = calls.iter().filter(|id| !completed.contains(*id)).map(|id| {
+            ContentBlock::ToolResult {
+                tool_use_id: id.clone(),
+                content: "[interrupted] No result was recorded before this session stopped. The tool outcome is unknown; it has not been rerun.".into(),
+                is_error: Some(true),
+            }
+        }).collect();
+        if !missing.is_empty() {
+            if messages
+                .get(index + 1)
+                .is_some_and(|message| message.role == Role::Tool)
+            {
+                messages[index + 1].content.extend(missing);
+                messages[index + 1]
+                    .content
+                    .sort_by_key(|block| match block {
+                        ContentBlock::ToolResult { tool_use_id, .. } => calls
+                            .iter()
+                            .position(|id| id == tool_use_id)
+                            .unwrap_or(usize::MAX),
+                        _ => usize::MAX,
+                    });
+            } else {
+                messages.insert(
+                    index + 1,
+                    Message {
+                        role: Role::Tool,
+                        content: missing,
+                    },
+                );
+            }
+        }
+        index += 1;
+    }
+    messages
+}
+
+/// Restore the compacted provider context only when replay has a trustworthy
+/// full-history baseline. Legacy or incomplete logs retain the full transcript.
+pub(crate) fn reconstructed_working_history(
+    events: Option<&[AgentEvent]>,
+    blob: &[Message],
+    full: &[Message],
+) -> Vec<Message> {
+    let Some(events) = events else {
+        return full.to_vec();
+    };
+    let events = active_context_events(events);
+    let rebuilt = root_history_from_events(events);
+    let matches =
+        |a: &[Message], b: &[Message]| match (serde_json::to_value(a), serde_json::to_value(b)) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        };
+    if events
+        .iter()
+        .any(|event| matches!(event, AgentEvent::Unknown))
+        || !matches(&rebuilt, full)
+        || rebuilt.len() < blob.len()
+        || !matches(&rebuilt[..blob.len()], blob)
+    {
+        return full.to_vec();
+    }
+
+    let mut working = Vec::new();
+    let mut start = 0;
+    for (index, event) in events.iter().enumerate() {
+        if let AgentEvent::Compaction {
+            agent_id,
+            summary,
+            replaced_upto,
+            ..
+        } = event
+        {
+            if agent_id != "root" {
+                continue;
+            }
+            // Reducing through this boundary flushes pending tool results before
+            // interpreting the split index in the pre-compaction working set.
+            working.extend(root_history_from_events(&events[start..index]));
+            working = repair_interrupted_tool_calls(working);
+            start = index + 1;
+            if summary.trim().is_empty()
+                || *replaced_upto == 0
+                || *replaced_upto > working.len()
+                || !crate::agent::compaction::tool_safe_boundaries(&working)
+                    .ok()
+                    .and_then(|boundaries| boundaries.get(*replaced_upto).copied())
+                    .unwrap_or(false)
+            {
+                return full.to_vec();
+            }
+            working.splice(
+                ..*replaced_upto,
+                [Message::user_text(format!(
+                    "[conversation summary]\n{summary}"
+                ))],
+            );
+        }
+    }
+    working.extend(root_history_from_events(&events[start..]));
+    working
+}
+
+/// A background thread owns the connection so appends do not block on SQLite I/O.
 pub struct EventLogWriter {
-    tx: std::sync::mpsc::Sender<WriterMsg>,
+    tx: Option<std::sync::mpsc::Sender<WriterMsg>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    startup_error: Option<String>,
 }
 
 enum WriterMsg {
@@ -483,60 +654,101 @@ enum WriterMsg {
         session_id: String,
         event: Box<AgentEvent>,
     },
-    /// Barrier: append everything queued so far, then signal. Used to guarantee
-    /// durability at turn-end / quit before the process may exit.
-    Flush(std::sync::mpsc::SyncSender<()>),
+    Flush(std::sync::mpsc::SyncSender<Result<(), String>>),
 }
 
 impl EventLogWriter {
-    /// Spawn the writer thread. The thread opens its own connection; if that
-    /// fails, appends are silently dropped (the blob save still persists the
-    /// session, so shadow-write failure is non-fatal in Stage 1).
     pub fn spawn() -> EventLogWriter {
+        Self::spawn_at(db_path())
+    }
+
+    /// Retains startup failures so append/flush can report them.
+    pub fn spawn_at(path: impl AsRef<Path>) -> EventLogWriter {
+        match Self::open(path) {
+            Ok(writer) => writer,
+            Err(error) => Self {
+                tx: None,
+                thread: None,
+                startup_error: Some(format!("{error:#}")),
+            },
+        }
+    }
+
+    pub fn open(path: impl AsRef<Path>) -> anyhow::Result<EventLogWriter> {
+        Self::from_connection(open_db_at(path.as_ref())?)
+    }
+
+    fn from_connection(conn: Connection) -> anyhow::Result<EventLogWriter> {
         let (tx, rx) = std::sync::mpsc::channel::<WriterMsg>();
-        std::thread::spawn(move || {
-            let conn = match open_db() {
-                Ok(c) => c,
-                Err(_) => {
-                    // Drain and discard so senders don't block on a full channel.
-                    for msg in rx {
-                        if let WriterMsg::Flush(ack) = msg {
-                            let _ = ack.send(());
+        let thread = std::thread::Builder::new()
+            .name("bob-event-log".into())
+            .spawn(move || {
+                // A lost event cannot be repaired by a later successful write.
+                let mut error = None;
+                for msg in rx {
+                    match msg {
+                        WriterMsg::Append { session_id, event } => {
+                            if let Err(err) =
+                                append_event_to(&conn, &session_id, now_millis(), &event)
+                            {
+                                error.get_or_insert_with(|| format!("{err:#}"));
+                            }
+                        }
+                        WriterMsg::Flush(ack) => {
+                            let result = error.clone().map_or(Ok(()), Err);
+                            let _ = ack.send(result);
                         }
                     }
-                    return;
                 }
-            };
-            for msg in rx {
-                match msg {
-                    WriterMsg::Append { session_id, event } => {
-                        let ts = now_millis();
-                        let _ = append_event_to(&conn, &session_id, ts, &event);
-                    }
-                    WriterMsg::Flush(ack) => {
-                        let _ = ack.send(());
-                    }
-                }
-            }
-        });
-        EventLogWriter { tx }
+            })?;
+        Ok(EventLogWriter {
+            tx: Some(tx),
+            thread: Some(thread),
+            startup_error: None,
+        })
     }
 
-    /// Queue one event for the given session. Non-blocking; a dead writer thread
-    /// (channel closed) is ignored.
-    pub fn append(&self, session_id: &str, event: &AgentEvent) {
-        let _ = self.tx.send(WriterMsg::Append {
-            session_id: session_id.to_string(),
-            event: Box::new(event.clone()),
-        });
+    pub(crate) fn check_startup(&self) -> anyhow::Result<()> {
+        if let Some(error) = &self.startup_error {
+            anyhow::bail!("event log writer startup failed: {error}");
+        }
+        Ok(())
     }
 
-    /// Block until every event queued before this call has been written. Call
-    /// before the process may exit (quit, context-clear) so the log is durable.
-    pub fn flush(&self) {
-        let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(0);
-        if self.tx.send(WriterMsg::Flush(ack_tx)).is_ok() {
-            let _ = ack_rx.recv();
+    /// Queue without waiting for SQLite. Background failures are reported by flush.
+    pub fn append(&self, session_id: &str, event: &AgentEvent) -> anyhow::Result<()> {
+        self.check_startup()?;
+        self.tx
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("event log writer is closed"))?
+            .send(WriterMsg::Append {
+                session_id: session_id.to_string(),
+                event: Box::new(event.clone()),
+            })
+            .map_err(|_| anyhow::anyhow!("event log writer disconnected"))
+    }
+
+    /// Wait for all earlier appends, reporting any startup or write failure.
+    pub fn flush(&self) -> anyhow::Result<()> {
+        self.check_startup()?;
+        let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
+        self.tx
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("event log writer is closed"))?
+            .send(WriterMsg::Flush(ack_tx))
+            .map_err(|_| anyhow::anyhow!("event log writer disconnected"))?;
+        ack_rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("event log writer disconnected before flush"))?
+            .map_err(anyhow::Error::msg)
+    }
+}
+
+impl Drop for EventLogWriter {
+    fn drop(&mut self) {
+        self.tx.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
         }
     }
 }
@@ -550,22 +762,21 @@ fn now_millis() -> i64 {
 }
 
 pub fn load_session(id: &str) -> anyhow::Result<Option<Session>> {
-    let conn = open_db()?;
+    load_session_from(&open_db()?, id)
+}
+
+pub(crate) fn load_session_from(conn: &Connection, id: &str) -> anyhow::Result<Option<Session>> {
     let data: Option<String> = conn
         .query_row("SELECT data FROM sessions WHERE id = ?1", [id], |r| {
             r.get(0)
         })
-        .ok();
-    match data {
-        Some(json) => Ok(Some(serde_json::from_str(&json)?)),
-        None => Ok(None),
-    }
+        .optional()?;
+    data.map(|json| serde_json::from_str(&json))
+        .transpose()
+        .map_err(Into::into)
 }
 
-/// A short multi-line preview of a session's tail: the last `n` user/assistant
-/// text messages, each collapsed to one line, role-prefixed and truncated. Powers
-/// the `--resume` picker so the user sees where a conversation left off. Returns an
-/// empty vec for an unknown id or a session with no readable text.
+/// Last `n` user/assistant text lines for the resume picker; empty on load failure.
 pub fn session_preview(id: &str, n: usize) -> Vec<String> {
     let session = match load_session(id) {
         Ok(Some(s)) => s,
@@ -574,7 +785,6 @@ pub fn session_preview(id: &str, n: usize) -> Vec<String> {
     preview_lines(&session.messages, n)
 }
 
-/// Build the last-`n` preview lines from a message list (split out for testing).
 fn preview_lines(messages: &[Message], n: usize) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for m in messages.iter().rev() {
@@ -584,7 +794,7 @@ fn preview_lines(messages: &[Message], n: usize) -> Vec<String> {
         let role = match m.role {
             Role::User => "you",
             Role::Assistant => "bob",
-            _ => continue, // skip system/tool turns in the preview
+            _ => continue,
         };
         let text = m.text();
         let text = text.trim();
@@ -600,28 +810,14 @@ fn preview_lines(messages: &[Message], n: usize) -> Vec<String> {
         };
         out.push(format!("{role}: {snippet}"));
     }
-    out.reverse(); // chronological order (oldest of the tail first)
+    out.reverse();
     out
 }
 
-/// Find the most recently updated session (for `--resume` with no id).
 pub fn latest_session() -> anyhow::Result<Option<Session>> {
-    let conn = open_db()?;
-    let data: Option<String> = conn
-        .query_row(
-            "SELECT data FROM sessions ORDER BY updated_at DESC LIMIT 1",
-            [],
-            |r| r.get(0),
-        )
-        .ok();
-    match data {
-        Some(json) => Ok(Some(serde_json::from_str(&json)?)),
-        None => Ok(None),
-    }
+    latest_session_from(&open_db()?, None)
 }
 
-/// Lightweight, transport-agnostic metadata about a stored session — enough to
-/// render a picker (TUI) or a drawer (remote app) without loading full history.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionSummary {
     pub id: String,
@@ -657,10 +853,7 @@ pub fn title_of(session: &Session) -> String {
     "New conversation".to_string()
 }
 
-/// Enumerate all stored sessions as summaries, most-recently-updated first.
-/// Reads the indexed columns directly — no need to parse each full blob. Both
-/// the TUI picker and the remote drawer use this so local and remote see one
-/// identical list.
+/// Newest-first summaries from indexed columns, without parsing full snapshots.
 pub fn list_sessions() -> Vec<SessionSummary> {
     query_summaries(None)
 }
@@ -676,10 +869,17 @@ pub fn list_sessions_in(cwd: &str) -> Vec<SessionSummary> {
 }
 
 fn query_summaries(cwd: Option<&str>) -> Vec<SessionSummary> {
-    let conn = match open_db() {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
+    open_db()
+        .and_then(|conn| query_summaries_from(&conn, cwd))
+        .unwrap_or_default()
+}
+
+const SESSION_ORDER: &str = "CAST(updated_at AS INTEGER) DESC, updated_at DESC, id ASC";
+
+pub(crate) fn query_summaries_from(
+    conn: &Connection,
+    cwd: Option<&str>,
+) -> anyhow::Result<Vec<SessionSummary>> {
     let map_row = |r: &rusqlite::Row| {
         Ok(SessionSummary {
             id: r.get(0)?,
@@ -688,436 +888,949 @@ fn query_summaries(cwd: Option<&str>) -> Vec<SessionSummary> {
             created_at: r.get(3)?,
             updated_at: r.get(4)?,
             message_count: r.get::<_, i64>(5)? as usize,
-            cwd: r.get::<_, String>(6).unwrap_or_default(),
+            cwd: r.get(6)?,
         })
     };
     let base =
         "SELECT id, title, provider, created_at, updated_at, message_count, cwd FROM sessions";
-    let rows: Result<Vec<SessionSummary>, _> = match cwd {
+    let rows = match cwd {
         Some(dir) => {
-            let sql = format!("{base} WHERE cwd = ?1 ORDER BY updated_at DESC");
-            let mut stmt = match conn.prepare(&sql) {
-                Ok(s) => s,
-                Err(_) => return Vec::new(),
-            };
-            let it = match stmt.query_map([dir], map_row) {
-                Ok(it) => it,
-                Err(_) => return Vec::new(),
-            };
-            it.collect()
+            let sql = format!("{base} WHERE cwd = ?1 ORDER BY {SESSION_ORDER}");
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map([dir], map_row)?;
+            rows.collect::<Result<Vec<_>, _>>()?
         }
         None => {
-            let sql = format!("{base} ORDER BY updated_at DESC");
-            let mut stmt = match conn.prepare(&sql) {
-                Ok(s) => s,
-                Err(_) => return Vec::new(),
-            };
-            let it = match stmt.query_map([], map_row) {
-                Ok(it) => it,
-                Err(_) => return Vec::new(),
-            };
-            it.collect()
+            let sql = format!("{base} ORDER BY {SESSION_ORDER}");
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map([], map_row)?;
+            rows.collect::<Result<Vec<_>, _>>()?
         }
     };
-    rows.unwrap_or_default()
+    Ok(rows)
 }
 
 /// The most recently updated session started in `cwd` (for `--continue`). None if
 /// there is no session for this directory.
 pub fn latest_session_in(cwd: &str) -> anyhow::Result<Option<Session>> {
-    let conn = open_db()?;
-    let data: Option<String> = conn
-        .query_row(
-            "SELECT data FROM sessions WHERE cwd = ?1 ORDER BY updated_at DESC LIMIT 1",
-            [cwd],
-            |r| r.get(0),
-        )
-        .ok();
-    match data {
-        Some(json) => Ok(Some(serde_json::from_str(&json)?)),
-        None => Ok(None),
-    }
+    latest_session_from(&open_db()?, Some(cwd))
+}
+
+pub(crate) fn latest_session_from(
+    conn: &Connection,
+    cwd: Option<&str>,
+) -> anyhow::Result<Option<Session>> {
+    let data: Option<String> = match cwd {
+        Some(dir) => conn
+            .query_row(
+                &format!(
+                    "SELECT data FROM sessions WHERE cwd = ?1 ORDER BY {SESSION_ORDER} LIMIT 1"
+                ),
+                [dir],
+                |r| r.get(0),
+            )
+            .optional()?,
+        None => conn
+            .query_row(
+                &format!("SELECT data FROM sessions ORDER BY {SESSION_ORDER} LIMIT 1"),
+                [],
+                |r| r.get(0),
+            )
+            .optional()?,
+    };
+    data.map(|json| serde_json::from_str(&json))
+        .transpose()
+        .map_err(Into::into)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn assistant(text: &str) -> Message {
-        Message {
-            role: Role::Assistant,
-            content: vec![crate::core::types::ContentBlock::Text { text: text.into() }],
+    mod sqlite_failures {
+        use super::*;
+
+        #[test]
+        fn query_helpers_distinguish_missing_rows_from_sql_errors() {
+            let conn = Connection::open_in_memory().unwrap();
+            init_schema(&conn).unwrap();
+            assert!(load_session_from(&conn, "missing").unwrap().is_none());
+            assert!(latest_session_from(&conn, None).unwrap().is_none());
+            assert!(load_events_from(&conn, "missing").unwrap().is_none());
+            conn.execute_batch("DROP TABLE sessions; DROP TABLE events;")
+                .unwrap();
+            assert!(load_session_from(&conn, "missing").is_err());
+            assert!(latest_session_from(&conn, None).is_err());
+            assert!(latest_session_from(&conn, Some(".")).is_err());
+            assert!(query_summaries_from(&conn, None).is_err());
+            assert!(query_summaries_from(&conn, Some(".")).is_err());
+            assert!(load_events_from(&conn, "missing").is_err());
         }
-    }
 
-    #[test]
-    fn preview_lines_returns_last_n_role_prefixed() {
-        let msgs = vec![
-            Message::user_text("first question"),
-            assistant("first answer"),
-            Message::user_text("second question"),
-            assistant("second answer"),
-        ];
-        let p = preview_lines(&msgs, 2);
-        // Last two, chronological, role-prefixed.
-        assert_eq!(p, vec!["you: second question", "bob: second answer"]);
-    }
-
-    #[test]
-    fn preview_lines_skips_empty_and_non_chat_roles_and_truncates() {
-        let long = "x".repeat(200);
-        let msgs = vec![
-            Message::user_text("   "), // empty after trim → skipped
-            Message::user_text(&long),
-        ];
-        let p = preview_lines(&msgs, 3);
-        assert_eq!(p.len(), 1);
-        assert!(p[0].starts_with("you: "));
-        assert!(p[0].ends_with('…'), "long line should be truncated");
-    }
-
-    #[test]
-    fn preview_lines_empty_for_no_messages() {
-        assert!(preview_lines(&[], 3).is_empty());
-    }
-
-    #[test]
-    fn agent_threads_round_trip() {
-        let session = Session {
-            agent_threads: vec![PersistedThread {
-                id: "reviewer".into(),
-                name: "reviewer".into(),
-                parent_id: "root".into(),
-                task: "review the diff".into(),
-                status: "done".into(),
-                cells: vec![
-                    PersistedCell::Assistant {
-                        text: "looks good".into(),
+        #[test]
+        fn writer_flush_reports_read_only_sqlite_error() {
+            let conn = Connection::open_in_memory().unwrap();
+            init_schema(&conn).unwrap();
+            conn.execute_batch("PRAGMA query_only = ON;").unwrap();
+            let writer = EventLogWriter::from_connection(conn).unwrap();
+            writer
+                .append(
+                    "s",
+                    &AgentEvent::TurnStart {
+                        agent_id: "root".into(),
                     },
-                    PersistedCell::Tool {
-                        name: "grep".into(),
-                        input: serde_json::json!({"pattern": "x"}),
-                        output: "3 matches".into(),
-                        is_error: false,
-                    },
-                    PersistedCell::Message {
-                        from: "user".into(),
-                        text: "also check y".into(),
-                    },
-                ],
-            }],
-            ..new_session("anthropic", "s1".into(), "now".into(), String::new())
-        };
-        let json = serde_json::to_string(&session).unwrap();
-        let back: Session = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.agent_threads.len(), 1);
-        let t = &back.agent_threads[0];
-        assert_eq!(t.name, "reviewer");
-        assert_eq!(t.cells.len(), 3);
-    }
-
-    #[test]
-    fn grants_round_trip_with_session() {
-        let session = Session {
-            grants: vec![
-                Grant::Tool {
-                    name: "edit_file".into(),
-                },
-                Grant::BashCommand {
-                    name: "cargo".into(),
-                    glob: "**".into(),
-                },
-            ],
-            ..new_session("anthropic", "s1".into(), "now".into(), String::new())
-        };
-
-        let value = serde_json::to_value(&session).unwrap();
-        assert_eq!(
-            value["grants"][0],
-            serde_json::json!({"kind": "tool", "name": "edit_file"})
-        );
-        assert_eq!(
-            value["grants"][1],
-            serde_json::json!({"kind": "bash_command", "name": "cargo", "glob": "**"})
-        );
-
-        let back: Session = serde_json::from_value(value).unwrap();
-        match &back.grants[0] {
-            Grant::Tool { name } => assert_eq!(name, "edit_file"),
-            other => panic!("expected tool grant, got {other:?}"),
+                )
+                .unwrap();
+            let error = writer.flush().unwrap_err().to_string();
+            assert!(error.contains("readonly"), "{error}");
+            assert!(writer.flush().is_err());
         }
-        match &back.grants[1] {
-            Grant::BashCommand { name, glob } => {
-                assert_eq!(name, "cargo");
-                assert_eq!(glob, "**");
-            }
-            other => panic!("expected bash grant, got {other:?}"),
-        }
-    }
 
-    #[test]
-    fn old_session_without_agent_threads_loads() {
-        // A session JSON from before the field existed must still deserialize
-        // (serde default → empty vec).
-        let json = r#"{
-            "id": "s1", "created_at": "t", "updated_at": "t",
-            "provider": "anthropic", "messages": []
-        }"#;
-        let s: Session = serde_json::from_str(json).unwrap();
-        assert!(s.agent_threads.is_empty());
-        assert!(s.todos.is_empty());
-        // Legacy sessions predate `cwd` → defaults to empty (so they show in the
-        // unscoped picker, never filtered out).
-        assert_eq!(s.cwd, "");
-    }
-
-    #[test]
-    fn new_session_records_cwd() {
-        let s = new_session("openai", "s2".into(), "now".into(), "/home/x/proj".into());
-        assert_eq!(s.cwd, "/home/x/proj");
-    }
-
-    // Build a session with `n` user messages under a fixed id.
-    fn sized(id: &str, n: usize) -> Session {
-        let mut s = new_session("anthropic", id.into(), "t".into(), String::new());
-        s.messages = (0..n)
-            .map(|i| Message::user_text(format!("m{i}")))
-            .collect();
-        s
-    }
-
-    fn count_on_disk(conn: &Connection, id: &str) -> i64 {
-        conn.query_row(
-            "SELECT message_count FROM sessions WHERE id = ?1",
-            [id],
-            |r| r.get(0),
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn shorter_history_cannot_clobber_longer() {
-        let conn = Connection::open_in_memory().unwrap();
-        init_schema(&conn).unwrap();
-        // A full 10-message history lands.
-        write_session_to(&conn, &sized("s", 10), false).unwrap();
-        assert_eq!(count_on_disk(&conn, "s"), 10);
-        // A stale writer with only 3 messages (the exact MCP-clobber scenario) is
-        // dropped — the longer history survives.
-        write_session_to(&conn, &sized("s", 3), false).unwrap();
-        assert_eq!(count_on_disk(&conn, "s"), 10);
-        // Growing (or equal) writes still win.
-        write_session_to(&conn, &sized("s", 12), false).unwrap();
-        assert_eq!(count_on_disk(&conn, "s"), 12);
-    }
-
-    #[test]
-    fn force_save_allows_intentional_shrink() {
-        let conn = Connection::open_in_memory().unwrap();
-        init_schema(&conn).unwrap();
-        write_session_to(&conn, &sized("s", 10), false).unwrap();
-        // A context-clear (force) legitimately shrinks to 0.
-        write_session_to(&conn, &sized("s", 0), true).unwrap();
-        assert_eq!(count_on_disk(&conn, "s"), 0);
-        // ...and afterwards normal growing saves resume from the reset baseline.
-        write_session_to(&conn, &sized("s", 2), false).unwrap();
-        assert_eq!(count_on_disk(&conn, "s"), 2);
-    }
-
-    #[test]
-    fn events_append_and_replay_in_order() {
-        let conn = Connection::open_in_memory().unwrap();
-        init_schema(&conn).unwrap();
-        write_session_to(&conn, &sized("s", 1), false).unwrap();
-        assert!(!has_events(&conn, "s"));
-
-        let e0 = AgentEvent::TurnStart {
-            agent_id: "root".into(),
-        };
-        let e1 = AgentEvent::TextDelta {
-            agent_id: "root".into(),
-            text: "hi".into(),
-        };
-        assert_eq!(append_event_to(&conn, "s", 100, &e0).unwrap(), 0);
-        assert_eq!(append_event_to(&conn, "s", 101, &e1).unwrap(), 1);
-
-        assert!(has_events(&conn, "s"));
-
-        let replayed = replay_events(&conn, "s").unwrap();
-        assert_eq!(replayed.len(), 2);
-        assert!(matches!(replayed[0], AgentEvent::TurnStart { .. }));
-        match &replayed[1] {
-            AgentEvent::TextDelta { text, .. } => assert_eq!(text, "hi"),
-            other => panic!("expected TextDelta, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn compaction_event_round_trips_summary() {
-        // The summary + split index must survive the log — they're what lets
-        // replay rebuild the compacted working set on resume.
-        let conn = Connection::open_in_memory().unwrap();
-        init_schema(&conn).unwrap();
-        let ev = AgentEvent::Compaction {
-            agent_id: "root".into(),
-            before_tokens: 900,
-            after_tokens: 300,
-            summary: "we did X and Y".into(),
-            replaced_upto: 7,
-        };
-        append_event_to(&conn, "s", 1, &ev).unwrap();
-        match &replay_events(&conn, "s").unwrap()[0] {
-            AgentEvent::Compaction {
-                summary,
-                replaced_upto,
-                ..
-            } => {
-                assert_eq!(summary, "we did X and Y");
-                assert_eq!(*replaced_upto, 7);
-            }
-            other => panic!("expected Compaction, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn unknown_future_variant_replays_as_noop() {
-        // A row written by a newer bob (unrecognized `kind`) must not abort replay —
-        // it decodes to AgentEvent::Unknown and is otherwise ignored.
-        let conn = Connection::open_in_memory().unwrap();
-        init_schema(&conn).unwrap();
-        write_session_to(&conn, &sized("s", 1), false).unwrap();
-        conn.execute(
-            "INSERT INTO events (session_id, seq, ts, kind, data) VALUES ('s', 0, 1, 'FutureThing', ?1)",
-            [r#"{"v":2,"kind":"FutureThing","payload":{"whatever":true}}"#],
-        )
-        .unwrap();
-        let good = AgentEvent::TurnStart {
-            agent_id: "root".into(),
-        };
-        append_event_to(&conn, "s", 2, &good).unwrap();
-        let replayed = replay_events(&conn, "s").unwrap();
-        assert_eq!(replayed.len(), 2);
-        assert!(matches!(replayed[0], AgentEvent::Unknown));
-        assert!(matches!(replayed[1], AgentEvent::TurnStart { .. }));
-    }
-
-    #[test]
-    fn seq_is_derived_from_the_log_not_a_missing_header() {
-        // Regression: a brand-new session logs events BEFORE its sessions row
-        // exists. seq must come from MAX(seq) over events, or every event collides
-        // on seq 0 and all but the first are silently dropped (the bug that made a
-        // resumed transcript render almost nothing).
-        let conn = Connection::open_in_memory().unwrap();
-        init_schema(&conn).unwrap();
-        // NOTE: no sessions row yet.
-        for i in 0..5 {
-            append_event_to(
-                &conn,
-                "s",
-                i,
-                &AgentEvent::UserPrompt {
-                    agent_id: "root".into(),
-                    text: format!("m{i}"),
-                },
+        #[test]
+        fn writer_flush_reports_deferred_constraint_failure() {
+            let conn = Connection::open_in_memory().unwrap();
+            init_schema(&conn).unwrap();
+            conn.execute_batch(
+                "PRAGMA foreign_keys = ON;
+                     CREATE TABLE parents (id INTEGER PRIMARY KEY);
+                     CREATE TABLE children (
+                         parent_id INTEGER REFERENCES parents(id) DEFERRABLE INITIALLY DEFERRED
+                     );
+                     CREATE TRIGGER reject_at_commit AFTER INSERT ON events
+                     BEGIN INSERT INTO children (parent_id) VALUES (1); END;",
             )
             .unwrap();
+            let writer = EventLogWriter::from_connection(conn).unwrap();
+            writer
+                .append(
+                    "s",
+                    &AgentEvent::TurnStart {
+                        agent_id: "root".into(),
+                    },
+                )
+                .unwrap();
+            let error = writer.flush().unwrap_err().to_string();
+            assert!(error.contains("FOREIGN KEY"), "{error}");
         }
-        assert_eq!(replay_events(&conn, "s").unwrap().len(), 5);
+
+        #[test]
+        fn writer_reports_disconnected_channel() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            drop(rx);
+            let writer = EventLogWriter {
+                tx: Some(tx),
+                thread: None,
+                startup_error: None,
+            };
+            assert!(writer
+                .append(
+                    "s",
+                    &AgentEvent::TurnStart {
+                        agent_id: "root".into()
+                    }
+                )
+                .is_err());
+            assert!(writer.flush().is_err());
+        }
+
+        #[test]
+        fn writer_reports_disconnect_during_flush() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                if let WriterMsg::Flush(ack) = rx.recv().unwrap() {
+                    drop(ack);
+                }
+            });
+            let writer = EventLogWriter {
+                tx: Some(tx),
+                thread: Some(thread),
+                startup_error: None,
+            };
+            assert!(writer
+                .flush()
+                .unwrap_err()
+                .to_string()
+                .contains("before flush"));
+        }
     }
 
-    #[test]
-    fn root_history_reducer_mirrors_the_turn_loop() {
-        use crate::core::types::ContentBlock;
-        // A user turn, an assistant turn with a tool_use, its tool_result, then a
-        // final assistant text — the reducer must yield exactly what run() pushes
-        // into full_history, bundling the tool_result into one Role::Tool message.
-        let assistant_with_tool = Message {
-            role: Role::Assistant,
-            content: vec![ContentBlock::ToolUse {
-                id: "t1".into(),
-                name: "read_file".into(),
-                input: serde_json::json!({"path": "a.rs"}),
-            }],
-        };
-        let events = vec![
-            AgentEvent::UserPrompt {
+    mod presentation_and_serialization {
+        use super::*;
+
+        fn assistant(text: &str) -> Message {
+            Message {
+                role: Role::Assistant,
+                content: vec![crate::core::types::ContentBlock::Text { text: text.into() }],
+            }
+        }
+
+        #[test]
+        fn preview_lines_filters_roles_and_formats_a_chronological_unicode_tail() {
+            let messages = vec![
+                Message::user_text("first question"),
+                assistant("first answer"),
+                Message::user_text(" second\nquestion "),
+                Message {
+                    role: Role::System,
+                    content: assistant("hidden system").content,
+                },
+                Message {
+                    role: Role::Tool,
+                    content: assistant("hidden tool").content,
+                },
+                assistant("   "),
+                assistant(&"界".repeat(81)),
+            ];
+            for (messages, n, expected) in [
+                (
+                    messages.as_slice(),
+                    2,
+                    vec![
+                        "you: second question".into(),
+                        format!("bob: {}…", "界".repeat(80)),
+                    ],
+                ),
+                (messages.as_slice(), 0, vec![]),
+                (&[][..], 3, vec![]),
+            ] {
+                assert_eq!(preview_lines(messages, n), expected);
+            }
+            assert_eq!(
+                preview_lines(&[assistant(&"界".repeat(80))], 1),
+                vec![format!("bob: {}", "界".repeat(80))]
+            );
+        }
+
+        #[test]
+        fn agent_threads_round_trip() {
+            let session = Session {
+                agent_threads: vec![PersistedThread {
+                    id: "reviewer".into(),
+                    name: "reviewer".into(),
+                    parent_id: "root".into(),
+                    task: "review the diff".into(),
+                    status: "done".into(),
+                    cells: vec![
+                        PersistedCell::Assistant {
+                            text: "looks good".into(),
+                        },
+                        PersistedCell::Tool {
+                            name: "grep".into(),
+                            input: serde_json::json!({"pattern": "x"}),
+                            output: "3 matches".into(),
+                            is_error: false,
+                        },
+                        PersistedCell::Message {
+                            from: "user".into(),
+                            text: "also check y".into(),
+                        },
+                    ],
+                }],
+                ..new_session("anthropic", "s1".into(), "now".into(), String::new())
+            };
+            let json = serde_json::to_string(&session).unwrap();
+            let back: Session = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                serde_json::to_value(back).unwrap(),
+                serde_json::to_value(session).unwrap()
+            );
+        }
+
+        #[test]
+        fn grants_round_trip_with_session() {
+            let session = Session {
+                grants: vec![
+                    Grant::Tool {
+                        name: "edit_file".into(),
+                    },
+                    Grant::BashCommand {
+                        name: "cargo".into(),
+                        glob: "**".into(),
+                    },
+                ],
+                ..new_session("anthropic", "s1".into(), "now".into(), String::new())
+            };
+
+            let value = serde_json::to_value(&session).unwrap();
+            assert_eq!(
+                value["grants"][0],
+                serde_json::json!({"kind": "tool", "name": "edit_file"})
+            );
+            assert_eq!(
+                value["grants"][1],
+                serde_json::json!({"kind": "bash_command", "name": "cargo", "glob": "**"})
+            );
+
+            let back: Session = serde_json::from_value(value).unwrap();
+            match &back.grants[0] {
+                Grant::Tool { name } => assert_eq!(name, "edit_file"),
+                other => panic!("expected tool grant, got {other:?}"),
+            }
+            match &back.grants[1] {
+                Grant::BashCommand { name, glob } => {
+                    assert_eq!(name, "cargo");
+                    assert_eq!(glob, "**");
+                }
+                other => panic!("expected bash grant, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn old_session_without_agent_threads_loads() {
+            let json = r#"{
+                    "id": "s1", "created_at": "t", "updated_at": "t",
+                    "provider": "anthropic", "messages": []
+                }"#;
+            let s: Session = serde_json::from_str(json).unwrap();
+            assert!(s.agent_threads.is_empty());
+            assert!(s.todos.is_empty());
+            assert_eq!(s.cwd, "");
+        }
+    }
+
+    mod snapshot_guards {
+        use super::*;
+
+        fn sized(id: &str, n: usize) -> Session {
+            let mut s = new_session("anthropic", id.into(), "t".into(), String::new());
+            s.messages = (0..n)
+                .map(|i| Message::user_text(format!("m{i}")))
+                .collect();
+            s
+        }
+
+        fn count_on_disk(conn: &Connection, id: &str) -> i64 {
+            conn.query_row(
+                "SELECT message_count FROM sessions WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        }
+
+        #[test]
+        fn force_save_allows_intentional_shrink_but_rejects_an_older_epoch() {
+            let conn = Connection::open_in_memory().unwrap();
+            init_schema(&conn).unwrap();
+            write_session_to(&conn, &sized("s", 10), false).unwrap();
+            write_session_to(&conn, &sized("s", 0), true).unwrap();
+            assert_eq!(count_on_disk(&conn, "s"), 0);
+            assert_eq!(
+                serde_json::to_value(load_session_from(&conn, "s").unwrap().unwrap()).unwrap(),
+                serde_json::to_value(sized("s", 0)).unwrap()
+            );
+            write_session_to(&conn, &sized("s", 2), false).unwrap();
+            assert_eq!(count_on_disk(&conn, "s"), 2);
+            assert_eq!(
+                serde_json::to_value(load_session_from(&conn, "s").unwrap().unwrap()).unwrap(),
+                serde_json::to_value(sized("s", 2)).unwrap()
+            );
+            let mut current = sized("s", 1);
+            current.context_epoch = 1;
+            current.messages[0] = Message::user_text("new context");
+            write_session_to(&conn, &current, false).unwrap();
+            write_session_to(&conn, &sized("s", 10), true).unwrap();
+            assert_eq!(count_on_disk(&conn, "s"), 1);
+            assert_eq!(
+                serde_json::to_value(load_session_from(&conn, "s").unwrap().unwrap()).unwrap(),
+                serde_json::to_value(current).unwrap()
+            );
+        }
+    }
+
+    mod event_log {
+        use super::*;
+
+        #[test]
+        fn events_append_and_replay_in_order() {
+            let conn = Connection::open_in_memory().unwrap();
+            init_schema(&conn).unwrap();
+            assert!(load_session_from(&conn, "s").unwrap().is_none());
+            assert!(!has_events(&conn, "s"));
+
+            let e0 = AgentEvent::TurnStart {
                 agent_id: "root".into(),
-                text: "fix it".into(),
-            },
-            AgentEvent::Message {
+            };
+            let e1 = AgentEvent::TextDelta {
                 agent_id: "root".into(),
-                message: assistant_with_tool.clone(),
-            },
-            AgentEvent::ToolResult {
+                text: "hi".into(),
+            };
+            assert_eq!(append_event_to(&conn, "s", 100, &e0).unwrap(), 0);
+            assert_eq!(append_event_to(&conn, "other", 200, &e1).unwrap(), 0);
+            assert_eq!(append_event_to(&conn, "s", 99, &e1).unwrap(), 1);
+            assert!(load_session_from(&conn, "s").unwrap().is_none());
+            write_session_to(
+                &conn,
+                &new_session("mock", "s".into(), "0".into(), ".".into()),
+                false,
+            )
+            .unwrap();
+
+            assert!(has_events(&conn, "s"));
+
+            for _ in 0..2 {
+                assert_eq!(
+                    serde_json::to_value(replay_events(&conn, "s").unwrap()).unwrap(),
+                    serde_json::to_value([&e0, &e1]).unwrap()
+                );
+            }
+            assert_eq!(
+                serde_json::to_value(replay_events(&conn, "other").unwrap()).unwrap(),
+                serde_json::to_value([&e1]).unwrap()
+            );
+        }
+
+        #[test]
+        fn compaction_event_round_trips_summary() {
+            let conn = Connection::open_in_memory().unwrap();
+            init_schema(&conn).unwrap();
+            let ev = AgentEvent::Compaction {
                 agent_id: "root".into(),
-                tool_use_id: "t1".into(),
-                output: "ok".into(),
-                is_error: false,
-            },
-            // A subagent's result must NOT enter root history.
-            AgentEvent::ToolResult {
-                agent_id: "task_1".into(),
-                tool_use_id: "x".into(),
-                output: "ignored".into(),
-                is_error: false,
-            },
-            AgentEvent::Message {
+                before_tokens: 900,
+                after_tokens: 300,
+                summary: "we did X and Y".into(),
+                replaced_upto: 7,
+            };
+            append_event_to(&conn, "s", 1, &ev).unwrap();
+            assert_eq!(
+                serde_json::to_value(replay_events(&conn, "s").unwrap()).unwrap(),
+                serde_json::to_value([ev]).unwrap()
+            );
+        }
+
+        #[test]
+        fn unknown_future_variant_replays_as_noop() {
+            let conn = Connection::open_in_memory().unwrap();
+            init_schema(&conn).unwrap();
+            write_session_to(
+                &conn,
+                &new_session("mock", "s".into(), "0".into(), ".".into()),
+                false,
+            )
+            .unwrap();
+            conn.execute(
+                    "INSERT INTO events (session_id, seq, ts, kind, data) VALUES ('s', 0, 1, 'FutureThing', ?1)",
+                    [r#"{"v":2,"kind":"FutureThing","payload":{"whatever":true}}"#],
+                )
+                .unwrap();
+            let good = AgentEvent::TurnStart {
                 agent_id: "root".into(),
-                message: Message {
+            };
+            append_event_to(&conn, "s", 2, &good).unwrap();
+            let replayed = replay_events(&conn, "s").unwrap();
+            assert_eq!(replayed.len(), 2);
+            assert!(matches!(replayed[0], AgentEvent::Unknown));
+            assert!(matches!(replayed[1], AgentEvent::TurnStart { .. }));
+        }
+    }
+
+    mod replay {
+        use super::*;
+
+        #[test]
+        fn root_history_reducer_mirrors_the_turn_loop() {
+            use crate::core::types::ContentBlock;
+            let assistant_with_tool = Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "t1".into(),
+                    name: "read_file".into(),
+                    input: serde_json::json!({"path": "a.rs"}),
+                }],
+            };
+            let events = vec![
+                AgentEvent::UserPrompt {
+                    agent_id: "root".into(),
+                    text: "fix it".into(),
+                },
+                AgentEvent::Message {
+                    agent_id: "root".into(),
+                    message: assistant_with_tool.clone(),
+                },
+                AgentEvent::ToolResult {
+                    agent_id: "root".into(),
+                    tool_use_id: "t1".into(),
+                    output: "ok".into(),
+                    is_error: false,
+                },
+                // A subagent's result must NOT enter root history.
+                AgentEvent::ToolResult {
+                    agent_id: "task_1".into(),
+                    tool_use_id: "x".into(),
+                    output: "ignored".into(),
+                    is_error: false,
+                },
+                AgentEvent::Message {
+                    agent_id: "root".into(),
+                    message: Message {
+                        role: Role::Assistant,
+                        content: vec![ContentBlock::Text {
+                            text: "done".into(),
+                        }],
+                    },
+                },
+            ];
+            let expected = vec![
+                Message::user_text("fix it"),
+                assistant_with_tool,
+                Message {
+                    role: Role::Tool,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: "t1".into(),
+                        content: "ok".into(),
+                        is_error: Some(false),
+                    }],
+                },
+                Message {
                     role: Role::Assistant,
                     content: vec![ContentBlock::Text {
                         text: "done".into(),
                     }],
                 },
-            },
-        ];
-        let h = root_history_from_events(&events);
-        assert_eq!(h.len(), 4);
-        assert_eq!(h[0].role, Role::User);
-        assert_eq!(h[0].text(), "fix it");
-        assert_eq!(h[1].role, Role::Assistant);
-        assert_eq!(h[2].role, Role::Tool);
-        // Exactly one tool_result, and the subagent's was excluded.
-        match &h[2].content[..] {
-            [ContentBlock::ToolResult { tool_use_id, .. }] => assert_eq!(tool_use_id, "t1"),
-            other => panic!("expected one root tool_result, got {other:?}"),
+            ];
+            assert_eq!(
+                serde_json::to_value(root_history_from_events(&events)).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
         }
-        assert_eq!(h[3].text(), "done");
-    }
 
-    #[test]
-    fn reconstructed_history_guards_against_a_short_log() {
-        let blob = vec![
-            Message::user_text("a"),
-            Message::user_text("b"),
-            Message::user_text("c"),
-        ];
-        // Legacy session (no events) → blob verbatim.
-        assert_eq!(reconstructed_history(None, &blob).len(), 3);
-        // A complete log (>= blob) wins.
-        let full = vec![
-            AgentEvent::UserPrompt {
+        #[test]
+        fn compacted_replay_restores_request_order_after_parallel_tool_completion() {
+            use crate::core::types::ContentBlock;
+            let assistant = Message {
+                role: Role::Assistant,
+                content: ["a", "b"]
+                    .into_iter()
+                    .map(|id| ContentBlock::ToolUse {
+                        id: id.into(),
+                        name: "read_file".into(),
+                        input: serde_json::json!({}),
+                    })
+                    .collect(),
+            };
+            let results = Message {
+                role: Role::Tool,
+                content: ["a", "b"]
+                    .into_iter()
+                    .map(|id| ContentBlock::ToolResult {
+                        tool_use_id: id.into(),
+                        content: id.into(),
+                        is_error: Some(false),
+                    })
+                    .collect(),
+            };
+            let full = vec![
+                Message::user_text("question"),
+                assistant.clone(),
+                results,
+                Message::user_text("continue"),
+            ];
+            let events = vec![
+                AgentEvent::UserPrompt {
+                    agent_id: "root".into(),
+                    text: "question".into(),
+                },
+                AgentEvent::Message {
+                    agent_id: "root".into(),
+                    message: assistant,
+                },
+                AgentEvent::ToolResult {
+                    agent_id: "root".into(),
+                    tool_use_id: "b".into(),
+                    output: "b".into(),
+                    is_error: false,
+                },
+                AgentEvent::ToolResult {
+                    agent_id: "root".into(),
+                    tool_use_id: "a".into(),
+                    output: "a".into(),
+                    is_error: false,
+                },
+                AgentEvent::Compaction {
+                    agent_id: "root".into(),
+                    before_tokens: 1000,
+                    after_tokens: 100,
+                    summary: "summary".into(),
+                    replaced_upto: 3,
+                },
+                AgentEvent::UserPrompt {
+                    agent_id: "root".into(),
+                    text: "continue".into(),
+                },
+            ];
+            assert_eq!(
+                serde_json::to_value(root_history_from_events(&events)).unwrap(),
+                serde_json::to_value(&full).unwrap()
+            );
+            let working = reconstructed_working_history(Some(&events), &full, &full);
+            assert_eq!(working.len(), 2);
+            assert_eq!(working[0].text(), "[conversation summary]\nsummary");
+            assert_eq!(working[1].text(), "continue");
+        }
+
+        #[test]
+        fn working_replay_requires_matching_authority_and_an_intact_tool_boundary() {
+            use crate::core::types::ContentBlock;
+            let mut events = vec![
+                AgentEvent::UserPrompt {
+                    agent_id: "root".into(),
+                    text: "question".into(),
+                },
+                AgentEvent::Message {
+                    agent_id: "root".into(),
+                    message: Message {
+                        role: Role::Assistant,
+                        content: vec![ContentBlock::ToolUse {
+                            id: "call".into(),
+                            name: "read_file".into(),
+                            input: serde_json::json!({}),
+                        }],
+                    },
+                },
+                AgentEvent::ToolResult {
+                    agent_id: "root".into(),
+                    tool_use_id: "call".into(),
+                    output: "result".into(),
+                    is_error: false,
+                },
+                AgentEvent::Compaction {
+                    agent_id: "root".into(),
+                    before_tokens: 100,
+                    after_tokens: 10,
+                    summary: "summary".into(),
+                    replaced_upto: 2,
+                },
+            ];
+            let full = root_history_from_events(&events);
+            let working = reconstructed_working_history(Some(&events), &full, &full);
+            assert_eq!(
+                serde_json::to_value(&working).unwrap(),
+                serde_json::to_value(&full).unwrap()
+            );
+            if let AgentEvent::Compaction { replaced_upto, .. } = events.last_mut().unwrap() {
+                *replaced_upto = 3;
+            }
+            assert_eq!(
+                serde_json::to_value(reconstructed_working_history(Some(&events), &full, &full))
+                    .unwrap(),
+                serde_json::to_value([Message::user_text("[conversation summary]\nsummary")])
+                    .unwrap()
+            );
+            let mut interleaved = events.clone();
+            interleaved.insert(
+                2,
+                AgentEvent::UserPrompt {
+                    agent_id: "root".into(),
+                    text: "coordination while tools ran".into(),
+                },
+            );
+            if let AgentEvent::Compaction { replaced_upto, .. } = interleaved.last_mut().unwrap() {
+                *replaced_upto = 2;
+            }
+            let interleaved_full = root_history_from_events(&interleaved);
+            let interleaved_working = reconstructed_working_history(
+                Some(&interleaved),
+                &interleaved_full,
+                &interleaved_full,
+            );
+            assert_eq!(
+                serde_json::to_value(interleaved_working).unwrap(),
+                serde_json::to_value(interleaved_full).unwrap()
+            );
+            let mut authoritative = full.clone();
+            authoritative[0] = Message::user_text("authoritative question");
+            let working = reconstructed_working_history(Some(&events), &[], &authoritative);
+            assert_eq!(
+                serde_json::to_value(working).unwrap(),
+                serde_json::to_value(authoritative).unwrap()
+            );
+        }
+
+        #[test]
+        fn interrupted_repair_is_idempotent_and_does_not_borrow_an_old_call_result() {
+            use crate::core::types::ContentBlock;
+            let call = Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "reused".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({}),
+                }],
+            };
+            let full = vec![
+                call.clone(),
+                Message {
+                    role: Role::Tool,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: "reused".into(),
+                        content: "earlier result".into(),
+                        is_error: Some(false),
+                    }],
+                },
+                call,
+            ];
+            let original = serde_json::to_value(&full).unwrap();
+            let repaired = repair_interrupted_tool_calls(full.clone());
+            assert_eq!(repaired.len(), 4);
+            assert!(
+                matches!(&repaired[3].content[0], ContentBlock::ToolResult { content, is_error: Some(true), .. } if content.as_text().unwrap().contains("outcome is unknown"))
+            );
+            assert_eq!(
+                serde_json::to_value(repair_interrupted_tool_calls(repaired.clone())).unwrap(),
+                serde_json::to_value(repaired).unwrap()
+            );
+            assert_eq!(serde_json::to_value(&full).unwrap(), original);
+        }
+
+        #[test]
+        fn compaction_after_interrupted_recovery_replays_working_only_repairs() {
+            use crate::core::types::ContentBlock;
+            let events = vec![
+                AgentEvent::Message {
+                    agent_id: "root".into(),
+                    message: Message {
+                        role: Role::Assistant,
+                        content: vec![ContentBlock::ToolUse {
+                            id: "unknown".into(),
+                            name: "bash".into(),
+                            input: serde_json::json!({}),
+                        }],
+                    },
+                },
+                AgentEvent::Compaction {
+                    agent_id: "root".into(),
+                    before_tokens: 100,
+                    after_tokens: 10,
+                    summary: "Interrupted command outcome unknown.".into(),
+                    replaced_upto: 2,
+                },
+            ];
+            let full = root_history_from_events(&events);
+            let working = reconstructed_working_history(Some(&events), &full, &full);
+            assert_eq!(working.len(), 1);
+            assert_eq!(
+                working[0].text(),
+                "[conversation summary]\nInterrupted command outcome unknown."
+            );
+            assert_eq!(full.len(), 1);
+            assert!(matches!(full[0].content[0], ContentBlock::ToolUse { .. }));
+        }
+
+        #[test]
+        fn replay_flushes_results_before_coordination_and_reset_discards_pending_results() {
+            use crate::core::types::ContentBlock;
+            let call = |id: &str| Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: id.into(),
+                    name: "read_file".into(),
+                    input: serde_json::json!({"path": id}),
+                }],
+            };
+            let result = |id: &str| AgentEvent::ToolResult {
                 agent_id: "root".into(),
-                text: "a".into(),
-            },
-            AgentEvent::UserPrompt {
-                agent_id: "root".into(),
-                text: "b".into(),
-            },
-            AgentEvent::UserPrompt {
-                agent_id: "root".into(),
-                text: "c".into(),
-            },
-        ];
-        assert_eq!(reconstructed_history(Some(&full), &blob).len(), 3);
-        // A truncated/corrupt log (fewer than the blob) must NOT lose history —
-        // fall back to the blob. This is the guard that saved the day after the
-        // seq-collision bug.
-        let short = vec![AgentEvent::UserPrompt {
-            agent_id: "root".into(),
-            text: "a".into(),
-        }];
-        let got = reconstructed_history(Some(&short), &blob);
-        assert_eq!(got.len(), 3, "short log must fall back to the blob");
+                tool_use_id: id.into(),
+                output: format!("output {id}").into(),
+                is_error: true,
+            };
+            let events = vec![
+                AgentEvent::UserPrompt {
+                    agent_id: "root".into(),
+                    text: "obsolete".into(),
+                },
+                AgentEvent::Message {
+                    agent_id: "root".into(),
+                    message: call("discarded"),
+                },
+                result("discarded"),
+                AgentEvent::ContextReset {
+                    agent_id: "root".into(),
+                    epoch: 1,
+                },
+                AgentEvent::UserPrompt {
+                    agent_id: "root".into(),
+                    text: "active".into(),
+                },
+                AgentEvent::Message {
+                    agent_id: "root".into(),
+                    message: call("kept"),
+                },
+                result("kept"),
+                AgentEvent::ContextReset {
+                    agent_id: "child".into(),
+                    epoch: 99,
+                },
+                AgentEvent::AgentMessage {
+                    to: "child".into(),
+                    from: "root".into(),
+                    text: "hidden".into(),
+                },
+                AgentEvent::AgentMessage {
+                    to: "root".into(),
+                    from: "reviewer".into(),
+                    text: "finding".into(),
+                },
+            ];
+            let expected = vec![
+                Message::user_text("active"),
+                call("kept"),
+                Message {
+                    role: Role::Tool,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: "kept".into(),
+                        content: "output kept".into(),
+                        is_error: Some(true),
+                    }],
+                },
+                Message::user_text(crate::agent::team::format_coord_message(
+                    "reviewer", "finding",
+                )),
+            ];
+            let before = serde_json::to_value(&events).unwrap();
+            for _ in 0..2 {
+                assert_eq!(
+                    serde_json::to_value(root_history_from_events(&events)).unwrap(),
+                    serde_json::to_value(&expected).unwrap()
+                );
+            }
+            assert_eq!(context_epoch(&events), 1);
+            assert_eq!(
+                serde_json::to_value(active_context_events(&events)).unwrap(),
+                serde_json::to_value(&events[4..]).unwrap()
+            );
+            assert_eq!(serde_json::to_value(&events).unwrap(), before);
+        }
+
+        #[test]
+        fn session_epoch_overrides_length_but_equal_epoch_retains_complete_blob() {
+            let events = vec![
+                AgentEvent::UserPrompt {
+                    agent_id: "root".into(),
+                    text: "archived".into(),
+                },
+                AgentEvent::ContextReset {
+                    agent_id: "root".into(),
+                    epoch: 2,
+                },
+                AgentEvent::UserPrompt {
+                    agent_id: "root".into(),
+                    text: "current log".into(),
+                },
+            ];
+            let mut session = new_session("mock", "s".into(), "0".into(), ".".into());
+            session.messages = vec![
+                Message::user_text("blob one"),
+                Message::user_text("blob two"),
+            ];
+            for (epoch, expected) in [
+                (1, vec![Message::user_text("current log")]),
+                (2, session.messages.clone()),
+                (3, session.messages.clone()),
+            ] {
+                session.context_epoch = epoch;
+                assert_eq!(
+                    serde_json::to_value(reconstructed_session_history(Some(&events), &session))
+                        .unwrap(),
+                    serde_json::to_value(expected).unwrap()
+                );
+            }
+        }
+
+        #[test]
+        fn partial_tool_repair_preserves_real_failures_and_restores_request_order() {
+            use crate::core::types::ContentBlock;
+            let calls = Message {
+                role: Role::Assistant,
+                content: ["first", "second", "third"]
+                    .into_iter()
+                    .map(|id| ContentBlock::ToolUse {
+                        id: id.into(),
+                        name: "bash".into(),
+                        input: serde_json::json!({"command": id}),
+                    })
+                    .collect(),
+            };
+            let real_result = ContentBlock::ToolResult {
+                tool_use_id: "second".into(),
+                content: "permission denied".into(),
+                is_error: Some(true),
+            };
+            let full = vec![
+                calls.clone(),
+                Message {
+                    role: Role::Tool,
+                    content: vec![real_result.clone()],
+                },
+                Message::user_text("continue"),
+            ];
+            let repaired = repair_interrupted_tool_calls(full.clone());
+            assert_eq!(repaired.len(), 3);
+            assert_eq!(
+                serde_json::to_value(&repaired[0]).unwrap(),
+                serde_json::to_value(calls).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(&repaired[1].content[1]).unwrap(),
+                serde_json::to_value(real_result).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(&repaired[2]).unwrap(),
+                serde_json::to_value(&full[2]).unwrap()
+            );
+            let results: Vec<_> = repaired[1]
+                .content
+                .iter()
+                .map(|block| match block {
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                    } => {
+                        assert_eq!(*is_error, Some(true));
+                        if tool_use_id != "second" {
+                            assert!(content.as_text().unwrap().contains("outcome is unknown"));
+                            assert!(content.as_text().unwrap().contains("has not been rerun"));
+                        }
+                        tool_use_id.as_str()
+                    }
+                    other => panic!("unexpected block: {other:?}"),
+                })
+                .collect();
+            assert_eq!(results, ["first", "second", "third"]);
+            assert_eq!(
+                serde_json::to_value(repair_interrupted_tool_calls(repaired.clone())).unwrap(),
+                serde_json::to_value(repaired).unwrap()
+            );
+        }
+
+        #[test]
+        fn reconstructed_history_selects_contents_from_the_authoritative_source() {
+            let blob: Vec<_> = ["blob a", "blob b", "blob c"]
+                .into_iter()
+                .map(Message::user_text)
+                .collect();
+            let events: Vec<_> = ["log a", "log b", "log c", "log d"]
+                .into_iter()
+                .map(|text| AgentEvent::UserPrompt {
+                    agent_id: "root".into(),
+                    text: text.into(),
+                })
+                .collect();
+            for (log, expected) in [
+                (None, vec!["blob a", "blob b", "blob c"]),
+                (Some(&events[..0]), vec!["blob a", "blob b", "blob c"]),
+                (Some(&events[..2]), vec!["blob a", "blob b", "blob c"]),
+                (Some(&events[..3]), vec!["log a", "log b", "log c"]),
+                (Some(&events[..]), vec!["log a", "log b", "log c", "log d"]),
+            ] {
+                assert_eq!(
+                    reconstructed_history(log, &blob)
+                        .iter()
+                        .map(Message::text)
+                        .collect::<Vec<_>>(),
+                    expected
+                );
+            }
+        }
     }
 }

@@ -9,8 +9,16 @@ permissions:
   contents: write
 
 jobs:
+  validate:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+    with:
+      skip-artifacts: true
+
   build:
     name: ${{ matrix.target }}
+    needs: validate
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

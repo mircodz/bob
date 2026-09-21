@@ -12,8 +12,103 @@ enum Shape {
 
 type Scope = BTreeMap<String, Shape>;
 
+pub(crate) const MAX_ITEMS: usize = 256;
+const MAX_OPERATIONS: usize = 256;
+const MAX_NESTING: usize = 16;
+
 pub(crate) fn validate(spec: &Spec) -> Result<(), String> {
+    let mut remaining = MAX_OPERATIONS;
+    validate_limits(&spec.steps, 0, &mut remaining)?;
     validate_steps(&spec.steps, &Scope::new(), &BTreeSet::new()).map(|_| ())
+}
+
+fn validate_limits(steps: &[Step], depth: usize, remaining: &mut usize) -> Result<(), String> {
+    for step in steps {
+        validate_op_limits(&step.op, depth, remaining)?;
+    }
+    Ok(())
+}
+
+fn validate_op_limits(op: &Op, depth: usize, remaining: &mut usize) -> Result<(), String> {
+    if depth > MAX_NESTING || *remaining == 0 {
+        return Err(format!(
+            "workflow exceeds {MAX_NESTING} nesting levels or {MAX_OPERATIONS} operations"
+        ));
+    }
+    *remaining -= 1;
+    match op {
+        Op::Agent(agent) => validate_agent(&agent.prompt, agent.schema.as_ref()),
+        Op::FanOut(fan) => {
+            validate_agent(&fan.prompt, fan.schema.as_ref())?;
+            validate_count(fan.repeat.unwrap_or(1))?;
+            match &fan.over {
+                serde_json::Value::Array(items) => validate_items(&fan.prompt, items),
+                serde_json::Value::String(_) => Ok(()),
+                _ => Err(format!(
+                    "fan-out over must be a reference or at most {MAX_ITEMS} items"
+                )),
+            }
+        }
+        Op::Parallel(parallel) => {
+            for op in parallel.branches.values() {
+                validate_op_limits(op, depth + 1, remaining)?;
+            }
+            Ok(())
+        }
+        Op::Loop(loop_op) => {
+            validate_count(loop_op.max.unwrap_or(5))?;
+            validate_limits(&loop_op.steps, depth + 1, remaining)
+        }
+    }
+}
+
+pub(crate) fn item_value<'a>(
+    key: &str,
+    item: &'a serde_json::Value,
+) -> Result<&'a serde_json::Value, String> {
+    let mut value = item;
+    for field in key.split('.').skip(1) {
+        value = value
+            .get(field)
+            .ok_or_else(|| format!("missing item field in '{{{key}}}'"))?;
+    }
+    Ok(value)
+}
+
+pub(crate) fn validate_items(prompt: &str, items: &[serde_json::Value]) -> Result<(), String> {
+    if items.len() > MAX_ITEMS {
+        return Err(format!("fan-out exceeds {MAX_ITEMS} items"));
+    }
+    let placeholders = placeholders(prompt)?;
+    for (index, item) in items.iter().enumerate() {
+        for (_, key) in &placeholders {
+            if !key.starts_with('$') {
+                item_value(key, item)
+                    .map_err(|error| format!("fan-out item {}: {error}", index + 1))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_count(count: usize) -> Result<(), String> {
+    if !(1..=20).contains(&count) {
+        return Err("workflow count must be in 1..=20".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_agent(
+    prompt: &str,
+    schema: Option<&serde_json::Value>,
+) -> Result<(), String> {
+    if prompt.trim().is_empty() {
+        return Err("agent prompt must not be blank".into());
+    }
+    if let Some(schema) = schema {
+        crate::tools::schema::CompiledSchema::compile(schema)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn reference_parts(reference: &str) -> Result<Vec<&str>, String> {
@@ -219,34 +314,129 @@ mod tests {
     }
 
     #[test]
+    fn operation_budget_counts_containers_and_all_parallel_branches() {
+        for count in [255, 256, 257] {
+            let steps = (0..count)
+                .map(|index| agent(&format!("step{index}"), "work"))
+                .collect::<Vec<_>>();
+            assert_eq!(check(json!(steps)).is_ok(), count <= 256);
+        }
+        for leaves in [255, 256] {
+            let branches = (0..leaves)
+                .map(|index| {
+                    (
+                        format!("branch{index}"),
+                        json!({"agent": {"prompt": "work"}}),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            let result = check(json!([{"id": "group", "parallel": {"branches": branches}}]));
+            assert_eq!(result.is_ok(), leaves == 255, "{leaves}: {result:?}");
+        }
+    }
+
+    #[test]
+    fn nesting_limit_accepts_sixteen_edges_and_rejects_seventeen() {
+        for depth in [15, 16, 17] {
+            let mut step = agent("leaf", "work");
+            for level in 0..depth {
+                step = json!({"id": format!("level{level}"), "loop": {"steps": [step]}});
+            }
+            let result = check(json!([step]));
+            assert_eq!(result.is_ok(), depth <= 16, "{depth}: {result:?}");
+        }
+    }
+
+    #[test]
+    fn inline_item_and_repeat_limits_include_their_endpoints() {
+        for count in [0, 1, 256, 257] {
+            let result = check(json!([{"id": "batch", "fan_out": {
+                "over": vec![json!(null); count], "prompt": "read {item}", "repeat": 20
+            }}]));
+            assert_eq!(result.is_ok(), count <= 256, "{count}: {result:?}");
+        }
+        for count in [0, 1, 20, 21] {
+            for operation in [
+                json!({"id": "batch", "fan_out": {"over": [], "prompt": "read {item}", "repeat": count}}),
+                json!({"id": "rounds", "loop": {"steps": [agent("leaf", "work")], "max": count}}),
+            ] {
+                assert_eq!(check(json!([operation])).is_ok(), matches!(count, 1 | 20));
+            }
+        }
+    }
+
+    #[test]
+    fn literal_item_data_is_not_interpreted_as_a_template_or_reference() {
+        check(json!([{"id": "batch", "fan_out": {
+            "over": ["{$missing}", "$future", "{item.missing}", {"text": "{$"}],
+            "prompt": "read {item}"
+        }}]))
+        .unwrap();
+        rejects(
+            json!([{"id": "batch", "fan_out": {
+                "over": [{"nested": ["not an object key"]}],
+                "prompt": "read {item.nested.0}"
+            }}]),
+            "missing item field",
+        );
+    }
+
+    #[test]
     fn validates_nested_loops_parallel_branches_and_items() {
         check(json!([
-            agent("seed", "produce input"),
-            { "id": "rounds", "loop": {
-                "steps": [
-                    { "id": "checks", "parallel": { "branches": {
-                        "left": { "loop": {
-                            "steps": [agent("draft", "read {$seed.payload.0}")],
-                            "until": "$draft.done"
-                        } },
-                        "right": { "fan_out": {
-                            "over": "$seed.list",
-                            "prompt": "{item} {item.details.0.name} {$seed.context}"
-                        } }
-                    } } },
-                    agent("verdict", "{$checks.left.draft.done} {$checks.right}")
-                ],
-                "until": "$verdict.done"
-            } },
-            agent("summary", concat!(
-                "{$rounds.checks.left.draft.any_field} ",
-                "{$rounds.checks.left._iterations} ",
-                "{$rounds._iterations} {$rounds._stop_reason}"
-            )),
-            { "id": "finish", "fan_out": {
-                "over": "$rounds.checks.right",
-                "prompt": "{\"result\": {\"value\": \"{item.details.name}\"}, \"meta\": \"{$summary}\"}"
-            } }
+        agent("seed", "produce input"),
+        { "id": "rounds", "loop": {
+            "steps": [
+                { "id": "checks", "parallel": { "branches": {
+                    "left": { "loop": {
+                        "steps": [agent("draft", "read {$seed.payload.0}")],
+                        "until": "$draft.done"
+                    } },
+                    "right": { "fan_out": {
+                        "over": "$seed.list",
+                        "prompt": "{item} {item.details.0.name} {$seed.context}"
+                    } }
+                } } },
+                agent("verdict", "{$checks.left.draft.done} {$checks.right}")
+            ],
+            "until": "$verdict.done"
+        } },
+        agent("summary", concat!(
+            "{$rounds.checks.left.draft.any_field} ",
+            "{$rounds.checks.left._iterations} ",
+            "{$rounds._iterations} {$rounds._stop_reason}"
+        )),
+        { "id": "finish", "fan_out": {
+            "over": "$rounds.checks.right",
+            "prompt": "{\"result\": {\"value\": \"{item.details.name}\"}, \"meta\": \"{$summary}\"}"
+        } }
+    ]))
+    .unwrap();
+    }
+
+    #[test]
+    fn checks_literal_item_paths_without_resolving_output_references() {
+        for item in [
+            json!({}),
+            json!(null),
+            json!(3),
+            json!([]),
+            json!({"path": null}),
+        ] {
+            rejects(
+                json!([{ "id": "batch", "fan_out": {
+                    "over": [{"path":{"name":"valid"}}, item],
+                    "prompt": "inspect {item.path.name}"
+                }}]),
+                "fan-out item 2: missing item field",
+            );
+        }
+        check(json!([
+            agent("source", "produce output"),
+            {"id":"batch","fan_out":{
+                "over":[{"path":{"0":null}}],
+                "prompt":"{item.path.0} {$source.runtime_value}"
+            }}
         ]))
         .unwrap();
     }
@@ -281,14 +471,14 @@ mod tests {
         }
         rejects(
             json!([{ "id": "fan", "fan_out": {
-                "over": "$missing.items", "prompt": "{item}"
-            } }]),
+            "over": "$missing.items", "prompt": "{item}"
+        } }]),
             "unavailable result",
         );
         rejects(
             json!([{ "id": "fan", "fan_out": {
-                "over": [], "prompt": "{item} {$missing}"
-            } }]),
+            "over": [], "prompt": "{item} {$missing}"
+        } }]),
             "unavailable result",
         );
     }
@@ -308,8 +498,8 @@ mod tests {
         }
         rejects(
             json!([{ "id": "container", "loop": {
-                "steps": [agent("inner", "a"), agent("inner", "b")]
-            } }]),
+            "steps": [agent("inner", "a"), agent("inner", "b")]
+        } }]),
             "duplicate",
         );
         for branch in ["outer", "container"] {
@@ -324,8 +514,8 @@ mod tests {
         }
         rejects(
             json!([{ "id": "container", "parallel": { "branches": {
-                "branch": { "loop": { "steps": [agent("branch", "a")] } }
-            } } }]),
+            "branch": { "loop": { "steps": [agent("branch", "a")] } }
+        } } }]),
             "shadowed",
         );
     }
@@ -387,19 +577,19 @@ mod tests {
         for reference in ["$last", "$first", "$rounds.last"] {
             rejects(
                 json!([{ "id": "rounds", "loop": {
-                    "steps": [agent("first", &format!("{{{reference}}}")), agent("last", "a")],
-                    "max": 2
-                } }]),
+                "steps": [agent("first", &format!("{{{reference}}}")), agent("last", "a")],
+                "max": 2
+            } }]),
                 "unavailable result",
             );
         }
         rejects(
             json!([{ "id": "rounds", "loop": {
-                "steps": [
-                    { "id": "nested", "loop": { "steps": [agent("local", "a")] } }
-                ],
-                "until": "$local.done"
-            } }]),
+            "steps": [
+                { "id": "nested", "loop": { "steps": [agent("local", "a")] } }
+            ],
+            "until": "$local.done"
+        } }]),
             "unavailable result",
         );
     }
@@ -409,9 +599,9 @@ mod tests {
         for reference in ["$left", "$right", "$group.left", "$local"] {
             rejects(
                 json!([{ "id": "group", "parallel": { "branches": {
-                    "left": { "loop": { "steps": [agent("local", "a")] } },
-                    "right": { "agent": { "prompt": format!("{{{reference}}}") } }
-                } } }]),
+                "left": { "loop": { "steps": [agent("local", "a")] } },
+                "right": { "agent": { "prompt": format!("{{{reference}}}") } }
+            } } }]),
                 "unavailable result",
             );
         }
@@ -488,11 +678,11 @@ mod tests {
         }
         rejects(
             json!([{ "id": "rounds", "loop": {
-                "steps": [{ "id": "group", "parallel": { "branches": {
-                    "branch": { "agent": { "prompt": "a" } }
-                } } }],
-                "until": "$group.missing"
-            } }]),
+            "steps": [{ "id": "group", "parallel": { "branches": {
+                "branch": { "agent": { "prompt": "a" } }
+            } } }],
+            "until": "$group.missing"
+        } }]),
             "unknown object field",
         );
         rejects(
@@ -589,8 +779,8 @@ mod tests {
             );
             rejects(
                 json!([{ "id": "rounds", "loop": {
-                    "steps": [agent("source", "a")], "until": reference
-                } }]),
+                "steps": [agent("source", "a")], "until": reference
+            } }]),
                 "invalid reference",
             );
         }
@@ -605,8 +795,8 @@ mod tests {
             );
             rejects(
                 json!([{ "id": "group", "parallel": { "branches": {
-                    "branch": { "agent": { "prompt": prompt } }
-                } } }]),
+                "branch": { "agent": { "prompt": prompt } }
+            } } }]),
                 "only allowed in a fan_out prompt",
             );
         }

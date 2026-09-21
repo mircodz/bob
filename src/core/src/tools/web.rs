@@ -1,6 +1,3 @@
-//! Web tools: web_fetch (retrieve a URL as readable text) and web_search (a
-//! keyless query against DuckDuckGo's HTML endpoint).
-
 use crate::core::types::ToolSpec;
 use crate::tools::registry::{Tool, ToolContext, ToolError, ToolResult};
 use async_trait::async_trait;
@@ -71,15 +68,13 @@ impl Tool for WebFetchTool {
         };
         if text.chars().count() > cap {
             let truncated: String = text.chars().take(cap).collect();
-            Ok(format!("{}\n…[truncated]", truncated))
+            Ok(format!("{}\n…[truncated]", truncated).into())
         } else {
-            Ok(text)
+            Ok(text.into())
         }
     }
 }
 
-/// `web_search`: a keyless web search via DuckDuckGo's HTML endpoint. Returns a
-/// ranked list of results (title · url · snippet) the model can then `web_fetch`.
 pub struct WebSearchTool;
 
 #[async_trait]
@@ -115,8 +110,7 @@ impl Tool for WebSearchTool {
         }
         let limit = (input["max_results"].as_u64().unwrap_or(8) as usize).clamp(1, 20);
 
-        // DuckDuckGo's no-JS HTML endpoint returns server-rendered results we can
-        // scrape without an API key. A browser-like UA avoids being turned away.
+        // The keyless HTML endpoint requires a browser-like User-Agent.
         let client = reqwest::Client::builder()
             .user_agent("Mozilla/5.0 (compatible; bob/0.1; +https://example.invalid/bob)")
             .build()
@@ -140,7 +134,7 @@ impl Tool for WebSearchTool {
 
         let results = parse_ddg_results(&body, limit);
         if results.is_empty() {
-            return Ok(format!("no results for \"{}\".", query));
+            return Ok(format!("no results for \"{}\".", query).into());
         }
         let mut out = String::new();
         for (i, r) in results.iter().enumerate() {
@@ -149,7 +143,7 @@ impl Tool for WebSearchTool {
                 out.push_str(&format!("   {}\n", r.snippet));
             }
         }
-        Ok(out.trim_end().to_string())
+        Ok(out.trim_end().into())
     }
 }
 
@@ -159,14 +153,10 @@ struct SearchResult {
     snippet: String,
 }
 
-/// Extract results from DuckDuckGo's HTML page. Each result is an anchor with
-/// class `result__a` (title + href, the href being a redirect wrapper we unwrap),
-/// followed by a `result__snippet` block.
+/// DDG pairs `result__a` anchors with `result__snippet` blocks in result order.
 fn parse_ddg_results(html: &str, limit: usize) -> Vec<SearchResult> {
-    // Anchor: <a ... class="result__a" href="LINK">TITLE</a>
     let anchor = Regex::new(r#"(?is)<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>"#)
         .expect("valid regex");
-    // Snippet: <a ... class="result__snippet" ...>TEXT</a>
     let snippet =
         Regex::new(r#"(?is)class="result__snippet"[^>]*>(.*?)</a>"#).expect("valid regex");
 
@@ -195,8 +185,7 @@ fn parse_ddg_results(html: &str, limit: usize) -> Vec<SearchResult> {
     out
 }
 
-/// DuckDuckGo wraps result links as `//duckduckgo.com/l/?uddg=<encoded>`; pull the
-/// real destination out of the `uddg` query param and percent-decode it.
+/// DDG wraps destinations in `//duckduckgo.com/l/?uddg=<encoded>`.
 fn unwrap_ddg_url(raw: &str) -> String {
     let raw = raw.trim();
     let candidate = if let Some(idx) = raw.find("uddg=") {
@@ -213,16 +202,12 @@ fn unwrap_ddg_url(raw: &str) -> String {
     }
 }
 
-/// Minimal percent-decoding (enough for URLs in DDG's `uddg` param).
 fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        // Decode `%XX` by reading the two following BYTES directly. Slicing the
-        // &str as `&s[i+1..i+3]` panics when a `%` is followed by a multi-byte
-        // UTF-8 char (the slice lands off a char boundary) — reachable from
-        // untrusted search-result HTML, so it must never panic.
+        // Use bytes: untrusted `%` sequences can split UTF-8 character boundaries.
         if bytes[i] == b'%' && i + 2 < bytes.len() {
             if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
                 out.push(hi * 16 + lo);
@@ -236,7 +221,6 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).to_string()
 }
 
-/// One hex digit (ASCII) → its value, or None if not a hex digit.
 fn hex_val(b: u8) -> Option<u8> {
     match b {
         b'0'..=b'9' => Some(b - b'0'),
@@ -246,7 +230,6 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
-/// Strip HTML tags + decode common entities from a small result fragment.
 fn clean_fragment(frag: &str) -> String {
     let tags = Regex::new(r"(?s)<[^>]+>").expect("valid regex");
     let s = tags.replace_all(frag, "");
@@ -285,11 +268,49 @@ fn html_to_text(html: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{files::tool_context, TestDir};
+
+    #[tokio::test]
+    async fn invalid_fetch_schemes_and_blank_searches_fail_before_network_io() {
+        let dir = TestDir::new();
+        let ctx = tool_context(dir.path());
+        for input in [
+            json!({}),
+            json!({"url": "file:///not-read"}),
+            json!({"url": "ftp://example.invalid"}),
+        ] {
+            let error = WebFetchTool.execute(input, &ctx).await.unwrap_err();
+            assert_eq!(
+                error.kind,
+                crate::tools::registry::ToolErrorKind::InvalidInput
+            );
+            assert!(error
+                .message
+                .contains("url must start with http:// or https://"));
+        }
+        for input in [json!({}), json!({"query": " \n\t "})] {
+            let error = WebSearchTool.execute(input, &ctx).await.unwrap_err();
+            assert_eq!(
+                error.kind,
+                crate::tools::registry::ToolErrorKind::InvalidInput
+            );
+            assert!(error.message.contains("query is required"));
+        }
+    }
 
     #[test]
     fn unwraps_ddg_redirect_url() {
-        let raw = "//duckduckgo.com/l/?uddg=https%3A%2F%2Fdoc.rust-lang.org%2Fstd%2F&rut=abc";
-        assert_eq!(unwrap_ddg_url(raw), "https://doc.rust-lang.org/std/");
+        for (raw, expected) in [
+            (
+                "//duckduckgo.com/l/?uddg=https%3A%2F%2Fdoc.rust-lang.org%2Fstd%2F&rut=abc",
+                "https://doc.rust-lang.org/std/",
+            ),
+            (" //example.com/path ", "https://example.com/path"),
+            ("https://example.com/a?q=a+b", "https://example.com/a?q=a+b"),
+            ("//duckduckgo.com/l/?uddg=", ""),
+        ] {
+            assert_eq!(unwrap_ddg_url(raw), expected);
+        }
     }
 
     #[test]
@@ -308,19 +329,66 @@ mod tests {
     }
 
     #[test]
-    fn clean_fragment_strips_tags_and_entities() {
-        assert_eq!(clean_fragment("a &amp; <b>b</b>  c"), "a & b c");
+    fn percent_decode_handles_normal_and_multibyte_without_panicking() {
+        for (input, expected) in [
+            ("https%3A%2F%2Fx", "https://x"),
+            ("%a€x", "%a€x"),
+            ("100%", "100%"),
+            ("%zz", "%zz"),
+            ("%2", "%2"),
+            ("%c3%a9+ok", "é+ok"),
+            ("%FF", "�"),
+        ] {
+            assert_eq!(percent_decode(input), expected);
+        }
     }
 
     #[test]
-    fn percent_decode_handles_normal_and_multibyte_without_panicking() {
-        // Normal decoding still works.
-        assert_eq!(percent_decode("https%3A%2F%2Fx"), "https://x");
-        // Regression: a `%` immediately before a multi-byte UTF-8 char used to
-        // panic (`&s[i+1..i+3]` off a char boundary). Must pass the `%` through.
-        assert_eq!(percent_decode("%a€x"), "%a€x");
-        // A bare trailing `%` and a `%` with a non-hex follower are passed through.
-        assert_eq!(percent_decode("100%"), "100%");
-        assert_eq!(percent_decode("%zz"), "%zz");
+    fn result_limit_counts_valid_anchors_and_missing_snippets_are_empty() {
+        let html = r#"
+            <a class="result__a" href="">discarded</a>
+            <a class="result__a" href="https://example.com/empty"><b> </b></a>
+            <a class="result__a" href="https://example.com/one">One</a>
+            <a class="result__a" href="https://example.com/two">Two</a>
+        "#;
+        assert!(parse_ddg_results(html, 0).is_empty());
+        assert!(parse_ddg_results("<p>No results</p>", 8).is_empty());
+        let results = parse_ddg_results(html, 1);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].url, "https://example.com/one");
+        assert_eq!(results[0].title, "One");
+        assert!(results[0].snippet.is_empty());
+        assert_eq!(parse_ddg_results(html, 8).len(), 2);
+    }
+
+    #[test]
+    fn readable_html_removes_script_style_and_preserves_text_entities() {
+        assert_eq!(
+            html_to_text("<STYLE>hidden</STYLE><script>\nnot text\n</script><p>A&nbsp;&amp;&nbsp;B</p>\n\n\n<p>&lt;C&gt;</p>"),
+            "A & B \n\n <C>"
+        );
+        assert_eq!(html_to_text("<script>hidden</script>"), "");
+    }
+
+    #[test]
+    fn ranked_results_keep_their_own_snippets_when_limited() {
+        let html = r#"
+            <a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fone%3Fq%3Da%26b%3Dc&amp;rut=x">One &amp; <b>First</b></a>
+            <a class="result__snippet">First &lt;summary&gt;</a>
+            <a class="result__a" href="//example.com/two">Two</a>
+            <a class="result__snippet">Second <b>summary</b></a>
+        "#;
+        for limit in [1, 2, 8] {
+            let results = parse_ddg_results(html, limit);
+            assert_eq!(results.len(), limit.min(2));
+            assert_eq!(results[0].title, "One & First");
+            assert_eq!(results[0].url, "https://example.com/one?q=a&b=c");
+            assert_eq!(results[0].snippet, "First <summary>");
+            if results.len() == 2 {
+                assert_eq!(results[1].title, "Two");
+                assert_eq!(results[1].url, "https://example.com/two");
+                assert_eq!(results[1].snippet, "Second summary");
+            }
+        }
     }
 }

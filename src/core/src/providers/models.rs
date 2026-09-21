@@ -1,13 +1,3 @@
-//! `ModelSpec` — the declarative metadata for one model, and the seam that
-//! resolves a `"provider/model"` string into it. This is the SDK-facing model
-//! value: the builder takes a spec string, resolves it here, and the result
-//! carries everything a provider needs (id, context window, output ceiling, wire
-//! protocol) as data rather than scattered substring lookups at call sites.
-//!
-//! Capability knowledge still lives in the graceful [`context_window_for`] /
-//! [`max_output_tokens_for`] matchers (they handle unknown/future models, which a
-//! static table can't) — `ModelSpec` just bundles their output into one value.
-
 use crate::providers::provider::{context_window_for, max_output_tokens_for};
 
 /// Which wire protocol a model speaks. Anthropic and the OpenAI Chat Completions
@@ -18,20 +8,15 @@ pub enum WireApi {
     Responses,
 }
 
-/// Declarative metadata for one model — resolved once, then carried through the
-/// stack instead of re-deriving caps at each call site.
 #[derive(Clone, Debug)]
 pub struct ModelSpec {
-    /// Provider id, e.g. "anthropic", "openai", "copilot".
     pub provider: String,
-    /// Model id, e.g. "claude-opus-4.8".
     pub model: String,
     /// Max input tokens (context window).
     pub context_window: usize,
     /// Default max output tokens for this model (Anthropic requires a value; the
     /// OpenAI providers may omit their cap, but this is the recovery ceiling).
     pub max_output: u32,
-    /// Wire protocol the provider should speak for this model.
     pub wire: WireApi,
 }
 
@@ -48,7 +33,6 @@ impl ModelSpec {
         ModelSpec::new(provider, model)
     }
 
-    /// Build a spec from an explicit provider + model id.
     pub fn new(provider: &str, model: &str) -> ModelSpec {
         ModelSpec {
             provider: provider.to_string(),
@@ -60,14 +44,8 @@ impl ModelSpec {
     }
 }
 
-/// The wire protocol for a provider+model. The OpenAI "responses"/Codex backend
-/// (reached via ChatGPT-subscription OAuth) and specific Codex models speak the
-/// Responses API; everything else speaks chat. Keeps the one-off model-name
-/// checks (formerly `RESPONSES_MODELS` + copilot's `is_responses_model`) in one
-/// place.
 pub fn wire_for(provider: &str, model: &str) -> WireApi {
     let m = model.to_ascii_lowercase();
-    // Codex/Responses-only model families, regardless of provider routing.
     let responses_family = m.contains("codex")
         || m.contains("-sol")
         || m.contains("-luna")
@@ -95,15 +73,9 @@ mod tests {
         assert_eq!(s.context_window, 200_000);
         assert_eq!(s.wire, WireApi::Chat);
 
-        // Legacy colon form still parses.
         let c = ModelSpec::parse("openai:gpt-4o");
         assert_eq!(c.provider, "openai");
         assert_eq!(c.model, "gpt-4o");
-
-        // Bare provider leaves model empty for the provider default.
-        let b = ModelSpec::parse("anthropic");
-        assert_eq!(b.provider, "anthropic");
-        assert_eq!(b.model, "");
     }
 
     #[test]
@@ -112,8 +84,81 @@ mod tests {
         assert_eq!(wire_for("openai", "gpt-5-codex"), WireApi::Responses);
         assert_eq!(wire_for("copilot", "gpt-5.6-luna"), WireApi::Responses);
         assert_eq!(wire_for("copilot", "gpt-6-astra"), WireApi::Responses);
-        // A plain chat model, and Anthropic, stay on chat.
         assert_eq!(wire_for("openai", "gpt-4o"), WireApi::Chat);
         assert_eq!(wire_for("anthropic", "claude-opus-4.8"), WireApi::Chat);
+    }
+
+    #[test]
+    fn parsing_preserves_model_suffixes_and_resolves_capabilities() {
+        for (input, provider, model, window, output, wire) in [
+            (
+                "openai/  gpt-5.6-sol  ",
+                "openai",
+                "gpt-5.6-sol",
+                400_000,
+                16_000,
+                WireApi::Responses,
+            ),
+            (
+                "copilot:vendor/model:preview",
+                "copilot",
+                "vendor/model:preview",
+                128_000,
+                16_000,
+                WireApi::Chat,
+            ),
+            (
+                "anthropic/CLAUDE-OPUS-1M",
+                "anthropic",
+                "CLAUDE-OPUS-1M",
+                1_000_000,
+                32_000,
+                WireApi::Chat,
+            ),
+            (
+                "openai/日本語:preview",
+                "openai",
+                "日本語:preview",
+                128_000,
+                16_000,
+                WireApi::Chat,
+            ),
+            ("anthropic", "anthropic", "", 128_000, 16_000, WireApi::Chat),
+            ("openai:", "openai", "", 128_000, 16_000, WireApi::Chat),
+        ] {
+            let spec = ModelSpec::parse(input);
+            assert_eq!(spec.provider, provider, "{input}");
+            assert_eq!(spec.model, model, "{input}");
+            assert_eq!(spec.context_window, window, "{input}");
+            assert_eq!(spec.max_output, output, "{input}");
+            assert_eq!(spec.wire, wire, "{input}");
+        }
+    }
+
+    #[test]
+    fn responses_routing_is_provider_scoped_and_model_case_insensitive() {
+        for provider in ["openai", "copilot"] {
+            for model in ["GPT-5.6-SOL", "GPT-5-CODEX", "gpt-6-astra"] {
+                assert_eq!(
+                    wire_for(provider, model),
+                    WireApi::Responses,
+                    "{provider}/{model}"
+                );
+            }
+            for model in ["gpt-4o", "claude-sonnet-5", "future-model", ""] {
+                assert_eq!(
+                    wire_for(provider, model),
+                    WireApi::Chat,
+                    "{provider}/{model}"
+                );
+            }
+        }
+        for provider in ["anthropic", "custom", ""] {
+            assert_eq!(
+                wire_for(provider, "gpt-5-codex"),
+                WireApi::Chat,
+                "{provider}"
+            );
+        }
     }
 }

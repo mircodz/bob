@@ -1,38 +1,65 @@
-//! Project file listing + fuzzy matching for `@file` autocomplete.
-
 use std::path::Path;
-use std::process::Command;
+use std::process::Stdio;
+use std::time::Duration;
+use tokio::process::Command;
 
-/// Gather candidate file paths (relative to `cwd`) for `@file` completion.
-/// Prefers `git ls-files` (honours .gitignore); falls back to a bounded walk
-/// that skips the usual noise directories.
-pub fn gather_files(cwd: &Path) -> Vec<String> {
-    if let Some(files) = git_ls_files(cwd) {
+/// Relative completion paths from Git, falling back to a bounded walk.
+pub async fn gather_files(cwd: &Path) -> Vec<String> {
+    if let Some(files) = git_ls_files(cwd).await {
         return files;
     }
-    let mut out = Vec::new();
-    walk(cwd, cwd, &mut out, 0);
-    out.sort();
-    out
+    let cwd = cwd.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let mut out = Vec::new();
+        walk(&cwd, &cwd, &mut out, 0);
+        out.sort();
+        out
+    })
+    .await
+    .unwrap_or_default()
 }
 
-fn git_ls_files(cwd: &Path) -> Option<Vec<String>> {
-    let output = Command::new("git")
+async fn git_ls_files(cwd: &Path) -> Option<Vec<String>> {
+    let output = git_output(
+        cwd,
+        &[
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ],
+        2 * 1024 * 1024,
+    )
+    .await?;
+    let files: Vec<String> = output
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .take(MAX_FILES)
+        .map(|path| String::from_utf8_lossy(path).into_owned())
+        .collect();
+    Some(files)
+}
+
+pub(super) async fn git_output(cwd: &Path, args: &[&str], limit: usize) -> Option<Vec<u8>> {
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(cwd)
-        .args(["ls-files", "--cached", "--others", "--exclude-standard"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let files: Vec<String> = text.lines().map(|l| l.to_string()).collect();
-    if files.is_empty() {
-        None
-    } else {
-        Some(files)
-    }
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = bob_core::core::process::ManagedProcess::spawn(&mut command).ok()?;
+    let output =
+        match tokio::time::timeout(Duration::from_secs(2), child.collect_output(limit)).await {
+            Ok(Ok(output)) => output,
+            _ => {
+                let _ = child.terminate_and_wait().await;
+                return None;
+            }
+        };
+    (output.status.success() && !output.stdout.truncated()).then_some(output.stdout.bytes)
 }
 
 const SKIP_DIRS: &[&str] = &[".git", "target", "node_modules", ".venv", "dist", "build"];
@@ -47,16 +74,19 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<String>, depth: usize) {
         Err(_) => return,
     };
     for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
         let path = entry.path();
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name.starts_with('.') && name != "." {
-            // Skip dotfiles/dotdirs except keep it simple (git path handles the rest).
-            if path.is_dir() {
-                continue;
-            }
+        if name.starts_with('.') && name != "." && file_type.is_dir() {
+            continue;
         }
-        if path.is_dir() {
+        if file_type.is_dir() {
             if SKIP_DIRS.contains(&name.as_ref()) {
                 continue;
             }
@@ -70,7 +100,6 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<String>, depth: usize) {
     }
 }
 
-/// A fuzzy match result: the path and its score (higher is better).
 pub struct Match<'a> {
     pub path: &'a str,
     pub score: i64,
@@ -87,7 +116,6 @@ pub fn fuzzy_rank<'a>(files: &'a [String], query: &str, limit: usize) -> Vec<&'a
         .iter()
         .filter_map(|f| score(f, &q).map(|score| Match { path: f, score }))
         .collect();
-    // Higher score first; break ties by shorter path, then lexical.
     matches.sort_by(|a, b| {
         b.score
             .cmp(&a.score)
@@ -97,9 +125,7 @@ pub fn fuzzy_rank<'a>(files: &'a [String], query: &str, limit: usize) -> Vec<&'a
     matches.into_iter().take(limit).map(|m| m.path).collect()
 }
 
-/// Subsequence score: every query char must appear in order. Rewards
-/// consecutive matches, matches right after a path separator, and matches in
-/// the basename. Returns None if not a subsequence.
+/// Reward consecutive, segment-boundary, and basename matches.
 fn score(path: &str, query: &[char]) -> Option<i64> {
     let hay: Vec<char> = path.to_lowercase().chars().collect();
     let basename_start = path.rfind('/').map(|i| i + 1).unwrap_or(0);
@@ -112,13 +138,13 @@ fn score(path: &str, query: &[char]) -> Option<i64> {
         if qi < query.len() && hc == query[qi] {
             let mut s = 1;
             if prev_matched {
-                s += 5; // consecutive
+                s += 5;
             }
             if prev_sep {
-                s += 3; // start of a path segment
+                s += 3;
             }
             if hi >= basename_start {
-                s += 2; // in the file name, not a parent dir
+                s += 2;
             }
             total += s;
             qi += 1;
@@ -155,33 +181,85 @@ mod tests {
     }
 
     #[test]
-    fn empty_query_returns_prefix() {
-        let f = files();
-        let got = fuzzy_rank(&f, "", 3);
-        assert_eq!(got.len(), 3);
+    fn query_matching_preserves_prefix_limits_and_gapped_subsequences() {
+        let candidates = files();
+        for (label, query, limit, expected) in [
+            (
+                "empty query preserves input order",
+                "",
+                3,
+                vec![
+                    "src/core/src/core/session.rs",
+                    "src/tui/src/tui/mod.rs",
+                    "src/tui/src/tui/files.rs",
+                ],
+            ),
+            (
+                "full-path subsequence",
+                "sesn",
+                5,
+                vec![
+                    "src/core/src/core/session.rs",
+                    "src/core/src/agent/agent.rs",
+                ],
+            ),
+            (
+                "case insensitive",
+                "SESN",
+                5,
+                vec![
+                    "src/core/src/core/session.rs",
+                    "src/core/src/agent/agent.rs",
+                ],
+            ),
+            (
+                "ranked prefix limit",
+                "sesn",
+                1,
+                vec!["src/core/src/core/session.rs"],
+            ),
+            ("non-subsequence rejected", "zzzz", 5, vec![]),
+            ("empty query zero limit", "", 0, vec![]),
+            ("matching query zero limit", "sesn", 0, vec![]),
+        ] {
+            assert_eq!(fuzzy_rank(&candidates, query, limit), expected, "{label}");
+        }
+        assert!(!candidates[0].contains("sesn"));
     }
 
     #[test]
-    fn subsequence_matches_across_path() {
-        let f = files();
-        // "sesn" is a subsequence of ".../session.rs" (se-ss-io-n) and matches
-        // no other candidate's basename as strongly.
-        let got = fuzzy_rank(&f, "session", 5);
-        assert_eq!(got.first(), Some(&"src/core/src/core/session.rs"));
+    fn gapped_basename_matching_requires_every_character_in_order() {
+        let candidates = ["session.rs", "agent.rs", "sense.rs"].map(String::from);
+        for query in ["sesn", "SESN"] {
+            assert_eq!(fuzzy_rank(&candidates, query, 10), vec!["session.rs"]);
+        }
+        assert!(fuzzy_rank(&candidates, "sessionn", 10).is_empty());
+        assert!(fuzzy_rank(&candidates, "noses", 10).is_empty());
     }
 
     #[test]
-    fn basename_beats_dir_match() {
-        let f = files();
-        // "files" should rank files.rs top (basename match), not other paths.
-        let got = fuzzy_rank(&f, "files", 5);
-        assert_eq!(got.first(), Some(&"src/tui/src/tui/files.rs"));
+    fn tied_scores_sort_by_length_then_lexically_not_input_order() {
+        let candidates = ["za.rs", "ba.rs", "a.rs", "ca.rs"].map(String::from);
+        assert_eq!(
+            fuzzy_rank(&candidates, "rs", 10),
+            vec!["a.rs", "ba.rs", "ca.rs", "za.rs"]
+        );
+        assert_eq!(fuzzy_rank(&candidates, "rs", 2), vec!["a.rs", "ba.rs"]);
     }
 
     #[test]
-    fn non_subsequence_is_filtered_out() {
-        let f = files();
-        let got = fuzzy_rank(&f, "zzzz", 5);
-        assert!(got.is_empty());
+    fn basename_match_outranks_a_competing_directory_match() {
+        let candidates = ["files/mod.rs", "src/files.rs"].map(String::from);
+        for candidate in &candidates {
+            assert_eq!(
+                fuzzy_rank(std::slice::from_ref(candidate), "files", 1),
+                vec![candidate.as_str()]
+            );
+        }
+        assert_eq!(
+            fuzzy_rank(&candidates, "files", 2),
+            vec!["src/files.rs", "files/mod.rs"]
+        );
+        assert_eq!(fuzzy_rank(&candidates, "files", 1), vec!["src/files.rs"]);
     }
 }

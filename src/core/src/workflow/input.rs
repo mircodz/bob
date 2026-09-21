@@ -8,7 +8,6 @@ const REDUCE_DEFAULT: &str = "Synthesize these results into a single summary.";
 const FIND_DEFAULT: &str =
     "Find items not already in the seen list; return {findings:[..]}, empty if none new.";
 
-/// Describe the existing shape and steps forms, including recursive operations.
 pub fn schema() -> Value {
     let mut definitions = json!({
         "name": {
@@ -28,16 +27,18 @@ pub fn schema() -> Value {
         },
         "output_schema": {
             "type": "object",
-            "description": "An arbitrary JSON Schema object for agent output. Its contents are passed through, not restricted to a fixed deliverable or validated as an external schema."
+            "description": "A JSON Schema object for agent output. Supported JSON Schema drafts are fully validated; external references and unknown dialects are rejected."
         },
         "items": {
             "type": "array",
             "minItems": 1,
+            "maxItems": super::validation::MAX_ITEMS,
             "items": {"type": "string"}
         },
         "steps": {
             "type": "array",
             "minItems": 1,
+            "maxItems": super::validation::MAX_ITEMS,
             "items": {"$ref": "#/$defs/step"}
         }
     });
@@ -53,7 +54,7 @@ pub fn schema() -> Value {
             "over": {
                 "description": "An inline array of arbitrary JSON items (possibly empty), or a reference to a prior output.",
                 "oneOf": [
-                    {"type": "array", "items": {}},
+                    {"type": "array", "maxItems": super::validation::MAX_ITEMS, "items": {}},
                     {"$ref": "#/$defs/reference"}
                 ]
             },
@@ -140,12 +141,6 @@ pub fn schema() -> Value {
     );
     let mut root = object_schema(Value::Object(properties), &[]);
     root["description"] = json!("Exactly one form: steps, or a canned shape. Only fields belonging to that form and shape are accepted.");
-    root["oneOf"] = Value::Array(
-        forms
-            .iter()
-            .map(|name| json!({"$ref": format!("#/$defs/{name}")}))
-            .collect(),
-    );
     root["$defs"] = definitions;
     root
 }
@@ -178,9 +173,7 @@ fn operation_schema(named: bool) -> Value {
     schema
 }
 
-/// Validate input structure before execution, without resolving reference visibility.
-/// Output schemas must be objects; their JSON Schema contents are not validated.
-/// `repeat` is capped at 20 to bound duplicate reviewers, like the loop round caps.
+/// Checks structure, not reference visibility; output schemas reject external references.
 pub fn validate(input: &Value) -> Result<(), String> {
     let object = as_object(input, "$")?;
     if let Some(title) = object.get("title") {
@@ -194,7 +187,7 @@ pub fn validate(input: &Value) -> Result<(), String> {
     match (object.contains_key("steps"), object.contains_key("shape")) {
         (true, false) => {
             fields(object, &["title", "read_only", "steps"], "$")?;
-            validate_steps(&object["steps"], "$.steps")
+            validate_steps(&object["steps"], "$.steps", 0)
         }
         (false, true) => validate_shape(object),
         _ => Err("$ must contain exactly one of steps or shape".into()),
@@ -244,14 +237,17 @@ fn validate_shape(object: &Map<String, Value>) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_steps(value: &Value, path: &str) -> Result<(), String> {
+fn validate_steps(value: &Value, path: &str, depth: usize) -> Result<(), String> {
     for (index, step) in nonempty_array(value, path)?.iter().enumerate() {
-        validate_operation(step, &format!("{path}[{index}]"), true)?;
+        validate_operation(step, &format!("{path}[{index}]"), true, depth)?;
     }
     Ok(())
 }
 
-fn validate_operation(value: &Value, path: &str, named: bool) -> Result<(), String> {
+fn validate_operation(value: &Value, path: &str, named: bool, depth: usize) -> Result<(), String> {
+    if depth > 16 {
+        return Err("workflow nesting exceeds 16 levels".into());
+    }
     let object = as_object(value, path)?;
     if named {
         fields(
@@ -286,7 +282,12 @@ fn validate_operation(value: &Value, path: &str, named: bool) -> Result<(), Stri
             if !over.is_array() {
                 reference(over, &format!("{path}.over"))?;
             }
-            prompt(required(body, "prompt", &path)?, &format!("{path}.prompt"))?;
+            let prompt_value = required(body, "prompt", &path)?;
+            prompt(prompt_value, &format!("{path}.prompt"))?;
+            if let Some(items) = over.as_array() {
+                super::validation::validate_items(prompt_value.as_str().unwrap(), items)
+                    .map_err(|error| format!("{path}: {error}"))?;
+            }
             optional_schema(body, "schema", &path)?;
             optional_count(body, "repeat", &path)?;
         }
@@ -300,12 +301,16 @@ fn validate_operation(value: &Value, path: &str, named: bool) -> Result<(), Stri
             }
             for (name, branch) in branches {
                 validate_name(name, &format!("{path} branch name {name:?}"))?;
-                validate_operation(branch, &format!("{path}.{name}"), false)?;
+                validate_operation(branch, &format!("{path}.{name}"), false, depth + 1)?;
             }
         }
         "loop" => {
             fields(body, &["steps", "until", "max"], &path)?;
-            validate_steps(required(body, "steps", &path)?, &format!("{path}.steps"))?;
+            validate_steps(
+                required(body, "steps", &path)?,
+                &format!("{path}.steps"),
+                depth + 1,
+            )?;
             if let Some(until) = body.get("until") {
                 reference(until, &format!("{path}.until"))?;
             }
@@ -332,6 +337,12 @@ fn nonempty_array<'a>(value: &'a Value, path: &str) -> Result<&'a Vec<Value>, St
     let array = value
         .as_array()
         .ok_or_else(|| format!("{path} must be an array"))?;
+    if array.len() > super::validation::MAX_ITEMS {
+        return Err(format!(
+            "{path} exceeds {} items",
+            super::validation::MAX_ITEMS
+        ));
+    }
     if array.is_empty() {
         return Err(format!("{path} must not be empty"));
     }
@@ -374,6 +385,7 @@ fn optional_prompt(object: &Map<String, Value>, key: &str, path: &str) -> Result
 fn optional_schema(object: &Map<String, Value>, key: &str, path: &str) -> Result<(), String> {
     if let Some(value) = object.get(key) {
         as_object(value, &format!("{path}.{key}"))?;
+        crate::tools::schema::CompiledSchema::compile(value)?;
     }
     Ok(())
 }
@@ -448,12 +460,85 @@ mod tests {
         }
     }
 
+    fn advertised_schema() -> &'static jsonschema::Validator {
+        static VALIDATOR: std::sync::OnceLock<jsonschema::Validator> = std::sync::OnceLock::new();
+        VALIDATOR.get_or_init(|| jsonschema::validator_for(&schema()).unwrap())
+    }
+
     fn accepts(value: &Value) {
         assert_eq!(validate(value), Ok(()), "input: {value}");
+        assert!(
+            advertised_schema().is_valid(value),
+            "schema rejected: {value}"
+        );
     }
 
     fn rejects(value: &Value) {
         assert!(validate(value).is_err(), "unexpectedly accepted: {value}");
+    }
+
+    #[test]
+    fn collection_limits_distinguish_empty_fan_outs_from_required_items_and_steps() {
+        for count in [0, 1, 256, 257] {
+            let fan = pipeline(json!({"fan_out": {
+                "over": vec![json!(null); count], "prompt": "read {item}"
+            }}));
+            assert_eq!(validate(&fan).is_ok(), count <= 256, "{count}: {fan}");
+            let shaped =
+                json!({"shape": "fan_out", "items": vec!["x"; count], "map_prompt": "read {item}"});
+            let steps = json!({"steps": (0..count).map(|index| {
+            json!({"id": format!("step{index}"), "agent": {"prompt": "read"}})
+        }).collect::<Vec<_>>()});
+            for input in [shaped, steps] {
+                assert_eq!(
+                    validate(&input).is_ok(),
+                    (1..=256).contains(&count),
+                    "count {count}"
+                );
+                assert_eq!(
+                    advertised_schema().is_valid(&input),
+                    (1..=256).contains(&count)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nested_errors_identify_the_invalid_leaf_not_just_the_container() {
+        for (field, value, message) in [
+            ("repeat", json!("2"), "must be an integer"),
+            ("prompt", json!(false), "must be a string"),
+            ("over", json!(true), "must be a string"),
+            ("schema", json!([]), "must be an object"),
+        ] {
+            let mut fan = json!({"over": [], "prompt": "read"});
+            fan[field] = value;
+            let input = pipeline(json!({"parallel": {"branches": {"review": {
+                "loop": {"steps": [{"id": "leaf", "fan_out": fan}]}
+            }}}}));
+            let error = validate(&input).unwrap_err();
+            let path = format!("$.steps[0].parallel.branches.review.loop.steps[0].fan_out.{field}");
+            assert!(error.contains(&path), "{error}");
+            assert!(error.contains(message), "{error}");
+        }
+    }
+
+    #[test]
+    fn structural_nesting_limit_applies_to_mixed_containers() {
+        for depth in [16, 17] {
+            let mut op = agent();
+            for level in 0..depth {
+                op = if level % 2 == 0 {
+                    json!({"parallel": {"branches": {format!("branch{level}"): op}}})
+                } else {
+                    let mut step = op.as_object().unwrap().clone();
+                    step.insert("id".into(), json!(format!("step{level}")));
+                    json!({"loop": {"steps": [step]}})
+                };
+            }
+            let result = validate(&pipeline(op));
+            assert_eq!(result.is_ok(), depth == 16, "{depth}: {result:?}");
+        }
     }
 
     #[test]
@@ -483,7 +568,7 @@ mod tests {
                                 {"id": "inner", "loop": {"steps": [
                                     {"id": "items", "fan_out": {
                                         "over": [{"name": "core"}, "cli", 3, true, null, []],
-                                        "prompt": "Inspect {item.name}", "repeat": 1
+                                        "prompt": "Inspect {item}", "repeat": 1
                                     }}
                                 ]}}
                             ]
@@ -516,15 +601,15 @@ mod tests {
     }
 
     #[test]
-    fn permits_arbitrary_output_schema_objects_and_empty_inline_arrays() {
-        for schema in [
-            json!({}),
-            json!({"type": "not-a-real-type", "arbitrary": null}),
-        ] {
+    fn validates_output_schemas_and_permits_empty_inline_arrays() {
+        for schema in [json!({}), json!({"type": "object", "arbitrary": null})] {
             accepts(&pipeline(
                 json!({"agent": {"prompt": "Inspect", "schema": schema}}),
             ));
         }
+        rejects(&pipeline(json!({"agent": {
+            "prompt": "Inspect", "schema": {"type": "not-a-real-type"}
+        }})));
         accepts(&pipeline(
             json!({"fan_out": {"over": [], "prompt": "Inspect {item}"}}),
         ));
@@ -574,6 +659,36 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn locally_rejects_mixed_forms_without_a_model_schema_root_combiner() {
+        let schema = schema();
+        assert_eq!(schema["type"], "object");
+        assert!(schema["properties"].is_object());
+        for combiner in ["oneOf", "anyOf", "allOf"] {
+            assert!(
+                schema.get(combiner).is_none(),
+                "provider root contains {combiner}"
+            );
+        }
+        let steps = pipeline(agent());
+        accepts(&steps);
+        for name in ["fan_out", "map_reduce", "loop"] {
+            let mut mixed = shape(name);
+            accepts(&mixed);
+            mixed["steps"] = steps["steps"].clone();
+            assert!(advertised_schema().is_valid(&mixed));
+            assert_eq!(
+                validate(&mixed),
+                Err("$ must contain exactly one of steps or shape".into())
+            );
+        }
+        assert!(advertised_schema().is_valid(&json!({})));
+        assert_eq!(
+            validate(&json!({})),
+            Err("$ must contain exactly one of steps or shape".into())
+        );
     }
 
     #[test]
@@ -785,7 +900,7 @@ mod tests {
 
     #[test]
     fn enforces_name_grammar_for_ids_and_branches() {
-        let pattern = regex::Regex::new(NAME_PATTERN).unwrap();
+        let validator = advertised_schema();
         for (name, valid) in [
             ("A", true),
             ("review_2-b", true),
@@ -801,15 +916,16 @@ mod tests {
             let mut input = pipeline(agent());
             input["steps"][0]["id"] = json!(name);
             assert_eq!(validate(&input).is_ok(), valid, "id: {name:?}");
+            assert_eq!(validator.is_valid(&input), valid, "schema id: {name:?}");
             let input = pipeline(json!({"parallel": {"branches": {name: agent()}}}));
             assert_eq!(validate(&input).is_ok(), valid, "branch: {name:?}");
-            assert_eq!(pattern.is_match(name), valid, "schema pattern: {name:?}");
+            assert_eq!(validator.is_valid(&input), valid, "schema branch: {name:?}");
         }
     }
 
     #[test]
     fn validates_reference_syntax_without_checking_visibility() {
-        let pattern = regex::Regex::new(REFERENCE_PATTERN).unwrap();
+        let validator = advertised_schema();
         for (text, valid) in [
             ("$future", true),
             ("$step.field.subfield", true),
@@ -835,7 +951,8 @@ mod tests {
                 pipeline(json!({"loop": {"steps": pipeline(agent())["steps"], "until": text}}));
             assert_eq!(validate(&over).is_ok(), valid, "over: {text:?}");
             assert_eq!(validate(&until).is_ok(), valid, "until: {text:?}");
-            assert_eq!(pattern.is_match(text), valid, "schema pattern: {text:?}");
+            assert_eq!(validator.is_valid(&over), valid, "schema over: {text:?}");
+            assert_eq!(validator.is_valid(&until), valid, "schema until: {text:?}");
         }
         for value in [Value::Null, json!(false), json!(3), json!({})] {
             rejects(&pipeline(
@@ -850,177 +967,86 @@ mod tests {
         ));
     }
 
-    fn assert_object(schema: &Value, required: &[&str], properties: &[&str]) {
-        assert_eq!(schema["type"], "object");
-        assert_eq!(schema["additionalProperties"], false);
-        assert_eq!(schema["required"], json!(required));
-        let actual = schema["properties"].as_object().unwrap();
-        assert_eq!(actual.len(), properties.len());
-        for key in properties {
-            assert!(actual.contains_key(*key), "missing property: {key}");
+    #[test]
+    fn schema_rejects_malformed_operations_and_property_values() {
+        let validator = advertised_schema();
+        for value in [
+            json!(null),
+            json!([]),
+            json!({"shape": "unknown"}),
+            json!({"shape": "loop", "max_rounds": 0}),
+            json!({"shape": "loop", "max_rounds": 21}),
+            json!({"shape": "loop", "max_rounds": 1.5}),
+            json!({"shape": "loop", "read_only": "true"}),
+            json!({"shape": "loop", "unknown": true}),
+            json!({"shape": "fan_out", "items": [1], "map_prompt": "go"}),
+            json!({"shape": "fan_out", "items": [], "map_prompt": "go"}),
+            json!({"shape": "fan_out", "items": vec!["x"; 257], "map_prompt": "go"}),
+            json!({"steps": []}),
+            json!({"steps": [{"agent": {"prompt": "go"}}]}),
+            json!({"steps": [{"id": "missing"}]}),
+            pipeline(json!({"agent": {"prompt": " "}})),
+            pipeline(json!({"agent": {"prompt": "go", "schema": []}})),
+            pipeline(json!({"agent": {"prompt": "go", "extra": true}})),
+            pipeline(json!({"agent": {"prompt": "go"}, "fan_out": {"over": [], "prompt": "go"}})),
+            pipeline(json!({"fan_out": {"over": {}, "prompt": "go"}})),
+            pipeline(json!({"fan_out": {"over": [], "prompt": "go", "repeat": 21}})),
+            pipeline(json!({"loop": {"steps": []}})),
+            pipeline(json!({"loop": {"steps": pipeline(agent())["steps"], "max": 0}})),
+            pipeline(json!({"parallel": {"branches": {}}})),
+            pipeline(
+                json!({"parallel": {"branches": {"branch": {"id": "forbidden", "agent": {"prompt": "go"}}}}}),
+            ),
+            pipeline(
+                json!({"parallel": {"branches": {"branch": {"loop": {"steps": [{"id": "bad", "agent": {"prompt": false}}]}}}}}),
+            ),
+        ] {
+            assert!(!validator.is_valid(&value), "schema accepted: {value}");
+            rejects(&value);
         }
     }
 
     #[test]
-    fn schema_describes_closed_exclusive_forms_and_defaults() {
+    fn schema_form_definitions_enforce_required_and_shape_specific_fields() {
         let schema = schema();
-        assert_eq!(schema["type"], "object");
-        assert_eq!(schema["additionalProperties"], false);
-        assert_eq!(schema["properties"]["read_only"]["type"], "boolean");
-        assert_eq!(schema["properties"]["read_only"]["default"], false);
-        assert_eq!(
-            schema["oneOf"],
-            json!([
-                {"$ref": "#/$defs/steps_form"}, {"$ref": "#/$defs/fan_out_shape"},
-                {"$ref": "#/$defs/map_reduce_shape"}, {"$ref": "#/$defs/loop_shape"}
-            ])
-        );
-        let defs = &schema["$defs"];
-        assert_object(
-            &defs["steps_form"],
-            &["steps"],
-            &["title", "read_only", "steps"],
-        );
-        assert_object(
-            &defs["fan_out_shape"],
-            &["shape", "items", "map_prompt"],
-            &[
-                "title",
-                "read_only",
-                "shape",
-                "items",
-                "map_prompt",
-                "map_schema",
-            ],
-        );
-        assert_object(
-            &defs["map_reduce_shape"],
-            &["shape", "items", "map_prompt"],
-            &[
-                "title",
-                "read_only",
-                "shape",
-                "items",
-                "map_prompt",
-                "map_schema",
+        for (form, valid, required, forbidden) in [
+            ("steps_form", pipeline(agent()), vec!["steps"], "shape"),
+            (
+                "fan_out_shape",
+                shape("fan_out"),
+                vec!["shape", "items", "map_prompt"],
                 "reduce_prompt",
-                "reduce_schema",
-            ],
-        );
-        assert_object(
-            &defs["loop_shape"],
-            &["shape"],
-            &["title", "read_only", "shape", "find_prompt", "max_rounds"],
-        );
-        for (definition, name) in [
-            ("fan_out_shape", "fan_out"),
-            ("map_reduce_shape", "map_reduce"),
-            ("loop_shape", "loop"),
+            ),
+            (
+                "map_reduce_shape",
+                shape("map_reduce"),
+                vec!["shape", "items", "map_prompt"],
+                "find_prompt",
+            ),
+            ("loop_shape", shape("loop"), vec!["shape"], "items"),
         ] {
-            assert_eq!(defs[definition]["properties"]["shape"]["const"], name);
-        }
-        assert_eq!(
-            defs["map_reduce_shape"]["properties"]["reduce_prompt"]["default"],
-            REDUCE_DEFAULT
-        );
-        assert_eq!(
-            defs["loop_shape"]["properties"]["find_prompt"]["default"],
-            FIND_DEFAULT
-        );
-    }
-
-    #[test]
-    fn schema_covers_recursive_operations_required_fields_and_constraints() {
-        let schema = schema();
-        let defs = &schema["$defs"];
-        assert_object(&defs["agent"], &["prompt"], &["prompt", "schema"]);
-        assert_object(
-            &defs["fan_out"],
-            &["over", "prompt"],
-            &["over", "prompt", "schema", "repeat"],
-        );
-        assert_object(&defs["parallel"], &["branches"], &["branches"]);
-        assert_object(&defs["loop"], &["steps"], &["steps", "until", "max"]);
-        assert_object(
-            &defs["step"],
-            &["id"],
-            &["id", "agent", "fan_out", "parallel", "loop"],
-        );
-        assert_object(&defs["operation"], &[], &OPERATIONS);
-        for definition in ["step", "operation"] {
-            let wrapper = &defs[definition];
-            assert_eq!(wrapper["oneOf"].as_array().unwrap().len(), OPERATIONS.len());
-            for (index, op) in OPERATIONS.iter().enumerate() {
-                assert_eq!(wrapper["oneOf"][index], json!({"required": [op]}));
-                assert_eq!(wrapper["properties"][*op]["$ref"], format!("#/$defs/{op}"));
+            let contract = json!({"$ref": format!("#/$defs/{form}"), "$defs": schema["$defs"]});
+            let validator = jsonschema::validator_for(&contract).unwrap();
+            assert!(validator.is_valid(&valid), "{form}: {valid}");
+            for field in required {
+                let mut missing = valid.clone();
+                missing.as_object_mut().unwrap().remove(field);
+                assert!(
+                    !validator.is_valid(&missing),
+                    "{form} accepted missing {field}"
+                );
             }
-        }
-        assert_eq!(defs["step"]["properties"]["id"]["$ref"], "#/$defs/name");
-        assert_eq!(defs["name"]["pattern"], NAME_PATTERN);
-        assert_eq!(defs["reference"]["pattern"], REFERENCE_PATTERN);
-        assert_eq!(defs["prompt"]["pattern"], "\\S");
-        let description = defs["prompt"]["description"].as_str().unwrap();
-        assert!(description.contains("{$step.field.subfield}"));
-        assert!(description.contains("{item.field}"));
-        for definition in ["items", "steps"] {
-            assert_eq!(defs[definition]["type"], "array");
-            assert_eq!(defs[definition]["minItems"], 1);
-        }
-        assert_eq!(defs["items"]["items"]["type"], "string");
-        assert_eq!(defs["steps"]["items"]["$ref"], "#/$defs/step");
-        assert_eq!(defs["loop"]["properties"]["steps"]["$ref"], "#/$defs/steps");
-        assert_eq!(
-            defs["loop"]["properties"]["until"]["$ref"],
-            "#/$defs/reference"
-        );
-        assert!(defs["loop"]["properties"]["until"]["description"]
-            .as_str()
-            .unwrap()
-            .contains("boolean"));
-        let branches = &defs["parallel"]["properties"]["branches"];
-        assert_eq!(branches["type"], "object");
-        assert_eq!(branches["minProperties"], 1);
-        assert_eq!(branches["additionalProperties"], false);
-        assert_eq!(
-            branches["patternProperties"][NAME_PATTERN]["$ref"],
-            "#/$defs/operation"
-        );
-        let over = &defs["fan_out"]["properties"]["over"];
-        assert_eq!(
-            over["oneOf"],
-            json!([
-                {"type": "array", "items": {}}, {"$ref": "#/$defs/reference"}
-            ])
-        );
-        for (definition, field, default) in [
-            ("fan_out", "repeat", 1),
-            ("loop", "max", 5),
-            ("loop_shape", "max_rounds", 5),
-        ] {
-            let count = &defs[definition]["properties"][field];
-            assert_eq!(count["type"], "integer");
-            assert_eq!(count["minimum"], 1);
-            assert_eq!(count["maximum"], 20);
-            assert_eq!(count["default"], default);
-        }
-        assert!(defs["fan_out"]["properties"]["repeat"]["description"]
-            .as_str()
-            .unwrap()
-            .contains("duplicate reviewers"));
-        assert_eq!(defs["output_schema"]["type"], "object");
-        assert!(defs["output_schema"].get("properties").is_none());
-        assert!(defs["output_schema"].get("additionalProperties").is_none());
-        for (definition, field) in [
-            ("agent", "schema"),
-            ("fan_out", "schema"),
-            ("fan_out_shape", "map_schema"),
-            ("map_reduce_shape", "map_schema"),
-            ("map_reduce_shape", "reduce_schema"),
-        ] {
-            assert_eq!(
-                defs[definition]["properties"][field]["$ref"],
-                "#/$defs/output_schema"
-            );
+            let mut extra = valid.clone();
+            extra[forbidden] = json!("unrelated");
+            assert!(!validator.is_valid(&extra), "{form} accepted {forbidden}");
+            if form != "steps_form" {
+                let mut wrong_shape = valid;
+                wrong_shape["shape"] = json!("unknown");
+                assert!(
+                    !validator.is_valid(&wrong_shape),
+                    "{form} accepted a different shape"
+                );
+            }
         }
     }
 
@@ -1031,8 +1057,15 @@ mod tests {
                 Value::Object(object) => {
                     if let Some(reference) = object.get("$ref") {
                         let reference = reference.as_str().unwrap();
+                        assert!(
+                            reference.starts_with("#/$defs/"),
+                            "nonlocal reference: {reference}"
+                        );
                         let pointer = reference.strip_prefix('#').unwrap();
-                        assert!(root.pointer(pointer).is_some(), "unresolved: {reference}");
+                        assert!(
+                            root.pointer(pointer).is_some_and(Value::is_object),
+                            "unresolved schema: {reference}"
+                        );
                     }
                     for value in object.values() {
                         visit(value, root);

@@ -1,31 +1,22 @@
-//! Stdio MCP transport: spawn the server subprocess and exchange newline-delimited
-//! JSON-RPC 2.0 over its stdin/stdout. A background reader matches each response to
-//! its pending request by id.
+//! Newline-delimited JSON-RPC over an owned server process.
 
 use super::Transport;
 use crate::core::config::McpServerConfig;
+use crate::core::process::ManagedProcess;
+use crate::lsp::transport::RpcConnection;
 use async_trait::async_trait;
-use serde_json::{json, Value};
-use std::collections::HashMap;
+use serde_json::Value;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin};
-use tokio::sync::oneshot;
-
-type Pending = Arc<Mutex<HashMap<i64, oneshot::Sender<Value>>>>;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 pub(crate) struct StdioTransport {
-    stdin: tokio::sync::Mutex<ChildStdin>,
-    pending: Pending,
-    next_id: AtomicI64,
-    // Keep the child alive for the life of the transport.
-    _child: tokio::sync::Mutex<Child>,
+    connection: Arc<RpcConnection>,
 }
 
 impl StdioTransport {
-    pub(crate) async fn connect(cfg: &McpServerConfig) -> anyhow::Result<StdioTransport> {
+    pub(crate) async fn connect(cfg: &McpServerConfig) -> anyhow::Result<Self> {
         let mut command = tokio::process::Command::new(&cfg.command);
         command
             .args(&cfg.args)
@@ -33,88 +24,155 @@ impl StdioTransport {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
-
-        let mut child = command
-            .spawn()
+        let mut child = ManagedProcess::spawn(&mut command)
             .map_err(|e| anyhow::anyhow!("failed to start MCP server '{}': {}", cfg.name, e))?;
         let stdin = child
-            .stdin
-            .take()
+            .take_stdin()
             .ok_or_else(|| anyhow::anyhow!("no stdin"))?;
         let stdout = child
-            .stdout
-            .take()
+            .take_stdout()
             .ok_or_else(|| anyhow::anyhow!("no stdout"))?;
+        let connection = RpcConnection::new(stdin, Some(child), false, Duration::from_secs(30));
+        spawn_reader(&connection, stdout);
+        Ok(Self { connection })
+    }
+}
 
-        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
-
-        // Background reader: match each JSON-RPC response to its pending sender.
-        {
-            let pending = pending.clone();
-            tokio::spawn(async move {
-                let mut lines = BufReader::new(stdout).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    if line.trim().is_empty() {
-                        continue;
-                    }
-                    if let Ok(msg) = serde_json::from_str::<Value>(&line) {
-                        if let Some(id) = msg.get("id").and_then(|v| v.as_i64()) {
-                            if let Some(tx) = pending.lock().unwrap().remove(&id) {
-                                let _ = tx.send(msg);
-                            }
-                        }
-                        // Notifications (no id) are ignored.
-                    }
-                }
-            });
+fn spawn_reader(
+    connection: &Arc<RpcConnection>,
+    stdout: impl tokio::io::AsyncRead + Send + Unpin + 'static,
+) {
+    let weak = Arc::downgrade(connection);
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stdout).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let Some(connection) = weak.upgrade() else {
+                return;
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<Value>(&line) {
+                Ok(message) => connection.receive(message),
+                Err(_) => break,
+            }
         }
-
-        Ok(StdioTransport {
-            stdin: tokio::sync::Mutex::new(stdin),
-            pending,
-            next_id: AtomicI64::new(1),
-            _child: tokio::sync::Mutex::new(child),
-        })
-    }
-
-    async fn write_line(&self, msg: &Value) -> anyhow::Result<()> {
-        let mut line = serde_json::to_string(msg)?;
-        line.push('\n');
-        let mut stdin = self.stdin.lock().await;
-        stdin.write_all(line.as_bytes()).await?;
-        stdin.flush().await?;
-        Ok(())
-    }
+        if let Some(connection) = weak.upgrade() {
+            connection.disconnect();
+        }
+    });
 }
 
 #[async_trait]
 impl Transport for StdioTransport {
     async fn request(&self, method: &str, params: Value) -> anyhow::Result<Value> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = oneshot::channel();
-        self.pending.lock().unwrap().insert(id, tx);
-
-        let msg = json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": params
-        });
-        self.write_line(&msg).await?;
-
-        let resp = tokio::time::timeout(std::time::Duration::from_secs(30), rx)
-            .await
-            .map_err(|_| anyhow::anyhow!("MCP request '{}' timed out", method))?
-            .map_err(|_| anyhow::anyhow!("MCP connection closed"))?;
-
-        if let Some(err) = resp.get("error") {
-            anyhow::bail!("MCP error: {}", err);
-        }
-        Ok(resp.get("result").cloned().unwrap_or(Value::Null))
+        self.connection.request(method, params).await
     }
 
     async fn notify(&self, method: &str, params: Value) {
-        let msg = json!({ "jsonrpc": "2.0", "method": method, "params": params });
-        let _ = self.write_line(&msg).await;
+        let _ = self.connection.notify(method, params).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn reader_ignores_blank_lines_and_notifications_and_preserves_unicode_reply() {
+        let connection = RpcConnection::new(tokio::io::sink(), None, false, Duration::from_secs(1));
+        let (reader, mut writer) = tokio::io::duplex(1024);
+        spawn_reader(&connection, reader);
+        let transport = StdioTransport {
+            connection: connection.clone(),
+        };
+        let mut request = Box::pin(transport.request("fixture", Value::Null));
+        assert!(futures::poll!(&mut request).is_pending());
+        writer
+            .write_all(b"\n \t\r\n{\"method\":\"notice\"}\n{\"id\":99,\"result\":\"wrong\"}\n")
+            .await
+            .unwrap();
+        writer
+            .write_all("{\"id\":1,\"result\":\"é😀\\ntext\"}\r\n".as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), request)
+                .await
+                .unwrap()
+                .unwrap(),
+            "é😀\ntext"
+        );
+        assert!(!connection.is_closed());
+    }
+
+    #[tokio::test]
+    async fn server_error_is_not_a_parse_failure_and_next_request_can_succeed() {
+        let connection = RpcConnection::new(tokio::io::sink(), None, false, Duration::from_secs(1));
+        let (reader, mut writer) = tokio::io::duplex(1024);
+        spawn_reader(&connection, reader);
+        let transport = StdioTransport {
+            connection: connection.clone(),
+        };
+        let mut request = Box::pin(transport.request("fixture", Value::Null));
+        assert!(futures::poll!(&mut request).is_pending());
+        writer
+            .write_all(b"{\"id\":1,\"error\":{\"code\":-32602,\"message\":\"invalid params\"}}\n")
+            .await
+            .unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(1), request)
+            .await
+            .unwrap()
+            .unwrap_err()
+            .to_string();
+        assert!(error.starts_with("JSON-RPC error:"));
+        assert!(error.contains("invalid params"));
+        assert!(!connection.is_closed());
+        let mut next = Box::pin(transport.request("next", Value::Null));
+        assert!(futures::poll!(&mut next).is_pending());
+        writer
+            .write_all(b"{\"id\":2,\"result\":null}\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), next)
+                .await
+                .unwrap()
+                .unwrap(),
+            Value::Null
+        );
+    }
+
+    #[tokio::test]
+    async fn reader_does_not_keep_stdio_connection_alive() {
+        let connection = RpcConnection::new(tokio::io::sink(), None, false, Duration::from_secs(1));
+        let (reader, _writer) = tokio::io::duplex(16);
+        spawn_reader(&connection, reader);
+        let weak = Arc::downgrade(&connection);
+        drop(connection);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn eof_and_malformed_frames_release_stdio_waiters() {
+        for bytes in [b"".as_slice(), b"not json\n".as_slice()] {
+            let connection =
+                RpcConnection::new(tokio::io::sink(), None, false, Duration::from_secs(1));
+            let (reader, mut server) = tokio::io::duplex(256);
+            spawn_reader(&connection, reader);
+            let transport = StdioTransport {
+                connection: connection.clone(),
+            };
+            let mut request = Box::pin(transport.request("fixture", Value::Null));
+            assert!(futures::poll!(&mut request).is_pending());
+            server.write_all(bytes).await.unwrap();
+            drop(server);
+            let result = tokio::time::timeout(Duration::from_millis(200), request)
+                .await
+                .unwrap();
+            assert!(result.unwrap_err().to_string().contains("closed"));
+            assert!(connection.is_closed());
+        }
     }
 }

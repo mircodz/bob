@@ -1,5 +1,5 @@
 [workspace]
-members = ["src/types", "src/core", "src/sdk", "src/cli"]
+members = ["src/types", "src/core", "src/cli"]
 default-members = ["src/cli"]
 resolver = "2"
 

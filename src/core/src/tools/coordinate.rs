@@ -1,21 +1,7 @@
-//! Coordination tools: the surface a team agent uses to spawn, message, and
-//! inspect other agents. These turn bob's fire-and-forget `task` into a live,
-//! addressable team.
-//!
-//! - `spawn_agent`: start a named subagent in the background with its own inbox,
-//!   registered in the shared team. It runs concurrently; its result is delivered
-//!   back to the spawner as a message when it finishes.
-//! - `send_message`: deliver a message into another agent's inbox (steer it, hand
-//!   it work, or reply). The recipient sees it at its next turn boundary.
-//! - `list_agents`: the team roster + each member's status.
-//!
-//! A spawned agent's result is not returned by the spawn call — it's delivered
-//! back as a message when the agent finishes, and the spawner's run loop is woken
-//! for a fresh turn to process it (see `Agent::has_pending_coordination`). So the
-//! spawner keeps control and can do other work while children run, with no
-//! blocking primitive that could deadlock.
+//! Spawned results arrive by message and wake the parent; the spawn call never
+//! waits for completion.
 
-use crate::agent::agent::{build_subagent, SubagentSpec, SUBAGENT_MAX_TURNS};
+use crate::agent::agent::{build_subagent, RunStopReason, SubagentSpec, SUBAGENT_MAX_TURNS};
 use crate::agent::env::AgentEnv;
 use crate::agent::lifecycle::SubagentLifecycle;
 use crate::agent::team::{mailbox, AgentRegistry, AgentStatus};
@@ -25,18 +11,12 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
-/// Shared configuration for building coordinated child agents — mirrors the
-/// pieces `TaskTool` uses to assemble a subagent, plus the team registry.
 #[derive(Clone)]
 pub struct CoordDeps {
-    /// The shared subagent-spawning environment (provider, tools, bus, cwd,
-    /// system, jobs, lsp, cancel) — the same bundle `task`/`workflow`/`explore`
-    /// hold.
     pub env: AgentEnv,
     pub team: AgentRegistry,
 }
 
-/// `spawn_agent`: start a named background subagent that is part of the team.
 pub struct SpawnAgentTool {
     pub deps: CoordDeps,
 }
@@ -121,18 +101,13 @@ impl Tool for SpawnAgentTool {
             .resolve_child(subagent_type, read_only)
             .map_err(ToolError::invalid_input)?;
 
-        // Build the child's mailbox and register it in the team before spawning,
-        // so a sibling can message it immediately.
+        // Register before spawning so siblings can message it immediately.
         let (inbox, tx) = mailbox();
         let handle = coord
             .team
             .try_register(name.clone(), child_depth, coord.name.clone(), tx)
             .map_err(ToolError::invalid_input)?;
 
-        // Announce the spawn so the UI shows a subagent cell (same signal the
-        // `task` tool emits). Prefer the short `description` for the label; fall
-        // back to the full task if the model didn't give one. The child's inner
-        // tool calls stay hidden; only this notice + its status appear.
         let label = input["description"]
             .as_str()
             .map(|s| s.trim())
@@ -147,6 +122,7 @@ impl Tool for SpawnAgentTool {
             task.clone(),
         )
         .with_handle(handle.clone())
+        .with_team(coord.team.clone())
         .with_report_to(coord.team.get(&coord.name));
 
         // Recursive spawning is added here to avoid a registry cycle, but never
@@ -161,12 +137,17 @@ impl Tool for SpawnAgentTool {
                         .is_none_or(|tools| tools.iter().any(|name| name == "spawn_agent"))
             });
         if may_spawn {
+            let mut env = self.deps.env.clone();
+            env.subagent_tools = child_tools.clone();
+            env.subagent_system = child_system.clone();
             child_tools.add(Arc::new(SpawnAgentTool {
-                deps: self.deps.clone(),
+                deps: CoordDeps {
+                    env,
+                    team: self.deps.team.clone(),
+                },
             }));
         }
 
-        // Assemble the child agent, itself a team member (so it can coordinate).
         let child = build_subagent(SubagentSpec {
             provider: self.deps.env.provider.clone(),
             tools: child_tools,
@@ -185,28 +166,48 @@ impl Tool for SpawnAgentTool {
             inbox: Some(inbox),
             team: Some(self.deps.team.clone()),
             parent_cancel: Some(self.deps.env.parent_cancel.clone()),
+            hooks: self.deps.env.hooks.clone(),
+            memory: self.deps.env.memory.clone(),
         });
 
-        // Run in the background. On completion, deliver the result back to the
-        // spawner as a message and mark the child's status.
         let parent_cancel = self.deps.env.parent_cancel.clone();
         tokio::spawn(async move {
             let mut child = child;
             let driver = async {
-                let mut result = child.run(&task).await?;
-                while child.has_outstanding_coordination() {
-                    if child.has_pending_coordination() {
-                        result = child.run("").await?;
+                let mut remaining = child.turn_budget();
+                let mut result = child.run_with_budget(&task, remaining).await?;
+                remaining = remaining.saturating_sub(result.turns);
+                loop {
+                    if result.stop_reason != RunStopReason::Completed {
+                        break;
+                    }
+                    if !child.has_outstanding_coordination() && child.try_close_inbox() {
+                        break;
+                    }
+                    if remaining == 0 || child.has_pending_coordination() {
+                        let next = child.run_with_budget("", remaining).await?;
+                        remaining = remaining.saturating_sub(next.turns);
+                        let previous = result.text;
+                        result = next;
+                        if remaining == 0 && result.turns == 0 && !previous.is_empty() {
+                            result.text = format!("{previous}\n\n{}", result.text);
+                        }
                     } else {
                         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     }
                 }
-                Ok::<_, anyhow::Error>(result)
+                Ok::<_, anyhow::Error>(result.text)
             };
             let outcome = handle.run_until_stopped(parent_cancel, driver).await;
+            if !child.settle_owned_mutations().await {
+                child.bus().emit(crate::core::events::AgentEvent::Error {
+                    agent_id: child.id.clone(),
+                    message: "memory mutation cleanup timed out; changes may still complete".into(),
+                });
+            }
             let cancelled = outcome.is_none() || child.is_cancelled();
             let (failed, result) = match outcome {
-                Some(Ok(out)) => (false, out),
+                Some(Ok(out)) => (child.turn_limit_summary().is_some(), out),
                 Some(Err(e)) => (true, format!("error: {e}")),
                 None => (false, "[cancelled]".into()),
             };
@@ -217,11 +218,11 @@ impl Tool for SpawnAgentTool {
             "spawned agent '{}'. It runs in the background; its result will arrive as a message \
              from it. Use send_message to steer it or list_agents to check status.",
             name
-        ))
+        )
+        .into())
     }
 }
 
-/// `send_message`: deliver a message into another agent's inbox.
 pub struct SendMessageTool {
     pub team: AgentRegistry,
 }
@@ -264,7 +265,7 @@ impl Tool for SendMessageTool {
             ));
         }
         if self.team.send(to, &from, message) {
-            Ok(format!("delivered to '{}'", to))
+            Ok(format!("delivered to '{}'", to).into())
         } else {
             Err(ToolError::not_found(format!(
                 "no agent named '{}' (it may have finished)",
@@ -274,7 +275,6 @@ impl Tool for SendMessageTool {
     }
 }
 
-/// Cancel a selected execution without stopping the main conversation or siblings.
 pub struct StopAgentTool {
     pub team: AgentRegistry,
 }
@@ -310,15 +310,14 @@ impl Tool for StopAgentTool {
             .team
             .stop(&caller.name, name)
             .map_err(ToolError::invalid_input)?;
-        Ok(if count == 0 {
+        Ok((if count == 0 {
             format!("cancellation already requested for '{name}'")
         } else {
             format!("cancellation requested for '{name}' and its running descendants ({count} agent(s))")
-        })
+        }).into())
     }
 }
 
-/// `list_agents`: the team roster + each member's status.
 pub struct ListAgentsTool {
     pub team: AgentRegistry,
 }
@@ -343,7 +342,7 @@ impl Tool for ListAgentsTool {
     async fn execute(&self, _input: Value, _ctx: &ToolContext) -> ToolResult {
         let roster = self.team.roster();
         if roster.is_empty() {
-            return Ok("no agents in the team yet.".to_string());
+            return Ok("no agents in the team yet.".into());
         }
         let mut out = String::from("team:\n");
         for (name, depth, status) in roster {
@@ -355,77 +354,234 @@ impl Tool for ListAgentsTool {
             };
             out.push_str(&format!("  {} (depth {}) — {}\n", name, depth, s));
         }
-        Ok(out)
+        Ok(out.into())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::events::{AgentEvent, EventBus};
-    use crate::providers::mock::MockProvider;
-    use crate::tools::file_tracker::FileTracker;
-    use crate::tools::jobs::JobRegistry;
-    use crate::tools::registry::{CoordContext, ToolRegistry};
-    use crate::tools::todo::TodoStore;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use crate::agent::team::AgentMessageKind;
+    use crate::tools::registry::{CoordContext, ToolErrorKind};
 
-    #[tokio::test]
-    async fn unknown_agent_type_does_not_leave_a_running_child() {
-        let team = AgentRegistry::new();
-        let bus = EventBus::new();
-        let spawns = Arc::new(AtomicUsize::new(0));
-        let count = spawns.clone();
-        bus.on(Arc::new(move |event| {
-            if matches!(event, AgentEvent::SubagentSpawn { .. }) {
-                count.fetch_add(1, Ordering::Relaxed);
-            }
-        }));
-        let jobs = JobRegistry::new();
-        let tool = SpawnAgentTool {
-            deps: CoordDeps {
-                env: AgentEnv {
-                    provider: Arc::new(MockProvider::new(vec![])),
-                    subagent_tools: ToolRegistry::new(None),
-                    bus,
-                    cwd: ".".into(),
-                    subagent_system: None,
-                    jobs: jobs.clone(),
-                    team: team.clone(),
-                    lsp: None,
-                    parent_cancel: Arc::new(AtomicBool::new(false)),
-                    definitions: Default::default(),
-                },
-                team: team.clone(),
-            },
-        };
-        let ctx = ToolContext {
+    fn context(team: &AgentRegistry, caller: &str) -> ToolContext {
+        ToolContext {
             cwd: ".".into(),
-            files: Arc::new(FileTracker::new()),
-            todos: Arc::new(TodoStore::new()),
-            jobs,
+            files: Arc::new(crate::tools::file_tracker::FileTracker::new()),
+            todos: Arc::new(crate::tools::todo::TodoStore::new()),
+            jobs: crate::tools::jobs::JobRegistry::new(),
             user_asker: None,
             lsp: None,
             coord: Some(CoordContext {
-                name: "root".into(),
+                name: caller.into(),
                 depth: 0,
                 team: team.clone(),
             }),
             permissions: None,
-        };
-        let result = tool
-            .execute(
-                json!({
-                    "name": "reviewer",
-                    "task": "review the code",
-                    "subagent_type": "missing"
-                }),
-                &ctx,
-            )
-            .await;
-        assert!(result.is_err());
-        assert!(team.roster().is_empty());
-        assert!(!team.has_running_children("root"));
-        assert_eq!(spawns.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn send_message_preserves_body_sender_and_target_isolation() {
+        let team = AgentRegistry::new();
+        let (mut inbox, tx) = mailbox();
+        team.register("worker".into(), 1, "root".into(), tx);
+        let (mut sibling, tx) = mailbox();
+        team.register("sibling".into(), 1, "root".into(), tx);
+        let tool = SendMessageTool { team: team.clone() };
+        let ctx = context(&team, "root");
+        for body in [
+            "finished: this is steering, not a completion",
+            "  keep spacing\n界🙂  ",
+        ] {
+            assert_eq!(
+                tool.execute(json!({"to":" worker ", "message":body}), &ctx)
+                    .await
+                    .unwrap()
+                    .as_text()
+                    .unwrap(),
+                "delivered to 'worker'"
+            );
+            let messages = inbox.drain();
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].from, "root");
+            assert_eq!(messages[0].text, body);
+            assert_eq!(messages[0].kind, AgentMessageKind::Actionable);
+            assert!(sibling.drain().is_empty());
+        }
+        assert_eq!(team.get("worker").unwrap().status(), AgentStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn send_message_rejects_invalid_unavailable_and_terminal_recipients() {
+        let team = AgentRegistry::new();
+        let (mut inbox, tx) = mailbox();
+        team.register("worker".into(), 1, "root".into(), tx);
+        let tool = SendMessageTool { team: team.clone() };
+        let mut ctx = context(&team, "root");
+        for input in [
+            json!({}),
+            json!({"to":" ", "message":"hello"}),
+            json!({"to":"worker", "message":""}),
+            json!({"to":"worker", "message":42}),
+        ] {
+            assert_eq!(
+                tool.execute(input, &ctx).await.unwrap_err().kind,
+                ToolErrorKind::InvalidInput
+            );
+            assert!(inbox.drain().is_empty());
+        }
+        ctx.coord = None;
+        assert_eq!(
+            tool.execute(json!({"to":"worker", "message":"hello"}), &ctx)
+                .await
+                .unwrap_err()
+                .kind,
+            ToolErrorKind::Unavailable
+        );
+        assert!(inbox.drain().is_empty());
+        ctx = context(&team, "root");
+        assert_eq!(
+            tool.execute(json!({"to":"missing", "message":"hello"}), &ctx)
+                .await
+                .unwrap_err()
+                .kind,
+            ToolErrorKind::NotFound
+        );
+        team.stop("root", "worker").unwrap();
+        assert_eq!(
+            tool.execute(json!({"to":"worker", "message":"too late"}), &ctx)
+                .await
+                .unwrap_err()
+                .kind,
+            ToolErrorKind::NotFound
+        );
+        assert!(inbox.drain().is_empty());
+        for status in [
+            AgentStatus::Done,
+            AgentStatus::Failed,
+            AgentStatus::Cancelled,
+        ] {
+            let team = AgentRegistry::new();
+            let (mut inbox, tx) = mailbox();
+            let handle = team.register("finished".into(), 1, "root".into(), tx);
+            handle.set_status(status.clone());
+            let tool = SendMessageTool { team: team.clone() };
+            assert_eq!(
+                tool.execute(
+                    json!({"to":"finished", "message":"too late"}),
+                    &context(&team, "root")
+                )
+                .await
+                .unwrap_err()
+                .kind,
+                ToolErrorKind::NotFound
+            );
+            assert!(inbox.drain().is_empty());
+            assert_eq!(handle.status(), status);
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_agent_enforces_caller_scope_and_is_idempotent_before_settlement() {
+        let team = AgentRegistry::new();
+        for (name, depth, parent) in [
+            ("root", 0, ""),
+            ("parent", 1, "root"),
+            ("child", 2, "parent"),
+            ("grandchild", 3, "child"),
+            ("sibling", 1, "root"),
+        ] {
+            let (_, tx) = mailbox();
+            team.register(name.into(), depth, parent.into(), tx);
+        }
+        let tool = StopAgentTool { team: team.clone() };
+        let ctx = context(&team, "parent");
+        for name in ["root", "parent", "sibling", "missing", " "] {
+            let error = tool.execute(json!({"name":name}), &ctx).await.unwrap_err();
+            assert_eq!(error.kind, ToolErrorKind::InvalidInput);
+            assert!(team
+                .roster()
+                .iter()
+                .all(|(name, _, _)| !team.get(name).unwrap().cancellation_requested()));
+        }
+        let mut unavailable = ctx.clone();
+        unavailable.coord = None;
+        assert_eq!(
+            tool.execute(json!({"name":"child"}), &unavailable)
+                .await
+                .unwrap_err()
+                .kind,
+            ToolErrorKind::Unavailable
+        );
+        assert_eq!(
+            tool.execute(json!({"name":" child "}), &ctx)
+                .await
+                .unwrap()
+                .as_text()
+                .unwrap(),
+            "cancellation requested for 'child' and its running descendants (2 agent(s))"
+        );
+        assert_eq!(
+            tool.execute(json!({"name":"child"}), &ctx)
+                .await
+                .unwrap()
+                .as_text()
+                .unwrap(),
+            "cancellation already requested for 'child'"
+        );
+        for name in ["child", "grandchild"] {
+            let handle = team.get(name).unwrap();
+            assert!(handle.cancellation_requested());
+            assert_eq!(handle.status(), AgentStatus::Running);
+            assert_eq!(handle.complete(false, false, None), AgentStatus::Cancelled);
+        }
+        for name in ["root", "parent", "sibling"] {
+            assert!(!team.get(name).unwrap().cancellation_requested());
+        }
+        assert_eq!(
+            tool.execute(json!({"name":"child"}), &ctx)
+                .await
+                .unwrap_err()
+                .kind,
+            ToolErrorKind::InvalidInput
+        );
+    }
+
+    #[tokio::test]
+    async fn list_agents_reports_all_terminal_states_without_mutation() {
+        let team = AgentRegistry::new();
+        let tool = ListAgentsTool { team: team.clone() };
+        let ctx = context(&team, "root");
+        assert!(tool.is_read_only());
+        assert_eq!(
+            tool.execute(json!({}), &ctx)
+                .await
+                .unwrap()
+                .as_text()
+                .unwrap(),
+            "no agents in the team yet."
+        );
+        for (name, status) in [
+            ("running", AgentStatus::Running),
+            ("done", AgentStatus::Done),
+            ("failed", AgentStatus::Failed),
+            ("cancelled", AgentStatus::Cancelled),
+        ] {
+            let (_, tx) = mailbox();
+            team.register(name.into(), 2, "root".into(), tx)
+                .set_status(status);
+        }
+        let before = team.roster();
+        let output = tool.execute(json!({}), &ctx).await.unwrap();
+        let output = output.as_text().unwrap();
+        assert_eq!(output.lines().count(), 5);
+        assert!(output.starts_with("team:\n"));
+        for name in ["running", "done", "failed", "cancelled"] {
+            assert!(output
+                .lines()
+                .any(|line| line == format!("  {name} (depth 2) — {name}")));
+        }
+        assert_eq!(team.roster(), before);
     }
 }

@@ -1,21 +1,5 @@
-//! Parameterized workflows: the model picks a *shape* and fills its blanks for the
-//! CURRENT task (the item list, the per-item prompt, schemas, a find prompt). The
-//! engine runs a canned control-flow around them. This is the safe, no-sandbox path
-//! to "use pattern X on this task": every child is a normal subagent whose tool
-//! calls are still permission-gated.
-//!
-//! The shapes mirror the canonical workflow patterns the model can't express with
-//! plain parameters otherwise:
-//!   - `fan_out`    : one agent per item, return ordered results and item outcomes.
-//!   - `map_reduce` : fan_out, then reduce only if every map succeeds;
-//!     classify-and-act and generate-and-filter are special cases.
-//!   - `loop`       : re-run a finder until a valid round turns up nothing new or
-//!     the round limit is reached, retaining findings on failure or cancellation.
-//!
-//! Failed items retain null result slots. Shape output stays in `WorkflowRun.output`
-//! on failure, with an error describing why the workflow could not complete.
-//!
-//! `{item}` in a prompt is substituted with each item's text.
+//! Parameterized fan-out, map-reduce, and finder loops.
+//! Failed items retain null result slots and partial output remains available on failure.
 
 use super::{
     agent, parallel, AgentOutcome, AgentSpec, OutcomeStatus, WorkflowContext, WorkflowRun,
@@ -23,7 +7,6 @@ use super::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-/// Which parameterized shape to run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Shape {
@@ -32,53 +15,77 @@ pub enum Shape {
     Loop,
 }
 
-/// A model-supplied parameterized workflow spec (the `workflow` tool's input). Only
-/// the fields relevant to the chosen `shape` are read; the rest may be omitted.
+/// Only fields relevant to the chosen shape are read.
 #[derive(Debug, Clone, Deserialize)]
 pub struct WorkflowParams {
     pub shape: Shape,
-    /// Short label for the run, shown in the workflow view (e.g. "review-files").
     #[serde(default)]
     pub title: String,
-    /// The things to operate on — one subagent per entry. Required for fan_out /
-    /// map_reduce.
+    /// Required for fan-out and map-reduce.
     #[serde(default)]
     pub items: Vec<String>,
     /// Per-item prompt (fan_out / map_reduce). `{item}` is substituted.
     #[serde(default)]
     pub map_prompt: String,
-    /// Optional JSON Schema forcing each map agent's structured output.
     #[serde(default)]
     pub map_schema: Option<Value>,
     /// map_reduce: how to synthesize the collected results (appended as JSON).
     #[serde(default)]
     pub reduce_prompt: Option<String>,
-    /// map_reduce: JSON Schema forcing the reduce agent's structured output.
     #[serde(default)]
     pub reduce_schema: Option<Value>,
-    /// loop: the finder prompt run each round. It should return {findings: [..]},
-    /// excluding anything in the seen list (substituted). Loops until a round
-    /// returns nothing new, or `max_rounds` (default 5) is hit.
+    /// Finder output is `{findings: [..]}`; the seen list is appended each round.
     #[serde(default)]
     pub find_prompt: Option<String>,
     #[serde(default)]
     pub max_rounds: Option<usize>,
 }
 
-/// Substitute `{item}` in a prompt template.
 fn fill(template: &str, item: &str) -> String {
     template.replace("{item}", item)
 }
 
-/// Run a parameterized workflow, dispatching on its shape.
+pub(crate) fn validate(params: &WorkflowParams) -> Result<(), String> {
+    match params.shape {
+        Shape::FanOut | Shape::MapReduce => {
+            if params.items.is_empty() || params.items.len() > super::validation::MAX_ITEMS {
+                return Err(format!(
+                    "workflow requires 1..={} items",
+                    super::validation::MAX_ITEMS
+                ));
+            }
+            super::validation::validate_agent(&params.map_prompt, params.map_schema.as_ref())?;
+            if params.shape == Shape::MapReduce {
+                super::validation::validate_agent(
+                    params
+                        .reduce_prompt
+                        .as_deref()
+                        .unwrap_or("Synthesize these results"),
+                    params.reduce_schema.as_ref(),
+                )?;
+            }
+        }
+        Shape::Loop => {
+            super::validation::validate_count(params.max_rounds.unwrap_or(5))?;
+            super::validation::validate_agent(
+                params.find_prompt.as_deref().unwrap_or("Find new items"),
+                None,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 pub async fn run(ctx: WorkflowContext, params: WorkflowParams) -> WorkflowRun {
+    if let Err(error) = validate(&params) {
+        return WorkflowRun::failed(Value::Null, error);
+    }
     match params.shape {
         Shape::FanOut | Shape::MapReduce => map_reduce(ctx, params).await,
         Shape::Loop => loop_until_done(ctx, params).await,
     }
 }
 
-/// fan_out / map_reduce: one agent per item, optionally followed by a reduce agent.
 async fn map_reduce(ctx: WorkflowContext, params: WorkflowParams) -> WorkflowRun {
     let is_reduce = params.shape == Shape::MapReduce;
     ctx.phase("Map", 0, if is_reduce { 2 } else { 1 });
@@ -136,8 +143,6 @@ async fn map_reduce(ctx: WorkflowContext, params: WorkflowParams) -> WorkflowRun
     }
 }
 
-/// loop: re-run the finder each round until a round surfaces nothing new (or the
-/// round cap is hit), deduping against everything already found.
 async fn loop_until_done(ctx: WorkflowContext, params: WorkflowParams) -> WorkflowRun {
     let find_prompt = params.find_prompt.clone().unwrap_or_else(|| {
         "Find items not already in the seen list; return {findings:[..]}, empty if none new."
@@ -219,8 +224,6 @@ fn result_value(outcome: &AgentOutcome) -> Value {
     }
 }
 
-// --- shared helpers --------------------------------------------------------
-
 /// Run one agent per item concurrently, preserving every outcome in input order.
 async fn map_items(
     ctx: &WorkflowContext,
@@ -269,7 +272,6 @@ fn strings(v: &Option<Value>, key: &str) -> Result<Vec<String>, String> {
         .collect()
 }
 
-/// A short, tree-friendly label for an item (truncated, newlines flattened).
 fn label(item: &str) -> String {
     let clean = item.replace('\n', " ");
     if clean.chars().count() > 40 {
@@ -284,9 +286,10 @@ mod tests {
     use super::*;
     use crate::core::events::EventBus;
     use crate::core::types::{Completion, GenerateOptions, Role, StreamEvent};
-    use crate::providers::mock::{MockProvider, MockReply, MockRule};
+    use crate::providers::mock::{MockReply, MockRule};
     use crate::providers::provider::Provider;
     use crate::tools::registry::ToolRegistry;
+    use crate::workflow::tests::{text, MockProvider};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use tokio::sync::mpsc;
@@ -396,6 +399,11 @@ mod tests {
     fn fill_substitutes_item() {
         assert_eq!(fill("review {item} now", "a.rs"), "review a.rs now");
         assert_eq!(fill("no marker", "x"), "no marker");
+        assert_eq!(fill("{item}/{item}", "{item} λ"), "{item} λ/{item} λ");
+        assert_eq!(
+            fill("{item.path} {$step} {item}", ""),
+            "{item.path} {$step} "
+        );
     }
 
     #[test]
@@ -404,70 +412,95 @@ mod tests {
         let long = "a".repeat(60);
         assert!(label(&long).ends_with('…'));
         assert_eq!(label(&long).chars().count(), 41);
+        assert_eq!(label(&"é".repeat(40)), "é".repeat(40));
+        assert_eq!(label(&"é".repeat(41)), format!("{}…", "é".repeat(40)));
+        assert_eq!(label("first\nsecond"), "first second");
+    }
+
+    #[test]
+    fn typed_shape_validation_checks_required_fields_and_exact_limits() {
+        for shape in [Shape::FanOut, Shape::MapReduce] {
+            for count in [0, 1, 256, 257] {
+                let mut input = params(shape);
+                input.items = vec!["item".into(); count];
+                assert_eq!(validate(&input).is_ok(), (1..=256).contains(&count));
+            }
+            let mut input = params(shape);
+            input.map_prompt = " \t\n".into();
+            assert!(validate(&input).unwrap_err().contains("blank"));
+            input.map_prompt = "work".into();
+            input.map_schema = Some(json!({"type": "invalid"}));
+            assert!(validate(&input).is_err());
+        }
+        for count in [0, 1, 20, 21] {
+            let mut input = params(Shape::Loop);
+            input.max_rounds = Some(count);
+            assert_eq!(validate(&input).is_ok(), matches!(count, 1 | 20));
+        }
+        let mut reduce = params(Shape::MapReduce);
+        reduce.reduce_prompt = Some(" ".into());
+        assert!(validate(&reduce).unwrap_err().contains("blank"));
+        reduce.reduce_prompt = None;
+        assert!(validate(&reduce).is_ok());
+        let mut finder = params(Shape::Loop);
+        finder.find_prompt = Some(" ".into());
+        assert!(validate(&finder).unwrap_err().contains("blank"));
+        finder.find_prompt = None;
+        finder.max_rounds = None;
+        assert!(validate(&finder).is_ok());
     }
 
     #[tokio::test]
     async fn map_reduce_runs_map_then_reduce() {
-        let provider = MockProvider::new(vec![MockRule {
-            needle: "structured_output".to_string(),
-            reply: MockReply::ToolCall {
-                name: "structured_output".to_string(),
-                input: json!({"ok": true}),
-            },
-        }]);
-        let schema = json!({"type": "object", "required": ["ok"]});
-        let params = WorkflowParams {
-            shape: Shape::MapReduce,
-            title: "t".into(),
-            items: vec!["a".into(), "b".into(), "c".into()],
-            map_prompt: "handle {item}".into(),
-            map_schema: Some(schema.clone()),
-            reduce_prompt: Some("combine".into()),
-            reduce_schema: Some(schema),
-            find_prompt: None,
-            max_rounds: None,
-        };
-        let out = run(ctx_with(Arc::new(provider)), params).await;
-        assert!(out.error.is_none());
-        assert_eq!(
-            out.output["results"],
-            json!([{"ok": true}, {"ok": true}, {"ok": true}])
-        );
-        assert_eq!(out.output["reduced"], json!({"ok": true}));
+        let provider = Arc::new(TestProvider::new(MockProvider::new(vec![
+            structured_rule("handle a", json!({"item": "a", "score": 7})),
+            structured_rule("handle b", json!({"item": "b", "score": 11})),
+            structured_rule("handle c", json!({"item": "c", "score": 19})),
+            structured_rule("combine", json!({"total": 37})),
+        ])));
+        let mut params = params(Shape::MapReduce);
+        params.map_schema = Some(json!({"type": "object", "required": ["item", "score"]}));
+        params.reduce_schema = Some(json!({"type": "object", "required": ["total"]}));
+        let out = run(ctx_with(provider.clone()), params).await;
+        assert!(out.error.is_none(), "{:?}", out.error);
+        let expected = json!([
+            {"item": "a", "score": 7},
+            {"item": "b", "score": 11},
+            {"item": "c", "score": 19},
+        ]);
+        assert_eq!(out.output["results"], expected);
+        assert_eq!(out.output["reduced"], json!({"total": 37}));
+        let prompts = provider.prompts.lock().unwrap();
+        let reducers: Vec<_> = prompts
+            .iter()
+            .enumerate()
+            .filter(|(_, prompt)| prompt.starts_with("combine"))
+            .collect();
+        assert_eq!(reducers.len(), 1);
+        let (reduce_index, reduce_prompt) = reducers[0];
+        let results = reduce_prompt
+            .strip_prefix("combine\n\nResults:\n")
+            .unwrap()
+            .split("\n\nWhen you have")
+            .next()
+            .unwrap();
+        assert_eq!(serde_json::from_str::<Value>(results).unwrap(), expected);
+        for item in ["a", "b", "c"] {
+            let maps: Vec<_> = prompts
+                .iter()
+                .enumerate()
+                .filter(|(_, prompt)| prompt.starts_with(&format!("handle {item}\n")))
+                .collect();
+            assert_eq!(maps.len(), 1);
+            assert!(maps[0].0 < reduce_index);
+        }
         let outcomes = out.output["outcomes"].as_array().unwrap();
         assert_eq!(outcomes.len(), 3);
-        for (outcome, item) in outcomes.iter().zip(["a", "b", "c"]) {
+        for (index, (outcome, item)) in outcomes.iter().zip(["a", "b", "c"]).enumerate() {
             assert_eq!(outcome["input"], item);
             assert_eq!(outcome["status"], "success");
+            assert_eq!(outcome["output"], expected[index]);
         }
-    }
-
-    #[tokio::test]
-    async fn loop_stops_when_a_round_is_dry() {
-        // Finder always returns an empty array → the first round is dry, loop ends.
-        let provider = MockProvider::new(vec![MockRule {
-            needle: "structured_output".to_string(),
-            reply: MockReply::ToolCall {
-                name: "structured_output".to_string(),
-                input: json!({"findings": []}),
-            },
-        }]);
-        let params = WorkflowParams {
-            shape: Shape::Loop,
-            title: String::new(),
-            items: vec![],
-            map_prompt: String::new(),
-            map_schema: None,
-            reduce_prompt: None,
-            reduce_schema: None,
-            find_prompt: Some("find bugs".into()),
-            max_rounds: Some(5),
-        };
-        let out = run(ctx_with(Arc::new(provider)), params).await;
-        assert!(out.error.is_none());
-        assert_eq!(out.output["rounds"], json!(1));
-        assert_eq!(out.output["findings"], json!([]));
-        assert_eq!(out.output["termination_reason"], "dry");
     }
 
     #[tokio::test]
@@ -515,7 +548,7 @@ mod tests {
             }
             assert_ne!(outcomes[0]["id"], outcomes[1]["id"]);
             assert_ne!(outcomes[1]["id"], outcomes[2]["id"]);
-            assert_eq!(outcomes[0]["label"], label(&long));
+            assert_eq!(outcomes[0]["label"], format!("{}…", "a".repeat(40)));
             assert!(outcomes[1]["error"]
                 .as_str()
                 .unwrap()
@@ -531,19 +564,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn map_outcomes_record_untruncated_input() {
-        let ctx = ctx_with(Arc::new(MockProvider::new(vec![])));
-        let item = format!("{}\nsecond line", "x".repeat(60));
-        let outcomes = map_items(&ctx, std::slice::from_ref(&item), "handle {item}", &None).await;
-        assert_eq!(outcomes.len(), 1);
-        assert!(outcomes[0].is_success());
-        assert_eq!(outcomes[0].input, Some(json!(item)));
-        assert_eq!(outcomes[0].label, label(&item));
-    }
-
-    #[tokio::test]
     async fn reduce_failure_retains_map_results() {
-        let mut provider = TestProvider::new(MockProvider::new(vec![]));
+        let mut provider = TestProvider::new(MockProvider::new(vec![
+            text("handle a"),
+            text("handle b"),
+            text("handle c"),
+        ]));
         provider.fail_on = Some("combine");
         let out = run(ctx_with(Arc::new(provider)), params(Shape::MapReduce)).await;
         assert!(out.error.is_some());
@@ -579,6 +605,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn loop_stops_when_a_round_is_dry() {
+        let provider = MockProvider::new(vec![MockRule {
+            needle: "structured_output".to_string(),
+            reply: MockReply::ToolCall {
+                name: "structured_output".to_string(),
+                input: json!({"findings": []}),
+            },
+        }]);
+        let params = WorkflowParams {
+            shape: Shape::Loop,
+            title: String::new(),
+            items: vec![],
+            map_prompt: String::new(),
+            map_schema: None,
+            reduce_prompt: None,
+            reduce_schema: None,
+            find_prompt: Some("find bugs".into()),
+            max_rounds: Some(5),
+        };
+        let out = run(ctx_with(Arc::new(provider)), params).await;
+        assert!(out.error.is_none());
+        assert_eq!(out.output["rounds"], json!(1));
+        assert_eq!(out.output["findings"], json!([]));
+        assert_eq!(out.output["termination_reason"], "dry");
+    }
+
+    #[tokio::test]
     async fn failed_finder_retains_partial_findings_and_counts_failed_round() {
         let mut provider = TestProvider::new(MockProvider::new(vec![structured_rule(
             "nothing yet",
@@ -601,12 +654,13 @@ mod tests {
         let provider = MockProvider::new(vec![
             structured_rule("nothing yet", json!({"findings": ["first"]})),
             structured_rule("- first", json!({"findings": ["discard this", 42]})),
+            text("You did not record a result."),
         ]);
         let out = run(ctx_with(Arc::new(provider)), params(Shape::Loop)).await;
-        assert!(out.error.as_deref().unwrap().contains("findings[1]"));
+        assert!(out.error.as_deref().unwrap().contains("/findings/1"));
         assert_eq!(out.output["findings"], json!(["first"]));
         assert_eq!(out.output["rounds"], 2);
-        assert_eq!(out.output["termination_reason"], "invalid_output");
+        assert_eq!(out.output["termination_reason"], "failed");
     }
 
     #[test]
@@ -636,6 +690,58 @@ mod tests {
         assert_eq!(out.output["findings"], json!(["first"]));
         assert_eq!(out.output["rounds"], 2);
         assert_eq!(out.output["termination_reason"], "dry");
+    }
+
+    #[tokio::test]
+    async fn loop_accumulates_new_findings_in_discovery_order_and_passes_only_seen_items() {
+        let provider = Arc::new(TestProvider::new(MockProvider::new(vec![
+            structured_rule(
+                "nothing yet",
+                json!({"findings": ["beta", "alpha", "beta"]}),
+            ),
+            structured_rule(
+                "- beta\n- alpha\n- gamma",
+                json!({"findings": ["alpha", "beta"]}),
+            ),
+            structured_rule(
+                "- beta\n- alpha",
+                json!({"findings": ["alpha", "gamma", "gamma"]}),
+            ),
+        ])));
+        let out = run(ctx_with(provider.clone()), params(Shape::Loop)).await;
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert_eq!(
+            out.output,
+            json!({
+                "findings": ["beta", "alpha", "gamma"], "rounds": 3, "termination_reason": "dry"
+            })
+        );
+        let prompts = provider.prompts.lock().unwrap();
+        let finder_prompts: Vec<_> = prompts
+            .iter()
+            .filter(|prompt| prompt.starts_with("find bugs"))
+            .collect();
+        assert_eq!(finder_prompts.len(), 3);
+        assert!(finder_prompts[0].contains("- nothing yet"));
+        assert!(finder_prompts[1].contains("- beta\n- alpha\n\n"));
+        assert!(!finder_prompts[1].contains("gamma"));
+        assert!(finder_prompts[2].contains("- beta\n- alpha\n- gamma\n\n"));
+    }
+
+    #[tokio::test]
+    async fn dry_round_at_the_cap_is_not_reported_as_exhaustion() {
+        let provider = MockProvider::new(vec![structured_rule(
+            "nothing yet",
+            json!({"findings": []}),
+        )]);
+        let mut input = params(Shape::Loop);
+        input.max_rounds = Some(1);
+        let result = run(ctx_with(Arc::new(provider)), input).await;
+        assert!(result.error.is_none());
+        assert_eq!(
+            result.output,
+            json!({"findings": [], "rounds": 1, "termination_reason": "dry"})
+        );
     }
 
     #[tokio::test]

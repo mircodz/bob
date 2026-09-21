@@ -1,13 +1,8 @@
-//! The retained view model. Agent events mutate a list of cells; the draw loop
-//! turns cells into ratatui Lines each frame. This is the TUI's equivalent of
-//! the CLI renderer — a pure subscriber to the event stream.
-
+use super::exploration::is_exploration;
 use bob_core::core::events::AgentEvent;
-use bob_core::core::types::{ContentBlock, Message, Role};
+use bob_core::core::types::{ContentBlock, Message, Role, ToolOutput};
 use serde_json::Value;
 
-/// Current unix time in whole seconds (for workflow-agent timing). Best-effort:
-/// a clock error yields 0, which just means a 0s duration.
 fn unix_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -22,23 +17,29 @@ pub enum ToolStatus {
     Error,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RetryState {
+    Waiting,
+    Recovering,
+    Streaming,
+    Done,
+}
+
 pub enum Cell {
-    /// Something the user typed.
     User(String),
     /// Streamed assistant prose (markdown). `open` while still streaming.
-    Assistant { text: String, open: bool },
-    /// A tool invocation and its (eventual) result.
+    Assistant {
+        text: String,
+        open: bool,
+    },
     Tool {
         id: String,
         name: String,
         input: Value,
         status: ToolStatus,
-        output: Option<String>,
-        /// Whether the user has clicked to expand this cell's output to its full
-        /// text (default false = short preview). Toggled by clicking the cell.
+        output: Option<ToolOutput>,
         expanded: bool,
     },
-    /// A subagent spawn notice, with a running count of tools it has called.
     Subagent {
         agent_id: String,
         task: String,
@@ -46,30 +47,23 @@ pub enum Cell {
         done: bool,
         failed: bool,
     },
-    /// A compaction notice. `done: false` renders as a live "Compacting…"
-    /// indicator; once the summary returns it flips to `done: true` ("Compacted").
     Compaction {
         before: usize,
         after: usize,
         done: bool,
     },
-    /// A generic dim notice (startup notices, errors).
+    Retry {
+        attempt: u32,
+        max_attempts: u32,
+        state: RetryState,
+    },
     Notice(String),
-    /// A proposed plan (from `exit_plan`), rendered as full Markdown in the
-    /// transcript so the user can read and scroll the whole thing before the
-    /// approval modal asks them to accept or refine it.
     Plan(String),
-    /// A system event surfaced inline as a bulleted line (model/mode switches),
-    /// e.g. "• Model changed to gpt-5.5 medium".
     Event(String),
-    /// A message delivered to/from an agent (shown only in the team drawer's
-    /// per-agent threads). `from` is the sender ("root", "user", or an agent name).
-    AgentMsg { from: String, text: String },
-    /// A live workflow run: its phases, each with the agents that ran in it. Built
-    /// from the workflow's own event stream (WorkflowPhase + the run's
-    /// SubagentSpawn/Done) so the run reads as one navigable tree instead of a flat
-    /// list of lines. Clicking an agent row opens that agent's transcript in the
-    /// team drawer.
+    AgentMsg {
+        from: String,
+        text: String,
+    },
     Workflow {
         /// The workflow run id (matches the `parent_id` on its agents' spawns).
         id: String,
@@ -79,33 +73,26 @@ pub enum Cell {
     },
 }
 
-/// One phase of a workflow run and the agents that ran under it.
 #[derive(Clone)]
 pub struct WfPhase {
     pub title: String,
-    /// 0-based phase index and the declared total, for a "2/3" progress readout.
+    /// Zero-based phase index.
     pub index: usize,
     pub total: usize,
     pub agents: Vec<WfAgent>,
 }
 
-/// One agent within a workflow phase — its id (for drill-in), display label, live
-/// status, and per-run metadata (tools, model, tokens, timing) so the workflow
-/// view can show a rich master-detail without re-deriving from the event stream.
 #[derive(Clone)]
 pub struct WfAgent {
     pub agent_id: String,
     pub label: String,
     pub status: WfStatus,
     pub tools: usize,
-    /// Model that answered (from the agent's `Completion` events), if seen yet.
     pub model: Option<String>,
     /// Total input tokens across this agent's completions.
     pub tokens: u64,
-    /// Wall-clock spawn→done in whole seconds, filled when the agent finishes.
     pub duration_secs: Option<u64>,
-    /// Monotonic-ish spawn stamp (unix secs) used to compute `duration_secs`. Not
-    /// rendered directly.
+    /// Unix seconds used to compute `duration_secs`.
     pub started_unix: u64,
 }
 
@@ -137,6 +124,8 @@ impl WfStatus {
 impl Cell {
     pub fn is_visible(&self) -> bool {
         match self {
+            Cell::Assistant { text, .. } => !text.is_empty(),
+            Cell::Retry { state, .. } => *state == RetryState::Waiting,
             Cell::Tool { name, status, .. } => {
                 !matches!(
                     name.as_str(),
@@ -148,10 +137,7 @@ impl Cell {
         }
     }
 
-    /// A content fingerprint used to cache a cell's rendered lines. Two cells
-    /// with the same fingerprint render identically, so the draw loop can reuse
-    /// cached Lines instead of re-running markdown/syntax highlighting every
-    /// frame. Only fields that affect rendering are hashed.
+    /// Hash only fields that affect rendered output.
     pub fn fingerprint(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         if !self.is_visible() {
@@ -171,11 +157,44 @@ impl Cell {
                 ..
             } => {
                 name.hash(&mut h);
-                // Value isn't Hash; its stable string form is good enough.
                 input.to_string().hash(&mut h);
                 (*status as u8).hash(&mut h);
-                if *expanded || !matches!(name.as_str(), "read_file" | "list_dir") {
-                    output.hash(&mut h);
+                if *expanded
+                    || *status == ToolStatus::Error
+                    || !is_exploration(name)
+                    || matches!(output, Some(ToolOutput::Shell(_)))
+                {
+                    output.is_some().hash(&mut h);
+                    if let Some(output) = output {
+                        std::mem::discriminant(output).hash(&mut h);
+                        match output {
+                            ToolOutput::Text(text) => text.hash(&mut h),
+                            ToolOutput::Shell(shell) => {
+                                shell.exit_code.hash(&mut h);
+                                shell.signal.hash(&mut h);
+                                shell.core_dumped.hash(&mut h);
+                                std::mem::discriminant(&shell.outcome).hash(&mut h);
+                                for stream in [&shell.stdout, &shell.stderr] {
+                                    stream.text.hash(&mut h);
+                                    stream.total_bytes.hash(&mut h);
+                                    stream.truncated.hash(&mut h);
+                                    stream.output_id.hash(&mut h);
+                                }
+                                shell
+                                    .page
+                                    .as_ref()
+                                    .map(|page| {
+                                        (
+                                            &page.job_id,
+                                            page.offset,
+                                            page.next_offset,
+                                            page.retained_bytes,
+                                        )
+                                    })
+                                    .hash(&mut h);
+                            }
+                        }
+                    }
                 }
                 expanded.hash(&mut h);
             }
@@ -194,6 +213,14 @@ impl Cell {
                 before.hash(&mut h);
                 after.hash(&mut h);
                 done.hash(&mut h);
+            }
+            Cell::Retry {
+                attempt,
+                max_attempts,
+                ..
+            } => {
+                attempt.hash(&mut h);
+                max_attempts.hash(&mut h);
             }
             Cell::Notice(t) | Cell::Event(t) | Cell::Plan(t) => t.hash(&mut h),
             Cell::AgentMsg { from, text } => {
@@ -225,24 +252,18 @@ impl Cell {
         h.finish()
     }
 
-    /// For a `Cell::Workflow`, map a rendered-line `offset` (0 = the cell's first
-    /// line) to the agent id on that row, if the row is an agent row. Mirrors the
-    /// line emission order in `render::render_workflow` for the RUNNING (expanded)
-    /// layout: line 0 is the header, then per phase one branch line followed by one
-    /// line per agent. Returns None for the header/phase/blank rows, for a collapsed
-    /// (done) run, or for any non-workflow cell.
+    /// Logical row offsets must match `render::render_workflow`; completed runs have no agent rows.
     pub fn workflow_agent_at(&self, offset: usize) -> Option<&str> {
         let Cell::Workflow { phases, done, .. } = self else {
             return None;
         };
         if *done {
-            return None; // collapsed to a single summary line
+            return None;
         }
-        // Row 0 = header. Walk phases accumulating rows.
         let mut row = 1usize;
         for phase in phases {
             if offset == row {
-                return None; // the phase branch line
+                return None;
             }
             row += 1;
             for agent in &phase.agents {
@@ -256,10 +277,12 @@ impl Cell {
     }
 }
 
-/// The index of a currently-open (streaming) assistant cell at the tail of
-/// `cells`, if any. Shared by the main ViewModel and per-agent threads.
 fn open_assistant_in(cells: &mut [Cell]) -> Option<&mut Cell> {
-    match cells.last_mut() {
+    match cells
+        .iter_mut()
+        .rev()
+        .find(|cell| !matches!(cell, Cell::Retry { .. }))
+    {
         Some(c @ Cell::Assistant { .. }) => match c {
             Cell::Assistant { open, .. } if *open => Some(c),
             _ => None,
@@ -268,7 +291,6 @@ fn open_assistant_in(cells: &mut [Cell]) -> Option<&mut Cell> {
     }
 }
 
-/// The most recent Tool cell with the given tool_use_id, if any.
 fn find_tool_in<'a>(cells: &'a mut [Cell], id: &str) -> Option<&'a mut Cell> {
     cells
         .iter_mut()
@@ -276,17 +298,70 @@ fn find_tool_in<'a>(cells: &'a mut [Cell], id: &str) -> Option<&'a mut Cell> {
         .find(|c| matches!(c, Cell::Tool { id: tid, .. } if tid == id))
 }
 
-/// Apply one agent event to a bare list of content cells — the reduction shared
-/// by the main transcript and each per-agent thread. Handles the *content*
-/// events (text, tool call/result, compaction, error, inter-agent messages);
-/// callers layer their own handling for spawn cells / busy state on top.
-///
-/// `include_messages` controls whether `AgentMessage` events append an `AgentMsg`
-/// cell: true for per-agent threads (where the conversation should show), false
-/// for the main transcript (which keeps coordination chatter internal).
+fn retry_draft_in(cells: &mut [Cell]) -> Option<&mut Cell> {
+    let cell = cells
+        .iter_mut()
+        .rev()
+        .find(|cell| matches!(cell, Cell::Assistant { .. } | Cell::Tool { .. }))?;
+    matches!(cell, Cell::Assistant { open: true, .. }).then_some(cell)
+}
+
+fn pending_retry_in(cells: &mut [Cell]) -> Option<&mut Cell> {
+    for cell in cells.iter_mut().rev() {
+        match cell {
+            Cell::Retry { state, .. } => {
+                return (*state != RetryState::Done).then_some(cell);
+            }
+            Cell::Assistant { open: false, .. } | Cell::Tool { .. } => {
+                return None;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+pub fn finish_retries(cells: &mut [Cell]) -> bool {
+    let mut finished = false;
+    for cell in cells {
+        if let Cell::Retry { state, .. } = cell {
+            finished |= *state != RetryState::Done;
+            *state = RetryState::Done;
+        }
+    }
+    finished
+}
+
+/// Shared content reducer. Include coordination messages only in per-agent threads.
 pub fn apply_content_event(cells: &mut Vec<Cell>, event: &AgentEvent, include_messages: bool) {
+    if matches!(
+        event,
+        AgentEvent::TurnStart { .. }
+            | AgentEvent::TurnEnd { .. }
+            | AgentEvent::ToolCall { .. }
+            | AgentEvent::Error { .. }
+    ) {
+        let retried = finish_retries(cells);
+        if retried && matches!(event, AgentEvent::Error { .. } | AgentEvent::TurnEnd { .. }) {
+            if let Some(Cell::Assistant { text, .. }) = retry_draft_in(cells) {
+                text.clear();
+            }
+        }
+    }
     match event {
         AgentEvent::TextDelta { text, .. } => {
+            let mut replacing_draft = false;
+            if let Some(Cell::Retry { state, .. }) = pending_retry_in(cells) {
+                if matches!(*state, RetryState::Waiting | RetryState::Recovering) {
+                    *state = RetryState::Streaming;
+                    replacing_draft = true;
+                }
+            }
+            if replacing_draft {
+                if let Some(Cell::Assistant { text, .. }) = retry_draft_in(cells) {
+                    text.clear();
+                }
+            }
             if let Some(Cell::Assistant { text: buf, .. }) = open_assistant_in(cells) {
                 buf.push_str(text);
             } else {
@@ -296,7 +371,35 @@ pub fn apply_content_event(cells: &mut Vec<Cell>, event: &AgentEvent, include_me
                 });
             }
         }
-        AgentEvent::Message { .. } => {
+        AgentEvent::Message { message, .. } => {
+            let retried = finish_retries(cells);
+            let draft = if retried {
+                retry_draft_in(cells)
+            } else {
+                open_assistant_in(cells)
+            };
+            if let Some(Cell::Assistant { text, open }) = draft {
+                if retried {
+                    *text = message.text();
+                }
+                *open = false;
+            } else if retried && !message.text().is_empty() {
+                cells.push(Cell::Assistant {
+                    text: message.text(),
+                    open: false,
+                });
+            }
+        }
+        AgentEvent::Completion { .. } => {
+            for cell in cells.iter_mut() {
+                if let Cell::Retry { state, .. } = cell {
+                    if *state == RetryState::Waiting {
+                        *state = RetryState::Streaming;
+                    }
+                }
+            }
+        }
+        AgentEvent::TurnEnd { .. } => {
             if let Some(Cell::Assistant { open, .. }) = open_assistant_in(cells) {
                 *open = false;
             }
@@ -342,22 +445,34 @@ pub fn apply_content_event(cells: &mut Vec<Cell>, event: &AgentEvent, include_me
             after_tokens,
             ..
         } => {
-            cells.push(Cell::Compaction {
+            if let Some(Cell::Retry { state, .. }) = pending_retry_in(cells) {
+                *state = RetryState::Recovering;
+            }
+            let compacted = Cell::Compaction {
                 before: *before_tokens,
                 after: *after_tokens,
                 done: true,
-            });
+            };
+            if let Some(pending) = cells
+                .iter_mut()
+                .rev()
+                .find(|cell| matches!(cell, Cell::Compaction { done: false, .. }))
+            {
+                *pending = compacted;
+            } else {
+                cells.push(compacted);
+            }
         }
         AgentEvent::ContextWarning {
             used_tokens,
             context_window,
-            pct,
             ..
         } => {
+            let pct = used_tokens.saturating_mul(100) / (*context_window).max(1);
             let window_k = (*context_window as f64 / 1000.0).round() as usize;
             let used_k = (*used_tokens as f64 / 1000.0).round() as usize;
             cells.push(Cell::Notice(format!(
-                "context {}% full (~{}k/{}k) — will auto-compact soon; /compact to summarize now",
+                "context ~{}% full (~{}k/{}k) — auto-compaction enabled; /compact to summarize now",
                 pct, used_k, window_k
             )));
         }
@@ -366,10 +481,18 @@ pub fn apply_content_event(cells: &mut Vec<Cell>, event: &AgentEvent, include_me
             max_attempts,
             ..
         } => {
-            cells.push(Cell::Notice(format!(
-                "connection hiccup — retrying ({}/{})…",
-                attempt, max_attempts
-            )));
+            let retry = Cell::Retry {
+                attempt: *attempt,
+                max_attempts: *max_attempts,
+                state: RetryState::Waiting,
+            };
+            if let Some(current) = cells.iter_mut().rev().find(
+                |cell| matches!(cell, Cell::Retry { state, .. } if *state != RetryState::Done),
+            ) {
+                *current = retry;
+            } else {
+                cells.push(retry);
+            }
         }
         AgentEvent::Error { message, .. } => {
             cells.push(Cell::Notice(format!("error: {}", message)));
@@ -387,16 +510,9 @@ pub fn apply_content_event(cells: &mut Vec<Cell>, event: &AgentEvent, include_me
 #[derive(Default)]
 pub struct ViewModel {
     pub cells: Vec<Cell>,
-    /// Whether the agent is currently working (drives the spinner + input lock).
     pub busy: bool,
-    /// Monotonic counter bumped whenever `cells` changes. The renderer compares it
-    /// to decide whether to rebuild its flattened line cache — a pure scroll (which
-    /// never mutates the view) leaves it untouched, so scrolling does no rebuild
-    /// work regardless of transcript length.
+    /// Bump on cell changes to invalidate cached rendering, not on scrolling.
     pub revision: u64,
-    /// The workflow-run id currently receiving events, so its phase/agent events
-    /// land in the right `Cell::Workflow` instead of flat lines. Set on the first
-    /// `WorkflowPhase`/`SubagentSpawn` of a run; cleared when the run ends.
     active_workflow: Option<String>,
 }
 
@@ -410,22 +526,19 @@ impl ViewModel {
         self.revision += 1;
     }
 
-    /// Settle transient state after replaying a session's event log on resume.
-    /// Replay reruns the live reducers, but a session killed mid-run may have a
-    /// `SubagentSpawn`/`ToolCall`/`WorkflowPhase` with no matching terminating event
-    /// in the log — leaving cells stuck rendering as "running" forever. A resumed
-    /// session is idle: clear `busy` and finalize every straggler to a terminal state
-    /// (interrupted work reads as finished, not failed).
+    /// Finalize work whose terminating event is missing from the replay log.
+    /// Interrupted work resumes as finished, not failed.
     pub fn reset_after_replay(&mut self) {
         self.busy = false;
         self.active_workflow = None;
+        finish_retries(&mut self.cells);
         for cell in &mut self.cells {
             match cell {
                 Cell::Subagent { done, .. } => *done = true,
                 Cell::Tool { status, output, .. } if *status == ToolStatus::Running => {
                     *status = ToolStatus::Ok;
                     if output.is_none() {
-                        *output = Some("(interrupted)".to_string());
+                        *output = Some("(interrupted)".into());
                     }
                 }
                 Cell::Workflow { done, phases, .. } => {
@@ -449,15 +562,11 @@ impl ViewModel {
         self.revision += 1;
     }
 
-    /// Push a proposed plan (rendered as full Markdown) into the transcript.
     pub fn push_plan(&mut self, plan: String) {
         self.cells.push(Cell::Plan(plan));
         self.revision += 1;
     }
 
-    /// Push a live "Compacting…" indicator and return its cell index, so the
-    /// caller can flip it to "Compacted" via `finish_compaction` when the
-    /// summarization network call returns.
     pub fn begin_compaction(&mut self) -> usize {
         self.cells.push(Cell::Compaction {
             before: 0,
@@ -468,38 +577,36 @@ impl ViewModel {
         self.cells.len() - 1
     }
 
-    /// Flip the live compaction cell at `idx` to its finished state, recording the
-    /// before/after token estimate. If nothing was compacted, drop the indicator.
-    pub fn finish_compaction(&mut self, idx: usize, before: usize, after: usize, did: bool) {
+    /// Successful compaction is finalized by its persisted event, regardless of
+    /// whether that event or the background outcome arrives first.
+    pub fn finish_compaction(&mut self, idx: usize, result: Result<(bool, usize, usize), String>) {
+        if !matches!(&result, Ok((true, _, _))) {
+            finish_retries(&mut self.cells);
+        }
         if let Some(cell) = self.cells.get_mut(idx) {
-            if did {
-                *cell = Cell::Compaction {
-                    before,
-                    after,
-                    done: true,
-                };
-            } else {
-                *cell = Cell::Notice("nothing to compact yet.".into());
+            match result {
+                Ok((true, _, _)) => return,
+                Ok((false, _, _)) => {
+                    *cell = Cell::Notice("nothing to compact yet.".into());
+                }
+                Err(error) => {
+                    *cell = Cell::Notice(format!("error: {error}"));
+                }
             }
         }
         self.revision += 1;
     }
 
-    /// Push an inline system-event line (model/mode switch), rendered with a
-    /// bullet like a tool cell.
     pub fn push_event(&mut self, text: String) {
         self.cells.push(Cell::Event(text));
         self.revision += 1;
     }
 
-    /// Clear the whole transcript (the `/clear` command).
     pub fn clear(&mut self) {
         self.cells.clear();
         self.revision += 1;
     }
 
-    /// Find a workflow run's cell by id (for the full-screen view). Returns the
-    /// (title, phases, done) so the view can render + navigate it.
     pub fn workflow_by_id(&self, id: &str) -> Option<(&str, &[WfPhase], bool)> {
         self.cells.iter().find_map(|c| match c {
             Cell::Workflow {
@@ -512,10 +619,7 @@ impl ViewModel {
         })
     }
 
-    /// Extract the finished workflow trees for session persistence, in transcript
-    /// order (matches the order of their `[workflow result]` hand-off messages, so
-    /// hydrate can pair them up by position). Only `done` runs are persisted — a
-    /// run still in flight isn't saved (it'll re-run or be abandoned).
+    /// Persist completed trees in transcript order; hydration pairs them with hand-offs by position.
     pub fn to_persisted_workflows(&self) -> Vec<bob_core::core::session::PersistedWorkflow> {
         self.cells
             .iter()
@@ -555,10 +659,7 @@ impl ViewModel {
             .collect()
     }
 
-    /// Toggle a tool cell's expanded/collapsed output at `idx`. Returns true if a
-    /// tool cell was actually toggled. Going through this method (rather than poking
-    /// `cells` directly) guarantees the render-cache revision is bumped, so the
-    /// "forgot to bump → stale render" bug can't happen.
+    /// Toggle output expansion and invalidate the render cache.
     pub fn toggle_tool_expanded(&mut self, idx: usize) -> bool {
         if let Some(Cell::Tool { expanded, .. }) = self.cells.get_mut(idx) {
             *expanded = !*expanded;
@@ -569,10 +670,7 @@ impl ViewModel {
         }
     }
 
-    /// Rebuild the scrollback from a stored message history (on `--resume`).
-    /// Tool results are matched back to their tool_use cell by id. `workflows` are
-    /// the persisted workflow trees, re-inserted in order at each `[workflow result]`
-    /// hand-off message so a resumed session shows past runs' trees.
+    /// Match tool results by id and restore workflow trees in hand-off order.
     pub fn hydrate(
         &mut self,
         messages: &[Message],
@@ -582,7 +680,6 @@ impl ViewModel {
         for m in messages {
             match m.role {
                 Role::User => {
-                    // Skip synthetic compaction-summary messages.
                     let text = m.text();
                     if text.starts_with("[conversation summary]") {
                         self.cells.push(Cell::Compaction {
@@ -592,22 +689,15 @@ impl ViewModel {
                         });
                         continue;
                     }
-                    // Skip inter-agent coordination messages folded into history
-                    // — they're internal, not user turns. (Shared marker so this
-                    // can't drift from the injector; see agent::team.)
                     if bob_core::agent::team::is_coord_message(&text) {
                         continue;
                     }
-                    // A workflow hand-off message: don't render the literal prompt;
-                    // instead re-insert the persisted workflow tree that preceded it.
                     if bob_core::workflow::is_handoff(&text) {
                         if let Some(pw) = wf_iter.next() {
                             self.cells.push(persisted_workflow_to_cell(pw));
                         }
                         continue;
                     }
-                    // A user turn may carry tool_results (role=tool is stored as
-                    // its own message, but be defensive).
                     for b in &m.content {
                         if let ContentBlock::Text { text } = b {
                             if !text.is_empty() {
@@ -626,10 +716,6 @@ impl ViewModel {
                                 });
                             }
                             ContentBlock::ToolUse { id, name, input } => {
-                                // A `workflow` tool call's visible artifact is the
-                                // live tree cell, not a tool line — so on resume,
-                                // re-insert the persisted tree here (paired in order),
-                                // exactly as the live path renders it.
                                 if name == "workflow" {
                                     if let Some(pw) = wf_iter.next() {
                                         self.cells.push(persisted_workflow_to_cell(pw));
@@ -644,10 +730,7 @@ impl ViewModel {
                                     output: None,
                                     expanded: false,
                                 });
-                                // Subagent tree cells come from live SubagentSpawn
-                                // *events*, which aren't in the message history. On
-                                // resume, reconstruct them from the tool's input so
-                                // spawned agents still show after a reload.
+                                // Message history lacks spawn events; reconstruct notices from tool input.
                                 self.hydrate_subagents(name, input);
                             }
                             _ => {}
@@ -681,9 +764,7 @@ impl ViewModel {
         self.revision += 1;
     }
 
-    /// Reconstruct Subagent tree cells from a persisted `task`/`spawn_agent` tool
-    /// call, so spawned agents still appear after a session is resumed. They're
-    /// marked done (the work is in the past) with an unknown tool count.
+    /// Reconstructed agents are finished, with unknown tool counts.
     fn hydrate_subagents(&mut self, name: &str, input: &Value) {
         let push = |cells: &mut Vec<Cell>, task: &str| {
             cells.push(Cell::Subagent {
@@ -725,8 +806,6 @@ impl ViewModel {
             .find(|c| matches!(c, Cell::Subagent { agent_id, .. } if agent_id == id))
     }
 
-    /// The `WfAgent` with the given id inside any live workflow cell, if present.
-    /// Workflow agents are keyed by their full id (e.g. "wf-demo.1-gather-1").
     fn find_wf_agent(&mut self, id: &str) -> Option<&mut WfAgent> {
         self.cells.iter_mut().rev().find_map(|c| match c {
             Cell::Workflow { phases, .. } => phases
@@ -737,7 +816,6 @@ impl ViewModel {
         })
     }
 
-    /// The `Cell::Workflow` for the given run id, if present.
     fn find_workflow(&mut self, id: &str) -> Option<&mut Cell> {
         self.cells
             .iter_mut()
@@ -745,8 +823,6 @@ impl ViewModel {
             .find(|c| matches!(c, Cell::Workflow { id: wid, .. } if wid == id))
     }
 
-    /// Whether `parent_id` names a live workflow run (its spawns group into the
-    /// tree). True for the active run or any existing workflow cell.
     fn is_workflow_parent(&self, parent_id: &str) -> bool {
         self.active_workflow.as_deref() == Some(parent_id)
             || parent_id.starts_with("wf-")
@@ -756,16 +832,9 @@ impl ViewModel {
                 .any(|c| matches!(c, Cell::Workflow { id, .. } if id == parent_id))
     }
 
-    /// Apply one agent event to the model.
     pub fn apply(&mut self, event: &AgentEvent) {
-        // Any applied event may mutate cells (append, or update a tool/subagent
-        // cell in place). Bump the revision so the renderer rebuilds its line cache;
-        // this is per-EVENT, not per-frame, so scrolling stays free.
         self.revision += 1;
-        // Events from spawned subagents (agent_id like "task_1") only update the
-        // count/done state of their Subagent cell — their inner chatter is never
-        // rendered as its own cells. A workflow agent (id "wf-…") updates its row in
-        // the workflow tree instead.
+        // Subagent content belongs in its own thread; only metadata updates the root view.
         if let Some(id) = subagent_id(event) {
             match event {
                 AgentEvent::ToolCall { .. } => {
@@ -777,9 +846,7 @@ impl ViewModel {
                 }
                 AgentEvent::TurnEnd { .. } => {
                     if let Some(a) = self.find_wf_agent(id) {
-                        // A workflow agent's completion is authoritatively marked by
-                        // SubagentDone (which carries failed); TurnEnd only nudges a
-                        // still-Running row toward done as a fallback.
+                        // SubagentDone owns failure status; TurnEnd only settles running rows.
                         if a.status == WfStatus::Running {
                             a.status = WfStatus::Done;
                         }
@@ -788,8 +855,6 @@ impl ViewModel {
                     }
                 }
                 AgentEvent::Completion { model, usage, .. } => {
-                    // Capture the agent's model + accumulate its input tokens for the
-                    // workflow view's per-agent metadata.
                     if let Some(a) = self.find_wf_agent(id) {
                         a.model = Some(model.clone());
                         a.tokens += usage.total_input();
@@ -805,10 +870,9 @@ impl ViewModel {
                 self.push_user(text.clone());
             }
             AgentEvent::TurnStart { .. } => {
+                apply_content_event(&mut self.cells, event, false);
                 self.busy = true;
-                // A root TurnStart while a workflow is active is the hand-off turn
-                // that runs AFTER the workflow finished — so mark the run done and
-                // stop routing further events into its tree.
+                // The root hand-off turn begins after the workflow finishes.
                 if let Some(id) = self.active_workflow.take() {
                     if let Some(Cell::Workflow { done, .. }) = self.find_workflow(&id) {
                         *done = true;
@@ -822,8 +886,6 @@ impl ViewModel {
                 ..
             } => {
                 if self.is_workflow_parent(parent_id) {
-                    // Attach the agent to the current phase of its workflow's tree
-                    // rather than pushing a standalone Subagent cell.
                     self.active_workflow = Some(parent_id.clone());
                     if let Some(Cell::Workflow { phases, .. }) = self.find_workflow(parent_id) {
                         let agent = WfAgent {
@@ -836,8 +898,6 @@ impl ViewModel {
                             duration_secs: None,
                             started_unix: unix_secs(),
                         };
-                        // Land it in the last (current) phase; if a run somehow
-                        // spawned before any phase, create an implicit one.
                         if let Some(last) = phases.last_mut() {
                             last.agents.push(agent);
                         } else {
@@ -878,30 +938,17 @@ impl ViewModel {
                 }
             }
             AgentEvent::TurnEnd { .. } => {
-                if let Some(Cell::Assistant { open, .. }) = open_assistant_in(&mut self.cells) {
-                    *open = false;
-                }
-                // Per-turn token counts are intentionally not rendered as a cell —
-                // they're noise in the transcript. Session + all-time totals live
-                // in the status bar and the /usage command.
+                apply_content_event(&mut self.cells, event, false);
                 self.busy = false;
             }
             AgentEvent::Error { .. } => {
                 apply_content_event(&mut self.cells, event, false);
                 self.busy = false;
             }
-            // Usage accounting is handled by the run-loop, not the view.
-            AgentEvent::Completion { .. } => {}
-            // Inter-agent coordination chatter is internal. In the MAIN transcript
-            // we only surface when the root agent SENDS a message to a subagent, as
-            // a simple one-liner — we don't care about the precise content (it's the
-            // agent's own output) or messages between subagents.
-            AgentEvent::AgentMessage { to, from, .. } if from == "root" => {
-                self.cells
-                    .push(Cell::Event(format!("Sent a message to {}", to)));
+            AgentEvent::UserMessageQueued { to, text } if to == "root" => {
+                self.cells.push(Cell::User(text.clone()));
             }
-            // A workflow phase boundary: ensure the run's Cell::Workflow exists and
-            // append this phase to its tree. Subsequent spawns attach to it.
+            AgentEvent::ContextReset { agent_id, .. } if agent_id == "root" => self.clear(),
             AgentEvent::WorkflowPhase {
                 workflow_id,
                 title,
@@ -910,7 +957,6 @@ impl ViewModel {
             } => {
                 self.active_workflow = Some(workflow_id.clone());
                 if self.find_workflow(workflow_id).is_none() {
-                    // Derive a display title from the id ("wf-demo" → "demo").
                     let display = workflow_id
                         .strip_prefix("wf-")
                         .unwrap_or(workflow_id)
@@ -931,13 +977,10 @@ impl ViewModel {
                     });
                 }
             }
-            // A freeform workflow log line stays a simple event line.
             AgentEvent::WorkflowLog { message, .. } => {
                 self.cells.push(Cell::Event(message.clone()));
             }
-            // A root ToolResult while a workflow is active is the `workflow` tool
-            // returning (it runs synchronously in the turn) — mark the run done so
-            // its tree collapses/finalizes without waiting for the next turn.
+            // The synchronous workflow tool returns before the next root turn starts.
             AgentEvent::ToolResult { .. } => {
                 if let Some(id) = self.active_workflow.take() {
                     if let Some(Cell::Workflow { done, .. }) = self.find_workflow(&id) {
@@ -946,14 +989,11 @@ impl ViewModel {
                 }
                 apply_content_event(&mut self.cells, event, false);
             }
-            // All other content events reduce via the shared helper (messages off).
             _ => apply_content_event(&mut self.cells, event, false),
         }
     }
 }
 
-/// Rebuild a `Cell::Workflow` from its persisted form (always `done`, since only
-/// finished runs are persisted).
 fn persisted_workflow_to_cell(pw: &bob_core::core::session::PersistedWorkflow) -> Cell {
     Cell::Workflow {
         id: pw.id.clone(),
@@ -985,10 +1025,6 @@ fn persisted_workflow_to_cell(pw: &bob_core::core::session::PersistedWorkflow) -
     }
 }
 
-/// If an event comes from any spawned agent (agent_id other than "root"), return
-/// that id; otherwise None (it's the root agent's own event). This covers both
-/// `task_*` subagents and named coordinated agents — none of their inner activity
-/// belongs in the main transcript.
 fn subagent_id(event: &AgentEvent) -> Option<&str> {
     let id = match event {
         AgentEvent::TurnStart { agent_id }
@@ -1008,7 +1044,10 @@ fn subagent_id(event: &AgentEvent) -> Option<&str> {
         AgentEvent::WorkflowPhase { .. } => return None,
         AgentEvent::WorkflowLog { .. } => return None,
         AgentEvent::AgentMessage { .. } => return None,
-        AgentEvent::Unknown => return None,
+        AgentEvent::Unknown
+        | AgentEvent::UserMessageQueued { .. }
+        | AgentEvent::ContextReset { .. }
+        | AgentEvent::ContextArchive { .. } => return None,
     };
     if id != "root" {
         Some(id)
@@ -1018,441 +1057,1120 @@ fn subagent_id(event: &AgentEvent) -> Option<&str> {
 }
 
 #[cfg(test)]
-mod fingerprint_tests {
+mod tests {
     use super::*;
-    use serde_json::json;
-
-    fn tool(name: &str, status: ToolStatus) -> Cell {
-        Cell::Tool {
-            id: "tool".into(),
-            name: name.into(),
-            input: json!({"path": "file.rs"}),
-            status,
-            output: None,
-            expanded: false,
-        }
-    }
 
     #[test]
-    fn visibility_and_fingerprints_ignore_hidden_payloads() {
-        for name in [
-            "job_status",
-            "job_output",
-            "todo_write",
-            "workflow",
-            "task",
-            "explore",
-            "spawn_agent",
+    fn content_reducer_closes_streams_and_matches_the_latest_tool_id() {
+        let mut cells = Vec::new();
+        let delta = |text: &str| AgentEvent::TextDelta {
+            agent_id: "root".into(),
+            text: text.into(),
+        };
+        let call = || AgentEvent::ToolCall {
+            agent_id: "root".into(),
+            tool_use_id: "same".into(),
+            name: "bash".into(),
+            input: serde_json::json!({"command": "run"}),
+        };
+        let result = |id: &str, text: &str, is_error| AgentEvent::ToolResult {
+            agent_id: "root".into(),
+            tool_use_id: id.into(),
+            output: text.into(),
+            is_error,
+        };
+        for event in [
+            delta("前"),
+            delta("e\u{301}"),
+            call(),
+            result("same", "first", false),
+            delta("after tool"),
+            call(),
+            result("missing", "orphan", true),
+            result("same", "second", true),
         ] {
-            for status in [ToolStatus::Running, ToolStatus::Ok, ToolStatus::Error] {
-                let mut cell = tool(name, status);
-                let visible = matches!(name, "task" | "explore" | "spawn_agent")
-                    && status == ToolStatus::Error;
-                assert_eq!(cell.is_visible(), visible);
-                let before = cell.fingerprint();
-                if let Cell::Tool {
-                    input,
-                    output,
-                    expanded,
-                    ..
-                } = &mut cell
-                {
-                    *input = json!({"large": "hidden input".repeat(1000)});
-                    *output = Some("hidden output".repeat(1000));
-                    *expanded = true;
+            apply_content_event(&mut cells, &event, false);
+        }
+        assert_eq!(cells.len(), 4);
+        assert!(matches!(&cells[0], Cell::Assistant { text, open: false } if text == "前e\u{301}"));
+        assert!(
+            matches!(&cells[1], Cell::Tool { status: ToolStatus::Ok, output: Some(text), expanded: false, .. } if text.as_text() == Some("first"))
+        );
+        assert!(matches!(&cells[2], Cell::Assistant { text, open: false } if text == "after tool"));
+        assert!(
+            matches!(&cells[3], Cell::Tool { status: ToolStatus::Error, output: Some(text), expanded: false, .. } if text.as_text() == Some("second"))
+        );
+
+        apply_content_event(&mut cells, &delta("new message"), false);
+        apply_content_event(
+            &mut cells,
+            &AgentEvent::Message {
+                agent_id: "root".into(),
+                message: Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: "new message".into(),
+                    }],
+                },
+            },
+            false,
+        );
+        apply_content_event(&mut cells, &delta("next"), false);
+        assert_eq!(cells.len(), 6);
+        assert!(
+            matches!(&cells[4], Cell::Assistant { text, open: false } if text == "new message")
+        );
+        assert!(matches!(&cells[5], Cell::Assistant { text, open: true } if text == "next"));
+    }
+
+    #[test]
+    fn retries_replace_drafts_but_preserve_authoritative_cancelled_or_failed_partials() {
+        use super::super::team::AgentTranscripts;
+        use bob_core::core::types::Usage;
+
+        for (replacement, final_text, failed, compacted) in [
+            (Some("complete "), Some("complete answer"), false, false),
+            (None, Some("partial answer"), false, false),
+            (None, Some("partial answer"), true, false),
+            (Some("latest partial"), Some("latest partial"), true, false),
+            (None, None, true, false),
+            (Some("complete "), Some("complete answer"), false, true),
+            (None, Some("partial answer"), true, true),
+        ] {
+            let mut events = Vec::new();
+            for agent_id in ["root", "worker"] {
+                events.extend([
+                    AgentEvent::TextDelta {
+                        agent_id: agent_id.into(),
+                        text: "partial answer".into(),
+                    },
+                    AgentEvent::StreamRetry {
+                        agent_id: agent_id.into(),
+                        attempt: 1,
+                        max_attempts: 10,
+                    },
+                ]);
+                if agent_id == "worker" {
+                    events.push(AgentEvent::UserMessageQueued {
+                        to: agent_id.into(),
+                        text: "keep checking".into(),
+                    });
                 }
-                if visible {
-                    assert_ne!(cell.fingerprint(), before);
-                } else {
-                    assert_eq!(cell.fingerprint(), before);
-                    assert_eq!(before, 0);
+                if compacted {
+                    events.push(AgentEvent::Compaction {
+                        agent_id: agent_id.into(),
+                        before_tokens: 100,
+                        after_tokens: 20,
+                        summary: "Recovered context".into(),
+                        replaced_upto: 1,
+                    });
+                }
+                if let Some(text) = replacement {
+                    events.push(AgentEvent::TextDelta {
+                        agent_id: agent_id.into(),
+                        text: text.into(),
+                    });
+                }
+                if let Some(text) = final_text {
+                    events.push(AgentEvent::Message {
+                        agent_id: agent_id.into(),
+                        message: Message {
+                            role: Role::Assistant,
+                            content: vec![ContentBlock::Text { text: text.into() }],
+                        },
+                    });
+                }
+                if failed {
+                    events.push(AgentEvent::Error {
+                        agent_id: agent_id.into(),
+                        message: "connection failed".into(),
+                    });
+                }
+                events.push(AgentEvent::TurnEnd {
+                    agent_id: agent_id.into(),
+                    usage: Usage::default(),
+                });
+            }
+            let events: Vec<AgentEvent> =
+                serde_json::from_str(&serde_json::to_string(&events).unwrap()).unwrap();
+            let mut root = ViewModel::new();
+            let mut teams = AgentTranscripts::new();
+            for event in &events {
+                root.apply(event);
+                teams.apply(event, None);
+                if let AgentEvent::TextDelta { agent_id, text } = event {
+                    if replacement == Some(text.as_str()) {
+                        let cells = if agent_id == "root" {
+                            &root.cells
+                        } else {
+                            &teams.get(agent_id).unwrap().cells
+                        };
+                        assert!(cells.iter().any(|cell| {
+                            matches!(cell, Cell::Assistant { text: draft, open: true } if draft == text)
+                        }));
+                    }
                 }
             }
+            let replayed = AgentTranscripts::replay(&events);
+            for cells in [
+                &root.cells,
+                &teams.get("worker").unwrap().cells,
+                &replayed.get("worker").unwrap().cells,
+            ] {
+                assert!(cells.iter().all(|cell| {
+                    !matches!(cell, Cell::Retry { state, .. } if *state != RetryState::Done)
+                }));
+                let text: Vec<_> = cells
+                    .iter()
+                    .filter(|cell| cell.is_visible())
+                    .filter_map(|cell| match cell {
+                        Cell::Assistant { text, open } => {
+                            assert!(!open);
+                            Some(text.as_str())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(text, final_text.into_iter().collect::<Vec<_>>());
+            }
         }
     }
 
     #[test]
-    fn collapsed_read_and_list_fingerprints_ignore_output_only() {
-        for name in ["read_file", "list_dir"] {
-            let mut cell = tool(name, ToolStatus::Ok);
-            assert!(cell.is_visible());
-            let before = cell.fingerprint();
-            if let Cell::Tool { output, .. } = &mut cell {
-                *output = Some("huge output".repeat(1000));
-            }
-            assert_eq!(cell.fingerprint(), before);
-            if let Cell::Tool { input, .. } = &mut cell {
-                *input = json!({"path": "other.rs"});
-            }
-            assert_ne!(cell.fingerprint(), before);
-            let before = cell.fingerprint();
-            if let Cell::Tool { status, .. } = &mut cell {
-                *status = ToolStatus::Error;
-            }
-            assert_ne!(cell.fingerprint(), before);
-            let before = cell.fingerprint();
-            if let Cell::Tool { expanded, .. } = &mut cell {
-                *expanded = true;
-            }
-            assert_ne!(cell.fingerprint(), before);
-            let before = cell.fingerprint();
-            if let Cell::Tool { output, .. } = &mut cell {
-                *output = Some("visible changed output".into());
-            }
-            assert_ne!(cell.fingerprint(), before);
-        }
-        let mut cell = tool("bash", ToolStatus::Ok);
-        let before = cell.fingerprint();
-        if let Cell::Tool { output, .. } = &mut cell {
-            *output = Some("visible preview".into());
-        }
-        assert_ne!(cell.fingerprint(), before);
-    }
+    fn retry_lifecycle_is_routed_and_interrupted_replay_is_not_live() {
+        use super::super::team::AgentTranscripts;
+        use bob_core::core::types::Usage;
 
-    #[test]
-    fn static_launch_notice_fingerprints_ignore_lifecycle() {
-        let mut cell = Cell::Subagent {
-            agent_id: "agent".into(),
-            task: "Review parser".into(),
-            tools: 0,
-            done: false,
-            failed: false,
+        let retry = |id: &str| AgentEvent::StreamRetry {
+            agent_id: id.into(),
+            attempt: 3,
+            max_attempts: 10,
         };
-        let before = cell.fingerprint();
-        if let Cell::Subagent {
-            agent_id,
-            tools,
-            done,
-            failed,
-            ..
-        } = &mut cell
-        {
-            *agent_id = "other".into();
-            *tools = 50;
-            *done = true;
-            *failed = true;
-        }
-        assert_eq!(cell.fingerprint(), before);
-        if let Cell::Subagent { task, .. } = &mut cell {
-            *task = "Review renderer".into();
-        }
-        assert_ne!(cell.fingerprint(), before);
-        if let Cell::Subagent { task, .. } = &mut cell {
-            *task = "  ".into();
-        }
-        let before = cell.fingerprint();
-        if let Cell::Subagent { agent_id, .. } = &mut cell {
-            *agent_id = "fallback label".into();
-        }
-        assert_ne!(cell.fingerprint(), before);
-    }
-
-    #[test]
-    fn assistant_fingerprint_tracks_text_not_streaming_state() {
-        let mut cell = Cell::Assistant {
-            text: "Hello".into(),
-            open: true,
+        let visible_retry = |cells: &[Cell]| {
+            cells
+                .iter()
+                .any(|cell| matches!(cell, Cell::Retry { .. }) && cell.is_visible())
         };
-        let before = cell.fingerprint();
-        if let Cell::Assistant { open, .. } = &mut cell {
-            *open = false;
+        let mut root = ViewModel::new();
+        let mut teams = AgentTranscripts::new();
+        let events = [retry("root"), retry("worker")];
+        for event in &events {
+            root.apply(event);
+            teams.apply(event, None);
         }
-        assert_eq!(cell.fingerprint(), before);
-        if let Cell::Assistant { text, .. } = &mut cell {
-            text.push_str(" world");
-        }
-        assert_ne!(cell.fingerprint(), before);
-    }
-}
-
-#[cfg(test)]
-mod workflow_view_tests {
-    use super::*;
-    use bob_core::core::events::AgentEvent;
-
-    fn phase(id: &str, title: &str, index: usize, total: usize) -> AgentEvent {
-        AgentEvent::WorkflowPhase {
-            workflow_id: id.into(),
-            title: title.into(),
-            index,
-            total,
-        }
-    }
-    fn spawn(parent: &str, agent: &str, task: &str) -> AgentEvent {
-        AgentEvent::SubagentSpawn {
-            parent_id: parent.into(),
-            agent_id: agent.into(),
-            task: task.into(),
-            prompt: String::new(),
-        }
-    }
-    fn done(agent: &str, failed: bool) -> AgentEvent {
-        AgentEvent::SubagentDone {
-            agent_id: agent.into(),
-            failed,
-            cancelled: false,
-        }
-    }
-
-    #[test]
-    fn builds_a_phase_grouped_tree() {
-        let mut vm = ViewModel::new();
-        vm.apply(&phase("wf-demo", "Gather", 0, 2));
-        vm.apply(&spawn("wf-demo", "wf-demo.1-a", "gather-1"));
-        vm.apply(&spawn("wf-demo", "wf-demo.2-b", "gather-2"));
-        vm.apply(&done("wf-demo.1-a", false));
-        vm.apply(&done("wf-demo.2-b", false));
-        vm.apply(&phase("wf-demo", "Synthesize", 1, 2));
-        vm.apply(&spawn("wf-demo", "wf-demo.3-s", "synthesize"));
-        vm.apply(&done("wf-demo.3-s", false));
-
-        // Exactly one workflow cell, two phases, agents attached to the right phase.
-        let wf = vm
-            .cells
-            .iter()
-            .find_map(|c| match c {
-                Cell::Workflow { phases, .. } => Some(phases),
-                _ => None,
-            })
-            .expect("a workflow cell");
-        assert_eq!(wf.len(), 2);
-        assert_eq!(wf[0].title, "Gather");
-        assert_eq!(wf[0].agents.len(), 2);
-        assert!(wf[0].agents.iter().all(|a| a.status == WfStatus::Done));
-        assert_eq!(wf[1].title, "Synthesize");
-        assert_eq!(wf[1].agents.len(), 1);
-        assert_eq!(wf[1].agents[0].agent_id, "wf-demo.3-s");
-    }
-
-    #[test]
-    fn failed_agent_marks_row_failed() {
-        let mut vm = ViewModel::new();
-        vm.apply(&phase("wf-x", "Only", 0, 1));
-        vm.apply(&spawn("wf-x", "wf-x.1-a", "a"));
-        vm.apply(&done("wf-x.1-a", true));
-        let a = vm.cells.iter().find_map(|c| match c {
-            Cell::Workflow { phases, .. } => phases[0].agents.first(),
-            _ => None,
+        let persisted = teams.to_persisted();
+        assert!(visible_retry(&root.cells));
+        assert!(visible_retry(&teams.get("worker").unwrap().cells));
+        root.apply(&AgentEvent::TurnEnd {
+            agent_id: "worker".into(),
+            usage: Usage::default(),
         });
-        assert_eq!(a.unwrap().status, WfStatus::Failed);
-    }
+        assert!(visible_retry(&root.cells));
+        teams.apply(
+            &AgentEvent::SubagentDone {
+                agent_id: "worker".into(),
+                failed: false,
+                cancelled: true,
+            },
+            None,
+        );
+        assert!(!visible_retry(&teams.get("worker").unwrap().cells));
+        root.reset_after_replay();
+        assert!(!visible_retry(&root.cells));
+        let replayed = AgentTranscripts::replay(&events);
+        assert!(!visible_retry(&replayed.get("worker").unwrap().cells));
+        let restored = AgentTranscripts::from_persisted(&persisted);
+        assert!(!visible_retry(&restored.get("worker").unwrap().cells));
 
-    #[test]
-    fn non_workflow_spawn_still_makes_a_flat_subagent_cell() {
-        let mut vm = ViewModel::new();
-        // A normal task_* subagent (parent "root") must NOT be swallowed by the tree.
-        vm.apply(&spawn("root", "task_1", "review"));
-        assert!(vm
-            .cells
-            .iter()
-            .any(|c| matches!(c, Cell::Subagent { agent_id, .. } if agent_id == "task_1")));
-        assert!(!vm.cells.iter().any(|c| matches!(c, Cell::Workflow { .. })));
-    }
-
-    #[test]
-    fn replaying_events_rebuilds_the_transcript() {
-        // Stage 2 invariant: replaying a session's event log through the SAME
-        // apply() the live loop uses reconstructs the transcript — including the
-        // user turn (now a UserPrompt event) and a notice cell that never existed
-        // in the message history. This is what makes "if it was drawn, it was
-        // saved" hold on resume.
-        let log = vec![
-            AgentEvent::UserPrompt {
+        for terminal in [
+            AgentEvent::Completion {
                 agent_id: "root".into(),
-                text: "fix the bug".into(),
+                model: "test".into(),
+                usage: Usage::default(),
             },
-            AgentEvent::TurnStart {
+            AgentEvent::Compaction {
                 agent_id: "root".into(),
-            },
-            AgentEvent::TextDelta {
-                agent_id: "root".into(),
-                text: "on it".into(),
-            },
-            AgentEvent::ToolCall {
-                agent_id: "root".into(),
-                tool_use_id: "t1".into(),
-                name: "read_file".into(),
-                input: serde_json::json!({"path": "a.rs"}),
-            },
-            AgentEvent::ToolResult {
-                agent_id: "root".into(),
-                tool_use_id: "t1".into(),
-                output: "fn main() {}".into(),
-                is_error: false,
+                before_tokens: 100,
+                after_tokens: 20,
+                summary: String::new(),
+                replaced_upto: 0,
             },
             AgentEvent::Error {
                 agent_id: "root".into(),
-                message: "flaky network".into(),
+                message: "connection failed".into(),
             },
             AgentEvent::TurnEnd {
                 agent_id: "root".into(),
-                usage: Default::default(),
+                usage: Usage::default(),
             },
-        ];
-        let mut vm = ViewModel::new();
-        for e in &log {
-            vm.apply(e);
+        ] {
+            root.apply(&retry("root"));
+            root.apply(&terminal);
+            assert!(!visible_retry(&root.cells));
         }
-        vm.reset_after_replay();
-
-        assert!(matches!(&vm.cells[0], Cell::User(t) if t == "fix the bug"));
-        assert!(vm
-            .cells
-            .iter()
-            .any(|c| matches!(c, Cell::Assistant { text, .. } if text == "on it")));
-        assert!(vm.cells.iter().any(
-            |c| matches!(c, Cell::Tool { name, status: ToolStatus::Ok, output: Some(o), .. }
-                if name == "read_file" && o == "fn main() {}")
-        ));
-        // The error notice — a view-only cell absent from any message history —
-        // survives because it's replayed from the event, not reconstructed.
-        assert!(vm
-            .cells
-            .iter()
-            .any(|c| matches!(c, Cell::Notice(t) if t.contains("flaky network"))));
-        // A resumed session is idle.
-        assert!(!vm.busy);
+        let compaction = root.begin_compaction();
+        root.apply(&retry("root"));
+        root.finish_compaction(compaction, Err("connection failed".into()));
+        assert!(!visible_retry(&root.cells));
     }
 
     #[test]
-    fn click_offset_maps_to_agent_id() {
-        let mut vm = ViewModel::new();
-        vm.apply(&phase("wf-demo", "Gather", 0, 1));
-        vm.apply(&spawn("wf-demo", "wf-demo.1-a", "gather-1"));
-        let cell = vm
-            .cells
-            .iter()
-            .find(|c| matches!(c, Cell::Workflow { .. }))
-            .unwrap();
-        // Row 0 = header, row 1 = phase branch, row 2 = the agent.
-        assert_eq!(cell.workflow_agent_at(0), None);
-        assert_eq!(cell.workflow_agent_at(1), None);
-        assert_eq!(cell.workflow_agent_at(2), Some("wf-demo.1-a"));
-    }
-
-    #[test]
-    fn workflow_persists_and_rehydrates() {
-        // Build a finished run, extract it, then rehydrate from a message history
-        // whose hand-off turn should re-materialize the tree in place.
-        let mut vm = ViewModel::new();
-        vm.apply(&phase("wf-demo", "Gather", 0, 1));
-        vm.apply(&spawn("wf-demo", "wf-demo.1-a", "gather-1"));
-        vm.apply(&done("wf-demo.1-a", false));
-        // A root TurnStart marks the run done (the hand-off turn).
-        vm.apply(&AgentEvent::TurnStart {
-            agent_id: "root".into(),
-        });
-
-        let persisted = vm.to_persisted_workflows();
-        assert_eq!(persisted.len(), 1);
-        assert_eq!(persisted[0].phases[0].agents[0].status, "done");
-
-        // Rehydrate: a user turn, then the hand-off message, then the agent's reply.
+    fn hydration_matches_out_of_order_results_without_rendering_internal_history() {
         let messages = vec![
-            Message::user_text("do the thing"),
-            Message::user_text(bob_core::workflow::handoff_prompt("demo", "{}")),
             Message {
-                role: Role::Assistant,
+                role: Role::System,
                 content: vec![ContentBlock::Text {
-                    text: "summary".into(),
+                    text: "system secret".into(),
                 }],
             },
+            Message::user_text("inspect 界"),
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Text {
+                        text: "checking".into(),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "read".into(),
+                        name: "read_file".into(),
+                        input: serde_json::json!({"path": "界.rs"}),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "shell".into(),
+                        name: "bash".into(),
+                        input: serde_json::json!({"command": "false"}),
+                    },
+                ],
+            },
+            Message {
+                role: Role::Tool,
+                content: vec![
+                    ContentBlock::ToolResult {
+                        tool_use_id: "shell".into(),
+                        content: "failed".into(),
+                        is_error: Some(true),
+                    },
+                    ContentBlock::ToolResult {
+                        tool_use_id: "orphan".into(),
+                        content: "ignore me".into(),
+                        is_error: None,
+                    },
+                    ContentBlock::ToolResult {
+                        tool_use_id: "read".into(),
+                        content: "raw\x1b[31m source".into(),
+                        is_error: None,
+                    },
+                ],
+            },
+            Message::user_text("[conversation summary]\nprivate summary"),
         ];
-        let mut restored = ViewModel::new();
-        restored.hydrate(&messages, &persisted);
-
-        // The hand-off text must NOT appear as a user cell; the tree must be back.
-        assert!(restored
-            .cells
-            .iter()
-            .any(|c| matches!(c, Cell::Workflow { done: true, .. })));
-        assert!(!restored
-            .cells
-            .iter()
-            .any(|c| matches!(c, Cell::User(t) if bob_core::workflow::is_handoff(t))));
+        let mut view = ViewModel::new();
+        view.hydrate(&messages, &[]);
+        assert_eq!(view.revision, 1);
+        assert!(!view.busy);
+        assert_eq!(view.cells.len(), 5);
+        assert!(matches!(&view.cells[0], Cell::User(text) if text == "inspect 界"));
+        assert!(
+            matches!(&view.cells[1], Cell::Assistant { text, open: false } if text == "checking")
+        );
+        for (index, expected_id, expected_status, expected_output, expected_input) in [
+            (
+                2,
+                "read",
+                ToolStatus::Ok,
+                "raw\x1b[31m source",
+                serde_json::json!({"path": "界.rs"}),
+            ),
+            (
+                3,
+                "shell",
+                ToolStatus::Error,
+                "failed",
+                serde_json::json!({"command": "false"}),
+            ),
+        ] {
+            let Cell::Tool {
+                id,
+                status,
+                output,
+                input,
+                expanded,
+                ..
+            } = &view.cells[index]
+            else {
+                panic!("expected tool at {index}");
+            };
+            assert_eq!(id, expected_id);
+            assert_eq!(*status, expected_status);
+            assert_eq!(
+                output.as_ref().and_then(ToolOutput::as_text),
+                Some(expected_output)
+            );
+            assert_eq!(input, &expected_input);
+            assert!(!expanded);
+        }
+        assert!(matches!(
+            view.cells[4],
+            Cell::Compaction {
+                before: 0,
+                after: 0,
+                done: true
+            }
+        ));
     }
 
     #[test]
-    fn tool_path_workflow_persists_and_rehydrates() {
-        // The `workflow` TOOL path: the run is marked done by the root ToolResult,
-        // and on resume the tree re-inserts at the workflow tool_use in history.
-        let mut vm = ViewModel::new();
-        vm.apply(&phase("wf-hunt-1", "Round 1", 0, 1));
-        vm.apply(&spawn("wf-hunt-1", "wf-hunt-1.1-a", "find:r1"));
-        vm.apply(&done("wf-hunt-1.1-a", false));
-        // The root's ToolResult (the workflow tool returning) marks the run done.
-        vm.apply(&AgentEvent::ToolResult {
-            agent_id: "root".into(),
-            tool_use_id: "tu1".into(),
-            output: "{}".into(),
-            is_error: false,
-        });
-        let persisted = vm.to_persisted_workflows();
-        assert_eq!(persisted.len(), 1);
+    fn structured_outputs_survive_replay_without_exposing_hidden_jobs() {
+        use super::super::render::render_cell;
+        use super::super::team::AgentTranscripts;
+        use bob_core::core::types::{ShellOutput, ShellStream};
 
-        // History: a user turn, then an assistant turn whose tool_use is `workflow`.
-        let messages = vec![
-            Message::user_text("hunt for bugs"),
-            Message {
+        let render = |cells: &[Cell]| {
+            let mut lines = Vec::new();
+            for cell in cells {
+                render_cell(cell, 160, &mut lines);
+            }
+            lines
+        };
+        let shell = |code, text: &str| {
+            ToolOutput::from(ShellOutput {
+                exit_code: Some(code),
+                stdout: ShellStream {
+                    text: text.into(),
+                    total_bytes: text.len() as u64,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+        };
+        let cases = [
+            ("bash", shell(0, "success output"), false),
+            ("bash", shell(7, "failure output"), true),
+            ("bash", ToolOutput::from("permission denied"), true),
+            ("grep", ToolOutput::from("source.rs:42:match"), false),
+            ("job_status", shell(7, "hidden job status"), true),
+            ("job_output", shell(0, "hidden job output"), false),
+        ];
+        let mut messages = Vec::new();
+        let mut events = Vec::new();
+        let mut live = ViewModel::new();
+        let mut teams = AgentTranscripts::new();
+        teams.on_spawn("worker", "root", "check", "");
+        for (index, (name, output, is_error)) in cases.iter().enumerate() {
+            let id = index.to_string();
+            let input = serde_json::json!({"command": "check"});
+            messages.push(Message {
                 role: Role::Assistant,
                 content: vec![ContentBlock::ToolUse {
-                    id: "tu1".into(),
-                    name: "workflow".into(),
-                    input: serde_json::json!({"shape": "loop"}),
+                    id: id.clone(),
+                    name: (*name).into(),
+                    input: input.clone(),
                 }],
-            },
-        ];
-        let mut restored = ViewModel::new();
-        restored.hydrate(&messages, &persisted);
-        // The tree is back, and NO bare `workflow` tool cell was rendered.
-        assert!(restored
-            .cells
-            .iter()
-            .any(|c| matches!(c, Cell::Workflow { done: true, .. })));
-        assert!(!restored
-            .cells
-            .iter()
-            .any(|c| matches!(c, Cell::Tool { name, .. } if name == "workflow")));
-    }
-
-    #[test]
-    fn reset_after_replay_finalizes_running_stragglers() {
-        // A session killed mid-run leaves spawn/tool/workflow events with no matching
-        // terminating event. After replay, reset_after_replay must finalize them all
-        // so nothing renders as stuck "running".
-        let mut vm = ViewModel::new();
-        // A standalone subagent that never got its SubagentDone.
-        vm.apply(&spawn("root", "task_1", "do work"));
-        // A tool call with no ToolResult.
-        vm.apply(&AgentEvent::ToolCall {
-            agent_id: "root".into(),
-            tool_use_id: "tu1".into(),
-            name: "bash".into(),
-            input: serde_json::json!({ "command": "sleep 999" }),
-        });
-        // A workflow whose agent never finished.
-        vm.apply(&phase("wf-x", "Round 1", 0, 1));
-        vm.apply(&spawn("wf-x", "wf-x.1-a", "find"));
-
-        vm.reset_after_replay();
-
-        for cell in &vm.cells {
-            match cell {
-                Cell::Subagent { done, .. } => assert!(*done, "subagent left running"),
-                Cell::Tool { status, .. } => {
-                    assert_ne!(*status, ToolStatus::Running, "tool left running")
+            });
+            messages.push(Message {
+                role: Role::Tool,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: id.clone(),
+                    content: output.clone(),
+                    is_error: Some(*is_error),
+                }],
+            });
+            for agent_id in ["root", "worker"] {
+                for event in [
+                    AgentEvent::ToolCall {
+                        agent_id: agent_id.into(),
+                        tool_use_id: id.clone(),
+                        name: (*name).into(),
+                        input: input.clone(),
+                    },
+                    AgentEvent::ToolResult {
+                        agent_id: agent_id.into(),
+                        tool_use_id: id.clone(),
+                        output: output.clone(),
+                        is_error: *is_error,
+                    },
+                ] {
+                    live.apply(&event);
+                    teams.apply(&event, None);
+                    events.push(event);
                 }
-                Cell::Workflow { done, phases, .. } => {
-                    assert!(*done, "workflow left running");
-                    for p in phases {
-                        for a in &p.agents {
-                            assert_ne!(a.status, WfStatus::Running, "wf agent left running");
-                        }
-                    }
-                }
-                _ => {}
             }
         }
-        assert!(!vm.busy, "busy must be cleared on resume");
+        let events: Vec<AgentEvent> =
+            serde_json::from_str(&serde_json::to_string(&events).unwrap()).unwrap();
+        let mut replay = ViewModel::new();
+        for event in &events {
+            replay.apply(event);
+        }
+        replay.reset_after_replay();
+        let team_replay = AgentTranscripts::replay(&events);
+        let messages: Vec<Message> =
+            serde_json::from_str(&serde_json::to_string(&messages).unwrap()).unwrap();
+        let mut hydrated = ViewModel::new();
+        hydrated.hydrate(&messages, &[]);
+        let persisted = serde_json::to_string(&teams.to_persisted()).unwrap();
+        let restored =
+            AgentTranscripts::from_persisted(&serde_json::from_str::<Vec<_>>(&persisted).unwrap());
+        let expected = render(&live.cells);
+        let text = expected
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("    exit 7"));
+        assert!(text.contains("  │ permission denied"));
+        assert!(text.contains("• Grep"));
+        assert!(!text.contains("source.rs:42:match"));
+        assert!(!text.contains("hidden job"));
+        for cells in [
+            &live.cells,
+            &replay.cells,
+            &hydrated.cells,
+            &teams.get("worker").unwrap().cells,
+            &team_replay.get("worker").unwrap().cells,
+            &restored.get("worker").unwrap().cells,
+        ] {
+            assert_eq!(render(cells), expected);
+            assert_eq!(cells.len(), cases.len());
+            for (cell, (name, expected_output, _)) in cells.iter().zip(&cases) {
+                let Cell::Tool { output, .. } = cell else {
+                    panic!("expected tool")
+                };
+                assert_eq!(output.as_ref(), Some(expected_output));
+                assert_eq!(cell.is_visible(), matches!(*name, "bash" | "grep"));
+            }
+        }
+    }
+
+    mod fingerprint_tests {
+        use super::*;
+        use serde_json::json;
+
+        fn tool(name: &str, status: ToolStatus) -> Cell {
+            Cell::Tool {
+                id: "tool".into(),
+                name: name.into(),
+                input: json!({"path": "file.rs"}),
+                status,
+                output: None,
+                expanded: false,
+            }
+        }
+
+        #[test]
+        fn visibility_and_fingerprints_ignore_hidden_payloads() {
+            for name in [
+                "job_status",
+                "job_output",
+                "todo_write",
+                "workflow",
+                "task",
+                "explore",
+                "spawn_agent",
+            ] {
+                for status in [ToolStatus::Running, ToolStatus::Ok, ToolStatus::Error] {
+                    let mut cell = tool(name, status);
+                    let visible = matches!(name, "task" | "explore" | "spawn_agent")
+                        && status == ToolStatus::Error;
+                    assert_eq!(cell.is_visible(), visible);
+                    let before = cell.fingerprint();
+                    if let Cell::Tool {
+                        input,
+                        output,
+                        expanded,
+                        ..
+                    } = &mut cell
+                    {
+                        *input = json!({"large": "hidden input".repeat(1000)});
+                        *output = Some("hidden output".repeat(1000).into());
+                        *expanded = true;
+                    }
+                    if visible {
+                        assert_ne!(cell.fingerprint(), before);
+                    } else {
+                        assert_eq!(cell.fingerprint(), before);
+                        assert_eq!(before, 0);
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn collapsed_read_and_list_fingerprints_ignore_output_only() {
+            for name in ["read_file", "list_dir", "grep", "glob"] {
+                let mut cell = tool(name, ToolStatus::Ok);
+                assert!(cell.is_visible());
+                let before = cell.fingerprint();
+                if let Cell::Tool { output, .. } = &mut cell {
+                    *output = Some("huge output".repeat(1000).into());
+                }
+                assert_eq!(cell.fingerprint(), before);
+                if let Cell::Tool { input, .. } = &mut cell {
+                    *input = json!({"path": "other.rs"});
+                }
+                assert_ne!(cell.fingerprint(), before);
+                let before = cell.fingerprint();
+                if let Cell::Tool { status, .. } = &mut cell {
+                    *status = ToolStatus::Error;
+                }
+                assert_ne!(cell.fingerprint(), before);
+                let before = cell.fingerprint();
+                if let Cell::Tool { output, .. } = &mut cell {
+                    *output = Some("failure details".into());
+                }
+                assert_ne!(cell.fingerprint(), before);
+                let before = cell.fingerprint();
+                if let Cell::Tool { expanded, .. } = &mut cell {
+                    *expanded = true;
+                }
+                assert_ne!(cell.fingerprint(), before);
+                let before = cell.fingerprint();
+                if let Cell::Tool { output, .. } = &mut cell {
+                    *output = Some("visible changed output".into());
+                }
+                assert_ne!(cell.fingerprint(), before);
+            }
+            let mut cell = tool("bash", ToolStatus::Ok);
+            let before = cell.fingerprint();
+            if let Cell::Tool { output, .. } = &mut cell {
+                *output = Some("visible preview".into());
+            }
+            assert_ne!(cell.fingerprint(), before);
+        }
+
+        #[test]
+        fn static_launch_notice_fingerprints_ignore_lifecycle() {
+            let mut cell = Cell::Subagent {
+                agent_id: "agent".into(),
+                task: "Review parser".into(),
+                tools: 0,
+                done: false,
+                failed: false,
+            };
+            let before = cell.fingerprint();
+            if let Cell::Subagent {
+                agent_id,
+                tools,
+                done,
+                failed,
+                ..
+            } = &mut cell
+            {
+                *agent_id = "other".into();
+                *tools = 50;
+                *done = true;
+                *failed = true;
+            }
+            assert_eq!(cell.fingerprint(), before);
+            if let Cell::Subagent { task, .. } = &mut cell {
+                *task = "Review renderer".into();
+            }
+            assert_ne!(cell.fingerprint(), before);
+            if let Cell::Subagent { task, .. } = &mut cell {
+                *task = "  ".into();
+            }
+            let before = cell.fingerprint();
+            if let Cell::Subagent { agent_id, .. } = &mut cell {
+                *agent_id = "fallback label".into();
+            }
+            assert_ne!(cell.fingerprint(), before);
+        }
+    }
+
+    mod compaction_view_tests {
+        use super::*;
+
+        fn compaction() -> AgentEvent {
+            AgentEvent::Compaction {
+                agent_id: "root".into(),
+                before_tokens: 900,
+                after_tokens: 100,
+                summary: "saved context".into(),
+                replaced_upto: 5,
+            }
+        }
+
+        #[test]
+        fn manual_compaction_has_one_cell_in_either_delivery_order() {
+            for event_first in [false, true] {
+                let mut view = ViewModel::new();
+                let cell = view.begin_compaction();
+                if event_first {
+                    view.apply(&compaction());
+                }
+                view.finish_compaction(cell, Ok((true, 900, 100)));
+                if !event_first {
+                    view.apply(&compaction());
+                }
+                assert_eq!(view.cells.len(), 1);
+                assert!(matches!(
+                    view.cells[0],
+                    Cell::Compaction {
+                        before: 900,
+                        after: 100,
+                        done: true,
+                    }
+                ));
+            }
+        }
+
+        #[test]
+        fn compaction_failure_is_not_reported_as_unnecessary() {
+            let mut view = ViewModel::new();
+            let cell = view.begin_compaction();
+            view.finish_compaction(cell, Err("compaction failed: HTTP 400".into()));
+            assert!(
+                matches!(&view.cells[cell], Cell::Notice(text) if text == "error: compaction failed: HTTP 400")
+            );
+            let cell = view.begin_compaction();
+            view.finish_compaction(cell, Ok((false, 10, 10)));
+            assert!(
+                matches!(&view.cells[cell], Cell::Notice(text) if text == "nothing to compact yet.")
+            );
+        }
+
+        #[test]
+        fn replay_compaction_and_overflow_warning_use_actual_counts() {
+            let mut view = ViewModel::new();
+            view.apply(&compaction());
+            assert!(matches!(view.cells[0], Cell::Compaction { done: true, .. }));
+            view.apply(&AgentEvent::ContextWarning {
+                agent_id: "root".into(),
+                used_tokens: 1_139_249,
+                context_window: 1_050_000,
+                pct: 95,
+            });
+            assert!(matches!(&view.cells[1], Cell::Notice(text) if text.contains("~108% full")));
+        }
+    }
+
+    mod message_previews {
+        use super::*;
+        use crate::tui::{render, team::AgentTranscripts};
+        use serde_json::json;
+
+        fn send_events(from: &str, text: &str) -> Vec<AgentEvent> {
+            vec![
+                AgentEvent::ToolCall {
+                    agent_id: from.into(),
+                    tool_use_id: "message-1".into(),
+                    name: "send_message".into(),
+                    input: json!({"to":"reviewer", "message":text}),
+                },
+                AgentEvent::ToolResult {
+                    agent_id: from.into(),
+                    tool_use_id: "message-1".into(),
+                    output: "delivered to 'reviewer'".into(),
+                    is_error: false,
+                },
+                AgentEvent::AgentMessage {
+                    to: "reviewer".into(),
+                    from: from.into(),
+                    text: text.into(),
+                },
+            ]
+        }
+
+        fn rendered(cells: &[Cell]) -> String {
+            let mut lines = Vec::new();
+            for cell in cells {
+                render::render_cell(cell, 100, &mut lines);
+            }
+            lines
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        #[test]
+        fn root_message_previews_survive_replay_without_truncating_stored_input() {
+            let text = format!(
+                "{}\nFinal instruction.",
+                "Check\n\tthe parser and preserve 日本語 café. ".repeat(20)
+            );
+            for delivery_before_result in [false, true] {
+                let mut events = send_events("root", &text);
+                if delivery_before_result {
+                    events.swap(1, 2);
+                }
+                let mut live = ViewModel::new();
+                for event in &events {
+                    live.apply(event);
+                    assert_eq!(
+                        live.cells.iter().filter(|cell| cell.is_visible()).count(),
+                        1
+                    );
+                }
+                assert!(matches!(live.cells.as_slice(),
+                    [Cell::Tool { name, input, status: ToolStatus::Ok, output: Some(output), .. }]
+                        if name == "send_message"
+                            && input["to"] == "reviewer"
+                            && input["message"].as_str() == Some(text.as_str())
+                            && output.as_text() == Some("delivered to 'reviewer'")
+                ));
+                let preview = rendered(&live.cells);
+                assert!(preview.contains("Message to reviewer"));
+                assert!(preview.contains("Check the parser and preserve 日本語 café."));
+                assert!(preview.len() < text.len());
+                let serialized = serde_json::to_string(&events).unwrap();
+                let replayed: Vec<AgentEvent> = serde_json::from_str(&serialized).unwrap();
+                let mut replay = ViewModel::new();
+                for event in &replayed {
+                    replay.apply(event);
+                }
+                replay.reset_after_replay();
+                assert_eq!(rendered(&replay.cells), preview);
+                assert!(live.toggle_tool_expanded(0));
+                assert!(replay.toggle_tool_expanded(0));
+                let expanded = rendered(&live.cells);
+                assert!(expanded.contains("Final instruction."));
+                assert_eq!(rendered(&replay.cells), expanded);
+            }
+        }
+
+        #[test]
+        fn agent_to_agent_message_preview_appears_in_sender_thread_and_replay() {
+            let mut events = Vec::new();
+            for id in ["implementer", "reviewer"] {
+                events.push(AgentEvent::SubagentSpawn {
+                    parent_id: "root".into(),
+                    agent_id: id.into(),
+                    task: id.into(),
+                    prompt: String::new(),
+                });
+            }
+            events.extend(send_events("implementer", "Review\n the parser changes."));
+            let mut live = AgentTranscripts::new();
+            for event in &events {
+                live.apply(event, None);
+            }
+            let sender = live.get("implementer").unwrap();
+            let text = rendered(&sender.cells);
+            assert!(text.contains("Message to reviewer"));
+            assert!(text.contains("Review the parser changes."));
+            assert!(sender.cells.iter().any(|cell| matches!(cell,
+                Cell::Tool { name, status: ToolStatus::Ok, output: Some(output), .. }
+                    if name == "send_message" && output.as_text() == Some("delivered to 'reviewer'")
+            )));
+            let serialized = serde_json::to_string(&events).unwrap();
+            let replayed: Vec<AgentEvent> = serde_json::from_str(&serialized).unwrap();
+            let replay = AgentTranscripts::replay(&replayed);
+            assert_eq!(text, rendered(&replay.get("implementer").unwrap().cells));
+            assert!(live.get("reviewer").unwrap().cells.is_empty());
+            assert!(replay.get("reviewer").unwrap().cells.is_empty());
+        }
+    }
+
+    mod workflow_view_tests {
+        use super::*;
+        use bob_core::core::events::AgentEvent;
+
+        fn phase(id: &str, title: &str, index: usize, total: usize) -> AgentEvent {
+            AgentEvent::WorkflowPhase {
+                workflow_id: id.into(),
+                title: title.into(),
+                index,
+                total,
+            }
+        }
+        fn spawn(parent: &str, agent: &str, task: &str) -> AgentEvent {
+            AgentEvent::SubagentSpawn {
+                parent_id: parent.into(),
+                agent_id: agent.into(),
+                task: task.into(),
+                prompt: String::new(),
+            }
+        }
+        fn done(agent: &str, failed: bool) -> AgentEvent {
+            AgentEvent::SubagentDone {
+                agent_id: agent.into(),
+                failed,
+                cancelled: false,
+            }
+        }
+
+        #[test]
+        fn builds_a_phase_grouped_tree() {
+            let mut vm = ViewModel::new();
+            vm.apply(&phase("wf-demo", "Gather", 0, 2));
+            vm.apply(&spawn("wf-demo", "wf-demo.1-a", "gather-1"));
+            vm.apply(&spawn("wf-demo", "wf-demo.2-b", "gather-2"));
+            vm.apply(&done("wf-demo.1-a", false));
+            vm.apply(&done("wf-demo.2-b", false));
+            vm.apply(&phase("wf-demo", "Synthesize", 1, 2));
+            vm.apply(&spawn("wf-demo", "wf-demo.3-s", "synthesize"));
+            vm.apply(&done("wf-demo.3-s", false));
+
+            let wf = vm
+                .cells
+                .iter()
+                .find_map(|c| match c {
+                    Cell::Workflow { phases, .. } => Some(phases),
+                    _ => None,
+                })
+                .expect("a workflow cell");
+            assert_eq!(wf.len(), 2);
+            assert_eq!(wf[0].title, "Gather");
+            assert_eq!(wf[0].agents.len(), 2);
+            assert!(wf[0].agents.iter().all(|a| a.status == WfStatus::Done));
+            assert_eq!(wf[1].title, "Synthesize");
+            assert_eq!(wf[1].agents.len(), 1);
+            assert_eq!(wf[1].agents[0].agent_id, "wf-demo.3-s");
+        }
+
+        #[test]
+        fn failed_agent_marks_row_failed() {
+            let mut vm = ViewModel::new();
+            vm.apply(&phase("wf-x", "Only", 0, 1));
+            vm.apply(&spawn("wf-x", "wf-x.1-a", "a"));
+            vm.apply(&done("wf-x.1-a", true));
+            let a = vm.cells.iter().find_map(|c| match c {
+                Cell::Workflow { phases, .. } => phases[0].agents.first(),
+                _ => None,
+            });
+            assert_eq!(a.unwrap().status, WfStatus::Failed);
+        }
+
+        #[test]
+        fn non_workflow_spawn_still_makes_a_flat_subagent_cell() {
+            let mut vm = ViewModel::new();
+            vm.apply(&spawn("root", "task_1", "review"));
+            assert!(vm
+                .cells
+                .iter()
+                .any(|c| matches!(c, Cell::Subagent { agent_id, .. } if agent_id == "task_1")));
+            assert!(!vm.cells.iter().any(|c| matches!(c, Cell::Workflow { .. })));
+        }
+
+        #[test]
+        fn replaying_events_rebuilds_the_transcript() {
+            let log = vec![
+                AgentEvent::UserPrompt {
+                    agent_id: "root".into(),
+                    text: "fix the bug".into(),
+                },
+                AgentEvent::TurnStart {
+                    agent_id: "root".into(),
+                },
+                AgentEvent::TextDelta {
+                    agent_id: "root".into(),
+                    text: "on it".into(),
+                },
+                AgentEvent::ToolCall {
+                    agent_id: "root".into(),
+                    tool_use_id: "t1".into(),
+                    name: "read_file".into(),
+                    input: serde_json::json!({"path": "a.rs"}),
+                },
+                AgentEvent::ToolResult {
+                    agent_id: "root".into(),
+                    tool_use_id: "t1".into(),
+                    output: "fn main() {}".into(),
+                    is_error: false,
+                },
+                AgentEvent::Error {
+                    agent_id: "root".into(),
+                    message: "flaky network".into(),
+                },
+                AgentEvent::TurnEnd {
+                    agent_id: "root".into(),
+                    usage: Default::default(),
+                },
+            ];
+            let mut vm = ViewModel::new();
+            for e in &log {
+                vm.apply(e);
+            }
+            vm.reset_after_replay();
+
+            assert!(matches!(&vm.cells[0], Cell::User(t) if t == "fix the bug"));
+            assert!(vm
+                .cells
+                .iter()
+                .any(|c| matches!(c, Cell::Assistant { text, .. } if text == "on it")));
+            assert!(vm.cells.iter().any(
+                |c| matches!(c, Cell::Tool { name, status: ToolStatus::Ok, output: Some(o), .. }
+                if name == "read_file" && o.as_text() == Some("fn main() {}"))
+            ));
+            assert!(vm
+                .cells
+                .iter()
+                .any(|c| matches!(c, Cell::Notice(t) if t.contains("flaky network"))));
+            assert!(!vm.busy);
+        }
+
+        #[test]
+        fn workflow_persists_and_rehydrates() {
+            let mut vm = ViewModel::new();
+            vm.apply(&phase("wf-demo", "Gather", 0, 1));
+            vm.apply(&spawn("wf-demo", "wf-demo.1-a", "gather-1"));
+            vm.apply(&done("wf-demo.1-a", false));
+            vm.apply(&AgentEvent::TurnStart {
+                agent_id: "root".into(),
+            });
+
+            let persisted = vm.to_persisted_workflows();
+            assert_eq!(persisted.len(), 1);
+            assert_eq!(persisted[0].phases[0].agents[0].status, "done");
+
+            let messages = vec![
+                Message::user_text("do the thing"),
+                Message::user_text(bob_core::workflow::handoff_prompt("demo", "{}")),
+                Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: "summary".into(),
+                    }],
+                },
+            ];
+            let mut restored = ViewModel::new();
+            restored.hydrate(&messages, &persisted);
+
+            assert!(restored
+                .cells
+                .iter()
+                .any(|c| matches!(c, Cell::Workflow { done: true, .. })));
+            assert!(!restored
+                .cells
+                .iter()
+                .any(|c| matches!(c, Cell::User(t) if bob_core::workflow::is_handoff(t))));
+        }
+
+        #[test]
+        fn tool_path_workflow_persists_and_rehydrates() {
+            let mut vm = ViewModel::new();
+            vm.apply(&phase("wf-hunt-1", "Round 1", 0, 1));
+            vm.apply(&spawn("wf-hunt-1", "wf-hunt-1.1-a", "find:r1"));
+            vm.apply(&done("wf-hunt-1.1-a", false));
+            vm.apply(&AgentEvent::ToolResult {
+                agent_id: "root".into(),
+                tool_use_id: "tu1".into(),
+                output: "{}".into(),
+                is_error: false,
+            });
+            let persisted = vm.to_persisted_workflows();
+            assert_eq!(persisted.len(), 1);
+
+            let messages = vec![
+                Message::user_text("hunt for bugs"),
+                Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::ToolUse {
+                        id: "tu1".into(),
+                        name: "workflow".into(),
+                        input: serde_json::json!({"shape": "loop"}),
+                    }],
+                },
+            ];
+            let mut restored = ViewModel::new();
+            restored.hydrate(&messages, &persisted);
+            assert!(restored
+                .cells
+                .iter()
+                .any(|c| matches!(c, Cell::Workflow { done: true, .. })));
+            assert!(!restored
+                .cells
+                .iter()
+                .any(|c| matches!(c, Cell::Tool { name, .. } if name == "workflow")));
+        }
+
+        #[test]
+        fn reset_after_replay_finalizes_running_stragglers() {
+            let mut vm = ViewModel::new();
+            vm.apply(&AgentEvent::TurnStart {
+                agent_id: "root".into(),
+            });
+            vm.apply(&spawn("root", "task_1", "do work"));
+            vm.apply(&spawn("root", "task_2", "failed work"));
+            vm.apply(&done("task_2", true));
+            for (id, status, output) in [
+                ("missing", ToolStatus::Running, None),
+                ("partial", ToolStatus::Running, Some("partial output")),
+                ("failed", ToolStatus::Error, Some("permission denied")),
+                ("finished", ToolStatus::Ok, Some("complete")),
+            ] {
+                vm.apply(&AgentEvent::ToolCall {
+                    agent_id: "root".into(),
+                    tool_use_id: id.into(),
+                    name: "bash".into(),
+                    input: serde_json::json!({"command": "work"}),
+                });
+                if status != ToolStatus::Running {
+                    vm.apply(&AgentEvent::ToolResult {
+                        agent_id: "root".into(),
+                        tool_use_id: id.into(),
+                        output: output.unwrap().into(),
+                        is_error: status == ToolStatus::Error,
+                    });
+                } else if let Some(Cell::Tool { output: stored, .. }) = vm.cells.last_mut() {
+                    *stored = output.map(ToolOutput::from);
+                }
+                assert!(vm.toggle_tool_expanded(vm.cells.len() - 1));
+            }
+            vm.apply(&phase("wf-x", "Round 1", 0, 1));
+            vm.apply(&spawn("wf-x", "running", "find"));
+            vm.apply(&spawn("wf-x", "failed", "check"));
+            vm.apply(&done("failed", true));
+            let revision = vm.revision;
+
+            for pass in 1..=2 {
+                vm.reset_after_replay();
+                assert_eq!(vm.revision, revision + pass);
+                assert!(!vm.busy);
+                assert!(vm.active_workflow.is_none());
+                assert_eq!(vm.cells.len(), 7);
+                assert!(matches!(
+                    &vm.cells[0],
+                    Cell::Subagent {
+                        done: true,
+                        failed: false,
+                        ..
+                    }
+                ));
+                assert!(matches!(
+                    &vm.cells[1],
+                    Cell::Subagent {
+                        done: true,
+                        failed: true,
+                        ..
+                    }
+                ));
+                for (index, expected_id, expected_status, expected_output) in [
+                    (2, "missing", ToolStatus::Ok, "(interrupted)"),
+                    (3, "partial", ToolStatus::Ok, "partial output"),
+                    (4, "failed", ToolStatus::Error, "permission denied"),
+                    (5, "finished", ToolStatus::Ok, "complete"),
+                ] {
+                    let Cell::Tool {
+                        id,
+                        status,
+                        output,
+                        expanded,
+                        input,
+                        ..
+                    } = &vm.cells[index]
+                    else {
+                        panic!("expected tool at {index}");
+                    };
+                    assert_eq!(id, expected_id);
+                    assert_eq!(*status, expected_status);
+                    assert_eq!(
+                        output.as_ref().and_then(ToolOutput::as_text),
+                        Some(expected_output)
+                    );
+                    assert!(*expanded);
+                    assert_eq!(input, &serde_json::json!({"command": "work"}));
+                }
+                let Cell::Workflow { done, phases, .. } = &vm.cells[6] else {
+                    panic!("expected workflow");
+                };
+                assert!(*done);
+                assert_eq!(phases.len(), 1);
+                assert_eq!(phases[0].agents.len(), 2);
+                assert_eq!(phases[0].agents[0].status, WfStatus::Done);
+                assert_eq!(phases[0].agents[1].status, WfStatus::Failed);
+            }
+        }
     }
 }

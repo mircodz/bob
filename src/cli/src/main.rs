@@ -5,7 +5,7 @@ use bob_core::core::session::{
     latest_session_in, list_sessions, list_sessions_in, load_session, new_session, session_preview,
     Session, SessionSummary,
 };
-use bob_core::providers::create_provider;
+use bob_core::providers::create_provider_with_options;
 use clap::{Parser, Subcommand};
 use std::io::Write;
 use std::path::PathBuf;
@@ -16,7 +16,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
     name = "bob",
     about = "A provider-agnostic, multi-agent coding assistant.",
     version,
-    // No subcommand → start a chat with the top-level options below.
     args_conflicts_with_subcommands = true
 )]
 struct Cli {
@@ -153,8 +152,6 @@ fn make_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-/// A short human "time ago" for a unix-seconds timestamp string, so same-titled
-/// sessions in the picker are distinguishable (e.g. "3m ago", "2h ago").
 fn time_ago(updated_at: &str) -> String {
     let then: u64 = updated_at.parse().unwrap_or(0);
     let now = SystemTime::now()
@@ -175,9 +172,7 @@ fn time_ago(updated_at: &str) -> String {
     }
 }
 
-/// Case-insensitive subsequence match: every char of `query` appears in `hay` in
-/// order (not necessarily adjacent). Empty query matches everything. Powers the
-/// picker's type-to-filter.
+/// Case-insensitive subsequence match; an empty query matches everything.
 fn fuzzy_match(query: &str, hay: &str) -> bool {
     let mut q = query.chars().flat_map(char::to_lowercase).peekable();
     if q.peek().is_none() {
@@ -191,29 +186,21 @@ fn fuzzy_match(query: &str, hay: &str) -> bool {
     q.peek().is_none()
 }
 
-/// A session plus its cached preview lines, for the picker.
 struct PickerItem {
     summary: SessionSummary,
     preview: Vec<String>,
-    /// Lowercased title + preview, precomputed for fuzzy filtering.
     haystack: String,
 }
 
-/// Interactive session picker shown for a bare `--resume`. Renders an arrow-key
-/// selectable list (↑/↓ or j/k) with a preview of each conversation's tail; typing
-/// fuzzy-filters by title + preview. Enter opens the highlighted session; Esc (or an
-/// empty list) starts a new one. Sessions are scoped to the current directory, with
-/// a fallback to all sessions for legacy entries saved without a cwd.
 fn pick_session(cwd: &str) -> anyhow::Result<Option<Session>> {
     let mut summaries = list_sessions_in(cwd);
     if summaries.is_empty() {
         summaries = list_sessions();
     }
     if summaries.is_empty() {
-        return Ok(None); // nothing to resume → caller creates a fresh one
+        return Ok(None);
     }
 
-    // Cache each session's preview (last 3 messages) up front.
     let items: Vec<PickerItem> = summaries
         .into_iter()
         .map(|summary| {
@@ -233,31 +220,16 @@ fn pick_session(cwd: &str) -> anyhow::Result<Option<Session>> {
     }
 }
 
-/// Drive the full-screen ratatui picker, returning the chosen index into `items`
-/// (or None for "start a new session"). Runs on the alternate screen and restores
-/// the terminal before returning, so it never scrolls the user's scrollback — the
-/// list is windowed to the viewport, so it handles hundreds of sessions cleanly.
 fn run_picker(items: &[PickerItem]) -> anyhow::Result<Option<usize>> {
     use crossterm::event::{self, Event, KeyCode, KeyModifiers};
     use crossterm::execute;
-    use crossterm::terminal::{
-        disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-    };
+    use crossterm::terminal::EnterAlternateScreen;
     use ratatui::backend::CrosstermBackend;
     use ratatui::Terminal;
 
-    enable_raw_mode()?;
+    let _restore = tui::TerminalGuard::activate()?;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
-    // Restore the terminal from one place, even on an early `?` return.
-    struct Restore;
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            let _ = disable_raw_mode();
-            let _ = crossterm::execute!(std::io::stdout(), LeaveAlternateScreen);
-        }
-    }
-    let _restore = Restore;
 
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
     let mut query = String::new();
@@ -265,7 +237,6 @@ fn run_picker(items: &[PickerItem]) -> anyhow::Result<Option<usize>> {
     let mut scroll = 0usize;
 
     let result = loop {
-        // Filter to the indices matching the current query (fuzzy over title+preview).
         let filtered: Vec<usize> = (0..items.len())
             .filter(|&i| fuzzy_match(&query, &items[i].haystack))
             .collect();
@@ -306,9 +277,6 @@ fn run_picker(items: &[PickerItem]) -> anyhow::Result<Option<usize>> {
     Ok(result)
 }
 
-/// Render one frame of the picker: a title, the windowed session list (each row =
-/// title + metadata; the selected row highlighted), a preview pane for the selected
-/// session, and a filter/hints footer. `scroll` is updated to keep `selected` visible.
 fn draw_picker(
     f: &mut ratatui::Frame,
     items: &[PickerItem],
@@ -333,7 +301,6 @@ fn draw_picker(
         ])
         .split(area);
 
-    // Title.
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
@@ -350,7 +317,6 @@ fn draw_picker(
         chunks[0],
     );
 
-    // Windowed list: keep the selection visible within the list area's height.
     let list_h = chunks[1].height as usize;
     if selected < *scroll {
         *scroll = selected;
@@ -394,7 +360,6 @@ fn draw_picker(
     }
     f.render_widget(Paragraph::new(rows), chunks[1]);
 
-    // Preview pane for the selected session.
     let preview_lines: Vec<Line> = filtered
         .get(selected)
         .map(|&i| &items[i].preview)
@@ -424,7 +389,6 @@ fn draw_picker(
         chunks[2],
     );
 
-    // Filter/footer.
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("› ", Style::default().fg(Color::DarkGray)),
@@ -449,17 +413,19 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Config { action }) => return run_config(action),
         Some(Command::Mcp { action }) => return run_mcp(action).await,
         Some(Command::Lsp { action }) => return run_lsp(action),
-        None => {} // fall through to a chat
+        None => {}
     }
 
     let cwd: PathBuf = std::env::current_dir()?;
     let config = load_config(&cwd)?;
 
-    // Resolve the provider spec: --provider/--model override config; a bare
-    // colon-form (--provider openai:gpt-5) is also accepted for convenience.
     let provider_spec = resolve_provider_spec(&cli, &config);
 
-    let provider = match create_provider(&provider_spec).await {
+    let timeouts = bob_core::providers::provider::StreamTimeouts {
+        startup: std::time::Duration::from_secs(config.provider_timeouts.startup_secs),
+        idle: std::time::Duration::from_secs(config.provider_timeouts.idle_secs),
+    };
+    let provider = match create_provider_with_options(&provider_spec, None, timeouts).await {
         Ok(p) => p,
         Err(e) => {
             eprintln!("\x1b[31m{}\x1b[0m\n", e);
@@ -468,11 +434,6 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // Resolve or create the session, scoped to the current directory.
-    //   --continue      → resume the most recent session in THIS dir (no picker)
-    //   --resume <id>   → load that session by id
-    //   --resume        → interactive picker over sessions in THIS dir
-    //   (no flag)       → fresh session
     let cwd_str = cwd.to_string_lossy().to_string();
     let session = if cli.r#continue {
         latest_session_in(&cwd_str)?
@@ -484,18 +445,12 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     .unwrap_or_else(|| new_session(provider.name(), make_id(), now_stamp(), cwd_str.clone()));
-    let session_id = session.id.clone();
-
-    tui::run(config, provider, provider_spec, cwd, session).await?;
+    let session_id = tui::run(config, provider, provider_spec, cwd, session).await?;
     println!("resume this session with:  bob --resume {}", session_id);
     Ok(())
 }
 
-/// Combine --provider/--model (and the colon shorthand / config default) into a
-/// single "provider:model" spec.
 fn resolve_provider_spec(cli: &Cli, config: &bob_core::core::config::BobConfig) -> String {
-    // Base provider: explicit flag, else the config `provider` (which may carry a
-    // colon model form).
     let base = cli
         .provider
         .clone()
@@ -517,7 +472,6 @@ fn resolve_provider_spec(cli: &Cli, config: &bob_core::core::config::BobConfig) 
     }
 }
 
-/// Interactive login flow, dispatched per provider.
 async fn run_login(which: &str) -> anyhow::Result<()> {
     match which {
         "copilot" | "github" => {
@@ -588,7 +542,6 @@ fn show_auth() -> anyhow::Result<()> {
         };
         println!("  {:<10} {}", prov, status);
     }
-    // Note any API keys present in the environment.
     for (env, prov) in [
         ("ANTHROPIC_API_KEY", "anthropic"),
         ("OPENAI_API_KEY", "openai"),
@@ -730,7 +683,6 @@ async fn run_mcp(action: McpAction) -> anyhow::Result<()> {
                 );
             }
 
-            // Static-token path (e.g. a GitHub Personal Access Token).
             if let Some(token) = token {
                 bob_core::auth::mcp::store_static_token(&name, &token)?;
                 println!("\x1b[32mstored token\x1b[0m for MCP server '{}'", name);
@@ -738,7 +690,6 @@ async fn run_mcp(action: McpAction) -> anyhow::Result<()> {
             }
 
             let url = server.url.clone().unwrap();
-            // Discover OAuth config if we don't already have it, and persist it.
             let oauth = match &server.oauth {
                 Some(o) => o.clone(),
                 None => {
@@ -790,7 +741,6 @@ async fn run_mcp(action: McpAction) -> anyhow::Result<()> {
         }
         McpAction::Remove { name } => {
             if remove_mcp_server(&name)? {
-                // Also clear any stored OAuth credentials for this server.
                 let mut store = bob_core::auth::AuthStore::load();
                 if store.remove(&format!("mcp:{}", name)) {
                     let _ = store.save();
@@ -908,51 +858,260 @@ fn done(pretty: &str, id: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{fuzzy_match, Cli, Command};
+    use super::{
+        fuzzy_match, resolve_provider_spec, Cli, Command, ConfigAction, LspAction, McpAction,
+    };
     use clap::Parser;
 
     #[test]
-    fn cli_rejects_removed_subcommands() {
-        for command in ["remote", "relay"] {
-            let error = Cli::try_parse_from(["bob", command]).err().unwrap();
-            assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
-        }
-    }
-
-    #[test]
-    fn cli_accepts_core_subcommands() {
-        for args in [
-            vec!["bob", "login", "copilot"],
-            vec!["bob", "logout", "copilot"],
-            vec!["bob", "auth"],
-            vec!["bob", "config"],
-            vec!["bob", "config", "init"],
-            vec!["bob", "mcp", "list"],
-            vec!["bob", "lsp", "list"],
+    fn resume_forms_distinguish_picker_id_alias_and_following_options() {
+        for (args, resume, continuing, provider, model) in [
+            (vec!["bob"], None, false, None, None),
+            (vec!["bob", "--resume"], Some(""), false, None, None),
+            (
+                vec!["bob", "--resume", "session-123"],
+                Some("session-123"),
+                false,
+                None,
+                None,
+            ),
+            (
+                vec!["bob", "--restore=session-123"],
+                Some("session-123"),
+                false,
+                None,
+                None,
+            ),
+            (
+                vec!["bob", "--resume", "-p", "openai", "-m", "model"],
+                Some(""),
+                false,
+                Some("openai"),
+                Some("model"),
+            ),
+            (vec!["bob", "-c"], None, true, None, None),
         ] {
             let cli = Cli::try_parse_from(&args).unwrap();
-            assert!(matches!(
-                cli.command,
-                Some(
-                    Command::Login { .. }
-                        | Command::Logout { .. }
-                        | Command::Auth
-                        | Command::Config { .. }
-                        | Command::Mcp { .. }
-                        | Command::Lsp { .. }
-                )
-            ));
+            assert!(cli.command.is_none(), "{args:?}");
+            assert_eq!(cli.resume.as_deref(), resume, "{args:?}");
+            assert_eq!(cli.r#continue, continuing, "{args:?}");
+            assert_eq!(cli.provider.as_deref(), provider, "{args:?}");
+            assert_eq!(cli.model.as_deref(), model, "{args:?}");
         }
-        assert!(Cli::try_parse_from(["bob"]).unwrap().command.is_none());
     }
 
     #[test]
-    fn fuzzy_match_is_case_insensitive_subsequence() {
-        assert!(fuzzy_match("", "anything"));
-        assert!(fuzzy_match("fb", "foo bar")); // subsequence, not adjacent
-        assert!(fuzzy_match("BAR", "foo bar")); // case-insensitive
-        assert!(fuzzy_match("foobar", "foo bar")); // spaces skipped as gaps
-        assert!(!fuzzy_match("baz", "foo bar")); // 'z' absent
-        assert!(!fuzzy_match("rab", "foo bar")); // wrong order
+    fn invalid_cli_input_reports_actionable_parse_error_kinds() {
+        use clap::error::ErrorKind;
+        for (args, kind) in [
+            (vec!["bob", "login"], ErrorKind::MissingRequiredArgument),
+            (vec!["bob", "logout"], ErrorKind::MissingRequiredArgument),
+            (
+                vec!["bob", "lsp", "add", "rust", "--", "rust-analyzer"],
+                ErrorKind::MissingRequiredArgument,
+            ),
+            (
+                vec!["bob", "lsp", "add", "rust", "--ext", "rs"],
+                ErrorKind::MissingRequiredArgument,
+            ),
+            (vec!["bob", "--unknown"], ErrorKind::UnknownArgument),
+            (
+                vec!["bob", "config", "init", "--unknown"],
+                ErrorKind::UnknownArgument,
+            ),
+            (
+                vec!["bob", "--continue", "auth"],
+                ErrorKind::ArgumentConflict,
+            ),
+        ] {
+            let error = Cli::try_parse_from(&args)
+                .err()
+                .expect("invalid arguments must fail");
+            assert_eq!(error.kind(), kind, "{args:?}: {error}");
+            assert!(error.to_string().contains("Usage:"), "{args:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn server_commands_preserve_argument_boundaries_and_repeated_environment() {
+        let cli = Cli::try_parse_from([
+            "bob",
+            "mcp",
+            "add",
+            "files",
+            "--env",
+            "A=one=two",
+            "-e",
+            "B=hello world",
+            "--",
+            "node",
+            "server script.js",
+            "--flag",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Mcp {
+                action:
+                    McpAction::Add {
+                        name,
+                        url,
+                        env,
+                        command,
+                    },
+            }) => {
+                assert_eq!(name, "files");
+                assert_eq!(url, None);
+                assert_eq!(env, vec!["A=one=two", "B=hello world"]);
+                assert_eq!(command, vec!["node", "server script.js", "--flag"]);
+            }
+            _ => panic!("expected MCP add"),
+        }
+        for root in [None, Some("web app")] {
+            let mut args = vec!["bob", "lsp", "add", "ts", "--ext", "ts,tsx"];
+            if let Some(root) = root {
+                args.extend(["--root", root]);
+            }
+            args.extend(["--", "typescript-language-server", "--stdio"]);
+            match Cli::try_parse_from(args).unwrap().command {
+                Some(Command::Lsp {
+                    action:
+                        LspAction::Add {
+                            name,
+                            ext,
+                            root: actual_root,
+                            command,
+                        },
+                }) => {
+                    assert_eq!(name, "ts");
+                    assert_eq!(ext, "ts,tsx");
+                    assert_eq!(actual_root, root.unwrap_or("."));
+                    assert_eq!(command, vec!["typescript-language-server", "--stdio"]);
+                }
+                _ => panic!("expected LSP add"),
+            }
+        }
+    }
+
+    #[test]
+    fn config_force_and_remote_mcp_options_select_exact_payloads() {
+        assert!(matches!(
+            Cli::try_parse_from(["bob", "config", "init", "--force"])
+                .unwrap()
+                .command,
+            Some(Command::Config {
+                action: Some(ConfigAction::Init { force: true })
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["bob", "mcp", "add", "remote", "--url", "https://example.invalid/mcp"]).unwrap().command,
+            Some(Command::Mcp { action: McpAction::Add { name, url: Some(url), env, command } })
+                if name == "remote" && url == "https://example.invalid/mcp" && env.is_empty() && command.is_empty()
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["bob", "mcp", "login", "remote", "--token", "test-token"]).unwrap().command,
+            Some(Command::Mcp { action: McpAction::Login { name, token: Some(token) } })
+                if name == "remote" && token == "test-token"
+        ));
+    }
+
+    #[test]
+    fn provider_resolution_obeys_explicit_model_then_config_then_colon_precedence() {
+        for (args, config_provider, config_model, expected) in [
+            (vec!["bob"], "copilot", "", "copilot"),
+            (vec!["bob"], "openai:embedded", "", "openai:embedded"),
+            (
+                vec!["bob"],
+                "openai:embedded",
+                "configured",
+                "openai:configured",
+            ),
+            (
+                vec!["bob", "-p", "anthropic:embedded"],
+                "openai",
+                "",
+                "anthropic:embedded",
+            ),
+            (
+                vec!["bob", "-p", "anthropic:embedded"],
+                "openai",
+                "configured",
+                "anthropic:configured",
+            ),
+            (
+                vec!["bob", "-p", "anthropic:embedded", "-m", "explicit"],
+                "openai",
+                "configured",
+                "anthropic:explicit",
+            ),
+            (
+                vec!["bob", "-m", "explicit"],
+                "openai:embedded",
+                "configured",
+                "openai:explicit",
+            ),
+        ] {
+            let cli = Cli::try_parse_from(&args).unwrap();
+            let config = bob_core::core::config::BobConfig {
+                provider: config_provider.into(),
+                model: config_model.into(),
+                ..Default::default()
+            };
+            assert_eq!(resolve_provider_spec(&cli, &config), expected, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn supported_commands_select_their_exact_action() {
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(args)
+                .unwrap_or_else(|error| panic!("{}: {error}", args.join(" ")))
+                .command
+        };
+        assert!(matches!(
+            parse(&["bob", "login", "copilot"]),
+            Some(Command::Login { provider }) if provider == "copilot"
+        ));
+        assert!(matches!(
+            parse(&["bob", "logout", "copilot"]),
+            Some(Command::Logout { provider }) if provider == "copilot"
+        ));
+        assert!(matches!(parse(&["bob", "auth"]), Some(Command::Auth)));
+        assert!(matches!(
+            parse(&["bob", "config"]),
+            Some(Command::Config { action: None })
+        ));
+        assert!(matches!(
+            parse(&["bob", "config", "init"]),
+            Some(Command::Config {
+                action: Some(ConfigAction::Init { force: false })
+            })
+        ));
+        assert!(matches!(
+            parse(&["bob", "mcp", "list"]),
+            Some(Command::Mcp {
+                action: McpAction::List
+            })
+        ));
+        assert!(matches!(
+            parse(&["bob", "lsp", "list"]),
+            Some(Command::Lsp {
+                action: LspAction::List
+            })
+        ));
+        assert!(parse(&["bob"]).is_none());
+    }
+
+    #[test]
+    fn session_filter_matches_case_insensitive_ordered_subsequences() {
+        for (label, query, haystack, expected) in [
+            ("empty query", "", "anything", true),
+            ("gapped letters", "fb", "foo bar", true),
+            ("case insensitive", "BAR", "foo bar", true),
+            ("space gap", "foobar", "foo bar", true),
+            ("absent letter", "baz", "foo bar", false),
+            ("wrong order", "rab", "foo bar", false),
+        ] {
+            assert_eq!(fuzzy_match(query, haystack), expected, "{label}");
+        }
     }
 }

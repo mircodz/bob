@@ -1,22 +1,10 @@
-//! OpenAI / ChatGPT subscription auth via the Codex **device-code** flow.
-//! Reverse-engineered from the open-source Codex CLI
-//! (codex-rs/login/src/device_code_auth.rs + server.rs). Three steps:
-//!   1. POST {issuer}/api/accounts/deviceauth/usercode  {client_id}
-//!      → { device_auth_id, user_code, interval }
-//!      Show the user {issuer}/codex/device + the user_code.
-//!   2. Poll POST {issuer}/api/accounts/deviceauth/token {device_auth_id, user_code}
-//!      (403/404 = pending) → { authorization_code, code_challenge, code_verifier }
-//!   3. POST {issuer}/oauth/token  (form-encoded, grant_type=authorization_code,
-//!      code, redirect_uri={issuer}/deviceauth/callback, client_id, code_verifier)
-//!      → { id_token, access_token, refresh_token }
-//!      Refresh uses grant_type=refresh_token at the same /oauth/token endpoint.
+//! ChatGPT subscription auth via Codex device codes, exchanged for OAuth tokens.
 
 use super::{now, store_tokens, urlencode, AuthStore};
 
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const ISSUER: &str = "https://auth.openai.com";
 
-/// The device+user code shown to the user, plus the id used to poll.
 #[derive(Debug, Clone)]
 pub struct DeviceCode {
     pub verification_uri: String,
@@ -32,7 +20,6 @@ fn client() -> reqwest::Client {
         .unwrap_or_else(|_| reqwest::Client::new())
 }
 
-/// Step 1: request the user code.
 pub async fn begin_login() -> anyhow::Result<DeviceCode> {
     let url = format!("{}/api/accounts/deviceauth/usercode", ISSUER);
     let res = client()
@@ -62,13 +49,11 @@ pub async fn begin_login() -> anyhow::Result<DeviceCode> {
     })
 }
 
-/// Step 2 + 3: poll until authorized, exchange for tokens, store them.
 pub async fn finish_login<F: FnMut()>(device: &DeviceCode, mut on_wait: F) -> anyhow::Result<()> {
     let client = client();
     let poll_url = format!("{}/api/accounts/deviceauth/token", ISSUER);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15 * 60);
 
-    // Poll for the authorization_code + PKCE codes.
     let (auth_code, code_verifier) = loop {
         if std::time::Instant::now() > deadline {
             anyhow::bail!("device auth timed out after 15 minutes");
@@ -104,7 +89,6 @@ pub async fn finish_login<F: FnMut()>(device: &DeviceCode, mut on_wait: F) -> an
         anyhow::bail!("device auth failed ({})", status);
     };
 
-    // Exchange the authorization code for tokens (form-encoded).
     let redirect_uri = format!("{}/deviceauth/callback", ISSUER);
     let token_url = format!("{}/oauth/token", ISSUER);
     let form = format!(

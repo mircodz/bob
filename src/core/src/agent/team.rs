@@ -1,68 +1,45 @@
-//! Agent coordination: the machinery that turns fire-and-forget subagents into an
-//! addressable, message-passing *team*. The main agent can spawn named subagents
-//! that run in the background, send messages into them mid-task, and receive
-//! their results back — and subagents may spawn their own children (nesting is
-//! bounded by [`MAX_SPAWN_DEPTH`], with a running-agent count capped by
-//! [`MAX_TEAM_SIZE`]).
-//!
-//! This module is pure coordination: channels, handles, and a registry. It has no
-//! knowledge of providers, tools, or the turn loop. The turn loop drains an
-//! [`AgentInbox`] at each turn boundary (the same cooperative seam as cancel),
-//! and the coordination tools route through an [`AgentRegistry`].
-
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, Notify};
 
-/// A hard ceiling on the number of *currently-running* agents in a team, as a
-/// runaway backstop. Finished agents don't count (their transcripts stay visible
-/// in the drawer but they release their live slot), so a long session can keep
-/// spawning without ever hitting a permanent cap.
+/// Settled agents release capacity but remain in the roster.
 pub const MAX_TEAM_SIZE: usize = 32;
 
-/// Maximum spawn nesting depth (root's direct children = depth 1). Bounds runaway
-/// recursive self-spawning; deep trees rarely help and cost context.
+/// Root's direct children have depth 1.
 pub const MAX_SPAWN_DEPTH: usize = 3;
 
-/// Prefix marking a message that was folded into an agent's history from another
-/// agent's inbox (rather than typed by the user). Providers reject a `system`
-/// role mid-conversation, so these must live as user-role text; this shared
-/// marker lets the injector and any consumer (e.g. the UI, which hides them)
-/// agree on exactly one format instead of duplicating a string literal.
+/// Providers reject mid-conversation system messages; coordination uses marked user text.
 pub const COORD_MESSAGE_PREFIX: &str = "[message from ";
 
-/// Format an inbound coordination message for injection into history.
 pub fn format_coord_message(from: &str, text: &str) -> String {
     format!("{COORD_MESSAGE_PREFIX}{from}]: {text}")
 }
 
-/// Whether `text` is a folded coordination message (see [`format_coord_message`]).
 pub fn is_coord_message(text: &str) -> bool {
     text.starts_with(COORD_MESSAGE_PREFIX)
 }
 
-/// A message delivered between agents. `from` is the sender's name (e.g. "root"
-/// or a subagent name), so the recipient can attribute and reply.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AgentMessageKind {
+    Actionable,
+    Completion { status: AgentStatus },
+}
+
 #[derive(Clone, Debug)]
 pub struct AgentMessage {
     pub from: String,
     pub text: String,
+    pub kind: AgentMessageKind,
 }
 
-/// The receiving end of an agent's mailbox. Owned by the `Agent`; the turn loop
-/// drains it (non-blocking) at each turn boundary and folds any messages into
-/// history so the model sees and can act on them.
 pub struct AgentInbox {
     rx: mpsc::UnboundedReceiver<AgentMessage>,
-    /// Messages pulled off the channel but not yet consumed (e.g. one peeked by
-    /// `has_pending` to detect a wake, then returned by the next `drain`).
+    /// Peeked messages, retained until consumed.
     pushback: std::collections::VecDeque<AgentMessage>,
 }
 
 impl AgentInbox {
-    /// Drain all currently-queued messages without blocking. Returns them in
-    /// arrival order (pushback first), empty if none are waiting.
     pub fn drain(&mut self) -> Vec<AgentMessage> {
         let mut out: Vec<AgentMessage> = self.pushback.drain(..).collect();
         while let Ok(msg) = self.rx.try_recv() {
@@ -71,13 +48,10 @@ impl AgentInbox {
         out
     }
 
-    /// Whether any message is waiting (in pushback or the channel), without
-    /// consuming it.
     pub fn has_pending(&mut self) -> bool {
         if !self.pushback.is_empty() {
             return true;
         }
-        // Peek the channel by pulling one and stashing it in pushback.
         if let Ok(msg) = self.rx.try_recv() {
             self.pushback.push_back(msg);
             return true;
@@ -85,7 +59,25 @@ impl AgentInbox {
         false
     }
 
-    /// Await the next message. Returns `None` if every sender has been dropped    /// (the agent can no longer receive).
+    pub fn has_actionable(&mut self) -> bool {
+        while let Ok(message) = self.rx.try_recv() {
+            self.pushback.push_back(message);
+        }
+        self.pushback
+            .iter()
+            .any(|message| message.kind == AgentMessageKind::Actionable)
+    }
+
+    /// Close successful child acceptance only when every accepted message was consumed.
+    pub fn try_close(&mut self, handle: &AgentHandle) -> bool {
+        let _status = handle.status.lock().unwrap();
+        if self.has_pending() {
+            return false;
+        }
+        handle.accepting.store(false, Ordering::Release);
+        true
+    }
+
     pub async fn recv(&mut self) -> Option<AgentMessage> {
         if let Some(msg) = self.pushback.pop_front() {
             return Some(msg);
@@ -94,23 +86,21 @@ impl AgentInbox {
     }
 }
 
-/// A cloneable handle to one agent in the team: its identity, how to message it,
-/// its spawn depth, and its live status. Stored in the [`AgentRegistry`].
 #[derive(Clone)]
 pub struct AgentHandle {
     pub name: String,
     pub depth: usize,
-    /// The name of the agent that spawned this one ("root" for top-level agents,
-    /// empty for the root itself). Used to scope coordination wakes to an agent's
-    /// OWN children rather than the whole team.
+    /// Spawner's name; empty for root. Scopes wakes to direct children.
     pub parent: String,
     tx: mpsc::UnboundedSender<AgentMessage>,
     status: Arc<Mutex<AgentStatus>>,
+    accepting: Arc<AtomicBool>,
+    terminal_event_pending: Arc<AtomicBool>,
     stop_requested: Arc<AtomicBool>,
     stop_notify: Arc<Notify>,
+    capacity_changed: Arc<Notify>,
 }
 
-/// Lifecycle of a team member, surfaced by `list_agents`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentStatus {
     Running,
@@ -119,11 +109,37 @@ pub enum AgentStatus {
     Cancelled,
 }
 
+pub(crate) struct PendingTerminalEvent {
+    pending: Arc<AtomicBool>,
+    capacity_changed: Arc<Notify>,
+}
+
+impl Drop for PendingTerminalEvent {
+    fn drop(&mut self) {
+        self.pending.store(false, Ordering::Release);
+        self.capacity_changed.notify_waiters();
+    }
+}
+
 impl AgentHandle {
-    /// Send a message into this agent's inbox. Returns false if the agent is gone
-    /// (its inbox was dropped), so callers can report a dead recipient.
+    pub(crate) fn begin_terminal_event(&self) -> PendingTerminalEvent {
+        self.terminal_event_pending.store(true, Ordering::Release);
+        PendingTerminalEvent {
+            pending: self.terminal_event_pending.clone(),
+            capacity_changed: self.capacity_changed.clone(),
+        }
+    }
+
+    /// Whether execution and terminal event publication have both finished.
+    pub fn is_settled(&self) -> bool {
+        let status = self.status.lock().unwrap();
+        *status != AgentStatus::Running && !self.terminal_event_pending.load(Ordering::Acquire)
+    }
+
     pub fn send(&self, msg: AgentMessage) -> bool {
-        self.status() == AgentStatus::Running
+        let status = self.status.lock().unwrap();
+        *status == AgentStatus::Running
+            && self.accepting.load(Ordering::Acquire)
             && !self.cancellation_requested()
             && self.tx.send(msg).is_ok()
     }
@@ -170,8 +186,12 @@ impl AgentHandle {
             let _ = parent.tx.send(AgentMessage {
                 from: self.name.clone(),
                 text: format!("finished: {output}"),
+                kind: AgentMessageKind::Completion {
+                    status: status.clone(),
+                },
             });
         }
+        self.capacity_changed.notify_waiters();
         status.clone()
     }
 
@@ -204,12 +224,11 @@ impl AgentHandle {
 
     pub fn set_status(&self, status: AgentStatus) {
         *self.status.lock().unwrap() = status;
+        self.capacity_changed.notify_waiters();
     }
 }
 
-/// Create a fresh mailbox: the [`AgentInbox`] the agent owns, plus a sender used
-/// to build its [`AgentHandle`]. Returned separately so the agent keeps the
-/// receiver while the registry holds the handle.
+/// The agent owns the receiver; the registry holds the sending handle.
 pub fn mailbox() -> (AgentInbox, mpsc::UnboundedSender<AgentMessage>) {
     let (tx, rx) = mpsc::unbounded_channel();
     (
@@ -221,12 +240,11 @@ pub fn mailbox() -> (AgentInbox, mpsc::UnboundedSender<AgentMessage>) {
     )
 }
 
-/// The shared team roster. Every agent (root + subagents) holds an `Arc` to the
-/// same registry, so any member can address any other by name. Registration and
-/// lookup are the only operations; messaging goes through the returned handle.
 #[derive(Clone, Default)]
 pub struct AgentRegistry {
     agents: Arc<Mutex<HashMap<String, AgentHandle>>>,
+    admission_queue: Arc<tokio::sync::Mutex<()>>,
+    capacity_changed: Arc<Notify>,
 }
 
 impl AgentRegistry {
@@ -234,10 +252,6 @@ impl AgentRegistry {
         AgentRegistry::default()
     }
 
-    /// Register a team member. Its `tx` (from [`mailbox`]) becomes the routing
-    /// channel; returns the handle (also stored) so the spawner can track it.
-    /// `parent` is the spawner's name (empty for the root) so wakes can be scoped
-    /// to an agent's own children.
     pub fn register(
         &self,
         name: String,
@@ -256,42 +270,134 @@ impl AgentRegistry {
         parent: String,
         tx: mpsc::UnboundedSender<AgentMessage>,
     ) -> Result<AgentHandle, String> {
-        let mut agents = self.agents.lock().unwrap();
-        if agents.iter().any(|(id, handle)| {
-            handle.status() == AgentStatus::Running
-                && (id == &name || is_descendant(&agents, id, &name))
-        }) {
-            return Err(format!(
-                "agent '{name}' or its descendants are still running"
-            ));
-        }
-        let parent_stopping = agents
-            .get(&parent)
-            .is_some_and(AgentHandle::cancellation_requested);
-        let handle = AgentHandle {
-            name: name.clone(),
-            depth,
-            parent,
-            tx,
-            status: Arc::new(Mutex::new(AgentStatus::Running)),
-            stop_requested: Arc::new(AtomicBool::new(parent_stopping)),
-            stop_notify: Arc::new(Notify::new()),
-        };
-        agents.insert(name, handle.clone());
-        Ok(handle)
+        self.try_register_batch(vec![(name, depth, parent, tx)])
+            .map(|mut handles| handles.remove(0))
     }
 
-    /// Look up a member by name.
+    /// Queue a leaf launch without reserving a team slot. Cancellation returns `None`.
+    /// The deadline includes time behind other waiters, bounding parent-held-slot deadlocks.
+    pub async fn register_when_available(
+        &self,
+        name: String,
+        depth: usize,
+        parent: String,
+        tx: mpsc::UnboundedSender<AgentMessage>,
+        cancelled: impl Fn() -> bool,
+        max_wait: std::time::Duration,
+    ) -> Result<Option<AgentHandle>, String> {
+        let admission = async {
+            let _queue = self.admission_queue.lock().await;
+            loop {
+                let changed = self.capacity_changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if cancelled() {
+                    return Ok(None);
+                }
+                if let Some(mut handles) = self.register_batch_if_available(vec![(
+                    name.clone(),
+                    depth,
+                    parent.clone(),
+                    tx.clone(),
+                )])? {
+                    return Ok(handles.pop());
+                }
+                changed.await;
+            }
+        };
+        let cancellation = async {
+            loop {
+                if cancelled() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        };
+        tokio::select! {
+            biased;
+            _ = cancellation => Ok(None),
+            result = tokio::time::timeout(max_wait, admission) => result.unwrap_or_else(|_| {
+                Err(format!(
+                    "timed out waiting for team capacity (maximum {MAX_TEAM_SIZE} agents); parent agents may be holding all slots"
+                ))
+            }),
+        }
+    }
+
+    pub fn try_register_batch(
+        &self,
+        requests: Vec<(String, usize, String, mpsc::UnboundedSender<AgentMessage>)>,
+    ) -> Result<Vec<AgentHandle>, String> {
+        self.register_batch_if_available(requests)?
+            .ok_or_else(|| format!("team is at the maximum of {MAX_TEAM_SIZE} running agents"))
+    }
+
+    fn register_batch_if_available(
+        &self,
+        requests: Vec<(String, usize, String, mpsc::UnboundedSender<AgentMessage>)>,
+    ) -> Result<Option<Vec<AgentHandle>>, String> {
+        let mut agents = self.agents.lock().unwrap();
+        let mut names = std::collections::HashSet::new();
+        for (name, depth, parent, _) in &requests {
+            if *depth > MAX_SPAWN_DEPTH {
+                return Err(format!(
+                    "spawn nesting too deep (max {MAX_SPAWN_DEPTH} levels)"
+                ));
+            }
+            if !names.insert(name)
+                || agents.iter().any(|(id, handle)| {
+                    !handle.is_settled() && (id == name || is_descendant(&agents, id, name))
+                })
+            {
+                return Err(format!(
+                    "agent '{name}' or its descendants are still running"
+                ));
+            }
+            if agents.get(parent).is_some_and(|handle| {
+                handle.cancellation_requested() || handle.status() != AgentStatus::Running
+            }) {
+                return Err(format!("parent agent '{parent}' is stopping or finished"));
+            }
+        }
+        if agents
+            .values()
+            .filter(|handle| !handle.is_settled())
+            .count()
+            .saturating_add(requests.len())
+            > MAX_TEAM_SIZE
+        {
+            return Ok(None);
+        }
+        let mut handles = Vec::with_capacity(requests.len());
+        for (name, depth, parent, tx) in requests {
+            let handle = AgentHandle {
+                name: name.clone(),
+                depth,
+                parent,
+                tx,
+                status: Arc::new(Mutex::new(AgentStatus::Running)),
+                accepting: Arc::new(AtomicBool::new(true)),
+                terminal_event_pending: Arc::new(AtomicBool::new(false)),
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                stop_notify: Arc::new(Notify::new()),
+                capacity_changed: self.capacity_changed.clone(),
+            };
+            agents.insert(name, handle.clone());
+            handles.push(handle);
+        }
+        Ok(Some(handles))
+    }
+
     pub fn get(&self, name: &str) -> Option<AgentHandle> {
         self.agents.lock().unwrap().get(name).cloned()
     }
 
-    /// Route a message to `to`. Returns false if unknown or unreachable.
     pub fn send(&self, to: &str, from: &str, text: &str) -> bool {
         match self.get(to) {
             Some(h) => h.send(AgentMessage {
                 from: from.to_string(),
                 text: text.to_string(),
+                kind: AgentMessageKind::Actionable,
             }),
             None => false,
         }
@@ -324,7 +430,23 @@ impl AgentRegistry {
         Ok(stopped)
     }
 
-    /// A (name, depth, status) snapshot of the whole team, for `list_agents`.
+    pub(crate) fn descendant_names(&self, parent: &str) -> Vec<String> {
+        let agents = self.agents.lock().unwrap();
+        agents
+            .keys()
+            .filter(|name| is_descendant(&agents, name, parent))
+            .cloned()
+            .collect()
+    }
+
+    pub fn stop_descendants(&self, parent: &str) -> usize {
+        let agents = self.agents.lock().unwrap();
+        agents
+            .iter()
+            .filter(|(name, handle)| is_descendant(&agents, name, parent) && handle.request_stop())
+            .count()
+    }
+
     pub fn roster(&self) -> Vec<(String, usize, AgentStatus)> {
         let mut v: Vec<_> = self
             .agents
@@ -337,43 +459,46 @@ impl AgentRegistry {
         v
     }
 
-    /// Whether a name is already taken by a STILL-RUNNING agent. A finished
-    /// agent's name is free to reuse (its transcript stays visible in the drawer,
-    /// but the live slot is released), so a long session can keep spawning.
+    /// Whether a name or its descendants are still running or publishing their
+    /// terminal events. Settled agents release their names for reuse.
     pub fn name_in_use(&self, name: &str) -> bool {
         let agents = self.agents.lock().unwrap();
         agents.iter().any(|(id, handle)| {
-            handle.status() == AgentStatus::Running
-                && (id == name || is_descendant(&agents, id, name))
+            !handle.is_settled() && (id == name || is_descendant(&agents, id, name))
         })
     }
 
-    /// Whether `parent` has any still-running direct children. Coordination wakes
-    /// are gated on this (an agent's OWN children), so an unrelated slow agent
-    /// elsewhere in the team can't stall this agent from processing its replies.
+    /// Whether any descendant is running or still publishing its terminal event.
+    /// The parent itself is excluded.
+    pub fn has_unsettled_descendants(&self, parent: &str) -> bool {
+        let agents = self.agents.lock().unwrap();
+        agents.iter().any(|(id, handle)| {
+            id != parent && is_descendant(&agents, id, parent) && !handle.is_settled()
+        })
+    }
+
+    /// Only direct children gate coordination wakes, not unrelated agents.
     pub fn has_running_children(&self, parent: &str) -> bool {
         self.agents
             .lock()
             .unwrap()
             .values()
-            .any(|h| h.parent == parent && h.status() == AgentStatus::Running)
+            .any(|h| h.parent == parent && !h.is_settled())
     }
 
-    /// Count of currently-running agents. The team-size cap counts only these, so
-    /// finished agents remain in the roster (visible in the drawer) without
-    /// consuming the live budget.
+    /// Count of running or publication-pending agents. The team-size cap counts
+    /// these until settled; finished agents remain visible without consuming the
+    /// live budget.
     pub fn active_len(&self) -> usize {
         self.agents
             .lock()
             .unwrap()
             .values()
-            .filter(|h| h.status() == AgentStatus::Running)
+            .filter(|h| !h.is_settled())
             .count()
     }
 
-    /// Whether a name is already taken by ANY agent (running or finished). Rarely
-    /// needed directly — callers usually want [`name_in_use`](Self::name_in_use),
-    /// which ignores finished agents so their names can be reused.
+    /// Includes settled agents, unlike `name_in_use`.
     pub fn contains(&self, name: &str) -> bool {
         self.agents.lock().unwrap().contains_key(name)
     }
@@ -395,248 +520,529 @@ fn is_descendant(agents: &HashMap<String, AgentHandle>, name: &str, ancestor: &s
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    mod registry {
+        use crate::agent::team::*;
 
-    #[test]
-    fn stop_is_scoped_to_descendants_and_preserves_siblings() {
-        let team = AgentRegistry::new();
-        let mut handles = HashMap::new();
-        for (name, parent) in [("root", ""), ("a", "root"), ("b", "a"), ("sibling", "root")] {
-            let (_inbox, tx) = mailbox();
-            handles.insert(name, team.register(name.into(), 1, parent.into(), tx));
+        #[test]
+        fn steering_and_final_acceptance_share_a_boundary() {
+            let team = AgentRegistry::new();
+            let (mut inbox, tx) = mailbox();
+            let handle = team.register("worker".into(), 1, "root".into(), tx);
+            assert!(team.send("worker", "root", "finished: actually steering"));
+            assert!(inbox.has_actionable());
+            assert!(!inbox.try_close(&handle));
+            assert_eq!(inbox.drain().len(), 1);
+            assert!(inbox.try_close(&handle));
+            assert!(!team.send("worker", "root", "late"));
         }
-        assert!(team.stop("b", "a").is_err());
-        assert!(team.stop("a", "sibling").is_err());
-        assert!(team.stop("root", "root").is_err());
-        assert!(team.stop("root", "missing").is_err());
-        assert_eq!(team.stop("root", "a").unwrap(), 2);
-        assert!(handles["a"].cancellation_requested());
-        assert!(handles["b"].cancellation_requested());
-        assert!(!handles["sibling"].cancellation_requested());
-        assert!(!handles["root"].cancellation_requested());
-        assert_eq!(team.stop("root", "a").unwrap(), 0);
-        assert_eq!(
-            handles["a"].complete(false, false, None),
-            AgentStatus::Cancelled
-        );
-        assert!(team.stop("root", "a").is_err());
-    }
 
-    #[test]
-    fn live_descendants_prevent_name_reuse_and_late_children_inherit_stop() {
-        let team = AgentRegistry::new();
-        let (_i, tx) = mailbox();
-        let a = team.register("a".into(), 1, "root".into(), tx);
-        let (_i, tx) = mailbox();
-        let b = team.register("b".into(), 2, "a".into(), tx);
-        a.set_status(AgentStatus::Done);
-        assert!(team.name_in_use("a"));
-        let (_i, tx) = mailbox();
-        assert!(team
-            .try_register("a".into(), 2, "sibling".into(), tx)
-            .is_err());
-        assert!(team.stop("sibling", "b").is_err());
-        team.stop("root", "b").unwrap();
-        let (_i, tx) = mailbox();
-        let late = team.register("late".into(), 3, "b".into(), tx);
-        assert!(late.cancellation_requested());
-        b.complete(false, true, None);
-        late.complete(false, true, None);
-        assert!(!team.name_in_use("a"));
-    }
+        #[test]
+        fn accepted_steering_cannot_race_past_successful_close() {
+            for _ in 0..32 {
+                let team = AgentRegistry::new();
+                let (mut inbox, tx) = mailbox();
+                let handle = team.register("worker".into(), 1, "root".into(), tx);
+                let barrier = Arc::new(std::sync::Barrier::new(2));
+                let ready = barrier.clone();
+                let finish = std::thread::spawn(move || {
+                    ready.wait();
+                    let closed = inbox.try_close(&handle);
+                    (closed, inbox)
+                });
+                barrier.wait();
+                let accepted = team.send("worker", "root", "steer");
+                let (closed, mut inbox) = finish.join().unwrap();
+                assert_ne!(accepted, closed);
+                assert_eq!(inbox.drain().len(), usize::from(accepted));
+            }
+        }
 
-    #[tokio::test]
-    async fn stop_before_start_does_not_poll_work_and_stop_interrupts_pending_work() {
-        let team = AgentRegistry::new();
-        let (_i, tx) = mailbox();
-        let handle = team.register("worker".into(), 1, "root".into(), tx);
-        team.stop("root", "worker").unwrap();
-        let result = handle
-            .run_until_stopped(Arc::new(AtomicBool::new(false)), async {
-                panic!("stopped work must not start")
-            })
-            .await;
-        assert!(result.is_none());
-        let (_i, tx) = mailbox();
-        let waiting = team.register("waiting".into(), 1, "root".into(), tx);
-        let worker = waiting.clone();
-        let run = tokio::spawn(async move {
-            worker
-                .run_until_stopped(
-                    Arc::new(AtomicBool::new(false)),
-                    std::future::pending::<()>(),
+        #[test]
+        fn admission_is_atomic_and_shared_under_concurrent_launches() {
+            let team = AgentRegistry::new();
+            let threads: Vec<_> = (0..MAX_TEAM_SIZE * 2)
+                .map(|i| {
+                    let team = team.clone();
+                    std::thread::spawn(move || {
+                        let (_inbox, tx) = mailbox();
+                        team.try_register(format!("w{i}"), 1, "root".into(), tx)
+                            .is_ok()
+                    })
+                })
+                .collect();
+            assert_eq!(
+                threads
+                    .into_iter()
+                    .map(|thread| thread.join().expect("admission thread panicked"))
+                    .filter(|ok| *ok)
+                    .count(),
+                MAX_TEAM_SIZE
+            );
+            let fresh = AgentRegistry::new();
+            let (_, a) = mailbox();
+            let (_, b) = mailbox();
+            assert!(fresh
+                .try_register_batch(vec![
+                    ("valid".into(), 1, "root".into(), a),
+                    ("invalid".into(), MAX_SPAWN_DEPTH + 1, "root".into(), b),
+                ])
+                .is_err());
+            assert!(fresh.roster().is_empty());
+        }
+
+        #[tokio::test]
+        async fn queued_admission_is_fifo_and_waits_for_terminal_publication() {
+            let team = AgentRegistry::new();
+            let handles: Vec<_> = (0..MAX_TEAM_SIZE)
+                .map(|index| {
+                    let (_, tx) = mailbox();
+                    team.register(format!("existing-{index}"), 1, "root".into(), tx)
+                })
+                .collect();
+            let (_, tx) = mailbox();
+            let first = team.register_when_available(
+                "first".into(),
+                1,
+                "root".into(),
+                tx,
+                || false,
+                std::time::Duration::from_secs(1),
+            );
+            tokio::pin!(first);
+            assert!(futures::poll!(first.as_mut()).is_pending());
+            let (_, tx) = mailbox();
+            let second = team.register_when_available(
+                "second".into(),
+                1,
+                "root".into(),
+                tx,
+                || false,
+                std::time::Duration::from_secs(1),
+            );
+            tokio::pin!(second);
+            assert!(futures::poll!(second.as_mut()).is_pending());
+            let publication = handles[0].begin_terminal_event();
+            handles[0].complete(false, false, None);
+            assert!(futures::poll!(first.as_mut()).is_pending());
+            drop(publication);
+            let first = first.await.unwrap().unwrap();
+            assert!(futures::poll!(second.as_mut()).is_pending());
+            assert_eq!(team.active_len(), MAX_TEAM_SIZE);
+            first.set_status(AgentStatus::Done);
+            assert_eq!(second.await.unwrap().unwrap().name, "second");
+            assert_eq!(team.active_len(), MAX_TEAM_SIZE);
+        }
+
+        #[tokio::test]
+        async fn queued_admission_cancellation_and_deadline_release_the_queue() {
+            let team = AgentRegistry::new();
+            let mut handles = Vec::new();
+            for index in 0..MAX_TEAM_SIZE {
+                let (_, tx) = mailbox();
+                handles.push(team.register(format!("parent-{index}"), 1, "root".into(), tx));
+            }
+            let cancel = AtomicBool::new(false);
+            let (_, tx) = mailbox();
+            let waiting = team.register_when_available(
+                "waiting".into(),
+                2,
+                "parent-0".into(),
+                tx,
+                || cancel.load(Ordering::Relaxed),
+                std::time::Duration::from_secs(1),
+            );
+            tokio::pin!(waiting);
+            assert!(futures::poll!(waiting.as_mut()).is_pending());
+            let queued_cancel = AtomicBool::new(false);
+            let (_, tx) = mailbox();
+            let queued = team.register_when_available(
+                "queued".into(),
+                2,
+                "parent-1".into(),
+                tx,
+                || queued_cancel.load(Ordering::Relaxed),
+                std::time::Duration::from_secs(1),
+            );
+            tokio::pin!(queued);
+            assert!(futures::poll!(queued.as_mut()).is_pending());
+            queued_cancel.store(true, Ordering::Relaxed);
+            assert!(queued.await.unwrap().is_none());
+            let (_, tx) = mailbox();
+            let error = team
+                .register_when_available(
+                    "timed-out".into(),
+                    2,
+                    "parent-1".into(),
+                    tx,
+                    || false,
+                    std::time::Duration::ZERO,
                 )
                 .await
-        });
-        tokio::task::yield_now().await;
-        team.stop("root", "waiting").unwrap();
-        assert!(tokio::time::timeout(std::time::Duration::from_secs(1), run)
-            .await
-            .unwrap()
-            .unwrap()
-            .is_none());
-    }
+                .err()
+                .unwrap();
+            assert!(error.contains("timed out waiting for team capacity"));
+            cancel.store(true, Ordering::Relaxed);
+            assert!(waiting.await.unwrap().is_none());
+            let (_, tx) = mailbox();
+            let error = team
+                .register_when_available(
+                    "deadlocked".into(),
+                    2,
+                    "parent-1".into(),
+                    tx,
+                    || false,
+                    std::time::Duration::ZERO,
+                )
+                .await
+                .err()
+                .unwrap();
+            assert!(error.contains("parent agents may be holding all slots"));
+            handles[2].complete(false, false, None);
+            let (_, tx) = mailbox();
+            assert!(team
+                .register_when_available(
+                    "next".into(),
+                    2,
+                    "parent-1".into(),
+                    tx,
+                    || false,
+                    std::time::Duration::from_secs(1),
+                )
+                .await
+                .unwrap()
+                .is_some());
+            assert!(!team.contains("waiting"));
+            assert!(!team.contains("queued"));
+            assert!(!team.contains("timed-out"));
+            assert!(!team.contains("deadlocked"));
+        }
 
-    #[test]
-    fn accepted_stop_cannot_race_into_a_successful_completion() {
-        for _ in 0..64 {
+        #[test]
+        fn direct_terminal_updates_are_settled_without_lifecycle_publication() {
+            for status in [
+                AgentStatus::Done,
+                AgentStatus::Failed,
+                AgentStatus::Cancelled,
+            ] {
+                let team = AgentRegistry::new();
+                let (_inbox, tx) = mailbox();
+                let handle = team.register("worker".into(), 1, "root".into(), tx);
+                assert!(!handle.is_settled());
+                assert!(team.has_unsettled_descendants("root"));
+                assert!(!team.has_unsettled_descendants("worker"));
+                handle.set_status(status);
+                assert!(handle.is_settled());
+                assert!(!team.has_unsettled_descendants("root"));
+            }
+            for (failed, cancelled) in [(false, false), (true, false), (false, true)] {
+                let team = AgentRegistry::new();
+                let (_inbox, tx) = mailbox();
+                let handle = team.register("worker".into(), 1, "root".into(), tx);
+                handle.complete(failed, cancelled, None);
+                assert!(handle.is_settled());
+            }
+        }
+
+        #[test]
+        fn unsettled_descendants_exclude_parent_and_unrelated_agents() {
+            let team = AgentRegistry::new();
+            let (_inbox, tx) = mailbox();
+            team.register("root".into(), 0, String::new(), tx);
+            assert!(!team.has_unsettled_descendants("root"));
+            let (_inbox, tx) = mailbox();
+            let parent = team.register("parent".into(), 1, "root".into(), tx);
+            let (_inbox, tx) = mailbox();
+            let child = team.register("child".into(), 2, "parent".into(), tx);
+            parent.complete(false, false, None);
+            assert!(team.has_unsettled_descendants("root"));
+            assert!(team.has_unsettled_descendants("parent"));
+            assert!(!team.has_unsettled_descendants("child"));
+            assert!(!team.has_unsettled_descendants("unrelated"));
+            child.complete(false, false, None);
+            assert!(!team.has_unsettled_descendants("root"));
+        }
+
+        #[test]
+        fn stop_is_scoped_to_descendants_and_preserves_siblings() {
+            let team = AgentRegistry::new();
+            let mut handles = HashMap::new();
+            for (name, parent) in [("root", ""), ("a", "root"), ("b", "a"), ("sibling", "root")] {
+                let (_inbox, tx) = mailbox();
+                handles.insert(name, team.register(name.into(), 1, parent.into(), tx));
+            }
+            assert!(team.stop("b", "a").is_err());
+            assert!(team.stop("a", "sibling").is_err());
+            assert!(team.stop("root", "root").is_err());
+            assert!(team.stop("root", "missing").is_err());
+            assert_eq!(team.stop("root", "a").unwrap(), 2);
+            assert!(handles["a"].cancellation_requested());
+            assert!(handles["b"].cancellation_requested());
+            assert!(!handles["sibling"].cancellation_requested());
+            assert!(!handles["root"].cancellation_requested());
+            assert_eq!(team.stop("root", "a").unwrap(), 0);
+            assert_eq!(
+                handles["a"].complete(false, false, None),
+                AgentStatus::Cancelled
+            );
+            assert!(team.stop("root", "a").is_err());
+        }
+
+        #[test]
+        fn live_descendants_prevent_name_reuse_and_late_children_inherit_stop() {
+            let team = AgentRegistry::new();
+            let (_i, tx) = mailbox();
+            let a = team.register("a".into(), 1, "root".into(), tx);
+            let (_i, tx) = mailbox();
+            let b = team.register("b".into(), 2, "a".into(), tx);
+            a.set_status(AgentStatus::Done);
+            assert!(team.name_in_use("a"));
+            let (_i, tx) = mailbox();
+            assert!(team
+                .try_register("a".into(), 2, "sibling".into(), tx)
+                .is_err());
+            assert!(team.stop("sibling", "b").is_err());
+            team.stop("root", "b").unwrap();
+            let (_i, tx) = mailbox();
+            assert!(team.try_register("late".into(), 3, "b".into(), tx).is_err());
+            b.complete(false, true, None);
+            assert!(!team.name_in_use("a"));
+        }
+
+        #[tokio::test]
+        async fn stop_before_start_does_not_poll_work_and_stop_interrupts_pending_work() {
             let team = AgentRegistry::new();
             let (_i, tx) = mailbox();
             let handle = team.register("worker".into(), 1, "root".into(), tx);
-            let barrier = Arc::new(std::sync::Barrier::new(2));
-            let child = handle.clone();
-            let ready = barrier.clone();
-            let finish = std::thread::spawn(move || {
-                ready.wait();
-                child.complete(false, false, None)
+            team.stop("root", "worker").unwrap();
+            let result = handle
+                .run_until_stopped(Arc::new(AtomicBool::new(false)), async {
+                    panic!("stopped work must not start")
+                })
+                .await;
+            assert!(result.is_none());
+            let (_i, tx) = mailbox();
+            let waiting = team.register("waiting".into(), 1, "root".into(), tx);
+            let worker = waiting.clone();
+            let started = Arc::new(Notify::new());
+            let entered = started.clone();
+            let run = tokio::spawn(async move {
+                worker
+                    .run_until_stopped(Arc::new(AtomicBool::new(false)), async move {
+                        entered.notify_one();
+                        std::future::pending::<()>().await
+                    })
+                    .await
             });
-            barrier.wait();
-            let accepted = team.stop("root", "worker").is_ok_and(|count| count == 1);
-            let status = finish.join().unwrap();
-            if accepted {
-                assert_eq!(status, AgentStatus::Cancelled);
+            tokio::time::timeout(std::time::Duration::from_secs(1), started.notified())
+                .await
+                .expect("work must be polled before stop");
+            team.stop("root", "waiting").unwrap();
+            assert!(tokio::time::timeout(std::time::Duration::from_secs(1), run)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_none());
+        }
+
+        #[test]
+        fn accepted_stop_cannot_race_into_a_successful_completion() {
+            for _ in 0..64 {
+                let team = AgentRegistry::new();
+                let (_i, tx) = mailbox();
+                let handle = team.register("worker".into(), 1, "root".into(), tx);
+                let barrier = Arc::new(std::sync::Barrier::new(2));
+                let child = handle.clone();
+                let ready = barrier.clone();
+                let finish = std::thread::spawn(move || {
+                    ready.wait();
+                    child.complete(false, false, None)
+                });
+                barrier.wait();
+                let accepted = team.stop("root", "worker").is_ok_and(|count| count == 1);
+                let status = finish.join().unwrap();
+                if accepted {
+                    assert_eq!(status, AgentStatus::Cancelled);
+                }
             }
         }
-    }
 
-    #[test]
-    fn completion_queues_parent_result_before_releasing_terminal_state() {
-        let team = AgentRegistry::new();
-        let (mut inbox, tx) = mailbox();
-        let parent = team.register("root".into(), 0, String::new(), tx);
-        let (_i, tx) = mailbox();
-        let child = team.register("worker".into(), 1, "root".into(), tx);
-        assert_eq!(
-            child.complete(false, false, Some((&parent, "result"))),
-            AgentStatus::Done
-        );
-        assert!(!team.has_running_children("root"));
-        assert_eq!(inbox.drain()[0].text, "finished: result");
-        assert!(!team.send("worker", "root", "late message"));
-    }
-
-    #[test]
-    fn spawn_report_back_reaches_root_inbox() {
-        // Simulates the real result-delivery loop: root is registered with its
-        // OWN inbox; a spawned child reports back to "root"; the message must land
-        // in root's inbox (the bug where root had no inbox → results were dropped).
-        let team = AgentRegistry::new();
-        let (mut root_inbox, root_tx) = mailbox();
-        team.register("root".into(), 0, String::new(), root_tx);
-
-        // Child registers, "runs", reports its result to root by name.
-        let (_child_inbox, child_tx) = mailbox();
-        team.register("reviewer".into(), 1, "root".into(), child_tx);
-        assert!(team.send("root", "reviewer", "finished: all good"));
-
-        // Root's inbox now has the child's report, and has_pending sees it.
-        assert!(root_inbox.has_pending());
-        let msgs = root_inbox.drain();
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].from, "reviewer");
-        assert_eq!(msgs[0].text, "finished: all good");
-    }
-
-    #[test]
-    fn register_route_and_drain() {
-        let reg = AgentRegistry::new();
-        let (mut inbox, tx) = mailbox();
-        reg.register("worker".into(), 1, "root".into(), tx);
-
-        assert!(reg.send("worker", "root", "hello"));
-        assert!(!reg.send("ghost", "root", "hi")); // unknown recipient
-
-        let msgs = inbox.drain();
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].from, "root");
-        assert_eq!(msgs[0].text, "hello");
-    }
-
-    #[test]
-    fn drain_is_ordered_and_nonblocking() {
-        let (mut inbox, tx) = mailbox();
-        for i in 0..3 {
-            tx.send(AgentMessage {
-                from: "root".into(),
-                text: format!("m{i}"),
-            })
-            .unwrap();
+        #[test]
+        fn completion_queues_parent_result_before_releasing_terminal_state() {
+            let team = AgentRegistry::new();
+            let (mut inbox, tx) = mailbox();
+            let parent = team.register("root".into(), 0, String::new(), tx);
+            let (_i, tx) = mailbox();
+            let child = team.register("worker".into(), 1, "root".into(), tx);
+            assert_eq!(
+                child.complete(false, false, Some((&parent, "result"))),
+                AgentStatus::Done
+            );
+            assert!(!team.has_running_children("root"));
+            assert!(!inbox.has_actionable());
+            let messages = inbox.drain();
+            assert_eq!(messages[0].text, "finished: result");
+            assert_eq!(
+                messages[0].kind,
+                AgentMessageKind::Completion {
+                    status: AgentStatus::Done
+                }
+            );
+            assert!(!team.send("worker", "root", "late message"));
         }
-        let msgs = inbox.drain();
-        assert_eq!(
-            msgs.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(),
-            ["m0", "m1", "m2"]
-        );
-        // Draining again yields nothing (non-blocking).
-        assert!(inbox.drain().is_empty());
+
+        #[test]
+        fn register_route_and_drain() {
+            let reg = AgentRegistry::new();
+            let (mut inbox, tx) = mailbox();
+            reg.register("worker".into(), 1, "root".into(), tx);
+
+            assert!(reg.send("worker", "root", "hello"));
+            assert!(!reg.send("ghost", "root", "hi"));
+
+            let msgs = inbox.drain();
+            assert_eq!(msgs.len(), 1);
+            assert_eq!(msgs[0].from, "root");
+            assert_eq!(msgs[0].text, "hello");
+        }
+
+        #[test]
+        fn drain_is_ordered_and_nonblocking() {
+            let (mut inbox, tx) = mailbox();
+            for i in 0..3 {
+                tx.send(AgentMessage {
+                    from: "root".into(),
+                    text: format!("m{i}"),
+                    kind: AgentMessageKind::Actionable,
+                })
+                .unwrap();
+            }
+            let msgs = inbox.drain();
+            assert_eq!(
+                msgs.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(),
+                ["m0", "m1", "m2"]
+            );
+            assert!(inbox.drain().is_empty());
+        }
+
+        #[test]
+        fn dead_inbox_send_fails() {
+            let reg = AgentRegistry::new();
+            let (inbox, tx) = mailbox();
+            reg.register("w".into(), 1, "root".into(), tx);
+            drop(inbox);
+            assert!(!reg.send("w", "root", "anyone home?"));
+        }
+
+        #[test]
+        fn wake_scopes_to_own_children_only() {
+            let reg = AgentRegistry::new();
+            let (_i1, t1) = mailbox();
+            let mine = reg.register("mine".into(), 1, "root".into(), t1);
+            let (_i2, t2) = mailbox();
+            let other = reg.register("other".into(), 1, "someone".into(), t2);
+
+            assert!(reg.has_running_children("root"));
+            assert!(reg.has_running_children("someone"));
+
+            mine.set_status(AgentStatus::Done);
+            assert!(!reg.has_running_children("root"));
+            assert!(reg.has_running_children("someone"));
+            let _ = other;
+        }
+
+        #[test]
+        fn active_len_and_name_reuse_ignore_finished() {
+            let reg = AgentRegistry::new();
+            let (_i, tx) = mailbox();
+            let h = reg.register("w".into(), 1, "root".into(), tx);
+            assert_eq!(reg.active_len(), 1);
+            assert!(reg.name_in_use("w"));
+
+            h.set_status(AgentStatus::Done);
+            assert_eq!(reg.active_len(), 0);
+            assert!(!reg.name_in_use("w"));
+            assert_eq!(reg.roster().len(), 1);
+        }
     }
 
-    #[test]
-    fn roster_reports_status() {
-        let reg = AgentRegistry::new();
-        let (_inbox, tx) = mailbox();
-        let h = reg.register("w".into(), 2, "root".into(), tx);
-        assert_eq!(
-            reg.roster(),
-            vec![("w".to_string(), 2, AgentStatus::Running)]
-        );
-        h.set_status(AgentStatus::Done);
-        assert_eq!(reg.roster()[0].2, AgentStatus::Done);
-    }
+    mod tools {
+        use crate::agent::env::AgentEnv;
+        use crate::agent::team::AgentRegistry;
+        use crate::core::events::{AgentEvent, EventBus};
+        use crate::providers::mock::MockProvider;
+        use crate::tools::coordinate::*;
+        use crate::tools::file_tracker::FileTracker;
+        use crate::tools::jobs::JobRegistry;
+        use crate::tools::registry::{CoordContext, ToolRegistry};
+        use crate::tools::registry::{Tool, ToolContext};
+        use crate::tools::todo::TodoStore;
+        use serde_json::json;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
 
-    #[tokio::test]
-    async fn recv_awaits_a_message() {
-        let (mut inbox, tx) = mailbox();
-        tokio::spawn(async move {
-            tx.send(AgentMessage {
-                from: "root".into(),
-                text: "ping".into(),
-            })
-            .unwrap();
-        });
-        let msg = inbox.recv().await.unwrap();
-        assert_eq!(msg.text, "ping");
-    }
-
-    #[test]
-    fn dead_inbox_send_fails() {
-        let reg = AgentRegistry::new();
-        let (inbox, tx) = mailbox();
-        reg.register("w".into(), 1, "root".into(), tx);
-        drop(inbox); // agent gone
-        assert!(!reg.send("w", "root", "anyone home?"));
-    }
-
-    #[test]
-    fn wake_scopes_to_own_children_only() {
-        let reg = AgentRegistry::new();
-        let (_i1, t1) = mailbox();
-        let mine = reg.register("mine".into(), 1, "root".into(), t1);
-        let (_i2, t2) = mailbox();
-        let other = reg.register("other".into(), 1, "someone".into(), t2);
-
-        assert!(reg.has_running_children("root"));
-        assert!(reg.has_running_children("someone"));
-
-        // root's child finishes; the unrelated running one must NOT block root.
-        mine.set_status(AgentStatus::Done);
-        assert!(!reg.has_running_children("root"));
-        assert!(reg.has_running_children("someone"));
-        let _ = other;
-    }
-
-    #[test]
-    fn active_len_and_name_reuse_ignore_finished() {
-        let reg = AgentRegistry::new();
-        let (_i, tx) = mailbox();
-        let h = reg.register("w".into(), 1, "root".into(), tx);
-        assert_eq!(reg.active_len(), 1);
-        assert!(reg.name_in_use("w"));
-
-        // Finished → slot freed + name reusable, but still in the roster.
-        h.set_status(AgentStatus::Done);
-        assert_eq!(reg.active_len(), 0);
-        assert!(!reg.name_in_use("w"));
-        assert_eq!(reg.roster().len(), 1);
+        #[tokio::test]
+        async fn unknown_agent_type_does_not_leave_a_running_child() {
+            let team = AgentRegistry::new();
+            let bus = EventBus::new();
+            let events = Arc::new(AtomicUsize::new(0));
+            let count = events.clone();
+            bus.on(Arc::new(move |_: &AgentEvent| {
+                count.fetch_add(1, Ordering::Relaxed);
+            }));
+            let provider = MockProvider::new(vec![]);
+            let jobs = JobRegistry::new();
+            let tool = SpawnAgentTool {
+                deps: CoordDeps {
+                    env: AgentEnv {
+                        provider: Arc::new(provider.clone()),
+                        subagent_tools: ToolRegistry::new(None),
+                        bus,
+                        cwd: ".".into(),
+                        subagent_system: None,
+                        jobs: jobs.clone(),
+                        team: team.clone(),
+                        lsp: None,
+                        parent_cancel: Arc::new(AtomicBool::new(false)),
+                        definitions: Default::default(),
+                        hooks: Default::default(),
+                        memory: None,
+                    },
+                    team: team.clone(),
+                },
+            };
+            let ctx = ToolContext {
+                cwd: ".".into(),
+                files: Arc::new(FileTracker::new()),
+                todos: Arc::new(TodoStore::new()),
+                jobs,
+                user_asker: None,
+                lsp: None,
+                coord: Some(CoordContext {
+                    name: "root".into(),
+                    depth: 0,
+                    team: team.clone(),
+                }),
+                permissions: None,
+            };
+            let result = tool
+                .execute(
+                    json!({
+                        "name": "reviewer",
+                        "task": "review the code",
+                        "subagent_type": "missing"
+                    }),
+                    &ctx,
+                )
+                .await;
+            assert!(result
+                .unwrap_err()
+                .message
+                .contains("unknown subagent type"));
+            assert!(team.roster().is_empty());
+            assert!(!team.has_running_children("root"));
+            assert_eq!(events.load(Ordering::Relaxed), 0);
+            assert!(ctx.jobs.list().is_empty());
+            assert_eq!(provider.call_count(), 0);
+        }
     }
 }

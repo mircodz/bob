@@ -1,8 +1,4 @@
-//! GitHub Copilot auth. Two-token dance:
-//!   1. GitHub OAuth token — obtained once via device flow, stored long-term.
-//!   2. Copilot API token — short-lived (~30 min), fetched from the GitHub token
-//!      on demand and cached until it nears expiry.
-//!      The Copilot chat API itself is OpenAI-compatible at api.githubcopilot.com.
+//! Long-lived GitHub device-flow tokens exchange for short-lived Copilot API tokens.
 
 use super::{
     poll_for_token, request_device_code, AuthStore, Credential, DeviceCode, DeviceFlowConfig,
@@ -23,13 +19,11 @@ fn device_flow() -> DeviceFlowConfig {
     }
 }
 
-/// Begin the device-login flow: returns the code/URL to show the user.
+/// Show the returned code and URL before finishing login.
 pub async fn begin_login() -> anyhow::Result<DeviceCode> {
     request_device_code(&device_flow()).await
 }
 
-/// Finish login: poll until the user authorizes, then persist the GitHub token
-/// under the "copilot" provider in the auth store.
 pub async fn finish_login<F: FnMut()>(device: &DeviceCode, on_wait: F) -> anyhow::Result<()> {
     let github_token = poll_for_token(&device_flow(), device, on_wait).await?;
     let mut store = AuthStore::load();
@@ -45,7 +39,6 @@ pub async fn finish_login<F: FnMut()>(device: &DeviceCode, on_wait: F) -> anyhow
     Ok(())
 }
 
-/// Is there a stored GitHub token for Copilot?
 pub fn is_logged_in() -> bool {
     AuthStore::load()
         .get("copilot")
@@ -53,10 +46,8 @@ pub fn is_logged_in() -> bool {
         .unwrap_or(false)
 }
 
-/// Exchange the stored GitHub token for a short-lived Copilot API token.
-/// Returns (token, expires_at_unix_secs, api_base_url). The api base comes from
-/// the response's `endpoints.api` — it differs for Enterprise accounts
-/// (api.enterprise.githubcopilot.com) vs. individual (api.githubcopilot.com).
+/// Returns (token, expiry in Unix seconds, API base URL).
+/// Use the returned endpoint for Enterprise account routing.
 pub async fn fetch_copilot_token(github_token: &str) -> anyhow::Result<(String, u64, String)> {
     let client = reqwest::Client::new();
     let res = client
@@ -85,28 +76,22 @@ pub async fn fetch_copilot_token(github_token: &str) -> anyhow::Result<(String, 
     Ok((token, expires_at, api_base))
 }
 
-/// Load the stored GitHub token (the long-lived one).
 pub fn github_token() -> Option<String> {
     AuthStore::load().get("copilot").map(|c| c.token.clone())
 }
 
-/// One model's capability limits from the Copilot `/models` response. Fields are
-/// optional because embedding models (and future entries) omit them.
+/// `/models` limits; embedding models may omit them.
 #[derive(Debug, Clone, Default)]
 pub struct ModelLimits {
     pub id: String,
     /// Total context window (input + output) the backend advertises.
     pub max_context_window_tokens: Option<usize>,
-    /// The input-token budget — what actually bounds our compaction. This is the
-    /// window MINUS the reserved output allowance, so it's the number to size the
-    /// history against.
+    /// Input budget for compaction, excluding reserved output tokens.
     pub max_prompt_tokens: Option<usize>,
     pub max_output_tokens: Option<usize>,
 }
 
-/// Fetch per-model capability limits from the Copilot `/models` endpoint using a
-/// freshly-minted Copilot token. Best-effort: returns an empty vec on any
-/// failure so callers can fall back to the static id-based heuristic.
+/// Returns no limits on failure so callers can use static heuristics.
 pub async fn fetch_model_limits(copilot_token: &str, api_base: &str) -> Vec<ModelLimits> {
     let client = reqwest::Client::new();
     let res = client

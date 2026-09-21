@@ -4,12 +4,14 @@ pub mod coordinate;
 pub mod diff;
 pub mod edit;
 pub mod file_tracker;
+pub mod filesystem;
 pub mod interact;
 pub mod jobs;
 pub mod lsp;
 pub mod lsp_actions;
 pub mod memory;
 pub mod registry;
+pub mod schema;
 pub mod search;
 pub mod structured;
 pub mod task;
@@ -23,14 +25,12 @@ use crate::tools::builtin::{ListDirTool, ReadFileTool, WriteFileTool};
 use crate::tools::edit::{EditFileTool, MultiEditTool};
 use crate::tools::interact::{AskUserTool, EnterPlanTool, ExitPlanTool};
 use crate::tools::jobs::{JobOutputTool, JobStatusTool};
-use crate::tools::memory::MemoryTool;
 use crate::tools::registry::Tool;
 use crate::tools::search::{GlobTool, GrepTool};
 use crate::tools::todo_write::TodoWriteTool;
 use crate::tools::web::{WebFetchTool, WebSearchTool};
 use std::sync::Arc;
 
-/// The full built-in tool set (not including `task`, which is wired separately).
 pub fn builtin_tools() -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(ReadFileTool),
@@ -44,7 +44,6 @@ pub fn builtin_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(WebFetchTool),
         Arc::new(WebSearchTool),
         Arc::new(TodoWriteTool),
-        Arc::new(MemoryTool),
         Arc::new(JobStatusTool),
         Arc::new(JobOutputTool),
         Arc::new(AskUserTool),

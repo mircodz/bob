@@ -1,6 +1,4 @@
 //! Minimal line-level diff (LCS-based) producing a unified-diff-style hunk list.
-//! Shared by the edit tools (to report what changed) and the TUI (to render a
-//! pretty colored diff).
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DiffOp {
@@ -17,14 +15,12 @@ pub struct DiffLine {
     pub new_line: Option<usize>,
 }
 
-/// Compute a line diff between two strings.
 pub fn diff_lines(before: &str, after: &str) -> Vec<DiffLine> {
     let a: Vec<&str> = before.split('\n').collect();
     let b: Vec<&str> = after.split('\n').collect();
     let n = a.len();
     let m = b.len();
 
-    // LCS table.
     let mut lcs = vec![vec![0usize; m + 1]; n + 1];
     for i in (0..n).rev() {
         for j in (0..m).rev() {
@@ -144,10 +140,7 @@ pub fn diff_stat(lines: &[DiffLine]) -> (usize, usize) {
     (added, removed)
 }
 
-/// Render a diff as a plain unified-style string (for tool output / the model).
-/// Each line is prefixed with its new-file line number (blank for removals) so
-/// UIs can show line numbers without recomputing the diff:
-///   "  12| context", "+ 13| added", "-   | removed".
+/// Prefix each line with its sign and line number (old for removals, new otherwise).
 pub fn format_unified(lines: &[DiffLine]) -> String {
     lines
         .iter()
@@ -169,4 +162,166 @@ pub fn format_unified(lines: &[DiffLine]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rows(lines: &[DiffLine]) -> Vec<(DiffOp, &str, Option<usize>, Option<usize>)> {
+        lines
+            .iter()
+            .map(|line| (line.op, line.text.as_str(), line.old_line, line.new_line))
+            .collect()
+    }
+
+    #[test]
+    fn diff_replacement_keeps_line_numbers_and_removes_before_adding_on_ties() {
+        use DiffOp::*;
+        let lines = diff_lines("same\nold\nend", "same\nnew\nend");
+        assert_eq!(
+            rows(&lines),
+            vec![
+                (Context, "same", Some(1), Some(1)),
+                (Remove, "old", Some(2), None),
+                (Add, "new", None, Some(2)),
+                (Context, "end", Some(3), Some(3)),
+            ]
+        );
+        assert_eq!(diff_stat(&lines), (1, 1));
+        assert_eq!(
+            format_unified(&lines),
+            "     1| same\n-    2| old\n+    2| new\n     3| end"
+        );
+        assert_eq!(
+            rows(&diff_lines("a\nb\na", "b\na\nb")),
+            vec![
+                (Remove, "a", Some(1), None),
+                (Context, "b", Some(2), Some(1)),
+                (Context, "a", Some(3), Some(2)),
+                (Add, "b", None, Some(3)),
+            ]
+        );
+    }
+
+    #[test]
+    fn diff_empty_and_trailing_lines_are_preserved() {
+        use DiffOp::*;
+        for (before, after, expected) in [
+            ("", "", vec![(Context, "", Some(1), Some(1))]),
+            (
+                "",
+                "x",
+                vec![(Remove, "", Some(1), None), (Add, "x", None, Some(1))],
+            ),
+            (
+                "x",
+                "",
+                vec![(Remove, "x", Some(1), None), (Add, "", None, Some(1))],
+            ),
+            (
+                "x",
+                "x\n",
+                vec![(Context, "x", Some(1), Some(1)), (Add, "", None, Some(2))],
+            ),
+            (
+                "x\n",
+                "x",
+                vec![
+                    (Context, "x", Some(1), Some(1)),
+                    (Remove, "", Some(2), None),
+                ],
+            ),
+        ] {
+            assert_eq!(
+                rows(&diff_lines(before, after)),
+                expected,
+                "{before:?} -> {after:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_diff_keeps_context_once_and_marks_only_internal_gaps() {
+        use DiffOp::*;
+        let lines = diff_lines("a\nb\nc\nd\ne\nf\ng", "a\nB\nc\nd\ne\nF\ng");
+        let compact = compact_diff(&lines, 0);
+        assert_eq!(
+            rows(&compact),
+            vec![
+                (Remove, "b", Some(2), None),
+                (Add, "B", None, Some(2)),
+                (Context, "...", None, None),
+                (Remove, "f", Some(6), None),
+                (Add, "F", None, Some(6)),
+            ]
+        );
+        assert_eq!(rows(&compact_diff(&lines, 2)), rows(&lines));
+        assert!(compact_diff(&diff_lines("unchanged", "unchanged"), 3).is_empty());
+        assert!(compact_diff(&[], 3).is_empty());
+    }
+
+    #[test]
+    fn diff_reconstructs_both_inputs_with_contiguous_line_numbers() {
+        let samples = [
+            "",
+            "a",
+            "a\n",
+            "\na",
+            "a\na\nb",
+            "b\na\nb",
+            "é\n終\n",
+            "a\n\nb",
+        ];
+        for before in samples {
+            for after in samples {
+                let lines = diff_lines(before, after);
+                let old: Vec<_> = lines.iter().filter(|line| line.op != DiffOp::Add).collect();
+                let new: Vec<_> = lines
+                    .iter()
+                    .filter(|line| line.op != DiffOp::Remove)
+                    .collect();
+                assert_eq!(
+                    old.iter()
+                        .map(|line| line.text.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    before
+                );
+                assert_eq!(
+                    new.iter()
+                        .map(|line| line.text.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    after
+                );
+                for (index, line) in old.iter().enumerate() {
+                    assert_eq!(line.old_line, Some(index + 1));
+                }
+                for (index, line) in new.iter().enumerate() {
+                    assert_eq!(line.new_line, Some(index + 1));
+                }
+                for line in &lines {
+                    if line.op == DiffOp::Add {
+                        assert_eq!(line.old_line, None);
+                    } else if line.op == DiffOp::Remove {
+                        assert_eq!(line.new_line, None);
+                    }
+                }
+                let (added, removed) = diff_stat(&lines);
+                assert_eq!(old.len() + added, new.len() + removed);
+                for context in [0, 1, 2, 20] {
+                    let compact = compact_diff(&lines, context);
+                    assert_eq!(diff_stat(&compact), (added, removed));
+                    let changes = |rows: &[DiffLine]| {
+                        rows.iter()
+                            .filter(|line| line.op != DiffOp::Context)
+                            .map(|line| (line.op, line.text.clone(), line.old_line, line.new_line))
+                            .collect::<Vec<_>>()
+                    };
+                    assert_eq!(changes(&compact), changes(&lines));
+                }
+            }
+        }
+    }
 }

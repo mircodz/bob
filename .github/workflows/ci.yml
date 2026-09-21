@@ -4,13 +4,17 @@ on:
   push:
     branches: [main, master]
   pull_request:
+  workflow_call:
+    inputs:
+      skip-artifacts:
+        description: Run validation without CI artifact builds
+        type: boolean
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Fast lint + test gate on Linux. fmt is blocking now that the tree is clean;
-  # clippy stays advisory until the existing lints are cleared.
   check:
     name: Lint & test
     runs-on: ubuntu-latest
@@ -22,20 +26,45 @@ jobs:
           components: rustfmt, clippy
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+      - name: Install search dependency
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
       - name: Format check
         run: cargo fmt --all --check
       - name: Build
         run: cargo build --workspace --all-targets
       - name: Test
         run: cargo test --workspace
-      - name: Clippy (non-blocking)
-        run: cargo clippy --workspace --all-targets || true
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
-  # Build the release binary on every OS and upload a downloadable artifact per
-  # platform for every push/PR — not just tagged releases.
+  platform-tests:
+    name: Test ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Install search dependency (macOS)
+        if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+        run: brew list ripgrep >/dev/null 2>&1 || brew install ripgrep
+      - name: Install search dependency (Windows)
+        if: runner.os == 'Windows'
+        run: choco install ripgrep --yes --no-progress
+      - name: Test workspace
+        run: cargo test --workspace
+
   build:
     name: Build ${{ matrix.target }}
-    needs: check
+    if: ${{ !inputs.skip-artifacts }}
+    needs: [check, platform-tests]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

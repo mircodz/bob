@@ -1,5 +1,3 @@
-//! The todo_write tool: replaces the current todo list.
-
 use crate::core::types::ToolSpec;
 use crate::tools::registry::{Tool, ToolContext, ToolResult};
 use crate::tools::todo::{render_todos, TodoItem, TodoStatus};
@@ -77,6 +75,96 @@ impl Tool for TodoWriteTool {
         Ok(format!(
             "todo list updated ({} done, {} in progress, {} pending)\n{}",
             done, prog, pend, rendered
-        ))
+        )
+        .into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{files::tool_context, TestDir};
+
+    #[tokio::test]
+    async fn todo_write_replaces_instead_of_appending_and_can_clear() {
+        let dir = TestDir::new();
+        let ctx = tool_context(dir.path());
+        TodoWriteTool
+            .execute(
+                json!({"todos": [
+                    {"content": "Old task", "status": "pending"}
+                ]}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let output = TodoWriteTool.execute(json!({"todos": [
+            {"content": "Implement", "active_form": "Implementing", "status": "in_progress"},
+            {"content": "Verify", "status": "pending"},
+            {"content": "Inspect", "active_form": "Inspecting", "status": "completed"}
+        ]}), &ctx).await.unwrap();
+        assert_eq!(output.as_text().unwrap(), "todo list updated (1 done, 1 in progress, 1 pending)\n[~] Implementing\n[ ] Verify\n[x] Inspect");
+        let snapshot = ctx.todos.items();
+        assert_eq!(
+            snapshot
+                .iter()
+                .map(|item| item.content.as_str())
+                .collect::<Vec<_>>(),
+            ["Implement", "Verify", "Inspect"]
+        );
+        assert_eq!(
+            TodoWriteTool
+                .execute(json!({"todos": []}), &ctx)
+                .await
+                .unwrap()
+                .as_text()
+                .unwrap(),
+            "todo list updated (0 done, 0 in progress, 0 pending)\n(todo list empty)"
+        );
+        assert!(ctx.todos.items().is_empty());
+        assert_eq!(snapshot.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn registered_invalid_write_preserves_the_entire_previous_list() {
+        use crate::tools::registry::{ToolErrorKind, ToolRegistry};
+        use std::sync::Arc;
+
+        let dir = TestDir::new();
+        let ctx = tool_context(dir.path());
+        let mut registry = ToolRegistry::new(None);
+        registry.add(Arc::new(TodoWriteTool));
+        registry
+            .execute(
+                "todo_write",
+                json!({"todos":[
+                    {"content":"Keep", "status":"in_progress", "active_form":"Keeping"}
+                ]}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let before = serde_json::to_value(ctx.todos.items()).unwrap();
+        for input in [
+            json!({}),
+            json!({"todos":null}),
+            json!({"todos":{}}),
+            json!({"todos":[{"content":"Missing status"}]}),
+            json!({"todos":[{"content":"Bad", "status":"unknown"}]}),
+            json!({"todos":[{"content":12, "status":"pending"}]}),
+            json!({"todos":[{"content":"Bad", "status":"pending", "active_form":false}]}),
+            json!({"todos":[{"content":"Valid prefix", "status":"completed"}, {}]}),
+        ] {
+            let error = registry
+                .execute("todo_write", input.clone(), &ctx)
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind, ToolErrorKind::InvalidInput, "{input}");
+            assert_eq!(
+                serde_json::to_value(ctx.todos.items()).unwrap(),
+                before,
+                "{input}"
+            );
+        }
     }
 }

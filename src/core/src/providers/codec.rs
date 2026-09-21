@@ -1,41 +1,15 @@
-//! Shared discipline for message → wire-format translation.
-//!
-//! The three provider wire formats (Anthropic content-block arrays, OpenAI
-//! role-split `tool_calls`, the Responses `input`-item stream) are genuinely
-//! different serializations — a codec trait can't dedupe the *bodies*. What it
-//! CAN do is make the one recurring bug impossible: silently dropping a
-//! `ContentBlock` variant.
-//!
-//! Historically each provider converted blocks with a `filter_map` ending in
-//! `_ => None`, so a block a provider didn't recognize just vanished — with no
-//! error and no test. OpenAI dropped `Thinking`/`RedactedThinking`/`ReasoningItem`
-//! this way.
-//!
-//! The fix is [`BlockWire`]: every conversion is an EXHAUSTIVE `match` returning
-//! an explicit decision per block — `Emit` it, or deliberately `Skip` it with a
-//! stated reason. A new `ContentBlock` variant then fails to compile in each
-//! provider until someone consciously decides how to handle it. The shared
-//! conformance test below runs every variant through every provider so a
-//! regression to silent-drop can't slip back in.
+//! Content-block conversion must explicitly emit or skip every variant.
 
 use serde_json::Value;
 
 use crate::core::types::StopReason;
 
-/// A provider's decision about one [`ContentBlock`](crate::core::types::ContentBlock)
-/// when building a request. `Skip` is a *deliberate* omission (the format can't
-/// represent this block), distinct from an accidental drop — the reason is
-/// documented at the call site.
 pub enum BlockWire {
     Emit(Value),
     Skip,
 }
 
-/// Map a provider's finish/stop-reason string to our [`StopReason`]. Accepts the
-/// union of both vocabularies — Anthropic (`tool_use`, `stop_sequence`) and
-/// OpenAI/chat (`tool_calls`, `function_call`, `length`) — so the two providers
-/// share one mapper instead of maintaining near-identical copies. Unknown strings
-/// fall back to `EndTurn`.
+/// Accepts Anthropic and OpenAI stop reasons; unknown values mean `EndTurn`.
 pub fn map_stop_reason(raw: &str) -> StopReason {
     match raw {
         "tool_use" | "tool_calls" | "function_call" => StopReason::ToolUse,
@@ -46,7 +20,6 @@ pub fn map_stop_reason(raw: &str) -> StopReason {
 }
 
 impl BlockWire {
-    /// The emitted JSON, or `None` when this block was deliberately skipped.
     pub fn into_value(self) -> Option<Value> {
         match self {
             BlockWire::Emit(v) => Some(v),
@@ -55,26 +28,24 @@ impl BlockWire {
     }
 }
 
-/// The key under which [`parse_tool_input`] tags a tool-argument JSON that
-/// failed to parse. The agent loop detects this and returns a real error to the
-/// model instead of silently invoking the tool with empty args.
+/// Parse-error sentinel recognized by the agent loop before tool execution.
 pub const TOOL_ARGS_PARSE_ERROR_KEY: &str = "__bob_tool_args_parse_error__";
 
-/// Turn a streamed tool_use's *accumulated argument string* into its input JSON.
-///
-/// Every provider streams tool arguments as a sequence of partial-JSON deltas
-/// that we concatenate into one string, then parse once the block closes. The
-/// three providers historically each did `serde_json::from_str(raw).unwrap_or(json!({}))`
-/// — so a raw string that was empty (a dropped/mis-indexed delta stream) OR
-/// merely unparseable BOTH collapsed to `{}` with no error. The tool then ran
-/// with empty args and failed downstream ("missing field …"), and the model saw
-/// only that misleading error — never that its arguments had been dropped.
-///
-/// This makes the three cases distinct:
-/// - empty accumulator → `{}` (a genuine no-argument call; legitimate).
-/// - valid JSON        → the parsed value.
-/// - unparseable JSON  → a tagged object `{ TOOL_ARGS_PARSE_ERROR_KEY: { raw, error } }`
-///   so the loss is *visible* and the agent loop can surface it to the model.
+pub(crate) fn complete_tool_input(id: &str, name: &str, raw: &str) -> anyhow::Result<Value> {
+    if id.is_empty() || name.is_empty() {
+        anyhow::bail!("tool call missing id or name");
+    }
+    let value: Value = serde_json::from_str(raw).map_err(|error| {
+        anyhow::anyhow!("incomplete or malformed arguments for {name}: {error}")
+    })?;
+    if !value.is_object() {
+        anyhow::bail!("arguments for {name} must be a JSON object");
+    }
+    Ok(value)
+}
+
+/// Empty arguments become `{}`; malformed JSON retains its raw text and error
+/// in a sentinel for the agent loop.
 pub fn parse_tool_input(raw: &str) -> Value {
     if raw.is_empty() {
         return serde_json::json!({});
@@ -90,8 +61,6 @@ pub fn parse_tool_input(raw: &str) -> Value {
     }
 }
 
-/// If `input` is a parse-error sentinel from [`parse_tool_input`], return a
-/// human-readable explanation (for a tool-result error). `None` otherwise.
 pub fn tool_input_parse_error(input: &Value) -> Option<String> {
     let obj = input.as_object()?;
     if obj.len() != 1 {
@@ -107,97 +76,98 @@ pub fn tool_input_parse_error(input: &Value) -> Option<String> {
 }
 
 #[cfg(test)]
-pub(crate) mod conformance {
-    use crate::core::types::ContentBlock;
-    use serde_json::json;
-
-    /// One of every [`ContentBlock`] variant. The shared test harness feeds this
-    /// through each provider's block converter to prove none are silently lost.
-    /// Adding a variant to `ContentBlock` without extending this list fails the
-    /// exhaustiveness check below.
-    pub fn all_content_blocks() -> Vec<ContentBlock> {
-        let blocks = vec![
-            ContentBlock::Text { text: "hi".into() },
-            ContentBlock::ToolUse {
-                id: "t1".into(),
-                name: "read_file".into(),
-                input: json!({"path": "a.rs"}),
-            },
-            ContentBlock::ToolResult {
-                tool_use_id: "t1".into(),
-                content: "ok".into(),
-                is_error: Some(false),
-            },
-            ContentBlock::Thinking {
-                thinking: "hmm".into(),
-                signature: "sig".into(),
-            },
-            ContentBlock::RedactedThinking { data: "xxx".into() },
-            ContentBlock::ReasoningItem {
-                item: json!({"id": "r1"}),
-            },
-        ];
-        // Exhaustiveness guard: if a ContentBlock variant is added and NOT
-        // included above, this match fails to compile — forcing the sample list
-        // (and thus every provider's conformance test) to cover it.
-        for b in &blocks {
-            match b {
-                ContentBlock::Text { .. }
-                | ContentBlock::ToolUse { .. }
-                | ContentBlock::ToolResult { .. }
-                | ContentBlock::Thinking { .. }
-                | ContentBlock::RedactedThinking { .. }
-                | ContentBlock::ReasoningItem { .. } => {}
-            }
-        }
-        blocks
-    }
-}
-
-#[cfg(test)]
 mod tests {
-    use super::map_stop_reason;
-    use crate::core::types::StopReason;
+    use super::*;
+    use serde_json::json;
 
     #[test]
     fn stop_reason_covers_both_provider_vocabularies() {
-        // Anthropic vocabulary.
         assert_eq!(map_stop_reason("tool_use"), StopReason::ToolUse);
         assert_eq!(map_stop_reason("stop_sequence"), StopReason::StopSequence);
         assert_eq!(map_stop_reason("max_tokens"), StopReason::MaxTokens);
-        // OpenAI / chat vocabulary.
         assert_eq!(map_stop_reason("tool_calls"), StopReason::ToolUse);
         assert_eq!(map_stop_reason("function_call"), StopReason::ToolUse);
         assert_eq!(map_stop_reason("length"), StopReason::MaxTokens);
-        // Anything else is a normal end-of-turn.
         assert_eq!(map_stop_reason("stop"), StopReason::EndTurn);
         assert_eq!(map_stop_reason(""), StopReason::EndTurn);
+        assert_eq!(map_stop_reason("future_reason"), StopReason::EndTurn);
     }
 
     #[test]
     fn parse_tool_input_distinguishes_empty_valid_and_broken() {
-        use super::{parse_tool_input, tool_input_parse_error};
-        use serde_json::json;
-
-        // Empty accumulator → a legitimate no-argument call, not an error.
         let empty = parse_tool_input("");
         assert_eq!(empty, json!({}));
         assert!(tool_input_parse_error(&empty).is_none());
 
-        // Valid JSON round-trips.
         let ok = parse_tool_input(r#"{"shape":"map_reduce","items":["a"]}"#);
-        assert_eq!(ok["shape"], "map_reduce");
+        assert_eq!(ok, json!({"shape":"map_reduce","items":["a"]}));
         assert!(tool_input_parse_error(&ok).is_none());
 
-        // Truncated / malformed JSON (the real bug) is TAGGED, not silently {} —
-        // and the tag carries the raw text + parser error for the model to see.
         let broken = parse_tool_input(r#"{"shape":"map_re"#);
         let explain = tool_input_parse_error(&broken).expect("should be tagged as a parse error");
         assert!(explain.contains("not valid JSON"));
-        assert!(explain.contains("shape")); // includes the raw fragment
+        assert!(explain.contains("shape"));
+    }
 
-        // A normal object that merely happens to have one key is NOT mistaken for
-        // the sentinel.
-        assert!(tool_input_parse_error(&json!({"path": "a.rs"})).is_none());
+    #[test]
+    fn complete_calls_require_identity_and_object_arguments() {
+        for (id, name) in [("", "read_file"), ("call-1", ""), ("", "")] {
+            assert_eq!(
+                complete_tool_input(id, name, "{}").unwrap_err().to_string(),
+                "tool call missing id or name"
+            );
+        }
+        for raw in ["null", "[]", "42", "true", "\"text\""] {
+            assert_eq!(
+                complete_tool_input("call-1", "read_file", raw)
+                    .unwrap_err()
+                    .to_string(),
+                "arguments for read_file must be a JSON object",
+                "{raw}"
+            );
+        }
+        for raw in ["", " ", "{", "{\"path\":", "{} trailing", "{\"x\":1,}"] {
+            let error = complete_tool_input("call-1", "read_file", raw).unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("incomplete or malformed arguments for read_file"));
+        }
+        assert_eq!(
+            complete_tool_input("call-1", "list", " {} \n").unwrap(),
+            json!({})
+        );
+        assert_eq!(
+            complete_tool_input(
+                "call-2",
+                "read_file",
+                r#"{"path":"日本語/😀.rs","options":{"lines":[1,3],"literal":"a\nb\"c"}}"#,
+            )
+            .unwrap(),
+            json!({"path":"日本語/😀.rs","options":{"lines":[1,3],"literal":"a\nb\"c"}})
+        );
+    }
+
+    #[test]
+    fn malformed_arguments_preserve_raw_evidence_and_do_not_tag_ordinary_values() {
+        for raw in [" ", "{\"path\":\"日本語", "{} trailing"] {
+            let parsed = parse_tool_input(raw);
+            assert_eq!(parsed.as_object().unwrap().len(), 1);
+            assert_eq!(parsed[TOOL_ARGS_PARSE_ERROR_KEY]["raw"], raw);
+            assert!(!parsed[TOOL_ARGS_PARSE_ERROR_KEY]["error"]
+                .as_str()
+                .unwrap()
+                .is_empty());
+            assert!(tool_input_parse_error(&parsed)
+                .unwrap()
+                .contains("Re-issue the call"));
+        }
+        for value in [
+            json!(null),
+            json!([]),
+            json!({"path":"a.rs"}),
+            json!({"__bob_tool_args_parse_error__":{"raw":"{","error":"bad"},"path":"a.rs"}),
+        ] {
+            assert!(tool_input_parse_error(&value).is_none(), "{value}");
+        }
     }
 }

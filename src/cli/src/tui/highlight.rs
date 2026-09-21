@@ -1,6 +1,3 @@
-//! Syntax highlighting for fenced code blocks via syntect. Loads the default
-//! syntax + theme sets once (lazily) and maps syntect styles to ratatui spans.
-
 use super::render::safe_display_text;
 use once_cell::sync::Lazy;
 use ratatui::style::{Color, Style};
@@ -19,9 +16,6 @@ static HIGHLIGHTER: Lazy<Highlighter> = Lazy::new(|| Highlighter {
     themes: ThemeSet::load_defaults(),
 });
 
-/// Highlight `code` (already newline-split by the caller is fine too) in the
-/// given language, returning one ratatui Line per source line. Falls back to
-/// plain, uncolored lines when the language isn't recognized.
 pub fn highlight(code: &str, lang: &str) -> Vec<Line<'static>> {
     let code = safe_display_text(code);
     let hl = &*HIGHLIGHTER;
@@ -58,7 +52,6 @@ pub fn highlight(code: &str, lang: &str) -> Vec<Line<'static>> {
             Err(_) => out.push(Line::from(line.to_string())),
         }
     }
-    // Drop a trailing empty line produced by a final newline.
     if matches!(out.last(), Some(l) if l.width() == 0) {
         out.pop();
     }
@@ -72,8 +65,6 @@ fn lang_syntax<'a>(
     if lang.is_empty() {
         return None;
     }
-    // `lang` may be a bare token ("rust"), an extension ("rs"), or a full path
-    // ("src/main.rs") — try token first, then the trailing extension.
     if let Some(s) = syntaxes.find_syntax_by_token(lang) {
         return Some(s);
     }
@@ -84,8 +75,6 @@ fn lang_syntax<'a>(
     syntaxes.find_syntax_by_extension(ext)
 }
 
-/// Highlight a single line of `code` in `lang`, returning styled spans (no
-/// trailing newline). Used by the diff renderer, which owns its own gutters.
 pub fn highlight_line(code: &str, lang: &str) -> Vec<Span<'static>> {
     let code = safe_display_text(code);
     let hl = &*HIGHLIGHTER;
@@ -142,10 +131,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn language_tokens_extensions_and_paths_share_syntax_and_preserve_source() {
+        let code = "let café = \"日本語\";";
+        let expected = highlight_line(code, "rust");
+        assert_eq!(
+            expected
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            code
+        );
+        for language in ["rs", "src/main.rs", "nested/path/main.rs"] {
+            assert_eq!(highlight_line(code, language), expected, "{language}");
+        }
+        let plain = highlight_line(code, "not-a-real-language");
+        assert_eq!(plain.len(), 1);
+        assert_eq!(plain[0].content, code);
+        assert_eq!(
+            plain[0].style.fg,
+            Some(super::super::theme::Palette::CODE_DEFAULT())
+        );
+        assert_ne!(
+            expected, plain,
+            "recognized syntax must actually add highlighting"
+        );
+    }
+
+    #[test]
     fn highlighting_strips_controls_before_syntax_splitting_and_preserves_styles() {
         let clean = "let café = \"日本語\";";
         let raw = format!("\u{1b}[31m{clean}\u{1b}[0m\u{9d}52;c;payload\u{9c}");
-        let original = raw.clone();
         for lang in ["rust", "sh", "unknown-language"] {
             assert_eq!(highlight_line(&raw, lang), highlight_line(clean, lang));
             assert_eq!(highlight(&raw, lang), highlight(clean, lang));
@@ -154,6 +169,5 @@ mod tests {
                 highlight(&format!("{clean}\n\t{clean}"), lang)
             );
         }
-        assert_eq!(raw, original);
     }
 }

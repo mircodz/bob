@@ -1,36 +1,22 @@
-//! Per-agent transcript capture + sidebar state. Every spawned agent gets an
-//! [`AgentThread`] — a mini transcript built from the same event stream and the
-//! same [`view::Cell`] reduction as the main view, so the main pane can show an
-//! agent's full live activity and (via the coordination team) let you message it.
-
-use super::view::{apply_content_event, Cell, ToolStatus};
+use super::view::{apply_content_event, finish_retries, Cell, ToolStatus};
 use bob_core::core::events::AgentEvent;
 use bob_core::core::session::{PersistedCell, PersistedThread};
 
-/// One spawned agent's live thread: who it is, its status, and its transcript
-/// (streamed text + tool calls + messages to/from it).
 pub struct AgentThread {
     pub name: String,
     /// Who spawned it ("root" or another agent's name).
     pub parent_id: String,
-    /// Short task/description label from the spawn event.
     pub task: String,
     pub status: ThreadStatus,
+    pub started: std::time::Instant,
     pub cells: Vec<Cell>,
     /// Content cells appended since the main pane last showed this thread.
     pub unread: usize,
-    /// Bumped on every transcript mutation, so a shared scrollback renderer can
-    /// invalidate its per-cell cache exactly like the root `ViewModel.revision`.
-    /// (Cells can change in place — a tool cell flips status without changing
-    /// `cells.len()` — so a length check alone would miss updates.)
+    /// Cache invalidation includes in-place cell mutations, not just appends.
     pub revision: u64,
 }
 
 impl AgentThread {
-    /// The label shown in the sidebar roster. `spawn_agent` children carry a
-    /// semantic handle (e.g. "researcher") as their id, so `name` is meaningful.
-    /// `task` children get an opaque auto-id (`task_7`); for those we prefer the
-    /// human `task` description ("review src/core") the model supplied at spawn.
     pub fn display_label(&self) -> &str {
         let looks_auto = self
             .name
@@ -60,6 +46,7 @@ impl AgentThread {
             parent_id,
             task,
             status: ThreadStatus::Running,
+            started: std::time::Instant::now(),
             cells: Vec::new(),
             unread: 0,
             revision: 0,
@@ -67,9 +54,6 @@ impl AgentThread {
     }
 }
 
-/// The set of per-agent threads, keyed by agent id (== the agent's team name for
-/// `spawn_agent` children; `task_N` for `task`-spawned ones). Fed by the event
-/// loop with every subagent event that the main transcript drops.
 #[derive(Default)]
 pub struct AgentTranscripts {
     /// Insertion order of agent ids, so the sidebar roster is stable.
@@ -97,9 +81,7 @@ impl AgentTranscripts {
         self.order.is_empty()
     }
 
-    /// Ids in DISPLAY order: still-running agents first (in spawn order), then
-    /// finished ones (done/failed) at the bottom. The sidebar navigates and renders
-    /// through this so selection stays aligned with what's shown.
+    /// Shared by sidebar rendering and navigation; running agents precede finished ones.
     pub fn display_order(&self) -> Vec<String> {
         let mut running: Vec<String> = Vec::new();
         let mut finished: Vec<String> = Vec::new();
@@ -114,8 +96,6 @@ impl AgentTranscripts {
         running
     }
 
-    /// The ids of currently-RUNNING agents, in registration order (for the sidebar
-    /// AGENTS tree — finished agents are excluded).
     pub fn running_ids(&self) -> Vec<String> {
         self.order
             .iter()
@@ -141,7 +121,6 @@ impl AgentTranscripts {
             if t.parent_id.is_empty() || t.parent_id == "root" {
                 break;
             }
-            // Only count parents that are themselves tracked agents.
             if !self.threads.contains_key(&t.parent_id) {
                 break;
             }
@@ -167,7 +146,6 @@ impl AgentTranscripts {
         true
     }
 
-    /// Clear the unread counter for an agent (called when the main pane shows it).
     pub fn mark_read(&mut self, id: &str) {
         if let Some(t) = self.threads.get_mut(id) {
             t.unread = 0;
@@ -185,27 +163,22 @@ impl AgentTranscripts {
         self.threads.get_mut(id).unwrap()
     }
 
-    /// Record a spawn: register the thread with its label + parent up front so it
-    /// appears in the roster even before it emits any content. `prompt` is the
-    /// full instruction the parent gave; it's recorded as the first message cell
-    /// so the main pane shows exactly what was delegated (from the parent).
     pub fn on_spawn(&mut self, agent_id: &str, parent_id: &str, task: &str, prompt: &str) {
         let already = self.threads.contains_key(agent_id);
         let t = self.ensure(agent_id);
         let restarting = t.status != ThreadStatus::Running;
         t.status = ThreadStatus::Running;
+        if restarting {
+            t.started = std::time::Instant::now();
+        }
         t.parent_id = parent_id.to_string();
         t.task = task.to_string();
-        // Seed the transcript with the delegated instructions once, rendered the
-        // same way as user input (a `Cell::User` band) so it reads like the opening
-        // prompt of the conversation.
         if (!already || restarting) && !prompt.trim().is_empty() {
             t.cells.push(Cell::User(prompt.to_string()));
             t.revision += 1;
         }
     }
 
-    /// Record completion, setting the final status.
     pub fn on_done(&mut self, agent_id: &str, failed: bool) {
         self.finish_thread(
             agent_id,
@@ -220,6 +193,7 @@ impl AgentTranscripts {
     fn finish_thread(&mut self, agent_id: &str, status: ThreadStatus) {
         let t = self.ensure(agent_id);
         t.status = status;
+        finish_retries(&mut t.cells);
         for cell in &mut t.cells {
             match cell {
                 Cell::Assistant { open, .. } => *open = false,
@@ -240,8 +214,7 @@ impl AgentTranscripts {
         t.revision += 1;
     }
 
-    /// Append a message line to an agent's thread (chat to/from it). `showing` is
-    /// the id the main pane is currently displaying, so unread isn't bumped for it.
+    /// Messages to the displayed thread do not increment unread.
     pub fn push_message(&mut self, agent_id: &str, from: &str, text: &str, showing: Option<&str>) {
         let is_showing = showing == Some(agent_id);
         let t = self.ensure(agent_id);
@@ -255,9 +228,7 @@ impl AgentTranscripts {
         }
     }
 
-    /// Feed one subagent event into its thread. `showing` is the id the main pane is
-    /// currently displaying (its unread counter isn't bumped). Returns the agent
-    /// id the event was routed to, if any.
+    /// Route subagent events without incrementing unread for the displayed thread.
     pub fn apply(&mut self, event: &AgentEvent, showing: Option<&str>) {
         match event {
             AgentEvent::SubagentSpawn {
@@ -279,12 +250,15 @@ impl AgentTranscripts {
                     self.on_done(agent_id, *failed);
                 }
             }
-            AgentEvent::AgentMessage { .. } => {
-                // Inter-agent messages are NOT shown in the main pane: an agent's
-                // outgoing message just duplicates its own final assistant output,
-                // so the line is redundant. (A message YOU send via the main pane is
-                // appended directly by send_agent_message, not through here.)
+            AgentEvent::UserMessageQueued { to, text } => {
+                if to != "root" {
+                    self.push_message(to, "user", text, showing);
+                }
             }
+            AgentEvent::ContextReset { agent_id, .. } if agent_id == "root" => {
+                *self = Self::new();
+            }
+            AgentEvent::AgentMessage { .. } => {}
             _ => {
                 if let Some(id) = event_agent_id(event) {
                     if id == "root" {
@@ -308,8 +282,6 @@ impl AgentTranscripts {
                         before = t.cells.len();
                         apply_content_event(&mut t.cells, event, true);
                         after = t.cells.len();
-                        // A content event may mutate a cell in place (tool status)
-                        // without growing `cells`, so bump unconditionally.
                         t.revision += 1;
                     }
                     if !is_showing && after > before {
@@ -322,7 +294,6 @@ impl AgentTranscripts {
         }
     }
 
-    /// Serialize every thread for session persistence.
     pub fn to_persisted(&self) -> Vec<PersistedThread> {
         self.order
             .iter()
@@ -344,8 +315,7 @@ impl AgentTranscripts {
             .collect()
     }
 
-    /// Rebuild threads from persisted state (on resume). Interrupted runs are
-    /// cancelled, not successful; completed outcomes retain their original state.
+    /// Interrupted runs resume as cancelled; completed outcomes retain their state.
     pub fn from_persisted(threads: &[PersistedThread]) -> Self {
         let mut out = AgentTranscripts::new();
         for pt in threads {
@@ -359,6 +329,7 @@ impl AgentTranscripts {
                 parent_id: pt.parent_id.clone(),
                 task: pt.task.clone(),
                 status,
+                started: std::time::Instant::now(),
                 cells: pt.cells.iter().map(cell_from_persisted).collect(),
                 unread: 0,
                 revision: 0,
@@ -370,8 +341,6 @@ impl AgentTranscripts {
     }
 }
 
-/// Map a live `Cell` to its persisted form. Returns None for cells the main pane
-/// never produces in a thread (Subagent/Compaction/Event).
 fn cell_to_persisted(cell: &Cell) -> Option<PersistedCell> {
     match cell {
         Cell::User(text) => Some(PersistedCell::User { text: text.clone() }),
@@ -385,7 +354,7 @@ fn cell_to_persisted(cell: &Cell) -> Option<PersistedCell> {
         } => Some(PersistedCell::Tool {
             name: name.clone(),
             input: input.clone(),
-            output: output.clone().unwrap_or_default(),
+            output: output.clone().unwrap_or_else(|| "".into()),
             is_error: matches!(status, ToolStatus::Error),
         }),
         Cell::AgentMsg { from, text } => Some(PersistedCell::Message {
@@ -397,7 +366,6 @@ fn cell_to_persisted(cell: &Cell) -> Option<PersistedCell> {
     }
 }
 
-/// Rebuild a live `Cell` from its persisted form.
 fn cell_from_persisted(pc: &PersistedCell) -> Cell {
     match pc {
         PersistedCell::User { text } => Cell::User(text.clone()),
@@ -451,18 +419,16 @@ fn event_agent_id(event: &AgentEvent) -> Option<&str> {
         | AgentEvent::WorkflowPhase { .. }
         | AgentEvent::WorkflowLog { .. }
         | AgentEvent::AgentMessage { .. } => None,
-        AgentEvent::Unknown => None,
+        AgentEvent::Unknown
+        | AgentEvent::UserMessageQueued { .. }
+        | AgentEvent::ContextReset { .. }
+        | AgentEvent::ContextArchive { .. } => None,
     }
 }
 
-/// Full-screen workflow view state: a single scrollable pane showing a collapsible
-/// phase/agent tree. `sel` is a cursor into the flattened list of visible rows
-/// (phase headers + agents); selecting an agent opens its main-pane transcript.
-/// `None` on the App means the view is closed.
 pub struct WorkflowView {
     pub run_id: String,
-    /// Cursor + scroll into the flattened row list (phase headers + agents), rebuilt
-    /// each draw. Enter on an agent focuses its transcript; on a phase toggles it.
+    /// Indexes visible phase and agent rows, rebuilt each draw.
     pub list: super::widgets::SelectList,
     /// Phase indices the user has collapsed (their agents are hidden).
     pub collapsed: std::collections::HashSet<usize>,
@@ -524,36 +490,43 @@ mod tests {
         let thread = t.get("reviewer").unwrap();
         assert_eq!(thread.task, "review");
         assert_eq!(thread.status, ThreadStatus::Done);
-        // one Tool cell + one Assistant cell
         assert_eq!(thread.cells.len(), 2);
         assert!(thread.unread >= 2);
     }
 
     #[test]
-    fn root_events_are_ignored() {
-        let mut t = AgentTranscripts::new();
-        t.apply(&tool_call("root", "t1", "bash"), None);
-        assert!(t.is_empty());
-    }
-
-    #[test]
-    fn inter_agent_message_adds_no_thread_cells() {
-        // Inter-agent messages are redundant with the sender's own output, so the
-        // thread must NOT append cells for them (only user-sent messages, via
-        // send_agent_message, appear).
-        let mut t = AgentTranscripts::new();
-        t.on_spawn("a", "root", "task a", "");
-        t.on_spawn("b", "root", "task b", "");
-        t.apply(
-            &AgentEvent::AgentMessage {
-                to: "b".into(),
-                from: "a".into(),
-                text: "check X".into(),
-            },
-            None,
-        );
-        assert_eq!(t.get("b").unwrap().cells.len(), 0);
-        assert_eq!(t.get("a").unwrap().cells.len(), 0);
+    fn non_content_events_do_not_create_root_or_coordination_cells() {
+        for (label, event) in [
+            ("root tool call", tool_call("root", "t1", "bash")),
+            (
+                "agent completion",
+                AgentEvent::Completion {
+                    agent_id: "a".into(),
+                    model: "m".into(),
+                    usage: Usage::default(),
+                },
+            ),
+            (
+                "inter-agent message",
+                AgentEvent::AgentMessage {
+                    to: "b".into(),
+                    from: "a".into(),
+                    text: "check X".into(),
+                },
+            ),
+        ] {
+            let mut threads = AgentTranscripts::new();
+            threads.on_spawn("a", "root", "task a", "");
+            threads.on_spawn("b", "root", "task b", "");
+            threads.apply(&event, None);
+            assert!(threads.get("root").is_none(), "{label}: no root thread");
+            assert_eq!(threads.display_order(), vec!["a", "b"], "{label}: roster");
+            for id in ["a", "b"] {
+                let thread = threads.get(id).unwrap();
+                assert!(thread.cells.is_empty(), "{label}: {id} content");
+                assert_eq!(thread.unread, 0, "{label}: {id} unread");
+            }
+        }
     }
 
     #[test]
@@ -588,15 +561,12 @@ mod tests {
     #[test]
     fn display_label_prefers_description_for_auto_ids() {
         let mut t = AgentTranscripts::new();
-        // `task` child: opaque id + human description → sidebar shows the description.
         t.on_spawn("task_7", "root", "review src/core", "audit it");
         assert_eq!(t.get("task_7").unwrap().display_label(), "review src/core");
         t.on_spawn("job_3", "root", "check tests", "run tests");
         assert_eq!(t.get("job_3").unwrap().display_label(), "check tests");
-        // `spawn_agent` child: semantic handle as id → keep the handle.
         t.on_spawn("researcher", "root", "dig into perf", "profile it");
         assert_eq!(t.get("researcher").unwrap().display_label(), "researcher");
-        // Auto-id with no description → fall back to the id, never blank.
         t.on_spawn("task_9", "root", "", "");
         assert_eq!(t.get("task_9").unwrap().display_label(), "task_9");
     }
@@ -666,7 +636,7 @@ mod tests {
         assert_eq!(thread.status, ThreadStatus::Cancelled);
         assert_eq!(thread.cells.len(), 2);
         assert!(
-            matches!(&thread.cells[1], Cell::Tool { status: ToolStatus::Error, output: Some(output), .. } if output == "(cancelled)")
+            matches!(&thread.cells[1], Cell::Tool { status: ToolStatus::Error, output: Some(output), .. } if output.as_text() == Some("(cancelled)"))
         );
     }
 
@@ -693,7 +663,7 @@ mod tests {
         let thread = threads.get("job_1").unwrap();
         assert_eq!(thread.status, ThreadStatus::Cancelled);
         assert!(
-            matches!(&thread.cells[0], Cell::Tool { status: ToolStatus::Error, output: Some(output), .. } if output == "(cancelled)")
+            matches!(&thread.cells[0], Cell::Tool { status: ToolStatus::Error, output: Some(output), .. } if output.as_text() == Some("(cancelled)"))
         );
         assert!(matches!(
             &thread.cells[1],
@@ -748,41 +718,111 @@ mod tests {
     }
 
     #[test]
-    fn completion_event_is_noop_content() {
-        let mut t = AgentTranscripts::new();
-        t.on_spawn("a", "root", "task", "");
-        t.apply(
-            &AgentEvent::Completion {
-                agent_id: "a".into(),
-                model: "m".into(),
+    fn depth_tracks_known_ancestors_and_bounds_cycles() {
+        let mut threads = AgentTranscripts::new();
+        for (id, parent) in [
+            ("a", "root"),
+            ("ab", "a"),
+            ("abc", "ab"),
+            ("orphan", "missing"),
+            ("cycle-a", "cycle-b"),
+            ("cycle-b", "cycle-a"),
+        ] {
+            threads.on_spawn(id, parent, "", "");
+        }
+        for (label, id, expected) in [
+            ("root child", "a", 0),
+            ("grandchild", "ab", 1),
+            ("great grandchild", "abc", 2),
+            ("unknown agent", "missing", 0),
+            ("untracked parent", "orphan", 0),
+            ("cycle cap", "cycle-a", 16),
+        ] {
+            assert_eq!(threads.depth_of(id), expected, "{label}");
+        }
+    }
+
+    #[test]
+    fn in_place_tool_updates_invalidate_revision_without_inflating_unread() {
+        let mut threads = AgentTranscripts::new();
+        threads.on_spawn("worker", "root", "task", "");
+        threads.apply(&tool_call("worker", "t1", "read_file"), None);
+        let thread = threads.get("worker").unwrap();
+        assert_eq!(thread.unread, 1);
+        assert_eq!(thread.cells.len(), 1);
+        let revision = thread.revision;
+        threads.apply(
+            &AgentEvent::ToolResult {
+                agent_id: "worker".into(),
+                tool_use_id: "t1".into(),
+                output: "result".into(),
+                is_error: false,
+            },
+            None,
+        );
+        let thread = threads.get("worker").unwrap();
+        assert_eq!(thread.cells.len(), 1);
+        assert_eq!(thread.unread, 1);
+        assert_eq!(thread.revision, revision + 1);
+        assert!(matches!(&thread.cells[0], Cell::Tool {
+        status: ToolStatus::Ok, output: Some(output), ..
+    } if output.as_text() == Some("result")));
+        threads.mark_read("worker");
+        assert_eq!(threads.get("worker").unwrap().unread, 0);
+        assert!(threads.toggle_tool("worker", 0));
+        assert!(matches!(
+            &threads.get("worker").unwrap().cells[0],
+            Cell::Tool { expanded: true, .. }
+        ));
+        assert_eq!(threads.get("worker").unwrap().revision, revision + 2);
+        assert!(!threads.toggle_tool("worker", 1));
+        assert!(!threads.toggle_tool("missing", 0));
+        assert_eq!(threads.get("worker").unwrap().revision, revision + 2);
+    }
+
+    #[test]
+    fn managed_agent_turn_end_waits_for_explicit_lifecycle_completion() {
+        let mut threads = AgentTranscripts::new();
+        threads.on_spawn("worker", "root", "task", "");
+        threads.apply(
+            &AgentEvent::TurnEnd {
+                agent_id: "worker".into(),
                 usage: Usage::default(),
             },
             None,
         );
-        assert_eq!(t.get("a").unwrap().cells.len(), 0);
-    }
-
-    #[test]
-    fn depth_of_walks_parent_chain() {
-        let mut t = AgentTranscripts::new();
-        t.on_spawn("a", "root", "", ""); // root child → depth 0
-        t.on_spawn("ab", "a", "", ""); // grandchild → 1
-        t.on_spawn("abc", "ab", "", ""); // great-grandchild → 2
-        assert_eq!(t.depth_of("a"), 0);
-        assert_eq!(t.depth_of("ab"), 1);
-        assert_eq!(t.depth_of("abc"), 2);
-        // Unknown id → 0.
-        assert_eq!(t.depth_of("missing"), 0);
-    }
-
-    #[test]
-    fn depth_of_survives_a_cycle() {
-        // A self-referential / cyclic parent must not hang (depth is capped).
-        let mut t = AgentTranscripts::new();
-        t.on_spawn("a", "b", "", "");
-        t.on_spawn("b", "a", "", "");
-        // Terminates and returns a bounded value.
-        assert!(t.depth_of("a") <= 16);
+        assert_eq!(threads.get("worker").unwrap().status, ThreadStatus::Running);
+        threads.apply(
+            &AgentEvent::SubagentDone {
+                agent_id: "worker".into(),
+                failed: true,
+                cancelled: true,
+            },
+            None,
+        );
+        assert_eq!(
+            threads.get("worker").unwrap().status,
+            ThreadStatus::Cancelled
+        );
+        assert!(threads.running_ids().is_empty());
+        threads.apply(
+            &AgentEvent::ContextReset {
+                agent_id: "worker".into(),
+                epoch: 1,
+            },
+            None,
+        );
+        assert_eq!(threads.display_order(), vec!["worker"]);
+        threads.apply(
+            &AgentEvent::ContextReset {
+                agent_id: "root".into(),
+                epoch: 1,
+            },
+            None,
+        );
+        assert!(threads.is_empty());
+        assert!(threads.get("worker").is_none());
+        assert!(threads.to_persisted().is_empty());
     }
 
     #[test]
@@ -791,8 +831,7 @@ mod tests {
         t.on_spawn("a", "root", "", "");
         t.on_spawn("b", "root", "", "");
         t.on_spawn("c", "root", "", "");
-        t.on_done("a", false); // a finishes
-                               // Running (b, c, in spawn order) first, then finished (a) at the bottom.
+        t.on_done("a", false);
         assert_eq!(t.display_order(), vec!["b", "c", "a"]);
         assert_eq!(t.running_ids(), vec!["b", "c"]);
     }

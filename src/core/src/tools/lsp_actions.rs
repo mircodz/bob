@@ -1,17 +1,7 @@
-//! LSP-powered code actions that MUTATE files. Kept separate from the read-only
-//! `lsp` tool because these must go through the permission prompt (they rewrite
-//! source across the whole project), whereas `lsp` is auto-approved.
-//!
-//! Two tools, sharing the WorkspaceEdit-application machinery below:
-//!   - `rename_symbol`   — drives `textDocument/rename` (the most common action,
-//!     with its own `newName` param).
-//!   - `code_action`     — the general surface: lists and applies any
-//!     `textDocument/codeAction` (quick-fixes, refactors, "organize imports", …).
-//!
-//! Doing these through the server is correct where a text search-replace would
-//! clobber unrelated matches, miss shadowed scopes, or can't compute the fix.
+//! Mutating LSP tools authorize each target and validate snapshots before commit.
 
 use crate::core::types::ToolSpec;
+use crate::lsp::workspace_edit::{apply_edits, collect_workspace_edit};
 use crate::tools::builtin::resolve_path;
 use crate::tools::diff::{compact_diff, diff_lines, diff_stat, format_unified};
 use crate::tools::registry::{Tool, ToolContext, ToolError, ToolResult};
@@ -21,9 +11,6 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// One-shot rename: the single most common refactor, with a dedicated tool so
-/// the model does it in one call (position + newName) instead of the list/apply
-/// dance of the general `code_action` tool.
 pub struct RenameSymbolTool {
     manager: Arc<crate::lsp::LspManager>,
 }
@@ -87,17 +74,24 @@ impl Tool for RenameSymbolTool {
             }
         };
 
-        // Sync the anchor file so the server resolves the position correctly.
-        if let Ok(text) = std::fs::read_to_string(&file) {
-            client.sync_file(&file, &text).await;
-        }
+        let file = crate::tools::filesystem::workspace_path(&ctx.cwd, &file)?;
+        let text = crate::tools::filesystem::read_regular(&file)?;
+        client
+            .sync_file(&file, &text)
+            .await
+            .map_err(|e| ToolError::failed(e.to_string()))?;
+        let character = client
+            .position_encoding()
+            .from_column(&text, line as usize, character as usize)
+            .ok_or_else(|| ToolError::invalid_input("position out of range"))?;
+        let mut snapshots = client.document_snapshots();
 
         let params = json!({
-            "textDocument": { "uri": format!("file://{}", file.to_string_lossy()) },
+            "textDocument": { "uri": crate::lsp::path_to_uri(&file) },
             "position": { "line": line, "character": character },
             "newName": new_name
         });
-        let result = match client.request("textDocument/rename", params).await {
+        let result = match client.request("textDocument/rename", params.clone()).await {
             Ok(r) => r,
             Err(e) => return Err(ToolError::failed(format!("rename failed: {}", e))),
         };
@@ -107,187 +101,264 @@ impl Tool for RenameSymbolTool {
             ));
         }
 
-        let edits = match collect_workspace_edit(&result) {
+        let mut edits = match collect_workspace_edit(&result) {
             Ok(e) if !e.is_empty() => e,
             Ok(_) => return Err(ToolError::failed("rename produced no changes")),
             Err(e) => return Err(ToolError::failed(e)),
         };
 
-        Ok(apply_and_report(edits, ctx))
+        if prepare_discovered(&edits, ctx, &client, &mut snapshots).await? {
+            let result = client
+                .request("textDocument/rename", params)
+                .await
+                .map_err(|error| ToolError::failed(error.to_string()))?;
+            edits = collect_workspace_edit(&result).map_err(ToolError::failed)?;
+        }
+        apply_and_report(edits, ctx, &client, &snapshots, &self.manager).await
     }
 }
 
-/// A single text replacement in a file, in LSP 0-based (line, char) coordinates.
-struct TextEdit {
-    start_line: usize,
-    start_char: usize,
-    end_line: usize,
-    end_char: usize,
-    new_text: String,
+async fn action_edit(
+    client: &crate::lsp::LspClient,
+    actions: &[Value],
+    title: &str,
+) -> Result<Value, ToolError> {
+    let mut matching = actions
+        .iter()
+        .filter(|action| action["title"].as_str() == Some(title));
+    let action = matching
+        .next()
+        .ok_or_else(|| ToolError::failed(format!("no action titled '{}'", title)))?;
+    if matching.next().is_some() {
+        return Err(ToolError::failed("ambiguous action title"));
+    }
+    let action = if action.get("edit").is_some() {
+        action.clone()
+    } else {
+        client
+            .request("codeAction/resolve", action.clone())
+            .await
+            .map_err(|error| ToolError::failed(error.to_string()))?
+    };
+    if action.get("disabled").is_some() || action.get("command").is_some() {
+        return Err(ToolError::failed(
+            "disabled actions and server commands are unsupported; no files changed",
+        ));
+    }
+    if action["edit"].is_null() {
+        return Err(ToolError::failed(
+            "action has no direct edit; no files changed",
+        ));
+    }
+    Ok(action["edit"].clone())
 }
 
-/// Parse a WorkspaceEdit (either `changes: {uri: [TextEdit]}` or
-/// `documentChanges: [{textDocument, edits}]`) into edits keyed by file path.
-fn collect_workspace_edit(result: &Value) -> Result<BTreeMap<PathBuf, Vec<TextEdit>>, String> {
-    let mut out: BTreeMap<PathBuf, Vec<TextEdit>> = BTreeMap::new();
+async fn authorize_target(ctx: &ToolContext, path: &std::path::Path) -> Result<(), ToolError> {
+    if let Some(permissions) = &ctx.permissions {
+        let request = crate::core::permissions::PermissionRequest {
+            tool: "edit_file".into(),
+            input: json!({"path":path}),
+            cwd: ctx.cwd.clone(),
+            bash: None,
+            preview: None,
+            agent: ctx.coord.as_ref().map(|coord| coord.name.clone()),
+            read_only: false,
+        };
+        if !permissions.check(&request).await {
+            return Err(ToolError::permission_denied(format!(
+                "workspace edit denied for {}; no files changed",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
 
-    let mut add = |uri: &str, edits: &Value| {
-        let path = uri_to_path(uri);
-        if let Some(arr) = edits.as_array() {
-            let list = out.entry(path).or_default();
-            for e in arr {
-                if let Some(te) = parse_text_edit(e) {
-                    list.push(te);
+async fn prepare_discovered(
+    edits: &BTreeMap<PathBuf, crate::lsp::workspace_edit::DocumentEdits>,
+    ctx: &ToolContext,
+    client: &crate::lsp::LspClient,
+    snapshots: &mut std::collections::HashMap<String, crate::lsp::DocumentSnapshot>,
+) -> Result<bool, ToolError> {
+    let mut discovered = Vec::new();
+    for (requested, edits) in edits {
+        let path = crate::tools::filesystem::workspace_path(&ctx.cwd, requested)?;
+        authorize_target(ctx, &path).await?;
+        let text = crate::tools::filesystem::read_regular(&path)?;
+        let uri = crate::lsp::path_to_uri(&path);
+        if let Some(snapshot) = snapshots.get(&uri) {
+            if snapshot.text != text
+                || edits
+                    .version
+                    .is_some_and(|version| version != snapshot.version)
+                || client
+                    .document_snapshot(&path)
+                    .is_none_or(|current| current.version != snapshot.version)
+            {
+                return Err(ToolError::failed(format!(
+                    "stale server snapshot for {}; no files changed",
+                    path.display()
+                )));
+            }
+        } else {
+            if edits.version.is_some() {
+                return Err(ToolError::failed(format!(
+                    "unknown document version for {}; no files changed",
+                    path.display()
+                )));
+            }
+            discovered.push((path, text));
+        }
+    }
+    if discovered.is_empty() {
+        return Ok(false);
+    }
+    for (path, text) in discovered {
+        let stamp = client
+            .sync_file(&path, &text)
+            .await
+            .map_err(|error| ToolError::failed(error.to_string()))?;
+        snapshots.insert(
+            crate::lsp::path_to_uri(&path),
+            crate::lsp::DocumentSnapshot {
+                version: stamp.version,
+                text,
+            },
+        );
+    }
+    Ok(true)
+}
+
+async fn apply_and_report(
+    edits: BTreeMap<PathBuf, crate::lsp::workspace_edit::DocumentEdits>,
+    ctx: &ToolContext,
+    client: &crate::lsp::LspClient,
+    snapshots: &std::collections::HashMap<String, crate::lsp::DocumentSnapshot>,
+    manager: &crate::lsp::LspManager,
+) -> ToolResult {
+    use crate::tools::filesystem::{prepare_batch, read_regular, workspace_path, WriteRequest};
+    let mut prepared = Vec::new();
+    for (requested, edits) in edits {
+        let path = workspace_path(&ctx.cwd, &requested)?;
+        authorize_target(ctx, &path).await?;
+        let uri = crate::lsp::path_to_uri(&path);
+        let snapshot = snapshots.get(&uri).ok_or_else(|| {
+            ToolError::failed(format!(
+                "{} was not snapshotted before the request; no files changed",
+                path.display()
+            ))
+        })?;
+        if edits
+            .version
+            .is_some_and(|version| version != snapshot.version)
+            || !client.document_snapshot(&path).is_some_and(|current| {
+                current.version == snapshot.version && current.text == snapshot.text
+            })
+        {
+            return Err(ToolError::failed(format!(
+                "stale document version for {}; no files changed",
+                path.display()
+            )));
+        }
+        let before = read_regular(&path)?;
+        if before != snapshot.text {
+            return Err(ToolError::failed(format!(
+                "{} changed since the server snapshot; synchronize and retry; no files changed",
+                path.display()
+            )));
+        }
+        let after = apply_edits(&before, &edits.edits, client.position_encoding())
+            .map_err(ToolError::failed)?;
+        prepared.push((path, before, after, snapshot.version, requested));
+    }
+    let requests = prepared
+        .iter()
+        .filter(|(_, before, after, _, _)| before != after)
+        .map(|(path, before, after, _, requested)| WriteRequest {
+            path: requested.clone(),
+            resolved: path.clone(),
+            content: after.clone(),
+            expected: Some(before.clone()),
+        })
+        .collect();
+    let batch = prepare_batch(ctx, requests).await?;
+    let committed = {
+        let _sync = client
+            .lock_documents()
+            .await
+            .map_err(|error| ToolError::failed(error.to_string()))?;
+        for (path, before, _, version, _) in &prepared {
+            if !client
+                .document_snapshot(path)
+                .is_some_and(|current| current.version == *version && current.text == *before)
+            {
+                return Err(ToolError::failed(
+                    "server document changed during preflight; no files changed",
+                ));
+            }
+        }
+        batch.commit()
+    };
+    let mut sync_errors = Vec::new();
+    for (path, _, _, _, _) in &prepared {
+        match read_regular(path) {
+            Ok(actual) => {
+                ctx.files.record_write(&path.to_string_lossy());
+                if let Err(error) = client.sync_file(path, &actual).await {
+                    sync_errors.push(format!("{}: {}", path.display(), error));
+                }
+                if let Some(other) = manager.client_for(path) {
+                    if other.name() != client.name() {
+                        if let Err(error) = other.sync_file(path, &actual).await {
+                            sync_errors.push(format!("{}: {}", path.display(), error));
+                        }
+                    }
                 }
             }
+            Err(error) => sync_errors.push(format!("{}: {}", path.display(), error)),
         }
-    };
-
-    if let Some(changes) = result.get("changes").and_then(|c| c.as_object()) {
-        for (uri, edits) in changes {
-            add(uri, edits);
-        }
-    } else if let Some(dc) = result.get("documentChanges").and_then(|d| d.as_array()) {
-        for entry in dc {
-            // TextDocumentEdit { textDocument: {uri}, edits: [...] }. Ignore
-            // create/rename/delete file ops — rename shouldn't produce them.
-            if let Some(uri) = entry["textDocument"]["uri"].as_str() {
-                add(uri, &entry["edits"]);
-            }
-        }
-    } else {
-        return Err("workspace edit had neither `changes` nor `documentChanges`".to_string());
     }
-    Ok(out)
-}
-
-fn parse_text_edit(e: &Value) -> Option<TextEdit> {
-    let range = &e["range"];
-    Some(TextEdit {
-        start_line: range["start"]["line"].as_u64()? as usize,
-        start_char: range["start"]["character"].as_u64()? as usize,
-        end_line: range["end"]["line"].as_u64()? as usize,
-        end_char: range["end"]["character"].as_u64()? as usize,
-        new_text: e["newText"].as_str().unwrap_or("").to_string(),
-    })
-}
-
-/// Apply the edits to disk and return a multi-file diff report.
-fn apply_and_report(edits: BTreeMap<PathBuf, Vec<TextEdit>>, ctx: &ToolContext) -> String {
+    if let Err(mut error) = committed {
+        if !sync_errors.is_empty() {
+            error.message.push_str(&format!(
+                "; document sync failed: {}",
+                sync_errors.join("; ")
+            ));
+        }
+        return Err(error);
+    }
+    if !sync_errors.is_empty() {
+        return Err(ToolError::failed(format!(
+            "disk edits committed; rollback not attempted; document sync failed: {}",
+            sync_errors.join("; ")
+        )));
+    }
     let mut report = String::new();
     let mut files_changed = 0;
     let mut total_added = 0;
     let mut total_removed = 0;
-
-    for (path, mut file_edits) in edits {
-        let before = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(e) => {
-                report.push_str(&format!("skipped {} (read error: {})\n", path.display(), e));
-                continue;
-            }
-        };
-        // Apply edits from the END of the file backwards so earlier offsets stay
-        // valid as we splice. Sort by (start_line, start_char) descending.
-        file_edits.sort_by_key(|b| std::cmp::Reverse((b.start_line, b.start_char)));
-        let after = match apply_edits(&before, &file_edits) {
-            Ok(s) => s,
-            Err(e) => {
-                report.push_str(&format!("skipped {} ({})\n", path.display(), e));
-                continue;
-            }
-        };
-        if after == before {
+    for (path, before, after, _, _) in prepared {
+        if before == after {
             continue;
         }
-        if let Err(e) = std::fs::write(&path, &after) {
-            report.push_str(&format!("failed to write {} ({})\n", path.display(), e));
-            continue;
-        }
-        // Keep the file tracker honest so a later edit_file doesn't flag a
-        // stale-read conflict on a file we just rewrote.
-        ctx.files.record_write(&path.to_string_lossy());
-
         let full = diff_lines(&before, &after);
         let (added, removed) = diff_stat(&full);
         total_added += added;
         total_removed += removed;
         files_changed += 1;
-        let compact = compact_diff(&full, 2);
-        let label = path.to_string_lossy();
         report.push_str(&format!(
             "```diff {}\n{}\n```\n",
-            label,
-            format_unified(&compact)
+            path.display(),
+            format_unified(&compact_diff(&full, 2))
         ));
     }
-
-    if files_changed == 0 {
-        return format!("no files changed.\n{}", report);
-    }
-    format!(
-        "renamed across {} file(s) (+{} -{})\n{}",
+    Ok(format!(
+        "changed {} file(s) (+{} -{})\n{}",
         files_changed, total_added, total_removed, report
     )
+    .into())
 }
 
-/// Splice a set of edits into `content`. Edits MUST be pre-sorted last-first so
-/// applying one doesn't shift the offsets of the next.
-fn apply_edits(content: &str, edits: &[TextEdit]) -> Result<String, String> {
-    // Work on a Vec<char>-per-line model via byte offsets computed from lines.
-    let line_starts = line_start_offsets(content);
-    let mut bytes = content.to_string();
-    for e in edits {
-        let start = offset_at(&line_starts, content, e.start_line, e.start_char)
-            .ok_or("edit position out of range")?;
-        let end = offset_at(&line_starts, content, e.end_line, e.end_char)
-            .ok_or("edit position out of range")?;
-        if start > end || end > bytes.len() {
-            return Err("edit range out of range".to_string());
-        }
-        bytes.replace_range(start..end, &e.new_text);
-    }
-    Ok(bytes)
-}
-
-/// Byte offset of the start of each line.
-fn line_start_offsets(s: &str) -> Vec<usize> {
-    let mut offsets = vec![0];
-    for (i, b) in s.bytes().enumerate() {
-        if b == b'\n' {
-            offsets.push(i + 1);
-        }
-    }
-    offsets
-}
-
-/// Convert an LSP (line, character) — where character is a UTF-16 code-unit
-/// offset — to a byte offset in `s`. We approximate UTF-16 with char counting;
-/// correct for the BMP (covers code, the practical case) and simpler than full
-/// UTF-16 accounting.
-fn offset_at(line_starts: &[usize], s: &str, line: usize, character: usize) -> Option<usize> {
-    let line_start = *line_starts.get(line)?;
-    let line_str = s[line_start..].split('\n').next().unwrap_or("");
-    let mut byte = line_start;
-    for (chars, ch) in line_str.chars().enumerate() {
-        if chars >= character {
-            break;
-        }
-        byte += ch.len_utf8();
-    }
-    Some(byte)
-}
-
-fn uri_to_path(uri: &str) -> PathBuf {
-    PathBuf::from(uri.strip_prefix("file://").unwrap_or(uri))
-}
-
-/// The general code-action surface. Two modes:
-///   - list (no `apply`): return the actions available at a position/range,
-///     plus the kinds the server advertised — so the model sees "what can I do
-///     here" without guessing.
-///   - apply (`apply` = an action title from the list): run that action and
-///     apply its WorkspaceEdit.
 pub struct CodeActionTool {
     manager: Arc<crate::lsp::LspManager>,
 }
@@ -339,11 +410,22 @@ impl Tool for CodeActionTool {
             Some(c) if c >= 1 => c - 1,
             _ => return Err(ToolError::invalid_input("character is required (1-based)")),
         };
-        let end_line = input["endLine"].as_i64().map(|l| l - 1).unwrap_or(line);
-        let end_char = input["endCharacter"]
-            .as_i64()
-            .map(|c| c - 1)
-            .unwrap_or(character);
+        let end_line = match input.get("endLine") {
+            None => line,
+            Some(value) => value
+                .as_i64()
+                .filter(|value| *value >= 1)
+                .map(|value| value - 1)
+                .ok_or_else(|| ToolError::invalid_input("endLine must be 1-based"))?,
+        };
+        let end_char = match input.get("endCharacter") {
+            None => character,
+            Some(value) => value
+                .as_i64()
+                .filter(|value| *value >= 1)
+                .map(|value| value - 1)
+                .ok_or_else(|| ToolError::invalid_input("endCharacter must be 1-based"))?,
+        };
 
         let client = match self.manager.client_for(&file) {
             Some(c) => c,
@@ -354,14 +436,26 @@ impl Tool for CodeActionTool {
                 )))
             }
         };
-        if let Ok(text) = std::fs::read_to_string(&file) {
-            client.sync_file(&file, &text).await;
+        let file = crate::tools::filesystem::workspace_path(&ctx.cwd, &file)?;
+        let text = crate::tools::filesystem::read_regular(&file)?;
+        client
+            .sync_file(&file, &text)
+            .await
+            .map_err(|e| ToolError::failed(e.to_string()))?;
+        if end_line < 0 || end_char < 0 || (end_line, end_char) < (line, character) {
+            return Err(ToolError::invalid_input("invalid or reversed action range"));
         }
+        let encoding = client.position_encoding();
+        let character = encoding
+            .from_column(&text, line as usize, character as usize)
+            .ok_or_else(|| ToolError::invalid_input("start position out of range"))?;
+        let end_char = encoding
+            .from_column(&text, end_line as usize, end_char as usize)
+            .ok_or_else(|| ToolError::invalid_input("end position out of range"))?;
+        let mut snapshots = client.document_snapshots();
 
-        // Include any diagnostics overlapping the range as context, so the server
-        // can offer the matching quick-fixes.
         let diags = client.diagnostics_for(&file);
-        let uri = format!("file://{}", file.to_string_lossy());
+        let uri = crate::lsp::path_to_uri(&file);
         let params = json!({
             "textDocument": { "uri": uri },
             "range": {
@@ -370,73 +464,42 @@ impl Tool for CodeActionTool {
             },
             "context": { "diagnostics": diags }
         });
-        let result = match client.request("textDocument/codeAction", params).await {
+        let result = match client
+            .request("textDocument/codeAction", params.clone())
+            .await
+        {
             Ok(r) => r,
             Err(e) => return Err(ToolError::failed(format!("codeAction failed: {}", e))),
         };
         let actions = result.as_array().cloned().unwrap_or_default();
 
-        // Apply mode: find the requested action by title and run it.
         if let Some(want) = input["apply"].as_str() {
-            let chosen = actions.iter().find(|a| a["title"].as_str() == Some(want));
-            let action = match chosen {
-                Some(a) => a,
-                None => {
-                    let titles: Vec<&str> =
-                        actions.iter().filter_map(|a| a["title"].as_str()).collect();
-                    return Err(ToolError::failed(format!(
-                        "no action titled '{}'. Available: {}",
-                        want,
-                        if titles.is_empty() {
-                            "(none)".to_string()
-                        } else {
-                            titles.join(" | ")
-                        }
-                    )));
-                }
-            };
-            // A CodeAction may carry its edit inline (`edit`) or need resolving
-            // via codeAction/resolve. Try inline first, then resolve.
-            let edit = if action.get("edit").is_some() {
-                action["edit"].clone()
-            } else {
-                match client.request("codeAction/resolve", action.clone()).await {
-                    Ok(resolved) => resolved["edit"].clone(),
-                    Err(e) => {
-                        return Err(ToolError::failed(format!(
-                            "could not resolve action: {}",
-                            e
-                        )))
-                    }
-                }
-            };
-            if edit.is_null() {
-                // Some actions run a command instead of returning an edit; we
-                // don't execute arbitrary server commands (side effects, no diff).
-                return Ok(format!(
-                    "action '{}' has no direct edit (it runs a server command, which bob does not \
-                     execute automatically).",
-                    want
-                ));
+            let edit = action_edit(&client, &actions, want).await?;
+            let mut edits = collect_workspace_edit(&edit).map_err(ToolError::failed)?;
+            if prepare_discovered(&edits, ctx, &client, &mut snapshots).await? {
+                let result = client
+                    .request("textDocument/codeAction", params)
+                    .await
+                    .map_err(|error| ToolError::failed(error.to_string()))?;
+                let actions = result
+                    .as_array()
+                    .ok_or_else(|| ToolError::failed("invalid code action response"))?;
+                let edit = action_edit(&client, actions, want).await?;
+                edits = collect_workspace_edit(&edit).map_err(ToolError::failed)?;
             }
-            let edits = match collect_workspace_edit(&edit) {
-                Ok(e) if !e.is_empty() => e,
-                Ok(_) => return Ok(format!("action '{}' produced no changes", want)),
-                Err(e) => return Err(ToolError::failed(e)),
-            };
-            return Ok(apply_and_report(edits, ctx));
+            return apply_and_report(edits, ctx, &client, &snapshots, &self.manager).await;
         }
 
-        // List mode: show available actions (title + kind) and advertised kinds.
         if actions.is_empty() {
             let kinds = client.code_action_kinds();
             if kinds.is_empty() {
-                return Ok("No code actions available here.".to_string());
+                return Ok("No code actions available here.".into());
             }
             return Ok(format!(
                 "No actions at this position. This server supports: {}",
                 kinds.join(", ")
-            ));
+            )
+            .into());
         }
         let mut out = String::from("Available code actions (apply one by title):\n");
         for a in &actions {
@@ -448,6 +511,81 @@ impl Tool for CodeActionTool {
                 out.push_str(&format!("  - {}  [{}]\n", title, kind));
             }
         }
-        Ok(out)
+        Ok(out.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::files::FileFixture;
+    use crate::tools::registry::ToolErrorKind;
+
+    #[tokio::test]
+    async fn rename_validates_required_fields_before_server_lookup() {
+        let fixture = FileFixture::new();
+        let manager = crate::lsp::LspManager::start(&[], fixture.dir.path());
+        let tool = RenameSymbolTool::new(manager);
+        let valid = json!({"filePath":"file.rs", "newName":"renamed", "line":1, "character":1});
+        for (field, invalid, message) in [
+            ("filePath", Value::Null, "filePath is required"),
+            ("filePath", json!(12), "filePath is required"),
+            ("newName", json!(""), "newName is required"),
+            ("newName", Value::Null, "newName is required"),
+            ("line", json!(0), "line is required (1-based)"),
+            ("line", json!(-1), "line is required (1-based)"),
+            ("line", json!(1.5), "line is required (1-based)"),
+            ("character", json!(0), "character is required (1-based)"),
+            ("character", json!("1"), "character is required (1-based)"),
+            ("character", Value::Null, "character is required (1-based)"),
+        ] {
+            let mut input = valid.clone();
+            input[field] = invalid;
+            let error = tool.execute(input, &fixture.ctx).await.unwrap_err();
+            assert_eq!(error.kind, ToolErrorKind::InvalidInput, "{field}");
+            assert_eq!(error.message, message);
+        }
+        let error = tool.execute(valid, &fixture.ctx).await.unwrap_err();
+        assert_eq!(error.kind, ToolErrorKind::Unavailable);
+        assert!(error.message.contains("no language server configured"));
+    }
+
+    #[tokio::test]
+    async fn code_action_validates_both_range_endpoints_before_server_lookup() {
+        let fixture = FileFixture::new();
+        let manager = crate::lsp::LspManager::start(&[], fixture.dir.path());
+        let tool = CodeActionTool::new(manager);
+        let valid = json!({"filePath":"file.rs", "line":1, "character":1});
+        let mut missing_file = valid.clone();
+        missing_file.as_object_mut().unwrap().remove("filePath");
+        assert_eq!(
+            tool.execute(missing_file, &fixture.ctx)
+                .await
+                .unwrap_err()
+                .message,
+            "filePath is required"
+        );
+        for (field, message) in [
+            ("line", "line is required (1-based)"),
+            ("character", "character is required (1-based)"),
+            ("endLine", "endLine must be 1-based"),
+            ("endCharacter", "endCharacter must be 1-based"),
+        ] {
+            for invalid in [Value::Null, json!(0), json!(-1), json!(1.5), json!("1")] {
+                let mut input = valid.clone();
+                input[field] = invalid;
+                let error = tool.execute(input, &fixture.ctx).await.unwrap_err();
+                assert_eq!(error.kind, ToolErrorKind::InvalidInput, "{field}");
+                assert_eq!(error.message, message);
+            }
+        }
+        for input in [
+            valid,
+            json!({"filePath":"file.rs", "line":1, "character":1, "endLine":2, "endCharacter":3}),
+        ] {
+            let error = tool.execute(input, &fixture.ctx).await.unwrap_err();
+            assert_eq!(error.kind, ToolErrorKind::Unavailable);
+            assert!(error.message.contains("no language server configured"));
+        }
     }
 }

@@ -1,7 +1,5 @@
-//! Clipboard integration via the OSC 52 terminal escape (works over SSH/tmux,
-//! no external clipboard dependency).
+//! OSC 52 clipboard access through the terminal, including over SSH.
 
-/// Copy `text` to the system clipboard using the OSC 52 escape sequence.
 pub(super) fn osc52_copy(text: &str) {
     use std::io::Write;
     let b64 = base64_encode(text.as_bytes());
@@ -11,7 +9,6 @@ pub(super) fn osc52_copy(text: &str) {
     let _ = out.flush();
 }
 
-/// Minimal standard base64 encoder (no external crate).
 fn base64_encode(input: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
@@ -34,4 +31,27 @@ fn base64_encode(input: &[u8]) -> String {
         });
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::base64_encode;
+
+    #[test]
+    fn standard_base64_vectors_cover_padding_and_binary_bytes() {
+        for (input, expected) in [
+            (b"".as_slice(), ""),
+            (b"f".as_slice(), "Zg=="),
+            (b"fo".as_slice(), "Zm8="),
+            (b"foo".as_slice(), "Zm9v"),
+            (b"foob".as_slice(), "Zm9vYg=="),
+            (b"fooba".as_slice(), "Zm9vYmE="),
+            (b"foobar".as_slice(), "Zm9vYmFy"),
+            (b"\x00\xfb\xff".as_slice(), "APv/"),
+            (b"\xfb\xff\xff".as_slice(), "+///"),
+            ("é".as_bytes(), "w6k="),
+        ] {
+            assert_eq!(base64_encode(input), expected, "{input:?}");
+        }
+    }
 }

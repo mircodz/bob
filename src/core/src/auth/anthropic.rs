@@ -1,17 +1,11 @@
-//! Anthropic subscription auth (Claude Pro/Max) via OAuth 2.0 + PKCE against
-//! claude.ai. The resulting access token bills the user's subscription instead
-//! of API credits. Tokens are short-lived and refreshed via the refresh token.
-//!
-//! NOTE: this uses the same public OAuth client id as Claude Code. Using it from
-//! a third-party tool is a gray area w.r.t. Anthropic's terms; API keys are the
-//! sanctioned path for custom tooling.
+//! Anthropic subscription OAuth + PKCE using Claude Code's public client ID.
+//! Third-party use may be restricted by Anthropic's terms; prefer API keys.
 
 use super::{
     authorize_url, exchange_code, now, pkce, refresh_token, store_tokens, wait_for_callback,
     AuthCodeConfig, AuthStore, Pkce,
 };
 
-// Public client id used by Claude Code's OAuth flow.
 const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
 const TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/token";
@@ -30,15 +24,13 @@ fn config() -> AuthCodeConfig {
     }
 }
 
-/// Result of starting login: the URL to open + the in-flight PKCE/state to
-/// complete with.
 pub struct LoginHandle {
     pub url: String,
     pkce: Pkce,
     state: String,
 }
 
-/// Step 1: build the authorize URL. Caller opens it in a browser.
+/// Open the returned URL in a browser before finishing login.
 pub fn begin_login() -> LoginHandle {
     let cfg = config();
     let pkce = pkce();
@@ -47,7 +39,6 @@ pub fn begin_login() -> LoginHandle {
     LoginHandle { url, pkce, state }
 }
 
-/// Step 2: wait for the browser redirect, exchange the code, store tokens.
 pub async fn finish_login(handle: LoginHandle) -> anyhow::Result<()> {
     let cfg = config();
     let code = wait_for_callback(cfg.callback_port, &handle.state).await?;
@@ -63,7 +54,7 @@ pub fn is_logged_in() -> bool {
         .unwrap_or(false)
 }
 
-/// Return a valid access token, refreshing it if expired. None if not logged in.
+/// Refresh expired tokens; error if not logged in.
 pub async fn access_token() -> anyhow::Result<String> {
     let store = AuthStore::load();
     let cred = store
@@ -79,7 +70,6 @@ pub async fn access_token() -> anyhow::Result<String> {
     if expires_at > now() + 60 {
         return Ok(cred.token);
     }
-    // Refresh.
     let refresh = cred
         .refresh_token
         .ok_or_else(|| anyhow::anyhow!("session expired and no refresh token; log in again"))?;

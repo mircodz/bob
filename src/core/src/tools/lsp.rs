@@ -1,10 +1,3 @@
-//! The `lsp` tool: a single tool exposing language-server intelligence to the
-//! model via an `operation` enum (diagnostics, definition, references, hover,
-//! symbols). It routes the target file to the right server through the
-//! LspManager, syncs the file's current on-disk text first, and returns compact,
-//! token-cheap output — for diagnostics, rustc-style with the source line and a
-//! caret under the column, which is far more actionable than a bare message.
-
 use crate::core::types::ToolSpec;
 use crate::lsp::LspManager;
 use crate::tools::builtin::resolve_path;
@@ -73,7 +66,6 @@ impl Tool for LspTool {
     async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
         let op = input["operation"].as_str().unwrap_or("");
 
-        // workspace_symbols is the only op not tied to a specific file.
         if op == "workspace_symbols" {
             let query = input["query"].as_str().unwrap_or("");
             return self.workspace_symbols(query).await;
@@ -93,21 +85,15 @@ impl Tool for LspTool {
             }
         };
 
-        // Read current on-disk text and sync it so the server sees the latest.
-        let text = match std::fs::read_to_string(&file) {
-            Ok(t) => t,
-            Err(e) => {
-                return Err(ToolError::failed(format!(
-                    "cannot read {}: {}",
-                    file.display(),
-                    e
-                )))
-            }
-        };
-        client.sync_file(&file, &text).await;
+        let file = crate::tools::filesystem::workspace_path(&ctx.cwd, &file)?;
+        let text = crate::tools::filesystem::read_regular(&file)?;
+        let stamp = client
+            .sync_file(&file, &text)
+            .await
+            .map_err(|error| ToolError::failed(error.to_string()))?;
 
         match op {
-            "diagnostics" => self.diagnostics(&client, &file, &text, &input).await,
+            "diagnostics" => self.diagnostics(&client, &file, &text, &input, stamp).await,
             "definition" => {
                 self.locations(&client, &file, &input, "textDocument/definition")
                     .await
@@ -128,16 +114,14 @@ impl Tool for LspTool {
 }
 
 impl LspTool {
-    /// Wait briefly for the server to (re)publish diagnostics for the file, then
-    /// render them rustc-style: `SEVERITY file:line:col message` + the source
-    /// line + a caret under the column. rust-analyzer pushes an empty set first
-    /// then the real one, so we poll with a short settle window.
+    /// Only a new publication for the synchronized document can report clean.
     async fn diagnostics(
         &self,
         client: &crate::lsp::LspClient,
         file: &Path,
         text: &str,
         input: &Value,
+        stamp: crate::lsp::SyncStamp,
     ) -> ToolResult {
         let min_sev = match input["severity"].as_str() {
             Some("all") => 4,
@@ -145,26 +129,18 @@ impl LspTool {
             _ => 1, // error
         };
 
-        // Poll up to ~5s, settling 200ms after the last change, for diagnostics.
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        let mut last: Vec<Value> = client.diagnostics_for(file);
-        loop {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            let now = client.diagnostics_for(file);
-            if !now.is_empty() && now.len() == last.len() {
-                break; // settled
-            }
-            last = now;
-            if tokio::time::Instant::now() >= deadline {
-                break;
-            }
-        }
-
-        let diags = client.diagnostics_for(file);
+        let publication = client
+            .fresh_diagnostics(file, stamp, std::time::Duration::from_secs(5))
+            .await
+            .map_err(|error| ToolError::failed(error.to_string()))?;
         let lines: Vec<&str> = text.lines().collect();
-        let mut out = String::new();
+        let mut out = if publication.version_confirmed {
+            String::new()
+        } else {
+            "Document version unavailable; freshness unconfirmed.\n".to_string()
+        };
         let mut shown = 0;
-        for d in &diags {
+        for d in &publication.diagnostics {
             let sev = d["severity"].as_i64().unwrap_or(1);
             if sev > min_sev {
                 continue;
@@ -180,7 +156,11 @@ impl LspTool {
                 _ => "HINT",
             };
             let line = d["range"]["start"]["line"].as_i64().unwrap_or(0);
-            let col = d["range"]["start"]["character"].as_i64().unwrap_or(0);
+            let units = d["range"]["start"]["character"].as_u64().unwrap_or(0) as usize;
+            let col = client
+                .position_encoding()
+                .to_column(text, line as usize, units)
+                .ok_or_else(|| ToolError::failed("server diagnostic has an invalid position"))?;
             let msg = d["message"].as_str().unwrap_or("");
             out.push_str(&format!(
                 "{} {}:{}:{} {}\n",
@@ -190,15 +170,18 @@ impl LspTool {
                 col + 1,
                 msg.replace('\n', " ")
             ));
-            // Source line + caret.
             if let Some(src) = lines.get(line as usize) {
                 out.push_str(&format!("  {}\n", src));
-                let pad: String = std::iter::repeat_n(' ', col as usize + 2).collect();
+                let pad: String = std::iter::repeat_n(' ', col + 2).collect();
                 out.push_str(&format!("{}^\n", pad));
             }
             shown += 1;
         }
         if shown == 0 {
+            if !publication.version_confirmed {
+                out.push_str("Server published no matching diagnostics; this is not a verified clean result.");
+                return Ok(out.into());
+            }
             return Ok(format!(
                 "No diagnostics for {} (at or above {} severity).",
                 rel(file),
@@ -207,9 +190,10 @@ impl LspTool {
                     2 => "warning",
                     _ => "hint",
                 }
-            ));
+            )
+            .into());
         }
-        Ok(out)
+        Ok(out.into())
     }
 
     async fn locations(
@@ -219,7 +203,7 @@ impl LspTool {
         input: &Value,
         method: &str,
     ) -> ToolResult {
-        let params = match position_params(file, input) {
+        let params = match position_params(client, file, input) {
             Ok(p) => p,
             Err(e) => return Err(e),
         };
@@ -229,13 +213,14 @@ impl LspTool {
         };
         let locs = collect_locations(&result);
         if locs.is_empty() {
-            return Ok("No results.".to_string());
+            return Ok("No results.".into());
         }
         Ok(locs
             .into_iter()
-            .map(|(uri, line, col)| format!("{}:{}:{}", uri_to_rel(&uri), line + 1, col + 1))
+            .map(|(uri, line, col)| render_location(client, &uri, line, col))
             .collect::<Vec<_>>()
-            .join("\n"))
+            .join("\n")
+            .into())
     }
 
     async fn references(
@@ -244,7 +229,7 @@ impl LspTool {
         file: &Path,
         input: &Value,
     ) -> ToolResult {
-        let mut params = match position_params(file, input) {
+        let mut params = match position_params(client, file, input) {
             Ok(p) => p,
             Err(e) => return Err(e),
         };
@@ -255,13 +240,14 @@ impl LspTool {
         };
         let locs = collect_locations(&result);
         if locs.is_empty() {
-            return Ok("No references found.".to_string());
+            return Ok("No references found.".into());
         }
         let mut out = format!("{} reference(s):\n", locs.len());
         for (uri, line, col) in locs {
-            out.push_str(&format!("{}:{}:{}\n", uri_to_rel(&uri), line + 1, col + 1));
+            out.push_str(&render_location(client, &uri, line, col));
+            out.push('\n');
         }
-        Ok(out)
+        Ok(out.into())
     }
 
     async fn hover(
@@ -270,7 +256,7 @@ impl LspTool {
         file: &Path,
         input: &Value,
     ) -> ToolResult {
-        let params = match position_params(file, input) {
+        let params = match position_params(client, file, input) {
             Ok(p) => p,
             Err(e) => return Err(e),
         };
@@ -281,15 +267,15 @@ impl LspTool {
         // hover.contents is MarkupContent { kind, value } or a string / array.
         let contents = &result["contents"];
         if let Some(s) = contents.as_str() {
-            return Ok(s.to_string());
+            return Ok(s.into());
         }
         if let Some(v) = contents["value"].as_str() {
-            return Ok(v.to_string());
+            return Ok(v.into());
         }
         if contents.is_null() {
-            return Ok("No hover information.".to_string());
+            return Ok("No hover information.".into());
         }
-        Ok(contents.to_string())
+        Ok(contents.to_string().into())
     }
 
     async fn document_symbols(&self, client: &crate::lsp::LspClient, file: &Path) -> ToolResult {
@@ -300,18 +286,17 @@ impl LspTool {
         };
         let arr = match result.as_array() {
             Some(a) if !a.is_empty() => a,
-            _ => return Ok("No symbols.".to_string()),
+            _ => return Ok("No symbols.".into()),
         };
         let mut out = String::new();
         for s in arr {
             render_symbol(s, 0, &mut out);
         }
-        Ok(out)
+        Ok(out.into())
     }
 
     async fn workspace_symbols(&self, query: &str) -> ToolResult {
-        // Query every ready server; merge results. workspace/symbol isn't file-
-        // scoped, so we can't route — ask all servers that have a client.
+        // No file routing for workspace/symbol; query all ready servers.
         let mut out = String::new();
         let mut any = false;
         for (name, _health) in self.manager.statuses() {
@@ -339,15 +324,17 @@ impl LspTool {
             }
         }
         if !any {
-            return Ok("No matching symbols.".to_string());
+            return Ok("No matching symbols.".into());
         }
-        Ok(out)
+        Ok(out.into())
     }
 }
 
-// --- helpers ---------------------------------------------------------------
-
-fn position_params(file: &Path, input: &Value) -> Result<Value, ToolError> {
+fn position_params(
+    client: &crate::lsp::LspClient,
+    file: &Path,
+    input: &Value,
+) -> Result<Value, ToolError> {
     let line = match input["line"].as_i64() {
         Some(l) if l >= 1 => l - 1,
         _ => return Err(ToolError::invalid_input("line is required (1-based)")),
@@ -356,6 +343,13 @@ fn position_params(file: &Path, input: &Value) -> Result<Value, ToolError> {
         Some(c) if c >= 1 => c - 1,
         _ => return Err(ToolError::invalid_input("character is required (1-based)")),
     };
+    let snapshot = client
+        .document_snapshot(file)
+        .ok_or_else(|| ToolError::failed("document is not synchronized"))?;
+    let character = client
+        .position_encoding()
+        .from_column(&snapshot.text, line as usize, character as usize)
+        .ok_or_else(|| ToolError::invalid_input("position is out of range"))?;
     Ok(json!({
         "textDocument": { "uri": path_uri(file) },
         "position": { "line": line, "character": character }
@@ -363,11 +357,9 @@ fn position_params(file: &Path, input: &Value) -> Result<Value, ToolError> {
 }
 
 fn path_uri(file: &Path) -> String {
-    format!("file://{}", file.to_string_lossy())
+    crate::lsp::path_to_uri(file)
 }
 
-/// Collect (uri, line, character) from a Location, Location[], or
-/// LocationLink[] result.
 fn collect_locations(result: &Value) -> Vec<(String, i64, i64)> {
     let mut out = Vec::new();
     let push = |out: &mut Vec<(String, i64, i64)>, v: &Value| {
@@ -414,7 +406,6 @@ fn render_symbol(s: &Value, depth: usize, out: &mut String) {
     }
 }
 
-/// LSP SymbolKind enum → short label.
 fn symbol_kind(k: i64) -> &'static str {
     match k {
         1 => "file",
@@ -439,7 +430,6 @@ fn symbol_kind(k: i64) -> &'static str {
     }
 }
 
-/// Best-effort path relative to cwd for display.
 fn rel(file: &Path) -> String {
     std::env::current_dir()
         .ok()
@@ -451,15 +441,155 @@ fn rel(file: &Path) -> String {
         .unwrap_or_else(|| file.to_string_lossy().to_string())
 }
 
-fn uri_to_rel(uri: &str) -> String {
-    let path = uri.strip_prefix("file://").unwrap_or(uri);
-    rel(Path::new(path))
+fn render_location(client: &crate::lsp::LspClient, uri: &str, line: i64, units: i64) -> String {
+    let column = reqwest::Url::parse(uri)
+        .ok()
+        .and_then(|url| url.to_file_path().ok())
+        .and_then(|path| client.document_snapshot(&path))
+        .and_then(|doc| {
+            client
+                .position_encoding()
+                .to_column(&doc.text, line as usize, units as usize)
+        });
+    match column {
+        Some(column) => format!("{}:{}:{}", uri_to_rel(uri), line + 1, column + 1),
+        None => format!(
+            "{}:{} (server {:?} offset {})",
+            uri_to_rel(uri),
+            line + 1,
+            client.position_encoding(),
+            units
+        ),
+    }
 }
 
-/// Keep language-server documents current without collecting diagnostics or
-/// waiting for analysis. Diagnostics are requested explicitly through the lsp tool.
+fn uri_to_rel(uri: &str) -> String {
+    reqwest::Url::parse(uri)
+        .ok()
+        .and_then(|url| url.to_file_path().ok())
+        .map(|path| rel(&path))
+        .unwrap_or_else(|| uri.to_string())
+}
+
+/// Syncs edits without collecting diagnostics or waiting for analysis.
 pub async fn sync_after_edit(lsp: &Option<Arc<LspManager>>, file: &Path, text: &str) {
     if let Some(client) = lsp.as_ref().and_then(|manager| manager.client_for(file)) {
-        client.sync_file(file, text).await;
+        let _ = client.sync_file(file, text).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::files::FileFixture;
+    use crate::tools::registry::{ToolErrorKind, ToolRegistry};
+
+    #[test]
+    fn location_results_accept_single_array_and_link_forms_in_order() {
+        let location = json!({
+            "uri":"file:///project/a.rs",
+            "range":{"start":{"line":3, "character":7}, "end":{"line":3, "character":9}}
+        });
+        let link = json!({
+            "targetUri":"file:///project/b.rs",
+            "targetRange":{"start":{"line":5, "character":2}, "end":{"line":5, "character":8}},
+            "targetSelectionRange":{"start":{"line":5, "character":2}, "end":{"line":5, "character":8}}
+        });
+        let first = ("file:///project/a.rs".to_string(), 3, 7);
+        let second = ("file:///project/b.rs".to_string(), 5, 2);
+        assert_eq!(collect_locations(&location), vec![first.clone()]);
+        assert_eq!(
+            collect_locations(&json!([location, link])),
+            vec![first, second]
+        );
+        for empty in [
+            Value::Null,
+            json!([]),
+            json!({"range":{"start":{"line":1}}}),
+        ] {
+            assert!(collect_locations(&empty).is_empty());
+        }
+    }
+
+    #[test]
+    fn symbol_rendering_preserves_hierarchy_and_converts_zero_based_lines() {
+        let symbol = json!({
+            "name":"Container", "kind":23, "range":{"start":{"line":4}},
+            "children":[
+                {"name":"run", "kind":6, "range":{"start":{"line":6}}, "children":[
+                    {"name":"local", "kind":13, "range":{"start":{"line":7}}}
+                ]},
+                {"name":"FLAG", "kind":14, "location":{"range":{"start":{"line":10}}}}
+            ]
+        });
+        let mut output = String::new();
+        render_symbol(&symbol, 0, &mut output);
+        assert_eq!(
+            output,
+            "struct Container  :5\n  method run  :7\n    var local  :8\n  const FLAG  :11\n"
+        );
+        let mut output = String::new();
+        render_symbol(
+            &json!({"name":"future", "kind":999, "range":{"start":{"line":0}}}),
+            0,
+            &mut output,
+        );
+        assert_eq!(output, "symbol future  :1\n");
+    }
+
+    #[test]
+    fn file_uri_display_decodes_spaces_unicode_and_reserved_characters() {
+        let cwd = std::env::current_dir().unwrap();
+        let relative = Path::new("src").join("space é#%.rs");
+        let path = cwd.join(&relative);
+        let uri = path_uri(&path);
+        assert!(uri.contains("%20"));
+        assert!(uri.contains("%23"));
+        assert!(uri.contains("%25"));
+        assert_eq!(uri_to_rel(&uri), relative.to_string_lossy());
+        assert_eq!(rel(&relative), relative.to_string_lossy());
+        for non_file in ["untitled:buffer", "https://example.invalid/a", "not a URI"] {
+            assert_eq!(uri_to_rel(non_file), non_file);
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_inputs_are_distinct_from_missing_server_configuration() {
+        let fixture = FileFixture::new();
+        let manager = LspManager::start(&[], fixture.dir.path());
+        let tool = Arc::new(LspTool::new(manager));
+        let mut registry = ToolRegistry::new(None);
+        registry.add(tool.clone());
+        for input in [
+            json!({}),
+            json!({"operation":"unknown"}),
+            json!({"operation":"diagnostics", "severity":"fatal"}),
+            json!({"operation":"hover", "filePath":12}),
+            json!({"operation":"hover", "line":1.5}),
+        ] {
+            assert_eq!(
+                registry
+                    .execute("lsp", input, &fixture.ctx)
+                    .await
+                    .unwrap_err()
+                    .kind,
+                ToolErrorKind::InvalidInput
+            );
+        }
+        let error = tool
+            .execute(json!({"operation":"hover"}), &fixture.ctx)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, ToolErrorKind::InvalidInput);
+        assert_eq!(error.message, "filePath is required");
+        let error = tool
+            .execute(
+                json!({"operation":"hover", "filePath":"missing.rs", "line":1, "character":1}),
+                &fixture.ctx,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, ToolErrorKind::Unavailable);
+        assert!(error.message.contains("no language server configured"));
     }
 }

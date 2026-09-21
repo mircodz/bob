@@ -1,9 +1,5 @@
-//! Minimal MCP (Model Context Protocol) client. MCP is JSON-RPC 2.0 exchanged
-//! either over a spawned subprocess's stdin/stdout (stdio transport) or over
-//! HTTP POST with SSE/JSON responses (streamable-HTTP transport). We perform the
-//! initialize handshake, list the server's tools, and expose each as a native
-//! `Tool` (namespaced `<server>_<tool>`) so the agent can't tell them apart from
-//! built-ins.
+//! MCP uses JSON-RPC over stdio or HTTP with JSON/SSE replies.
+//! Server tools are registered as `<server>_<tool>`.
 
 mod http;
 mod stdio;
@@ -15,16 +11,14 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
-/// A transport carries JSON-RPC requests/notifications to one MCP server.
 #[async_trait]
 pub(crate) trait Transport: Send + Sync {
-    /// Send a request and await its `result` (mapping a JSON-RPC error to Err).
+    /// JSON-RPC errors become `Err`, not successful results.
     async fn request(&self, method: &str, params: Value) -> anyhow::Result<Value>;
-    /// Fire-and-forget notification (no response expected).
+    /// Notifications expect no reply; delivery errors are ignored.
     async fn notify(&self, method: &str, params: Value);
 }
 
-/// A live connection to one MCP server, over whichever transport it uses.
 #[derive(Clone)]
 pub struct McpClient {
     name: String,
@@ -32,8 +26,6 @@ pub struct McpClient {
 }
 
 impl McpClient {
-    /// Connect to the server (spawning it for stdio, or opening an HTTP session),
-    /// run the initialize handshake, and return the client.
     pub async fn connect(cfg: &McpServerConfig) -> anyhow::Result<McpClient> {
         let transport: Arc<dyn Transport> = if cfg.is_http() {
             Arc::new(http::HttpTransport::connect(cfg).await?)
@@ -45,7 +37,6 @@ impl McpClient {
             transport,
         };
 
-        // initialize handshake.
         client
             .transport
             .request(
@@ -57,7 +48,6 @@ impl McpClient {
                 }),
             )
             .await?;
-        // notifications/initialized (fire-and-forget).
         client
             .transport
             .notify("notifications/initialized", json!({}))
@@ -66,7 +56,6 @@ impl McpClient {
         Ok(client)
     }
 
-    /// List the server's tools and wrap each as a native namespaced Tool.
     pub async fn list_tools(&self) -> anyhow::Result<Vec<Arc<dyn Tool>>> {
         let result = self.transport.request("tools/list", json!({})).await?;
         let tools = result
@@ -98,13 +87,11 @@ impl McpClient {
         Ok(out)
     }
 
-    /// Call a tool on the server, returning its text content joined.
     async fn call_tool(&self, name: &str, args: Value) -> anyhow::Result<String> {
         let result = self
             .transport
             .request("tools/call", json!({ "name": name, "arguments": args }))
             .await?;
-        // result.content is an array of {type, text|...}.
         let parts = result
             .get("content")
             .and_then(|c| c.as_array())
@@ -130,10 +117,9 @@ impl McpClient {
     }
 }
 
-/// A single MCP tool, wrapped to look like a native Tool.
 struct McpTool {
     client: McpClient,
-    /// The tool's name on the server (without the server namespace prefix).
+    /// Tool name on the server, without the local namespace prefix.
     raw_name: String,
     spec: ToolSpec,
 }
@@ -148,13 +134,12 @@ impl Tool for McpTool {
         self.client
             .call_tool(&self.raw_name, input)
             .await
+            .map(Into::into)
             .map_err(|e| ToolError::failed(e.to_string()))
     }
 }
 
-/// Connect to every configured MCP server and return all their tools flattened,
-/// plus a notice string per server (connected N tools / failed). Servers that
-/// fail to connect are skipped (not fatal).
+/// Connection and listing failures become notices; other servers remain available.
 pub async fn connect_all(configs: &[McpServerConfig]) -> (Vec<Arc<dyn Tool>>, Vec<String>) {
     let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
     let mut notices: Vec<String> = Vec::new();
@@ -163,9 +148,7 @@ pub async fn connect_all(configs: &[McpServerConfig]) -> (Vec<Arc<dyn Tool>>, Ve
             Ok(client) => match client.list_tools().await {
                 Ok(t) => {
                     notices.push(format!("MCP '{}': {} tool(s)", cfg.name, t.len()));
-                    // Each wrapped McpTool holds an Arc clone of the client, so
-                    // the connection (and its subprocess) stays alive as long as
-                    // any of its tools remain registered.
+                    // Registered tools keep the transport and subprocess alive.
                     tools.extend(t);
                 }
                 Err(e) => notices.push(format!("MCP '{}': list failed: {}", cfg.name, e)),
@@ -174,4 +157,156 @@ pub async fn connect_all(configs: &[McpServerConfig]) -> (Vec<Arc<dyn Tool>>, Ve
         }
     }
     (tools, notices)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    struct ExpectedRequest {
+        method: &'static str,
+        params: Value,
+        reply: anyhow::Result<Value>,
+    }
+
+    struct ScriptedTransport(Mutex<VecDeque<ExpectedRequest>>);
+
+    #[async_trait]
+    impl Transport for ScriptedTransport {
+        async fn request(&self, method: &str, params: Value) -> anyhow::Result<Value> {
+            let expected = self
+                .0
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unexpected request");
+            assert_eq!(method, expected.method);
+            assert_eq!(params, expected.params);
+            expected.reply
+        }
+
+        async fn notify(&self, method: &str, _params: Value) {
+            panic!("unexpected notification: {method}");
+        }
+    }
+
+    fn scripted_client(requests: Vec<ExpectedRequest>) -> (McpClient, Arc<ScriptedTransport>) {
+        let transport = Arc::new(ScriptedTransport(Mutex::new(requests.into())));
+        (
+            McpClient {
+                name: "fixture".into(),
+                transport: transport.clone(),
+            },
+            transport,
+        )
+    }
+
+    #[tokio::test]
+    async fn listed_tools_preserve_metadata_and_execute_with_raw_server_name() {
+        let schema = json!({"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false});
+        let arguments = json!({"query":"é😀","nested":{"values":[1,null,true]}});
+        let (client, transport) = scripted_client(vec![
+            ExpectedRequest {
+                method: "tools/list",
+                params: json!({}),
+                reply: Ok(json!({"tools":[
+                    {"name":"search","description":"Search a project","inputSchema":schema},
+                    {"name":"ping"},
+                    {"name":""},
+                    {"description":"unnamed"},
+                    {"name":42}
+                ]})),
+            },
+            ExpectedRequest {
+                method: "tools/call",
+                params: json!({"name":"search","arguments":arguments}),
+                reply: Ok(json!({"content":[{"type":"text","text":"found"}]})),
+            },
+        ]);
+        let tools = client.list_tools().await.unwrap();
+        assert_eq!(tools.len(), 2);
+        let spec = tools[0].spec();
+        assert_eq!(spec.name, "fixture_search");
+        assert_eq!(spec.description, "Search a project");
+        assert_eq!(spec.input_schema, schema);
+        let fallback = tools[1].spec();
+        assert_eq!(fallback.name, "fixture_ping");
+        assert_eq!(fallback.description, "");
+        assert_eq!(
+            fallback.input_schema,
+            json!({"type":"object","properties":{}})
+        );
+        drop(client);
+        let ctx = crate::test_support::files::tool_context(std::path::Path::new("."));
+        assert_eq!(
+            tools[0]
+                .execute(arguments, &ctx)
+                .await
+                .unwrap()
+                .as_text()
+                .unwrap(),
+            "found"
+        );
+        assert!(transport.0.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn content_blocks_keep_order_and_non_text_payloads() {
+        let image = json!({"type":"image","data":"AA==","mimeType":"image/png"});
+        let resource =
+            json!({"type":"resource","resource":{"uri":"file:///fixture.rs","text":"source"}});
+        let (client, transport) = scripted_client(vec![ExpectedRequest {
+            method: "tools/call",
+            params: json!({"name":"inspect","arguments":{}}),
+            reply: Ok(json!({"content":[
+                {"type":"text","text":"first\nsecond"}, image,
+                {"type":"text","text":""}, resource,
+                {"type":"text","text":"last"}
+            ]})),
+        }]);
+        assert_eq!(
+            client.call_tool("inspect", json!({})).await.unwrap(),
+            format!("first\nsecond\n{image}\n\n{resource}\nlast")
+        );
+        assert!(transport.0.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn transport_errors_propagate_through_listing_and_tool_execution() {
+        let (client, transport) = scripted_client(vec![
+            ExpectedRequest {
+                method: "tools/list",
+                params: json!({}),
+                reply: Err(anyhow::anyhow!("list denied")),
+            },
+            ExpectedRequest {
+                method: "tools/call",
+                params: json!({"name":"run","arguments":{"x":1}}),
+                reply: Err(anyhow::anyhow!("connection lost")),
+            },
+        ]);
+        assert_eq!(
+            client.list_tools().await.err().unwrap().to_string(),
+            "list denied"
+        );
+        let tool = McpTool {
+            client,
+            raw_name: "run".into(),
+            spec: ToolSpec {
+                name: "fixture_run".into(),
+                description: String::new(),
+                input_schema: json!({"type":"object"}),
+            },
+        };
+        let ctx = crate::test_support::files::tool_context(std::path::Path::new("."));
+        let error = tool.execute(json!({"x":1}), &ctx).await.unwrap_err();
+        assert!(matches!(
+            error.kind,
+            crate::tools::registry::ToolErrorKind::Failed
+        ));
+        assert_eq!(error.message, "connection lost");
+        assert!(transport.0.lock().unwrap().is_empty());
+    }
 }

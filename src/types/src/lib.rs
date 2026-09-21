@@ -1,9 +1,4 @@
-//! bob-types — the provider-agnostic vocabulary shared across the workspace.
-//!
-//! Providers translate to/from these; agents, tools, stores, and the
-//! orchestrator only ever deal in these shapes. This crate is a leaf: it depends
-//! only on `serde`/`serde_json` so every other crate can build on it without
-//! pulling in the engine.
+//! Provider-neutral message and request types; no engine dependencies.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -17,7 +12,6 @@ pub enum Role {
     Tool,
 }
 
-/// A single piece of content within a message.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
@@ -31,13 +25,11 @@ pub enum ContentBlock {
     },
     ToolResult {
         tool_use_id: String,
-        content: String,
+        content: ToolOutput,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
     },
-    /// Anthropic extended-thinking block. The `signature` is opaque and MUST be
-    /// echoed back verbatim in the assistant turn that carries the `tool_use`, or
-    /// the next request is rejected. Not shown to the user.
+    /// Anthropic requires the signature unchanged alongside tool calls. Not displayed.
     Thinking {
         thinking: String,
         signature: String,
@@ -46,13 +38,92 @@ pub enum ContentBlock {
     RedactedThinking {
         data: String,
     },
-    /// An OpenAI Responses API reasoning item, stored verbatim so it can be
-    /// echoed back in the next request's `input` (required to preserve reasoning
-    /// continuity across tool calls when `store: false`). Opaque to everything
-    /// except the Responses provider; other providers skip it.
+    /// Opaque Responses reasoning, echoed unchanged for `store: false` continuity.
+    /// Other providers skip it.
     ReasoningItem {
         item: Value,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+pub enum ToolOutput {
+    Text(String),
+    Shell(Box<ShellOutput>),
+}
+
+impl ToolOutput {
+    pub fn model_text(&self) -> std::borrow::Cow<'_, str> {
+        match self {
+            Self::Text(text) => std::borrow::Cow::Borrowed(text),
+            Self::Shell(shell) => std::borrow::Cow::Owned(
+                serde_json::to_string(shell).expect("shell output is serializable"),
+            ),
+        }
+    }
+
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            Self::Text(text) => Some(text),
+            Self::Shell(_) => None,
+        }
+    }
+}
+
+impl From<String> for ToolOutput {
+    fn from(text: String) -> Self {
+        Self::Text(text)
+    }
+}
+
+impl From<&str> for ToolOutput {
+    fn from(text: &str) -> Self {
+        Self::Text(text.to_owned())
+    }
+}
+
+impl From<ShellOutput> for ToolOutput {
+    fn from(output: ShellOutput) -> Self {
+        Self::Shell(Box::new(output))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellOutcome {
+    #[default]
+    Exited,
+    TimedOut,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellOutput {
+    pub exit_code: Option<i32>,
+    pub signal: Option<i32>,
+    pub core_dumped: bool,
+    pub outcome: ShellOutcome,
+    pub stdout: ShellStream,
+    pub stderr: ShellStream,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<ShellPage>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellStream {
+    pub text: String,
+    pub total_bytes: u64,
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellPage {
+    pub job_id: String,
+    pub offset: usize,
+    pub next_offset: Option<usize>,
+    pub retained_bytes: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -69,7 +140,7 @@ impl Message {
         }
     }
 
-    /// Concatenate all text blocks.
+    /// Text blocks only; excludes tool results and reasoning.
     pub fn text(&self) -> String {
         self.content
             .iter()
@@ -82,7 +153,6 @@ impl Message {
     }
 }
 
-/// Provider-agnostic description of a callable tool.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToolSpec {
     pub name: String,
@@ -101,7 +171,6 @@ pub struct Usage {
 }
 
 impl Usage {
-    /// Accumulate another usage into this one (all four counters).
     pub fn add(&mut self, other: &Usage) {
         self.input_tokens += other.input_tokens;
         self.output_tokens += other.output_tokens;
@@ -123,7 +192,6 @@ pub enum StopReason {
     StopSequence,
 }
 
-/// What a provider returns for one turn of generation.
 #[derive(Clone, Debug)]
 pub struct Completion {
     pub message: Message,
@@ -131,7 +199,6 @@ pub struct Completion {
     pub usage: Usage,
 }
 
-/// Streaming events, normalized across providers.
 #[derive(Clone, Debug)]
 pub enum StreamEvent {
     TextDelta {
@@ -148,15 +215,12 @@ pub enum StreamEvent {
     MessageStop {
         completion: Completion,
     },
-    /// A mid-stream API failure (e.g. Responses `response.failed`). The agent loop
-    /// surfaces this as a real error rather than a fabricated assistant message.
+    /// Stream failure, not assistant content.
     Error {
         message: String,
     },
 }
 
-/// Reasoning intensity for models that support it (OpenAI Responses
-/// `reasoning.effort`, Anthropic extended thinking). Off = don't request any.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum ReasoningEffort {
     #[default]
@@ -201,7 +265,6 @@ impl ReasoningEffort {
         }
     }
 
-    /// Parse a label back into a variant (for CLI/picker input).
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "off" | "none" => Some(ReasoningEffort::Off),
@@ -214,7 +277,6 @@ impl ReasoningEffort {
     }
 }
 
-/// Options for a single generation.
 #[derive(Clone, Debug, Default)]
 pub struct GenerateOptions {
     pub system: Option<String>,
@@ -224,6 +286,331 @@ pub struct GenerateOptions {
     pub temperature: Option<f32>,
     /// Ask the provider to insert prompt-cache breakpoints (Anthropic).
     pub cache: bool,
-    /// Reasoning intensity, if the model supports it.
     pub reasoning: ReasoningEffort,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn roles_have_stable_lowercase_wire_names() {
+        for (role, wire) in [
+            (Role::System, "system"),
+            (Role::User, "user"),
+            (Role::Assistant, "assistant"),
+            (Role::Tool, "tool"),
+        ] {
+            assert_eq!(serde_json::to_value(role).unwrap(), json!(wire));
+            assert_eq!(serde_json::from_value::<Role>(json!(wire)).unwrap(), role);
+        }
+        for invalid in [json!("Assistant"), json!("developer"), json!(null)] {
+            assert!(serde_json::from_value::<Role>(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn message_fixture_decodes_fields_and_encodes_the_documented_shape() {
+        let fixture = json!({
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "Checking…\n"},
+                {"type": "tool_use", "id": "call-7", "name": "lookup",
+                 "input": {"path": "a/b", "limits": [1, null, true]}},
+                {"type": "tool_result", "tool_use_id": "call-7", "content": {"type": "text", "data": "found"}}
+            ]
+        });
+        let decoded: Message = serde_json::from_value(fixture.clone()).unwrap();
+        assert_eq!(decoded.role, Role::Assistant);
+        assert_eq!(decoded.content.len(), 3);
+        assert!(
+            matches!(&decoded.content[0], ContentBlock::Text { text } if text == "Checking…\n")
+        );
+        assert!(matches!(
+            &decoded.content[1],
+            ContentBlock::ToolUse { id, name, input }
+                if id == "call-7" && name == "lookup"
+                    && input == &json!({"path": "a/b", "limits": [1, null, true]})
+        ));
+        assert!(matches!(
+            &decoded.content[2],
+            ContentBlock::ToolResult { tool_use_id, content, is_error: None }
+                if tool_use_id == "call-7" && content.as_text() == Some("found")
+        ));
+
+        let constructed = Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Text {
+                    text: "Checking…\n".into(),
+                },
+                ContentBlock::ToolUse {
+                    id: "call-7".into(),
+                    name: "lookup".into(),
+                    input: json!({"path": "a/b", "limits": [1, null, true]}),
+                },
+                ContentBlock::ToolResult {
+                    tool_use_id: "call-7".into(),
+                    content: "found".into(),
+                    is_error: None,
+                },
+            ],
+        };
+        assert_eq!(serde_json::to_value(constructed).unwrap(), fixture);
+    }
+
+    #[test]
+    fn tool_output_tags_preserve_shell_data_and_model_text() {
+        let shell = ShellOutput {
+            exit_code: Some(7),
+            stdout: ShellStream {
+                text: "[exit: 0] is ordinary output\n".into(),
+                total_bytes: 99,
+                truncated: true,
+                output_id: Some("output_12".into()),
+            },
+            stderr: ShellStream {
+                text: "failed\n".into(),
+                total_bytes: 7,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        for output in [ToolOutput::from("plain result"), ToolOutput::from(shell)] {
+            let encoded = serde_json::to_value(&output).unwrap();
+            let restored: ToolOutput = serde_json::from_value(encoded.clone()).unwrap();
+            assert_eq!(restored, output);
+            match &output {
+                ToolOutput::Text(text) => {
+                    assert_eq!(encoded, json!({"type": "text", "data": text}));
+                    assert_eq!(restored.model_text(), text.as_str());
+                }
+                ToolOutput::Shell(shell) => {
+                    assert_eq!(encoded["type"], "shell");
+                    assert_eq!(encoded["data"]["exit_code"], 7);
+                    assert_eq!(encoded["data"]["stdout"]["output_id"], "output_12");
+                    assert_eq!(
+                        serde_json::from_str::<ShellOutput>(&restored.model_text()).unwrap(),
+                        **shell
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tool_result_error_flag_distinguishes_absent_false_and_true() {
+        for flag in [None, Some(false), Some(true)] {
+            let mut fixture = json!({
+                "type": "tool_result", "tool_use_id": "call", "content": {"type": "text", "data": "output"}
+            });
+            if let Some(flag) = flag {
+                fixture["is_error"] = json!(flag);
+            }
+            let block: ContentBlock = serde_json::from_value(fixture.clone()).unwrap();
+            assert!(matches!(block, ContentBlock::ToolResult { is_error, .. } if is_error == flag));
+            let constructed = ContentBlock::ToolResult {
+                tool_use_id: "call".into(),
+                content: "output".into(),
+                is_error: flag,
+            };
+            assert_eq!(serde_json::to_value(constructed).unwrap(), fixture);
+        }
+        let block: ContentBlock = serde_json::from_value(json!({
+            "type": "tool_result", "tool_use_id": "call", "content": {"type": "text", "data": "output"}, "is_error": null
+        }))
+        .unwrap();
+        assert!(matches!(
+            block,
+            ContentBlock::ToolResult { is_error: None, .. }
+        ));
+    }
+
+    #[test]
+    fn opaque_reasoning_survives_without_interpretation() {
+        let fixtures = [
+            json!({"type": "thinking", "thinking": "private\n思考", "signature": " sig+/=\n\u{0000}"}),
+            json!({"type": "redacted_thinking", "data": " encrypted+/=\n\u{0000}"}),
+            json!({"type": "reasoning_item", "item": {
+                "id": "rs_1", "type": "reasoning", "encrypted_content": "opaque+/=",
+                "summary": [{"type": "summary_text", "text": "not public text"}],
+                "future_field": {"nested": [null, true, 42, "λ"]}
+            }}),
+        ];
+        for fixture in fixtures {
+            let block: ContentBlock = serde_json::from_value(fixture.clone()).unwrap();
+            match &block {
+                ContentBlock::Thinking {
+                    thinking,
+                    signature,
+                } => {
+                    assert_eq!(thinking, "private\n思考");
+                    assert_eq!(signature, " sig+/=\n\u{0000}");
+                }
+                ContentBlock::RedactedThinking { data } => {
+                    assert_eq!(data, " encrypted+/=\n\u{0000}");
+                }
+                ContentBlock::ReasoningItem { item } => assert_eq!(item, &fixture["item"]),
+                other => panic!("wrong reasoning variant: {other:?}"),
+            }
+            assert_eq!(serde_json::to_value(&block).unwrap(), fixture);
+            assert_eq!(
+                Message {
+                    role: Role::Assistant,
+                    content: vec![block]
+                }
+                .text(),
+                ""
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_content_does_not_silently_become_empty_text() {
+        for fixture in [
+            json!({"type": "unknown", "text": "hello"}),
+            json!({"text": "hello"}),
+            json!({"type": "text"}),
+            json!({"type": "tool_use", "name": "lookup", "input": {}}),
+            json!({"type": "tool_result", "tool_use_id": "call", "content": {"type": "text", "data": "x"}, "is_error": "false"}),
+            json!({"type": "thinking", "thinking": "unsigned"}),
+            json!({"type": "redacted_thinking"}),
+        ] {
+            assert!(
+                serde_json::from_value::<ContentBlock>(fixture.clone()).is_err(),
+                "{fixture}"
+            );
+        }
+    }
+
+    #[test]
+    fn text_extraction_joins_only_text_in_order_without_normalizing() {
+        let message: Message = serde_json::from_value(json!({
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "  café"},
+                {"type": "tool_use", "id": "call", "name": "hidden", "input": {"text": "hidden"}},
+                {"type": "text", "text": ""},
+                {"type": "tool_result", "tool_use_id": "call", "content": {"type": "text", "data": "hidden"}},
+                {"type": "thinking", "thinking": "hidden", "signature": "sig"},
+                {"type": "redacted_thinking", "data": "hidden"},
+                {"type": "reasoning_item", "item": {"text": "hidden"}},
+                {"type": "text", "text": "\n世界  "}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(message.text(), "  café\n世界  ");
+        assert_eq!(
+            Message {
+                role: Role::Tool,
+                content: vec![]
+            }
+            .text(),
+            ""
+        );
+    }
+
+    #[test]
+    fn usage_legacy_fixture_defaults_only_cache_counters() {
+        let usage: Usage =
+            serde_json::from_value(json!({"input_tokens": 17, "output_tokens": 23})).unwrap();
+        assert_eq!(usage.input_tokens, 17);
+        assert_eq!(usage.output_tokens, 23);
+        assert_eq!(usage.cache_creation_input_tokens, 0);
+        assert_eq!(usage.cache_read_input_tokens, 0);
+        assert_eq!(
+            serde_json::to_value(usage).unwrap(),
+            json!({
+                "input_tokens": 17, "output_tokens": 23,
+                "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0
+            })
+        );
+        for invalid in [
+            json!({"input_tokens": 1}),
+            json!({"output_tokens": 1}),
+            json!({"input_tokens": -1, "output_tokens": 2}),
+            json!({"input_tokens": 1, "output_tokens": 2, "cache_read_input_tokens": null}),
+        ] {
+            assert!(serde_json::from_value::<Usage>(invalid).is_err());
+        }
+        assert_eq!(
+            serde_json::to_value(Usage::default()).unwrap(),
+            json!({
+                "input_tokens": 0, "output_tokens": 0,
+                "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0
+            })
+        );
+    }
+
+    #[test]
+    fn usage_accumulates_every_counter_and_excludes_output_from_total_input() {
+        let mut usage: Usage = serde_json::from_value(json!({
+            "input_tokens": 4_294_967_300_u64, "output_tokens": 11,
+            "cache_creation_input_tokens": 17, "cache_read_input_tokens": 23
+        }))
+        .unwrap();
+        let other = Usage {
+            input_tokens: 31,
+            output_tokens: 37,
+            cache_creation_input_tokens: 41,
+            cache_read_input_tokens: 43,
+        };
+        usage.add(&other);
+        usage.add(&Usage::default());
+        assert_eq!(
+            serde_json::to_value(usage).unwrap(),
+            json!({
+                "input_tokens": 4_294_967_331_u64, "output_tokens": 48,
+                "cache_creation_input_tokens": 58, "cache_read_input_tokens": 66
+            })
+        );
+        assert_eq!(usage.total_input(), 4_294_967_455);
+        assert_eq!(
+            serde_json::to_value(other).unwrap(),
+            json!({
+                "input_tokens": 31, "output_tokens": 37,
+                "cache_creation_input_tokens": 41, "cache_read_input_tokens": 43
+            })
+        );
+        assert_eq!(Usage::default().total_input(), 0);
+    }
+
+    #[test]
+    fn reasoning_mappings_are_explicit_for_every_level() {
+        for (effort, wire, budget, label) in [
+            (ReasoningEffort::Off, None, None, "off"),
+            (ReasoningEffort::Low, Some("low"), Some(4_000), "low"),
+            (
+                ReasoningEffort::Medium,
+                Some("medium"),
+                Some(10_000),
+                "medium",
+            ),
+            (ReasoningEffort::High, Some("high"), Some(24_000), "high"),
+            (ReasoningEffort::Max, Some("high"), Some(48_000), "max"),
+        ] {
+            assert_eq!(effort.as_str(), wire, "{effort:?}");
+            assert_eq!(effort.thinking_budget(), budget, "{effort:?}");
+            assert_eq!(effort.label(), label, "{effort:?}");
+            assert_eq!(ReasoningEffort::parse(label), Some(effort));
+        }
+    }
+
+    #[test]
+    fn reasoning_parser_accepts_aliases_and_rejects_unknown_labels() {
+        for (label, expected) in [
+            (" NONE ", ReasoningEffort::Off),
+            ("\tMinimal\n", ReasoningEffort::Low),
+            (" MED ", ReasoningEffort::Medium),
+            (" HIGH ", ReasoningEffort::High),
+            (" XHIGH ", ReasoningEffort::Max),
+            ("Extra", ReasoningEffort::Max),
+        ] {
+            assert_eq!(ReasoningEffort::parse(label), Some(expected));
+        }
+        for label in ["", " \n", "auto", "low high", "maximum", "high!", "médium"] {
+            assert_eq!(ReasoningEffort::parse(label), None, "{label:?}");
+        }
+    }
 }

@@ -1,46 +1,27 @@
-//! Bash command analysis for the permission classifier, built on a real shell
-//! grammar (`brush-parser`) rather than a hand-rolled tokenizer.
-//!
-//! The security-critical job is: given a command string the model wants to run,
-//! enumerate EVERY command it would actually execute — including ones hidden
-//! inside pipelines, `&&`/`||`/`;` lists, subshells `( … )`, brace groups
-//! `{ …; }`, control-flow bodies, process substitutions `<( … )`, and command
-//! substitutions `$( … )` / backticks (which brush stores as raw strings, so we
-//! recursively re-parse them). The classifier then decides allow/deny/ask.
-//!
-//! Fail closed: if the command doesn't parse, or contains a construct we don't
-//! model, [`analyze`] returns an error and the caller must NOT auto-allow it.
+//! Bash command analysis for permission checks using `brush-parser`.
+//! Parse failures return `None`; unmodeled constructs set [`Analysis::has_dynamic`].
+//! Neither may be auto-allowed.
 
 use brush_parser::ast;
 
-/// One resolved simple command as an argv vector (`["git","rev-parse","HEAD"]`).
-/// Only the *literal* words are captured; words that are themselves expansions
-/// (a bare `$(…)` used as the command name) surface via [`Analysis::has_dynamic`].
+/// Raw command words; expansions and quoting set [`Analysis::has_dynamic`].
 pub type Argv = Vec<String>;
 
-/// The result of analyzing a bash command line.
 #[derive(Debug, Default, Clone)]
 pub struct Analysis {
-    /// Every simple command that would run, flattened across the whole tree
-    /// (pipelines, lists, subshells, substitutions, control flow).
+    /// Commands found in modeled portions of the input; incomplete if dynamic.
     pub commands: Vec<Argv>,
-    /// True if any pipeline feeds into a shell interpreter (`… | sh`), i.e. the
-    /// classic `curl … | sh` remote-exec shape.
+    /// A pipeline feeds an interpreter (`… | sh`).
     pub pipes_to_shell: bool,
-    /// True if the input used a construct we can enumerate but whose *effect* is
-    /// dynamic enough that the caller should be cautious (a command name that is
-    /// itself an expansion, an eval, etc.). Reserved for future refinement.
+    /// True when effects or expansions are not fully modeled.
     pub has_dynamic: bool,
-    /// True if any command writes to a file via an output/append redirection
-    /// (`> f`, `>> f`, `&> f`, `>| f`, `<> f`, `>&`). The command *name* can be
-    /// harmless and allowlisted (`echo payload > .zshrc`) while the redirection
-    /// is the real mutation — so a redirecting command must never auto-allow.
-    /// Input redirections (`< f`, here-docs, here-strings) do not set this.
+    /// Output redirections mutate files independently of the command name.
+    /// Input-only redirections do not set this.
     pub has_output_redirect: bool,
+    /// Literal redirection targets, checked separately from command arguments.
+    pub redirect_paths: Vec<String>,
 }
 
-/// Shell interpreters that, when a pipe feeds into them, mean "run piped input as
-/// code" (`curl x | sh`). Kept in sync with the classifier's interpreter set.
 const SHELL_INTERPRETERS: &[&str] = &[
     "sh", "bash", "zsh", "dash", "ksh", "fish", "python", "python3", "node", "ruby", "perl", "php",
 ];
@@ -49,16 +30,13 @@ fn base_name(cmd: &str) -> &str {
     cmd.rsplit('/').next().unwrap_or(cmd)
 }
 
-/// Parse + analyze a bash command line. Returns `None` when the input can't be
-/// parsed (malformed, or a construct brush rejects) — the caller treats that as
-/// "un-analyzable → never auto-allow".
 pub fn analyze(raw: &str) -> Option<Analysis> {
     let mut a = Analysis::default();
     walk_program(raw, &mut a, 0)?;
     Some(a)
 }
 
-/// Recursion cap so a pathological nest of substitutions can't blow the stack.
+// Bound substitution recursion to prevent stack exhaustion.
 const MAX_DEPTH: usize = 24;
 
 fn walk_program(raw: &str, a: &mut Analysis, depth: usize) -> Option<()> {
@@ -95,7 +73,6 @@ fn walk_and_or(list: &ast::AndOrList, a: &mut Analysis, depth: usize) -> Option<
 
 fn walk_pipeline(p: &ast::Pipeline, a: &mut Analysis, depth: usize) -> Option<()> {
     for (i, cmd) in p.seq.iter().enumerate() {
-        // A real pipe into a shell interpreter is `… | sh`.
         if i > 0 {
             if let ast::Command::Simple(sc) = cmd {
                 if let Some(name) = simple_command_name(sc) {
@@ -117,22 +94,20 @@ fn walk_command(cmd: &ast::Command, a: &mut Analysis, depth: usize) -> Option<()
             walk_compound(cc, a, depth)?;
             walk_redirect_list(redirects.as_ref(), a, depth)
         }
-        // A function DEFINITION doesn't run its body now, but we still walk it so an
-        // allowlist can't be fooled by hiding `rm` in a function some later command
-        // calls. `FunctionBody(CompoundCommand, …)`.
-        ast::Command::Function(f) => walk_compound(&f.body.0, a, depth),
-        // `[[ … ]]` runs no simple command itself, but a command substitution inside
-        // it IS executed (`[[ -n $(rm x) ]]`). Walk the expression's words so those
-        // hidden commands are surfaced, and any trailing redirections.
+        // Inspect function bodies even though definitions do not execute them.
+        ast::Command::Function(f) => {
+            a.has_dynamic = true;
+            walk_compound(&f.body.0, a, depth)
+        }
+        // `[[ … ]]` can execute substitutions despite having no command name.
         ast::Command::ExtendedTest(e, redirects) => {
+            a.has_dynamic = true;
             walk_extended_test(&e.expr, a, depth)?;
             walk_redirect_list(redirects.as_ref(), a, depth)
         }
     }
 }
 
-/// Walk an extended-test expression, running every word through [`walk_word`] so a
-/// command substitution hidden in `[[ … ]]` lands in `a.commands` like any other.
 fn walk_extended_test(e: &ast::ExtendedTestExpr, a: &mut Analysis, depth: usize) -> Option<()> {
     match e {
         ast::ExtendedTestExpr::And(l, r) | ast::ExtendedTestExpr::Or(l, r) => {
@@ -150,9 +125,6 @@ fn walk_extended_test(e: &ast::ExtendedTestExpr, a: &mut Analysis, depth: usize)
     }
 }
 
-/// Walk a compound-level redirect list (redirections attached to a subshell, brace
-/// group, `[[ … ]]`, etc.), recording output redirections and any substitutions in
-/// their targets.
 fn walk_redirect_list(
     redirects: Option<&ast::RedirectList>,
     a: &mut Analysis,
@@ -166,9 +138,7 @@ fn walk_redirect_list(
     Some(())
 }
 
-/// Inspect one I/O redirection: flag output/append forms (the real mutation in
-/// `echo x > f`), and walk substitutions in the target so `> $(f)` / `> >(cmd)`
-/// still surface their commands. Input-only forms don't flag but are still walked.
+// Input-only redirections can still execute substitutions in their targets.
 fn note_redirect(r: &ast::IoRedirect, a: &mut Analysis, depth: usize) -> Option<()> {
     match r {
         ast::IoRedirect::File(_, kind, target) => {
@@ -180,8 +150,14 @@ fn note_redirect(r: &ast::IoRedirect, a: &mut Analysis, depth: usize) -> Option<
                 a.has_output_redirect = true;
             }
             match target {
-                ast::IoFileRedirectTarget::Filename(w)
-                | ast::IoFileRedirectTarget::Duplicate(w) => walk_word(&w.value, a, depth)?,
+                ast::IoFileRedirectTarget::Filename(w) => {
+                    a.redirect_paths.push(w.value.clone());
+                    walk_word(&w.value, a, depth)?;
+                }
+                ast::IoFileRedirectTarget::Duplicate(w) => {
+                    a.has_dynamic = true;
+                    walk_word(&w.value, a, depth)?;
+                }
                 ast::IoFileRedirectTarget::ProcessSubstitution(_, sub) => {
                     walk_compound_list(&sub.list, a, depth)?
                 }
@@ -190,10 +166,11 @@ fn note_redirect(r: &ast::IoRedirect, a: &mut Analysis, depth: usize) -> Option<
         }
         ast::IoRedirect::OutputAndError(w, _) => {
             a.has_output_redirect = true;
+            a.redirect_paths.push(w.value.clone());
             walk_word(&w.value, a, depth)?;
         }
         ast::IoRedirect::HereString(_, w) => walk_word(&w.value, a, depth)?,
-        ast::IoRedirect::HereDocument(_, _) => {}
+        ast::IoRedirect::HereDocument(_, _) => a.has_dynamic = true,
     }
     Some(())
 }
@@ -202,9 +179,12 @@ fn walk_compound(cc: &ast::CompoundCommand, a: &mut Analysis, depth: usize) -> O
     match cc {
         ast::CompoundCommand::Subshell(s) => walk_compound_list(&s.list, a, depth),
         ast::CompoundCommand::BraceGroup(b) => walk_compound_list(&b.list, a, depth),
-        ast::CompoundCommand::ForClause(f) => walk_compound_list(&f.body.list, a, depth),
+        ast::CompoundCommand::ForClause(f) => {
+            // Expansion of the iteration list is not modeled.
+            a.has_dynamic = true;
+            walk_compound_list(&f.body.list, a, depth)
+        }
         ast::CompoundCommand::WhileClause(w) | ast::CompoundCommand::UntilClause(w) => {
-            // WhileOrUntilClauseCommand(condition: CompoundList, body: DoGroupCommand).
             walk_compound_list(&w.0, a, depth)?;
             walk_compound_list(&w.1.list, a, depth)
         }
@@ -222,6 +202,7 @@ fn walk_compound(cc: &ast::CompoundCommand, a: &mut Analysis, depth: usize) -> O
             Some(())
         }
         ast::CompoundCommand::CaseClause(c) => {
+            a.has_dynamic = true;
             for case in &c.cases {
                 if let Some(cmds) = &case.cmd {
                     walk_compound_list(cmds, a, depth)?;
@@ -229,9 +210,11 @@ fn walk_compound(cc: &ast::CompoundCommand, a: &mut Analysis, depth: usize) -> O
             }
             Some(())
         }
-        ast::CompoundCommand::ArithmeticForClause(f) => walk_compound_list(&f.body.list, a, depth),
-        // Arithmetic / coprocess: no simple-command args we can allowlist. Treat as
-        // dynamic so they never auto-allow through this path.
+        ast::CompoundCommand::ArithmeticForClause(f) => {
+            a.has_dynamic = true;
+            walk_compound_list(&f.body.list, a, depth)
+        }
+        // These effects are not modeled; never auto-allow.
         ast::CompoundCommand::Arithmetic(_) | ast::CompoundCommand::Coprocess(_) => {
             a.has_dynamic = true;
             Some(())
@@ -240,10 +223,11 @@ fn walk_compound(cc: &ast::CompoundCommand, a: &mut Analysis, depth: usize) -> O
 }
 
 fn walk_simple(sc: &ast::SimpleCommand, a: &mut Analysis, depth: usize) -> Option<()> {
-    // Build the argv from the command name + suffix words, and recurse into any
-    // command substitutions found in ANY of its words (name, prefix, suffix).
     let mut argv: Argv = Vec::new();
     if let Some(word) = &sc.word_or_name {
+        if word.value.contains(['$', '`', '*', '?', '[', '~']) {
+            a.has_dynamic = true;
+        }
         argv.push(word.value.clone());
         walk_word(&word.value, a, depth)?;
     }
@@ -275,11 +259,11 @@ fn walk_prefix_suffix_item(
             walk_word(&w.value, a, depth)?;
         }
         ast::CommandPrefixOrSuffixItem::AssignmentWord(_, w) => {
-            // `FOO=$(...)` — don't add to argv, but scan the value for substitutions.
+            // Assignments can change program loading and shell interpretation.
+            a.has_dynamic = true;
             walk_word(&w.value, a, depth)?;
         }
         ast::CommandPrefixOrSuffixItem::ProcessSubstitution(_, sub) => {
-            // `<( … )` / `>( … )` runs its own command list.
             walk_compound_list(&sub.list, a, depth)?;
         }
         ast::CommandPrefixOrSuffixItem::IoRedirect(r) => note_redirect(r, a, depth)?,
@@ -287,16 +271,16 @@ fn walk_prefix_suffix_item(
     Some(())
 }
 
-/// The literal command name of a simple command, if it has a plain word name.
 fn simple_command_name(sc: &ast::SimpleCommand) -> Option<String> {
     sc.word_or_name.as_ref().map(|w| w.value.clone())
 }
 
-/// Scan a raw word for command substitutions (`$( … )`, backticks) and recurse
-/// into each — brush leaves these as unparsed strings, so this is where hidden
-/// commands like `echo $(rm -rf ~)` get surfaced.
+// Brush leaves word substitutions unparsed; recursively analyze their commands.
 fn walk_word(raw: &str, a: &mut Analysis, depth: usize) -> Option<()> {
-    // Fast path: no expansion markers → nothing to recurse into.
+    // Raw argv retains quoting and glob syntax; do not classify it as literal.
+    if raw.contains(['\'', '"', '\\', '*', '?', '[', '~', '{', '}']) {
+        a.has_dynamic = true;
+    }
     if !raw.contains('$') && !raw.contains('`') {
         return Some(());
     }
@@ -316,7 +300,8 @@ fn collect_substitutions(
     use brush_parser::word::WordPiece;
     match piece {
         WordPiece::CommandSubstitution(s) | WordPiece::BackquotedCommandSubstitution(s) => {
-            // Recurse: the substitution body is itself a program.
+            // Its output may become arguments or paths, even when the body is safe.
+            a.has_dynamic = true;
             walk_program(s, a, depth + 1)?;
         }
         WordPiece::DoubleQuotedSequence(seq) | WordPiece::GettextDoubleQuotedSequence(seq) => {
@@ -324,10 +309,10 @@ fn collect_substitutions(
                 collect_substitutions(&p.piece, a, depth)?;
             }
         }
-        // Arithmetic can contain a command substitution in bash; treat presence as
-        // dynamic rather than trying to model it.
+        // Arithmetic can contain unmodeled command substitutions.
         WordPiece::ArithmeticExpression(_) => a.has_dynamic = true,
-        _ => {}
+        // Parameter expansion and other unmodeled pieces can hide execution.
+        _ => a.has_dynamic = true,
     }
     Some(())
 }
@@ -336,7 +321,75 @@ fn collect_substitutions(
 mod tests {
     use super::*;
 
-    /// The set of command names (base name of argv[0]) the analysis found.
+    #[test]
+    fn unmodeled_expansions_fail_closed() {
+        for (case, raw) in [
+            ("heredoc substitution", "cat <<EOF\n$(printf hello)\nEOF\n"),
+            ("indented heredoc", "cat <<-EOF\n\t`printf hello`\nEOF\n"),
+            ("quoted heredoc", "cat <<'EOF'\nplain text\nEOF\n"),
+            (
+                "for substitution",
+                "for item in $(printf hello); do printf ok; done",
+            ),
+            (
+                "for backticks",
+                "for item in `printf hello`; do printf ok; done",
+            ),
+            (
+                "arithmetic for",
+                "for ((i = $(printf 0); i < 1; i++)); do printf ok; done",
+            ),
+            (
+                "case substitution",
+                "case $(printf hello) in hello) printf ok;; esac",
+            ),
+            ("parameter default", "printf ${value:-$(printf hello)}"),
+            ("arithmetic expansion", "printf $((1 + 2))"),
+            ("dynamic command", "$(printf printf) hello"),
+            ("assignment", "SHELL_VALUE=hello printf ok"),
+            ("glob", "cat *.txt"),
+            ("quoted path", "cat '../outside/file'"),
+        ] {
+            assert!(
+                analyze(raw).is_none_or(|analysis| analysis.has_dynamic),
+                "{case}: {raw}"
+            );
+            assert!(
+                !crate::core::permissions::parse_bash(raw).analyzable,
+                "{case}: {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_input_fails_closed() {
+        for (case, raw) in [
+            ("unterminated substitution", "echo $("),
+            ("unterminated quote", "echo 'unterminated"),
+            ("unterminated double quote", "echo \"unterminated"),
+            ("missing pipeline target", "cat file |"),
+            ("missing redirect target", "cat >"),
+        ] {
+            assert!(analyze(raw).is_none(), "{case}: {raw}");
+            let parsed = crate::core::permissions::parse_bash(raw);
+            assert!(!parsed.analyzable, "{case}");
+            assert!(
+                parsed.commands.is_empty(),
+                "partial analysis must not escape: {case}"
+            );
+            assert!(parsed.redirect_paths.is_empty(), "{case}");
+            assert_eq!(parsed.raw, raw);
+        }
+    }
+
+    #[test]
+    fn redirection_paths_are_separate_from_argv() {
+        let analysis = analyze("cat < input > output").unwrap();
+        assert_eq!(analysis.commands, vec![vec!["cat".to_string()]]);
+        assert_eq!(analysis.redirect_paths, ["input", "output"]);
+        assert!(analysis.has_output_redirect);
+    }
+
     fn names(raw: &str) -> Vec<String> {
         analyze(raw)
             .unwrap()
@@ -347,95 +400,175 @@ mod tests {
     }
 
     #[test]
-    fn plain_command() {
-        assert_eq!(names("ls -la"), ["ls"]);
+    fn command_lists_preserve_order_and_arguments() {
+        for (case, raw, expected) in [
+            ("plain", "ls -la", vec!["ls"]),
+            ("and chain", "cd foo && ls -la", vec!["cd", "ls"]),
+            ("pipeline", "a | b | c", vec!["a", "b", "c"]),
+            ("semicolon list", "x ; y ; z", vec!["x", "y", "z"]),
+        ] {
+            assert_eq!(names(raw), expected, "{case}: {raw}");
+        }
+        let parsed = crate::core::permissions::parse_bash("cd foo && ls -la");
+        assert!(parsed.analyzable);
+        assert_eq!(parsed.commands, vec![vec!["cd", "foo"], vec!["ls", "-la"]]);
     }
 
     #[test]
-    fn chains_and_pipes_enumerate_every_command() {
-        assert_eq!(names("cd foo && ls -la"), ["cd", "ls"]);
-        assert_eq!(names("a | b | c"), ["a", "b", "c"]);
-        assert_eq!(names("x ; y ; z"), ["x", "y", "z"]);
+    fn nested_commands_are_surfaced() {
+        for (case, raw, expected) in [
+            ("substitution", "echo $(rm -rf ~)", vec!["echo", "rm"]),
+            ("backticks", "echo `rm -rf /`", vec!["echo", "rm"]),
+            (
+                "nested substitution",
+                "echo $(echo $(rm x))",
+                vec!["echo", "echo", "rm"],
+            ),
+            ("subshell", "(rm -rf /)", vec!["rm"]),
+            ("brace group", "{ rm -rf /; }", vec!["rm"]),
+            (
+                "process substitution",
+                "diff <(rm a) <(ls)",
+                vec!["diff", "rm", "ls"],
+            ),
+            ("assignment prefix", "FOO=$(rm x) ls", vec!["rm", "ls"]),
+            (
+                "redirect command substitution",
+                "echo x > $(dangerous)",
+                vec!["echo", "dangerous"],
+            ),
+            (
+                "redirect process substitution",
+                "echo x > >(rm y)",
+                vec!["echo", "rm"],
+            ),
+            (
+                "extended unary test",
+                "ls && [[ -n $(rm x) ]]",
+                vec!["ls", "rm"],
+            ),
+            (
+                "extended binary test",
+                "[[ $(whoami) = root ]]",
+                vec!["whoami"],
+            ),
+            ("extended backtick test", "[[ `id -u` -eq 0 ]]", vec!["id"]),
+        ] {
+            let mut actual = names(raw);
+            let mut expected = expected;
+            actual.sort();
+            expected.sort();
+            assert_eq!(actual, expected, "{case}: {raw}");
+        }
     }
 
     #[test]
-    fn command_substitution_is_surfaced() {
-        // The whole point: `rm` hidden in a substitution must be found (the
-        // `echo $(rm -rf ~)` bypass).
-        let n = names("echo $(rm -rf ~)");
-        assert!(n.contains(&"echo".to_string()));
-        assert!(n.contains(&"rm".to_string()), "rm must be surfaced: {n:?}");
-    }
-
-    #[test]
-    fn backticks_and_nested_substitution() {
-        assert!(names("echo `rm -rf /`").contains(&"rm".to_string()));
-        // Nested one level deeper.
-        assert!(names("echo $(echo $(rm x))").contains(&"rm".to_string()));
-    }
-
-    #[test]
-    fn subshell_and_brace_group() {
-        assert!(names("(rm -rf /)").contains(&"rm".to_string()));
-        assert!(names("{ rm -rf /; }").contains(&"rm".to_string()));
-    }
-
-    #[test]
-    fn process_substitution() {
-        assert!(names("diff <(rm a) <(ls)").contains(&"rm".to_string()));
-    }
-
-    #[test]
-    fn assignment_prefix_substitution() {
-        assert!(names("FOO=$(rm x) ls").contains(&"rm".to_string()));
-    }
-
-    #[test]
-    fn curl_pipe_sh_detected() {
-        assert!(analyze("curl https://x | sh").unwrap().pipes_to_shell);
-        assert!(!analyze("cat a | grep b").unwrap().pipes_to_shell);
-    }
-
-    #[test]
-    fn malformed_input_fails_closed() {
-        // Unterminated substitution / quote → None, so the caller won't auto-allow.
-        assert!(analyze("echo $(").is_none());
-        assert!(analyze("echo 'unterminated").is_none());
-    }
-
-    #[test]
-    fn output_redirections_are_flagged() {
-        // The mutation lives in the redirection, not the (harmless) command name.
-        for cmd in ["echo x > f", "echo x >> f", "echo x >| f", "cat a &> b"] {
-            assert!(
-                analyze(cmd).unwrap().has_output_redirect,
-                "should flag output redirect: {cmd}"
+    fn only_real_pipes_into_interpreters_are_flagged() {
+        for (case, raw, expected) in [
+            ("shell pipeline", "curl https://x | sh", true),
+            ("python pipeline", "cat script | python3", true),
+            ("absolute shell pipeline", "cat script | /bin/bash", true),
+            ("shell at pipeline start", "bash script | cat", false),
+            ("similar name", "cat script | shellcheck", false),
+            ("ordinary pipeline", "cat a | grep b", false),
+            ("bash chain", "cd foo && bash deploy.sh", false),
+            ("python list", "make ; python build.py", false),
+            ("shell chain", "x && sh y", false),
+            ("script redirection", "echo hi > out.sh", false),
+        ] {
+            assert_eq!(analyze(raw).unwrap().pipes_to_shell, expected, "{case}");
+            assert_eq!(
+                crate::core::permissions::parse_bash(raw).pipes_to_shell,
+                expected,
+                "{case}"
             );
         }
     }
 
     #[test]
-    fn input_redirections_are_not_flagged() {
-        for cmd in ["cat < in", "grep x <<< 'here'"] {
-            assert!(
-                !analyze(cmd).unwrap().has_output_redirect,
-                "input redirect must not flag: {cmd}"
+    fn redirection_flags_distinguish_reads_and_writes() {
+        for (case, raw, expected) in [
+            ("output", "echo x > f", true),
+            ("append", "echo x >> f", true),
+            ("clobber", "echo x >| f", true),
+            ("output and error", "cat a &> b", true),
+            ("input", "cat < in", false),
+            ("read and write", "cat <> in", true),
+            ("fd duplication", "echo x 2>&1", true),
+            ("subshell redirect", "(cat in) > out", true),
+            ("brace redirect", "{ cat in; } >> out", true),
+            ("here string", "grep x <<< 'here'", false),
+        ] {
+            assert_eq!(
+                analyze(raw).unwrap().has_output_redirect,
+                expected,
+                "{case}"
             );
         }
     }
 
     #[test]
-    fn substitution_in_redirect_target_is_surfaced() {
-        assert!(names("echo x > $(dangerous)").contains(&"dangerous".to_string()));
-        assert!(names("echo x > >(rm y)").contains(&"rm".to_string()));
+    fn comments_and_quoted_literals_do_not_invent_commands_or_redirections() {
+        for raw in [
+            "echo literal # rm secret > target",
+            "echo '$(rm secret) | sh > target'",
+            "echo '`rm secret`'",
+        ] {
+            let analysis = analyze(raw).unwrap();
+            assert_eq!(names(raw), ["echo"], "{raw}");
+            assert!(!analysis.pipes_to_shell, "{raw}");
+            assert!(!analysis.has_output_redirect, "{raw}");
+            assert!(analysis.redirect_paths.is_empty(), "{raw}");
+        }
+        for raw in ["", "   ", "# rm secret > target\n"] {
+            let analysis = analyze(raw).unwrap();
+            assert!(analysis.commands.is_empty(), "{raw:?}");
+            assert!(analysis.redirect_paths.is_empty(), "{raw:?}");
+            assert!(!analysis.has_output_redirect);
+            assert!(!analysis.pipes_to_shell);
+        }
     }
 
     #[test]
-    fn extended_test_substitutions_are_surfaced() {
-        // The `[[ … ]]` bypass: a command substitution inside an extended test IS
-        // executed and must be surfaced so the allowlist can't be fooled.
-        assert!(names("ls && [[ -n $(rm x) ]]").contains(&"rm".to_string()));
-        assert!(names("[[ $(whoami) = root ]]").contains(&"whoami".to_string()));
-        assert!(names("[[ `id -u` -eq 0 ]]").contains(&"id".to_string()));
+    fn control_flow_includes_conditions_and_every_possible_branch() {
+        for (raw, expected) in [
+            (
+                "if test -f x; then cat x; elif test -f y; then cat y; else printf missing; fi",
+                vec![
+                    vec!["test", "-f", "x"],
+                    vec!["cat", "x"],
+                    vec!["test", "-f", "y"],
+                    vec!["cat", "y"],
+                    vec!["printf", "missing"],
+                ],
+            ),
+            (
+                "while test -f x; do rm x; done",
+                vec![vec!["test", "-f", "x"], vec!["rm", "x"]],
+            ),
+            (
+                "until test -f x; do touch x; done",
+                vec![vec!["test", "-f", "x"], vec!["touch", "x"]],
+            ),
+        ] {
+            let analysis = analyze(raw).unwrap();
+            assert!(!analysis.has_dynamic, "{raw}");
+            assert_eq!(analysis.commands, expected, "{raw}");
+            assert!(!analysis.has_output_redirect);
+            assert!(analysis.redirect_paths.is_empty());
+        }
+    }
+
+    #[test]
+    fn deeply_nested_substitutions_fail_closed_without_leaking_partial_analysis() {
+        let mut raw = "printf leaf".to_string();
+        for _ in 0..40 {
+            raw = format!("echo $({raw})");
+        }
+        assert!(analyze(&raw).is_none());
+        let parsed = crate::core::permissions::parse_bash(&raw);
+        assert!(!parsed.analyzable);
+        assert!(parsed.commands.is_empty());
+        assert_eq!(parsed.raw, raw);
     }
 }

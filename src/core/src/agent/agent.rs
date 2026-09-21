@@ -1,43 +1,32 @@
-//! The core agent loop. Runs a provider ↔ tool conversation to completion and
-//! returns the final text. Communicates progress ONLY through the event bus.
-
-use crate::agent::compaction::{maybe_compact, CompactionOptions};
+use crate::agent::compaction::{input_safe_budget, maybe_compact, CompactionOptions};
 use crate::core::events::{AgentEvent, EventBus};
 use crate::core::types::{
-    Completion, ContentBlock, GenerateOptions, Message, Role, StopReason, StreamEvent, Usage,
+    Completion, ContentBlock, GenerateOptions, Message, Role, StopReason, StreamEvent, ToolOutput,
+    Usage,
 };
-use crate::providers::provider::Provider;
+#[cfg(test)]
+use crate::providers::provider::has_status_code;
+use crate::providers::provider::{is_transient_error, Provider, MAX_RETRIES, RETRY_DELAY};
 use crate::tools::file_tracker::FileTracker;
 use crate::tools::registry::{ToolContext, ToolRegistry};
 use crate::tools::todo::TodoStore;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+#[path = "streaming.rs"]
+mod streaming;
+
 static AGENT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// The canonical id/name of the top-level agent. Subagents report back to it and
-/// the UI keys the main transcript on it, so it must not be a bare string literal
-/// scattered across files.
+/// Canonical root identity used by coordination and transcript routing.
 pub const ROOT_AGENT_ID: &str = "root";
 
-/// Tuning knobs shared by EVERY agent (root + subagents), centralized so the
-/// frontends and the subagent-spawning tools can't silently disagree.
-///
-/// The context window is NOT here — it's model-specific and derived per provider
-/// via [`crate::providers::provider::Provider::context_window`]. A provider that
-/// can't tell falls back to [`crate::providers::provider::context_window_for`],
-/// which is the single source of model→window knowledge.
 pub const COMPACT_THRESHOLD: f64 = 0.8;
 pub const KEEP_RECENT: usize = 6;
-/// Turn budgets: the root gets a large budget; coordinated/`task` subagents a
-/// moderate one; the read-only `explore` agent a smaller one (it only searches).
 pub const DEFAULT_MAX_TURNS: u32 = 200;
 pub const SUBAGENT_MAX_TURNS: u32 = 100;
 pub const EXPLORE_MAX_TURNS: u32 = 60;
 
-/// What a spawning tool must supply to build a child agent. The shared tuning
-/// constants (context window, compaction, etc.) are filled in by [`build_subagent`]
-/// so the three spawn sites (task, explore, spawn_agent) can't drift.
 pub struct SubagentSpec {
     pub provider: Arc<dyn Provider>,
     pub tools: ToolRegistry,
@@ -50,21 +39,17 @@ pub struct SubagentSpec {
     pub name: String,
     pub max_turns: u32,
     pub depth: usize,
-    /// Team membership: an inbox + roster for coordinated agents; `None` for the
-    /// fire-and-forget `task`/`explore` children.
     pub inbox: Option<crate::agent::team::AgentInbox>,
     pub team: Option<crate::agent::team::AgentRegistry>,
-    /// The spawner's cancel flag, so a Cancel on the root cascades into this child.
-    /// `None` only for the root itself.
+    /// Ancestor cancellation, observed but never cleared by the child.
     pub parent_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    pub hooks: crate::agent::hooks::Hooks,
+    pub memory: Option<Arc<dyn crate::core::memory::MemoryRepository>>,
 }
 
-/// Build a child agent from a [`SubagentSpec`], filling the shared tuning
-/// constants. The one place subagents are constructed, so their configuration
-/// stays consistent.
 pub fn build_subagent(spec: SubagentSpec) -> Agent {
     let context_window = spec.provider.context_window();
-    Agent::new(AgentConfig {
+    let mut agent = Agent::new(AgentConfig {
         provider: spec.provider,
         tools: spec.tools,
         bus: spec.bus,
@@ -84,14 +69,12 @@ pub fn build_subagent(spec: SubagentSpec) -> Agent {
         depth: spec.depth,
         parent_cancel: spec.parent_cancel,
         cancel: None,
-        // Hooks are a root-agent guardrail; subagents don't inherit them (yet).
-        hooks: crate::agent::hooks::Hooks::default(),
-    })
+        hooks: spec.hooks,
+    });
+    agent.set_memory_repository(spec.memory);
+    agent
 }
 
-/// Whether a turn should stop: the agent's OWN cancel flag is set, OR any ancestor
-/// flag it observes is set. Split out as a pure function so the cascade semantics
-/// (self OR parent) can be unit-tested without standing up a full provider.
 fn cancel_requested(
     own: &std::sync::atomic::AtomicBool,
     parent: Option<&Arc<std::sync::atomic::AtomicBool>>,
@@ -118,58 +101,59 @@ pub struct AgentConfig {
     pub context_window: usize,
     pub compact_threshold: f64,
     pub keep_recent: usize,
-    /// Shared background-job registry (so the `task`/job tools and the UI see
-    /// the same jobs). Defaults to a fresh empty registry.
+    /// Shared job and output ownership across this session.
     pub jobs: crate::tools::jobs::JobRegistry,
     /// UI hook for ask_user / exit_plan. None → those tools return a note.
     pub user_asker: Option<Arc<dyn crate::tools::registry::UserAsker>>,
-    /// Language servers for this project. None if none configured. Shared with
-    /// every agent (root + subagents) so all see the same server processes.
+    /// Shared server processes for the root and subagents.
     pub lsp: Option<Arc<crate::lsp::LspManager>>,
-    /// This agent's mailbox for inter-agent coordination. None → the agent is not
-    /// part of a team (no inbox drain).
     pub inbox: Option<crate::agent::team::AgentInbox>,
-    /// The shared team roster, so coordination tools can address other agents.
     pub team: Option<crate::agent::team::AgentRegistry>,
-    /// This agent's own name in the team + its spawn depth (root = 0).
     pub name: String,
     pub depth: usize,
-    /// An ancestor's cancel flag, observed (read-only) in addition to this agent's
-    /// own. Set for spawned children so a Cancel on the root cascades to the whole
-    /// tree — each agent still owns its own flag (cleared at its own turn start),
-    /// but `is_cancelled` also honors any ancestor's. `None` for the root.
+    /// Ancestor cancellation, observed but never cleared by this agent.
     pub parent_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
-    /// The agent's OWN cancel flag. Normally `None` (a fresh flag is created), but
-    /// the root injects one so it can hand the same flag to its subagent-spawning
-    /// tools as their `parent_cancel` — one Cancel then reaches root and every child.
+    /// Optional shared local cancellation flag; otherwise created by the agent.
     pub cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
-    /// Tool-call hooks (SDK `.on_pre_tool` / `.on_post_tool`). Empty by default;
-    /// applied in `run_one` to gate/rewrite every tool call.
     pub hooks: crate::agent::hooks::Hooks,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunStopReason {
+    Completed,
+    Cancelled,
+    TurnLimit,
+    TimedOut,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunOutcome {
+    pub text: String,
+    pub stop_reason: RunStopReason,
+    pub turns: u32,
 }
 
 pub struct Agent {
     pub id: String,
     cfg: AgentConfig,
-    /// The working history sent to the provider. May be compacted in place once it
-    /// approaches the context window (older turns collapsed into a summary).
+    /// Provider-facing context; older messages may be compacted.
     history: Vec<Message>,
-    /// The full, never-compacted transcript — every user/assistant/tool message in
-    /// order. This is what gets persisted so a resumed session shows the WHOLE
-    /// conversation, not the compacted view the model happened to last run on.
+    /// Uncompacted transcript retained for persistence and display.
     full_history: Vec<Message>,
     files: Arc<FileTracker>,
     todos: Arc<TodoStore>,
-    /// Cooperative cancel flag. When set, the run loop finishes the current
-    /// step, ensures the history is left in a valid state, and returns early.
     cancel: Arc<std::sync::atomic::AtomicBool>,
-    /// Reasoning intensity requested for each generation (runtime-settable).
     reasoning: crate::core::types::ReasoningEffort,
-    /// Highest context-usage warning threshold already emitted this run, so a graded
-    /// warning fires once per level as usage climbs (and re-arms after a compaction
-    /// drops usage back down).
+    /// Highest warning emitted; compaction rearms lower thresholds.
     warned_pct: u8,
     turn_limit_summary: Option<String>,
+    memory: Option<Arc<dyn crate::core::memory::MemoryRepository>>,
+    request_system: Option<String>,
+    context_estimate: crate::agent::context::ContextEstimate,
+    structured_sink: Option<crate::tools::structured::OutputSink>,
+    structured_error: std::sync::Mutex<Option<String>>,
+    #[cfg(test)]
+    skip_retry_backoff: bool,
 }
 
 impl Agent {
@@ -181,6 +165,7 @@ impl Agent {
             .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
         Agent {
             id,
+            request_system: cfg.system.clone(),
             cfg,
             history: Vec::new(),
             full_history: Vec::new(),
@@ -190,19 +175,34 @@ impl Agent {
             reasoning: crate::core::types::ReasoningEffort::default(),
             warned_pct: 0,
             turn_limit_summary: None,
+            memory: None,
+            context_estimate: Default::default(),
+            structured_sink: None,
+            structured_error: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            skip_retry_backoff: false,
         }
     }
 
-    /// The full, never-compacted transcript. This is what the frontend persists so
-    /// a resumed session shows the entire conversation. (The compacted working view
-    /// is an internal detail of staying under the context window.)
+    /// Full transcript, distinct from the compacted provider context.
     pub fn messages(&self) -> &[Message] {
         &self.full_history
     }
 
-    /// The specs of the tools this agent exposes to the model — its names,
-    /// descriptions, and input schemas. Lets a caller introspect the toolset (e.g.
-    /// verify a registered subagent definition is advertised).
+    pub fn working_messages(&self) -> &[Message] {
+        &self.history
+    }
+
+    pub fn context_usage(&self) -> (usize, usize) {
+        (
+            self.context_estimate.used(
+                crate::agent::compaction::estimate_history_tokens(&self.history)
+                    + self.system_overhead_tokens(),
+            ),
+            self.cfg.context_window,
+        )
+    }
+
     pub fn tool_specs(&self) -> Vec<crate::core::types::ToolSpec> {
         self.cfg.tools.specs()
     }
@@ -211,17 +211,16 @@ impl Agent {
         self.todos.clone()
     }
 
-    /// Whether this agent should be woken to process coordination messages. It
-    /// wakes only when there is a pending message AND none of its OWN children are
-    /// still running — so when it spawned several agents, it wakes ONCE after they
-    /// have all reported, sees every result together, and can write a single
-    /// synthesized reply rather than one dribbled paragraph per agent. (If a
-    /// message is waiting but one of its children is still running, we hold off;
-    /// that child's completion will re-trigger the check.) Gating on its OWN
-    /// children — not the whole team — means an unrelated slow agent elsewhere
-    /// can't stall this agent. The frontend polls this on an idle agent and, if
-    /// true, drives a fresh empty-prompt "wake" turn.
+    /// Actionable messages wake immediately; completion reports may be batched.
     pub fn has_pending_coordination(&mut self) -> bool {
+        if self
+            .cfg
+            .inbox
+            .as_mut()
+            .is_some_and(|inbox| inbox.has_actionable())
+        {
+            return true;
+        }
         let own_children_running = self
             .cfg
             .team
@@ -236,11 +235,7 @@ impl Agent {
             .is_some_and(|inbox| inbox.has_pending())
     }
 
-    /// Whether this agent still has coordination work outstanding: either a message
-    /// waiting to be processed, OR one of its own children still running (whose
-    /// result will arrive later). A driver loop keeps the agent alive until this is
-    /// false. (`has_pending_coordination` is the stricter "ready to wake NOW" gate;
-    /// this is the looser "not done yet" gate used by a child-agent driver.)
+    /// Keeps the driver alive while child results are pending, even before a wake is ready.
     pub fn has_outstanding_coordination(&mut self) -> bool {
         let own_children_running = self
             .cfg
@@ -255,15 +250,114 @@ impl Agent {
                 .is_some_and(|inbox| inbox.has_pending())
     }
 
-    /// A handle to this agent's cancel flag. Set it to `true` (from the UI on
-    /// another task) to cooperatively interrupt an in-flight `run`.
+    pub fn drain_coordination(&mut self) {
+        if let Some(inbox) = self.cfg.inbox.as_mut() {
+            for message in inbox.drain() {
+                if matches!(
+                    message.kind,
+                    crate::agent::team::AgentMessageKind::Actionable
+                ) {
+                    if let Some(sink) = &self.structured_sink {
+                        sink.lock().unwrap().take();
+                    }
+                }
+                let msg = Message::user_text(crate::agent::team::format_coord_message(
+                    &message.from,
+                    &message.text,
+                ));
+                self.history.push(msg.clone());
+                self.full_history.push(msg);
+                self.cfg.bus.emit(AgentEvent::AgentMessage {
+                    to: self.id.clone(),
+                    from: message.from,
+                    text: message.text,
+                });
+            }
+        }
+    }
+
+    pub fn discard_pending_coordination(&mut self) {
+        if let Some(inbox) = self.cfg.inbox.as_mut() {
+            inbox.drain();
+        }
+    }
+
+    pub(crate) async fn settle_owned_mutations(&self) -> bool {
+        if self.cfg.depth == 0 {
+            return self.cfg.jobs.cancel_blocking_mutations_and_wait().await;
+        }
+        let mut owners = vec![self.cfg.name.clone()];
+        if let Some(team) = &self.cfg.team {
+            owners.extend(team.descendant_names(&self.cfg.name));
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for owner in owners {
+                if !self
+                    .cfg
+                    .jobs
+                    .cancel_blocking_mutations_for_and_wait(&owner)
+                    .await
+                {
+                    return false;
+                }
+            }
+            true
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    pub fn try_close_inbox(&mut self) -> bool {
+        let Some(handle) = self
+            .cfg
+            .team
+            .as_ref()
+            .and_then(|team| team.get(&self.cfg.name))
+        else {
+            return true;
+        };
+        self.cfg
+            .inbox
+            .as_mut()
+            .is_none_or(|inbox| inbox.try_close(&handle))
+    }
+
+    pub fn set_memory_repository(
+        &mut self,
+        memory: Option<Arc<dyn crate::core::memory::MemoryRepository>>,
+    ) {
+        self.memory = memory;
+        self.request_system = self.cfg.system.clone();
+        self.context_estimate.reset();
+    }
+
+    async fn refresh_system(&mut self) -> anyhow::Result<bool> {
+        let Some(system) = until_cancelled(
+            &self.cancel,
+            self.cfg.parent_cancel.as_ref(),
+            crate::core::memory::with_memory_context(
+                self.cfg.system.clone().unwrap_or_default(),
+                self.cfg.cwd.clone(),
+                self.memory.clone(),
+            ),
+        )
+        .await
+        else {
+            return Ok(false);
+        };
+        let system = system?;
+        self.request_system = if self.cfg.system.is_some() || !system.is_empty() {
+            Some(system)
+        } else {
+            None
+        };
+        Ok(true)
+    }
+
     pub fn cancel_handle(&self) -> Arc<std::sync::atomic::AtomicBool> {
         self.cancel.clone()
     }
 
-    /// A clone of this agent's event bus, so a caller can attach a listener (the
-    /// SDK's streaming path forwards these to an async channel). The bus is a
-    /// cheap shared handle — cloning shares the same listener set.
     pub fn bus(&self) -> EventBus {
         self.cfg.bus.clone()
     }
@@ -273,25 +367,31 @@ impl Agent {
     }
 
     pub fn load_history(&mut self, messages: Vec<Message>) {
-        self.history = messages.clone();
-        self.full_history = messages;
+        self.load_histories(messages.clone(), messages);
+    }
+
+    pub fn load_histories(&mut self, full: Vec<Message>, working: Vec<Message>) {
+        self.full_history = full;
+        self.history = working;
+        self.context_estimate.reset();
+        self.warned_pct = 0;
     }
 
     pub fn set_provider(&mut self, provider: Arc<dyn Provider>) {
+        self.cfg.context_window = provider.context_window();
         self.cfg.provider = provider;
+        self.context_estimate.reset();
+        self.warned_pct = 0;
     }
 
-    /// Set the reasoning intensity used for subsequent generations.
     pub fn set_reasoning(&mut self, effort: crate::core::types::ReasoningEffort) {
         self.reasoning = effort;
     }
 
-    /// The current reasoning intensity.
     pub fn reasoning(&self) -> crate::core::types::ReasoningEffort {
         self.reasoning
     }
 
-    /// The current provider (for listing models, showing the active model, etc.).
     pub fn provider(&self) -> Arc<dyn Provider> {
         self.cfg.provider.clone()
     }
@@ -300,9 +400,24 @@ impl Agent {
         self.turn_limit_summary.as_deref()
     }
 
-    /// Run the agent on a single user prompt, looping over tool calls.
+    pub fn turn_budget(&self) -> u32 {
+        self.cfg.max_turns
+    }
+
     pub async fn run(&mut self, prompt: &str) -> anyhow::Result<String> {
+        self.cancel.store(false, Ordering::Relaxed);
+        Ok(self.run_with_budget(prompt, self.turn_budget()).await?.text)
+    }
+
+    /// Run without resetting cancellation, consuming at most the supplied budget.
+    pub async fn run_with_budget(
+        &mut self,
+        prompt: &str,
+        max_turns: u32,
+    ) -> anyhow::Result<RunOutcome> {
         self.turn_limit_summary = None;
+        let max_turns = max_turns.min(self.cfg.max_turns);
+        let mut turns = 0;
         let ctx = ToolContext {
             cwd: self.cfg.cwd.clone(),
             files: self.files.clone(),
@@ -323,16 +438,11 @@ impl Agent {
             permissions: None,
         };
 
-        // A non-empty prompt is a real user turn. An EMPTY prompt is a
-        // coordination "wake" — no user message; the inbox drain below provides
-        // the content (a team member's result). Skip pushing an empty user turn.
+        // Empty prompts are coordination wakes, not user turns.
         if !prompt.is_empty() {
             let m = Message::user_text(prompt);
             self.history.push(m.clone());
             self.full_history.push(m);
-            // Emit the user turn so it's part of the event stream (and the replay
-            // log), not just a UI-side push. The frontend renders the user line
-            // from this event.
             self.cfg.bus.emit(AgentEvent::UserPrompt {
                 agent_id: self.id.clone(),
                 text: prompt.to_string(),
@@ -341,144 +451,59 @@ impl Agent {
         self.cfg.bus.emit(AgentEvent::TurnStart {
             agent_id: self.id.clone(),
         });
-        // Fresh run: clear any stale cancel signal.
-        self.cancel
-            .store(false, std::sync::atomic::Ordering::Relaxed);
 
-        let mut total = Usage::default();
+        let mut turn = TurnEndGuard {
+            bus: self.cfg.bus.clone(),
+            agent_id: self.id.clone(),
+            usage: Usage::default(),
+        };
         let mut final_text = String::new();
-        // Set true when the model finishes on its own (no more tool calls) or we
-        // stop deliberately. If the turn loop runs to exhaustion instead, we report
-        // that explicitly rather than returning an empty result.
         let mut finished = false;
 
-        // Output-cap recovery: normally we send NO max_tokens (the server enforces
-        // the model's true maximum). But if a response still comes back truncated
-        // (`StopReason::MaxTokens`) — e.g. a large `structured_output` — we retry the
-        // SAME turn with an explicit, raised cap so the model can finish instead of
-        // emitting a truncated tool call the loop would retry forever. `None` = let
-        // the server decide; `Some(n)` = a recovery override for the next attempt.
         let mut max_tokens_override: Option<u32> = None;
         let mut truncation_recoveries: u32 = 0;
 
-        for _turn in 0..self.cfg.max_turns {
-            // Interrupt before starting a new turn — history ends on a valid
-            // boundary here (a tool_result message or the initial user prompt),
-            // so we can stop cleanly.
+        'turns: for _turn in 0..max_turns {
+            // History is at a tool-safe boundary here.
             if self.is_cancelled() {
                 final_text = "[interrupted]".to_string();
                 break;
             }
-            // Coordination seam: fold any messages from other agents into history
-            // as a synthetic user turn, so the model sees and can act on them at
-            // this turn boundary. No-op when the agent has no inbox (not a team).
-            if let Some(inbox) = self.cfg.inbox.as_mut() {
-                let messages = inbox.drain();
-                for m in messages {
-                    let msg = Message::user_text(crate::agent::team::format_coord_message(
-                        &m.from, &m.text,
-                    ));
-                    self.history.push(msg.clone());
-                    self.full_history.push(msg);
-                    self.cfg.bus.emit(AgentEvent::AgentMessage {
-                        to: self.id.clone(),
-                        from: m.from.clone(),
-                        text: m.text.clone(),
-                    });
-                }
-            }
-            // Compact history if approaching the context window. The overhead of
-            // the system prompt + every tool schema is counted toward the budget so
-            // we compact before the real request (system + tools + history) exceeds
-            // the window, not just when the message text alone does.
-            let system_overhead_tokens = self
-                .cfg
-                .system
-                .as_deref()
-                .map(crate::agent::compaction::estimate_tokens)
-                .unwrap_or(0)
-                + self
-                    .cfg
-                    .tools
-                    .specs()
-                    .iter()
-                    .map(|s| {
-                        crate::agent::compaction::estimate_tokens(&s.name)
-                            + crate::agent::compaction::estimate_tokens(&s.description)
-                            + crate::agent::compaction::estimate_tokens(&s.input_schema.to_string())
-                    })
-                    .sum::<usize>();
-            let history = std::mem::take(&mut self.history);
-            // Graded pre-compaction warning: as estimated usage climbs past 70 / 85
-            // / 95% of the window, emit ONE warning per level so the user sees
-            // context filling up before an auto-compaction silently rewrites it.
-            let used = crate::agent::compaction::estimate_history_tokens(&history)
-                + system_overhead_tokens;
+            turns += 1;
+            self.drain_coordination();
+            let (used, _) = self.context_usage();
             self.warn_context(used);
-            let compaction = maybe_compact(
-                history,
-                &self.cfg.provider,
-                &CompactionOptions {
-                    context_window: self.cfg.context_window,
-                    threshold: self.cfg.compact_threshold,
-                    keep_recent: self.cfg.keep_recent,
-                    system_overhead_tokens,
-                },
-            )
-            .await;
-            self.history = compaction.messages;
-            if compaction.compacted {
-                self.cfg.bus.emit(AgentEvent::Compaction {
-                    agent_id: self.id.clone(),
-                    before_tokens: compaction.before_tokens,
-                    after_tokens: compaction.after_tokens,
-                    summary: compaction.summary.clone(),
-                    replaced_upto: compaction.replaced_upto,
-                });
-                // Usage just dropped; re-arm the graded warning to the new level so
-                // it can warn again as history rebuilds toward the window.
-                self.rearm_context_warning(compaction.after_tokens);
+            if self
+                .compact_with_threshold(self.cfg.compact_threshold)
+                .await?
+                .is_none()
+            {
+                break;
             }
 
-            // Stream the assistant turn (text deltas forwarded to the bus), with a
-            // small internal retry loop for transient/overflow errors. Extracted so
-            // the turn loop reads at one level of abstraction.
             let completion = match self.stream_completion(max_tokens_override).await? {
                 StreamOutcome::Completed(c) => c,
-                StreamOutcome::Interrupted => {
-                    final_text = "[interrupted]".to_string();
+                StreamOutcome::Interrupted(text) => {
+                    if !text.is_empty() {
+                        self.record_summary(&text);
+                    }
+                    final_text = text;
                     break;
                 }
             };
 
-            // Output-truncation recovery: if the response was cut off (a partial
-            // tool call the loop would otherwise retry forever), retry the SAME turn
-            // with a raised cap. Decided BEFORE pushing to history, so a discarded
-            // partial turn never pollutes the transcript. Bounded so a genuinely
-            // oversized request fails cleanly instead of looping.
+            self.record_usage(completion.usage, &mut turn.usage);
+
+            // Retry truncation before recording history; discarded calls must not leak in.
             if let Some(bumped) =
                 self.truncation_retry_cap(&completion, truncation_recoveries, max_tokens_override)
             {
                 truncation_recoveries += 1;
                 max_tokens_override = Some(bumped);
-                // Silent, self-healing retry — nothing user-visible.
                 continue;
             }
-            // Cleared on any non-truncated (or unrecoverable) completion so the next
-            // turn starts back at the server default rather than a stale override.
+            // Recovery overrides must not carry into the next turn.
             max_tokens_override = None;
-
-            total.input_tokens += completion.usage.input_tokens;
-            total.output_tokens += completion.usage.output_tokens;
-            total.cache_creation_input_tokens += completion.usage.cache_creation_input_tokens;
-            total.cache_read_input_tokens += completion.usage.cache_read_input_tokens;
-
-            // Per-completion usage event (precise, one per model call).
-            self.cfg.bus.emit(AgentEvent::Completion {
-                agent_id: self.id.clone(),
-                model: self.cfg.provider.model().to_string(),
-                usage: completion.usage,
-            });
 
             self.history.push(completion.message.clone());
             self.full_history.push(completion.message.clone());
@@ -487,7 +512,6 @@ impl Agent {
                 message: completion.message.clone(),
             });
 
-            // Collect tool_use blocks.
             let tool_uses: Vec<(String, String, serde_json::Value)> = completion
                 .message
                 .content
@@ -512,36 +536,44 @@ impl Agent {
                 {
                     continue;
                 }
+                if self.cfg.name != ROOT_AGENT_ID
+                    && self
+                        .structured_sink
+                        .as_ref()
+                        .is_none_or(|sink| sink.lock().unwrap().is_some())
+                {
+                    loop {
+                        if self.is_cancelled() {
+                            final_text = completion.message.text();
+                            break 'turns;
+                        }
+                        if self.has_pending_coordination() {
+                            continue 'turns;
+                        }
+                        let children_running = self
+                            .cfg
+                            .team
+                            .as_ref()
+                            .is_some_and(|team| team.has_running_children(&self.cfg.name));
+                        if !children_running {
+                            if self.try_close_inbox() {
+                                break;
+                            }
+                            continue 'turns;
+                        }
+                        until_cancelled(
+                            &self.cancel,
+                            self.cfg.parent_cancel.as_ref(),
+                            tokio::time::sleep(std::time::Duration::from_millis(10)),
+                        )
+                        .await;
+                    }
+                }
                 final_text = completion.message.text();
                 finished = true;
                 break;
             }
 
-            // Interrupt requested while the model was streaming: don't run the
-            // tools, but we MUST still answer every tool_use with a result or the
-            // history becomes invalid for the next request. Feed back a cancel
-            // notice for each, then stop.
-            if self.is_cancelled() {
-                let results = tool_uses
-                    .iter()
-                    .map(|(id, _, _)| ContentBlock::ToolResult {
-                        tool_use_id: id.clone(),
-                        content: "interrupted by user".to_string(),
-                        is_error: Some(true),
-                    })
-                    .collect();
-                let msg = Message {
-                    role: Role::Tool,
-                    content: results,
-                };
-                self.history.push(msg.clone());
-                self.full_history.push(msg);
-                final_text = "[interrupted]".to_string();
-                break;
-            }
-
-            // Execute the requested tools (concurrent reads, sequential mutations),
-            // then record the results as one Tool-role message.
             let results = self.execute_tool_uses(&ctx, &tool_uses).await;
             let msg = Message {
                 role: Role::Tool,
@@ -551,163 +583,38 @@ impl Agent {
             self.full_history.push(msg);
         }
 
-        // If the turn loop ran to exhaustion without the model finishing, give it
-        // ONE final tool-less turn to wind down — summarize what it accomplished and
-        // what's left — instead of returning a bare "[stopped]" stub. This is what a
-        // parent agent (or the user) actually needs as a handoff.
-        if !finished && final_text.is_empty() && !self.is_cancelled() {
-            final_text = self.wind_down().await;
+        // One tool-less handoff is allowed after budget exhaustion.
+        if !finished && final_text.is_empty() && !self.is_cancelled() && max_turns > 0 {
+            final_text = self.wind_down(max_turns, &mut turn.usage).await;
         }
-        if !finished && final_text.is_empty() {
-            final_text = format!(
-                "[stopped after reaching the {}-turn limit without finishing]",
-                self.cfg.max_turns
-            );
-        }
-        if !finished && !self.is_cancelled() {
+        let stop_reason = if self.is_cancelled() {
+            if final_text.is_empty() {
+                final_text = "[interrupted]".to_string();
+            }
+            RunStopReason::Cancelled
+        } else if finished {
+            RunStopReason::Completed
+        } else {
+            if final_text.is_empty() {
+                final_text = format!(
+                    "[stopped after reaching the {max_turns}-turn limit without finishing]"
+                );
+                self.record_summary(&final_text);
+            }
             self.turn_limit_summary = Some(final_text.clone());
-        }
+            RunStopReason::TurnLimit
+        };
 
-        self.cfg.bus.emit(AgentEvent::TurnEnd {
-            agent_id: self.id.clone(),
-            usage: total,
-        });
-        Ok(final_text)
+        drop(turn);
+        Ok(RunOutcome {
+            text: final_text,
+            stop_reason,
+            turns,
+        })
     }
 
-    /// Stream one assistant turn to completion, forwarding text deltas to the bus.
-    /// Owns the internal retry state machine: a context-length rejection triggers a
-    /// reactive compaction + retry (once), a transient error backs off and retries
-    /// up to the attempt cap, and a fatal/exhausted error propagates. Returns
-    /// `Interrupted` if the run was cancelled mid-stream before a completion.
-    async fn stream_completion(
-        &mut self,
-        max_tokens_override: Option<u32>,
-    ) -> anyhow::Result<StreamOutcome> {
-        // Retry a transient stream failure (dropped connection, 429/5xx, overload)
-        // up to 10 times with capped exponential backoff before giving up — matches
-        // Claude Code's persistence so a flaky network doesn't kill a turn.
-        const MAX_STREAM_ATTEMPTS: u32 = 10;
-        let mut attempt = 0u32;
-        let mut recovered_overflow = false;
-        loop {
-            attempt += 1;
-            let opts = GenerateOptions {
-                system: self.cfg.system.clone(),
-                messages: self.history.clone(),
-                tools: self.cfg.tools.specs(),
-                cache: true,
-                reasoning: self.reasoning,
-                // Normally None (server enforces the true max); set only while
-                // recovering from a truncated response.
-                max_tokens: max_tokens_override,
-                ..Default::default()
-            };
-            let mut rx = match self.cfg.provider.stream(opts).await {
-                Ok(rx) => rx,
-                Err(e) => {
-                    // Failure before the stream even opened (network/auth/length).
-                    match classify_error(&e.to_string()) {
-                        ProviderErrorKind::Overflow if !recovered_overflow => {
-                            recovered_overflow = true;
-                            self.compact_now().await;
-                            continue;
-                        }
-                        ProviderErrorKind::Transient if attempt < MAX_STREAM_ATTEMPTS => {
-                            self.cfg.bus.emit(AgentEvent::StreamRetry {
-                                agent_id: self.id.clone(),
-                                attempt,
-                                max_attempts: MAX_STREAM_ATTEMPTS,
-                            });
-                            self.backoff(attempt).await;
-                            continue;
-                        }
-                        _ => return Err(e),
-                    }
-                }
-            };
-
-            let mut completion = None;
-            let mut stream_error = None;
-            loop {
-                // Cancel-aware receive: poll on a short interval so a cancel (e.g. the
-                // user quitting) is observed PROMPTLY even while the provider stream is
-                // parked waiting on the network. Without the timeout, `recv().await`
-                // only wakes on the next event, so cancel wasn't seen until the stream
-                // yielded — which made quit wait out the caller's exit timeout.
-                let evt =
-                    match tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
-                        .await
-                    {
-                        Ok(Some(evt)) => evt,
-                        Ok(None) => break, // stream closed
-                        Err(_) => {
-                            // Poll interval elapsed with no event: check cancel, keep waiting.
-                            if self.is_cancelled() {
-                                break;
-                            }
-                            continue;
-                        }
-                    };
-                match evt {
-                    StreamEvent::TextDelta { text } => {
-                        self.cfg.bus.emit(AgentEvent::TextDelta {
-                            agent_id: self.id.clone(),
-                            text,
-                        });
-                    }
-                    StreamEvent::MessageStop { completion: done } => {
-                        completion = Some(done);
-                    }
-                    StreamEvent::Error { message } => {
-                        stream_error = Some(message);
-                        break;
-                    }
-                    _ => {}
-                }
-                if self.is_cancelled() {
-                    break;
-                }
-            }
-
-            // Interrupted mid-stream before the model finished: stop cleanly.
-            if self.is_cancelled() && completion.is_none() {
-                return Ok(StreamOutcome::Interrupted);
-            }
-
-            if let Some(message) = stream_error {
-                match classify_error(&message) {
-                    ProviderErrorKind::Overflow if !recovered_overflow => {
-                        recovered_overflow = true;
-                        self.compact_now().await;
-                        continue;
-                    }
-                    ProviderErrorKind::Transient if attempt < MAX_STREAM_ATTEMPTS => {
-                        self.cfg.bus.emit(AgentEvent::StreamRetry {
-                            agent_id: self.id.clone(),
-                            attempt,
-                            max_attempts: MAX_STREAM_ATTEMPTS,
-                        });
-                        self.backoff(attempt).await;
-                        continue;
-                    }
-                    // Out of retries, or a genuinely fatal error.
-                    _ => return Err(anyhow::anyhow!("{}", message)),
-                }
-            }
-
-            return Ok(match completion {
-                Some(c) => StreamOutcome::Completed(c),
-                None => return Err(anyhow::anyhow!("stream ended without completion")),
-            });
-        }
-    }
-
-    /// Execute a turn's tool calls and return their result blocks in request order.
-    /// Read-only tools (reads/searches/status) run concurrently for speed; mutating
-    /// tools (edits, writes, bash, coordination) run sequentially so two edits to
-    /// the same file in one turn can't race. Emits a `ToolCall` event per call
-    /// first, so the UI shows every invocation before results stream back.
+    /// Reads run concurrently; mutations are serialized to avoid races.
+    /// Results retain request order, with all call events emitted before results.
     async fn execute_tool_uses(
         &self,
         ctx: &ToolContext,
@@ -721,24 +628,13 @@ impl Agent {
                 input: input.clone(),
             });
         }
-        // Kick off the read-only calls concurrently, preserving their order.
         let mut concurrent = Vec::new();
         for (id, name, input) in tool_uses {
             if self.cfg.tools.is_read_only(name) {
-                let tools = self.cfg.tools.clone();
-                let bus = self.cfg.bus.clone();
-                let hooks = self.cfg.hooks.clone();
-                let agent_id = self.id.clone();
-                let ctx = ctx.clone();
-                let (id, name, input) = (id.clone(), name.clone(), input.clone());
-                concurrent.push(async move {
-                    run_one(&tools, &bus, &hooks, &agent_id, &ctx, id, name, input).await
-                });
+                concurrent.push(self.run_tool(ctx, id, name, input));
             }
         }
         let mut concurrent_results = futures::future::join_all(concurrent).await.into_iter();
-        // Weave concurrent read results back into request order; run mutating tools
-        // inline where they sit.
         let mut results: Vec<ContentBlock> = Vec::with_capacity(tool_uses.len());
         for (id, name, input) in tool_uses {
             if self.cfg.tools.is_read_only(name) {
@@ -746,30 +642,76 @@ impl Agent {
                     results.push(r);
                 }
             } else {
-                results.push(
-                    run_one(
-                        &self.cfg.tools,
-                        &self.cfg.bus,
-                        &self.cfg.hooks,
-                        &self.id,
-                        ctx,
-                        id.clone(),
-                        name.clone(),
-                        input.clone(),
-                    )
-                    .await,
-                );
+                results.push(self.run_tool(ctx, id, name, input).await);
             }
         }
         results
     }
 
-    /// Decide whether a completion looks truncated and, if so, the raised
-    /// `max_tokens` cap to retry the SAME turn with. Returns `None` to proceed
-    /// (not truncated, out of recovery budget, or already at the model's ceiling).
-    /// Detects truncation two ways because a stream that drops mid-tool-call may
-    /// never deliver `finish_reason`: an explicit `MaxTokens` stop, OR a tool call
-    /// whose arguments are the `parse_tool_input` error sentinel (truncated JSON).
+    async fn run_tool(
+        &self,
+        ctx: &ToolContext,
+        id: &str,
+        name: &str,
+        input: &serde_json::Value,
+    ) -> ContentBlock {
+        if name == "structured_output" {
+            if let Some(sink) = &self.structured_sink {
+                sink.lock().unwrap().take();
+            }
+        }
+        if let Some(result) = until_cancelled(
+            &self.cancel,
+            self.cfg.parent_cancel.as_ref(),
+            run_one(
+                &self.cfg.tools,
+                &self.cfg.bus,
+                &self.cfg.hooks,
+                &self.id,
+                ctx,
+                id.to_string(),
+                name.to_string(),
+                input.clone(),
+            ),
+        )
+        .await
+        {
+            if name == "structured_output" {
+                *self.structured_error.lock().unwrap() = match &result {
+                    ContentBlock::ToolResult {
+                        content,
+                        is_error: Some(true),
+                        ..
+                    } => Some(content.model_text().into_owned()),
+                    _ => None,
+                };
+            }
+            return result;
+        }
+        let mutations_settled = self.settle_owned_mutations().await;
+        let content = if mutations_settled {
+            if name == "memory" {
+                "interrupted by user; any memory mutation already started has settled and may have taken effect"
+            } else {
+                "interrupted by user"
+            }
+        } else {
+            "interrupted, but memory mutation cleanup exceeded its deadline; changes may still complete"
+        }.to_string();
+        self.cfg.bus.emit(AgentEvent::ToolResult {
+            agent_id: self.id.clone(),
+            tool_use_id: id.to_string(),
+            output: content.clone().into(),
+            is_error: true,
+        });
+        ContentBlock::ToolResult {
+            tool_use_id: id.to_string(),
+            content: content.into(),
+            is_error: Some(true),
+        }
+    }
+
+    /// Dropped streams may omit `finish_reason`; malformed arguments also signal truncation.
     fn truncation_retry_cap(
         &self,
         completion: &Completion,
@@ -787,40 +729,27 @@ impl Agent {
         if completion.stop_reason != StopReason::MaxTokens && !truncated_tool_args {
             return None;
         }
-        // Base the next cap on what the model actually produced, doubled, and
-        // clamped to the model's real output ceiling.
         let ceiling = crate::providers::provider::max_output_tokens_for(self.cfg.provider.model());
         let produced = completion.usage.output_tokens as u32;
         let bumped = produced.saturating_mul(2).max(8_192).min(ceiling);
-        // Retry only if the bumped cap actually grows the budget over what we last
-        // asked for; otherwise proceed (the partial + parse-error message at least
-        // gives the model something actionable).
+        // Retry only with more output room; otherwise retain the actionable parse error.
         (Some(bumped) != current_override && bumped > produced).then_some(bumped)
     }
 
-    /// Run the agent on `prompt` but force its FINAL answer to be a single JSON
-    /// object matching `schema`, returned as a validated `serde_json::Value`. This
-    /// is the seam workflow orchestration uses: code gets data it can branch on
-    /// instead of prose it would have to parse.
-    ///
-    /// Mechanism: a one-off `structured_output` tool (whose advertised schema IS
-    /// `schema`) is added to the agent's registry for the duration of the call; the
-    /// prompt is suffixed with an instruction to finish by calling it; the normal
-    /// `run()` loop drives everything. The tool captures the validated payload into
-    /// a shared sink we read afterward. If the model finishes without calling it,
-    /// we nudge once and re-run; still nothing → `Err`. The registry is restored on
-    /// exit so the agent is unchanged for any later `run`.
+    /// Capture a schema-validated result through a temporary tool, nudging once
+    /// if omitted. Always restore the registry after the run completes or fails.
     pub async fn run_structured(
         &mut self,
         prompt: &str,
         schema: serde_json::Value,
     ) -> anyhow::Result<serde_json::Value> {
         use crate::tools::structured::StructuredOutputTool;
+        crate::tools::schema::CompiledSchema::compile(&schema).map_err(anyhow::Error::msg)?;
 
         let sink: crate::tools::structured::OutputSink = Arc::new(std::sync::Mutex::new(None));
+        self.structured_sink = Some(sink.clone());
+        self.structured_error.lock().unwrap().take();
 
-        // Snapshot the registry so we can restore it — run() reads self.cfg.tools
-        // directly, and adding the structured tool must not leak into later turns.
         let original_tools = self.cfg.tools.clone();
         self.cfg.tools.add(Arc::new(StructuredOutputTool::new(
             schema.clone(),
@@ -831,16 +760,10 @@ impl Agent {
             `structured_output` tool exactly once with your final answer as its arguments. \
             That tool call IS your deliverable — do not also write a prose summary.";
 
-        // First attempt: the real prompt + the structured-output instruction.
-        // Capture the run Results WITHOUT `?` so a provider/stream error can't
-        // early-return past the registry restore below — leaking the one-off
-        // structured_output tool (and its finish-instruction schema) into every
-        // later normal turn on this agent.
+        // Capture errors without `?` so the temporary registry is always restored.
         let first = self.run(&format!("{prompt}{instruction}")).await;
         let mut captured = sink.lock().unwrap().take();
 
-        // One corrective retry if the model didn't call the tool (empty-prompt wake
-        // turn — no new user message, just the nudge folded into history).
         let mut second = Ok(String::new());
         if first.is_ok()
             && captured.is_none()
@@ -853,27 +776,28 @@ impl Agent {
             captured = sink.lock().unwrap().take();
         }
 
-        // Restore the registry regardless of outcome (success, run error, or a
-        // missing result), so the agent is unchanged for any later run.
         self.cfg.tools = original_tools;
+        self.structured_sink = None;
 
-        // Surface a run error only after restoring — the restore must always happen.
         first?;
         second?;
 
         captured.ok_or_else(|| {
-            anyhow::anyhow!("agent did not produce a structured result matching the schema")
+            let detail = self.structured_error.lock().unwrap().take();
+            anyhow::anyhow!(
+                "agent did not produce a structured result matching the schema{}",
+                detail
+                    .map(|detail| format!(": {detail}"))
+                    .unwrap_or_default()
+            )
         })
     }
 
-    /// Emit a graded context-usage warning if `used` tokens crosses the next
-    /// threshold (70 / 85 / 95% of the window) not yet warned this run. Fires at
-    /// most once per level as usage climbs.
     fn warn_context(&mut self, used: usize) {
         let window = self.cfg.context_window.max(1);
-        let pct = ((used * 100) / window) as u8;
+        let pct = used.saturating_mul(100) / window;
         for level in [95u8, 85, 70] {
-            if pct >= level && self.warned_pct < level {
+            if pct >= usize::from(level) && self.warned_pct < level {
                 self.warned_pct = level;
                 self.cfg.bus.emit(AgentEvent::ContextWarning {
                     agent_id: self.id.clone(),
@@ -886,74 +810,181 @@ impl Agent {
         }
     }
 
-    /// Reset the graded warning arm to the level `used` now sits in, so warnings
-    /// can fire again as history climbs back toward the window after a compaction.
     fn rearm_context_warning(&mut self, used: usize) {
         let window = self.cfg.context_window.max(1);
-        let pct = ((used * 100) / window) as u8;
+        let pct = used.saturating_mul(100) / window;
         self.warned_pct = [95u8, 85, 70]
             .into_iter()
-            .find(|&level| pct >= level)
+            .find(|&level| pct >= usize::from(level))
             .unwrap_or(0);
     }
 
-    /// Force a compaction of the conversation now (the `/compact` command). Public
-    /// so the frontend can summarize on demand rather than waiting for the
-    /// threshold. Returns `(did_compact, before_tokens, after_tokens)` for the
-    /// working history, and does NOT emit a Compaction event — the caller drives
-    /// its own in-chat indicator, so an event would duplicate it.
-    pub async fn compact(&mut self) -> (bool, usize, usize) {
-        let before = crate::agent::compaction::estimate_history_tokens(&self.history);
-        let len_before = self.history.len();
-        self.compact_inner(false).await;
-        let after = crate::agent::compaction::estimate_history_tokens(&self.history);
-        (self.history.len() < len_before, before, after)
+    /// Compact the working context, preserving the full transcript and logging
+    /// successful compaction for resume. Cancellation or failure leaves it intact.
+    pub async fn compact(&mut self) -> anyhow::Result<(bool, usize, usize)> {
+        self.cancel.store(false, Ordering::Relaxed);
+        self.compact_with_threshold(0.0)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("compaction cancelled; history unchanged"))
     }
 
-    /// Compact history NOW, emitting a Compaction event so the UI shows it happened.
-    /// Used by the automatic (threshold / overflow) paths.
-    async fn compact_now(&mut self) {
-        self.compact_inner(true).await;
-    }
-
-    /// Compact the working history. `emit` controls whether a Compaction event is
-    /// published (automatic paths emit; the manual `/compact` command does not,
-    /// since the frontend renders its own live indicator).
-    async fn compact_inner(&mut self, emit: bool) {
-        let history = std::mem::take(&mut self.history);
-        let compaction = maybe_compact(
-            history,
-            &self.cfg.provider,
-            &CompactionOptions {
-                context_window: self.cfg.context_window,
-                threshold: 0.0, // force compaction regardless of the estimate
-                keep_recent: self.cfg.keep_recent,
-                system_overhead_tokens: 0,
-            },
-        )
-        .await;
-        self.history = compaction.messages;
-        if emit && compaction.compacted {
-            self.cfg.bus.emit(AgentEvent::Compaction {
-                agent_id: self.id.clone(),
-                before_tokens: compaction.before_tokens,
-                after_tokens: compaction.after_tokens,
-                summary: compaction.summary.clone(),
-                replaced_upto: compaction.replaced_upto,
-            });
+    async fn compact_now(&mut self) -> anyhow::Result<bool> {
+        match self.compact_with_threshold(0.0).await? {
+            None => Ok(false),
+            Some((true, _, _)) => Ok(true),
+            Some((false, _, _)) => anyhow::bail!(
+                "context window exceeded, but no history could be compacted; use a larger-context model or start a new session"
+            ),
         }
     }
 
-    /// Sleep for an exponential backoff before retrying a transient failure.
-    async fn backoff(&self, attempt: u32) {
-        let secs = (0.5 * 2f64.powi(attempt as i32 - 1)).min(8.0);
-        tokio::time::sleep(std::time::Duration::from_secs_f64(secs)).await;
+    fn system_overhead_tokens(&self) -> usize {
+        use crate::agent::compaction::estimate_tokens;
+        self.request_system
+            .as_deref()
+            .map(estimate_tokens)
+            .unwrap_or(0)
+            + self
+                .cfg
+                .tools
+                .specs()
+                .iter()
+                .map(|s| {
+                    estimate_tokens(&s.name)
+                        + estimate_tokens(&s.description)
+                        + estimate_tokens(&s.input_schema.to_string())
+                })
+                .sum::<usize>()
     }
 
-    /// A final tool-less generation when the turn budget is exhausted: ask the
-    /// model to summarize what it did and what remains, so the caller gets a real
-    /// handoff instead of a stub. Best-effort — falls back to a stub on error.
-    async fn wind_down(&mut self) -> String {
+    async fn compact_with_threshold(
+        &mut self,
+        threshold: f64,
+    ) -> anyhow::Result<Option<(bool, usize, usize)>> {
+        if !self.refresh_system().await? {
+            return Ok(None);
+        }
+        let (used, _) = self.context_usage();
+        self.warn_context(used);
+        let threshold =
+            if threshold > 0.0 && used > (self.cfg.context_window as f64 * threshold) as usize {
+                0.0
+            } else {
+                threshold
+            };
+        let options = CompactionOptions {
+            context_window: self.cfg.context_window,
+            threshold,
+            keep_recent: self.cfg.keep_recent,
+            system_overhead_tokens: self.system_overhead_tokens(),
+        };
+        let on_retry = |attempt| {
+            self.cfg.bus.emit(AgentEvent::StreamRetry {
+                agent_id: self.id.clone(),
+                attempt,
+                max_attempts: MAX_RETRIES,
+            });
+        };
+        let Some(result) = until_cancelled(
+            &self.cancel,
+            self.cfg.parent_cancel.as_ref(),
+            maybe_compact(
+                self.history.clone(),
+                &self.cfg.provider,
+                &options,
+                &on_retry,
+            ),
+        )
+        .await
+        else {
+            return Ok(None);
+        };
+        let result = result
+            .map_err(|error| anyhow::anyhow!("compaction failed; history unchanged: {error:#}"))?;
+        if self.is_cancelled() {
+            return Ok(None);
+        }
+        if threshold > 0.0 {
+            anyhow::ensure!(
+                result.after_tokens <= input_safe_budget(self.cfg.context_window),
+                "context still exceeds the safe request budget; use /compact or a larger-context model"
+            );
+        }
+        let outcome = (result.compacted, result.before_tokens, result.after_tokens);
+        if result.compacted {
+            self.history = result.messages;
+            self.context_estimate.reset();
+            self.rearm_context_warning(result.after_tokens);
+            self.cfg.bus.emit(AgentEvent::Compaction {
+                agent_id: self.id.clone(),
+                before_tokens: result.before_tokens,
+                after_tokens: result.after_tokens,
+                summary: result.summary,
+                replaced_upto: result.replaced_upto,
+            });
+        }
+        Ok(Some(outcome))
+    }
+
+    async fn backoff(&self) {
+        #[cfg(test)]
+        if self.skip_retry_backoff {
+            return;
+        }
+        until_cancelled(
+            &self.cancel,
+            self.cfg.parent_cancel.as_ref(),
+            tokio::time::sleep(RETRY_DELAY),
+        )
+        .await;
+    }
+
+    fn record_usage(&mut self, usage: Usage, total: &mut Usage) {
+        self.context_estimate.observe(
+            usage,
+            crate::agent::compaction::estimate_history_tokens(&self.history)
+                + self.system_overhead_tokens(),
+        );
+        total.input_tokens += usage.input_tokens;
+        total.output_tokens += usage.output_tokens;
+        total.cache_creation_input_tokens += usage.cache_creation_input_tokens;
+        total.cache_read_input_tokens += usage.cache_read_input_tokens;
+        self.cfg.bus.emit(AgentEvent::Completion {
+            agent_id: self.id.clone(),
+            model: self.cfg.provider.model().to_string(),
+            usage,
+        });
+    }
+
+    fn record_summary(&mut self, text: &str) {
+        let message = Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
+        };
+        self.history.push(message.clone());
+        self.full_history.push(message.clone());
+        self.cfg.bus.emit(AgentEvent::Message {
+            agent_id: self.id.clone(),
+            message,
+        });
+    }
+
+    async fn wind_down(&mut self, max_turns: u32, total: &mut Usage) -> String {
+        match self
+            .compact_with_threshold(self.cfg.compact_threshold)
+            .await
+        {
+            Ok(Some(_)) => {}
+            Ok(None) => return String::new(),
+            Err(error) => {
+                let text =
+                    format!("[stopped after reaching the {max_turns}-turn limit; {error:#}]");
+                self.record_summary(&text);
+                return text;
+            }
+        }
         let mut messages = self.history.clone();
         messages.push(Message::user_text(
             "You've reached your turn limit and can no longer call tools. In a few \
@@ -961,79 +992,104 @@ impl Agent {
              your recommended next step. Do not attempt any more tools.",
         ));
         let opts = GenerateOptions {
-            system: self.cfg.system.clone(),
+            system: self.request_system.clone(),
             messages,
-            tools: Vec::new(), // no tools — force a text answer
+            tools: Vec::new(),
             cache: true,
             reasoning: self.reasoning,
             max_tokens: Some(1024),
             ..Default::default()
         };
-        match self.cfg.provider.generate(opts).await {
+        let on_retry = |attempt| {
+            self.cfg.bus.emit(AgentEvent::StreamRetry {
+                agent_id: self.id.clone(),
+                attempt,
+                max_attempts: MAX_RETRIES,
+            });
+        };
+        let Some(completion) = until_cancelled(
+            &self.cancel,
+            self.cfg.parent_cancel.as_ref(),
+            crate::providers::provider::generate_with_retry(
+                self.cfg.provider.as_ref(),
+                opts,
+                &on_retry,
+            ),
+        )
+        .await
+        else {
+            return String::new();
+        };
+        let fallback =
+            format!("[stopped after reaching the {max_turns}-turn limit without finishing]");
+        let text = match completion {
             Ok(c) => {
+                self.record_usage(c.usage, total);
                 let text = c.message.text().trim().to_string();
                 if text.is_empty() {
-                    format!(
-                        "[stopped after {} turns without finishing]",
-                        self.cfg.max_turns
-                    )
+                    fallback
                 } else {
                     format!("[turn limit reached] {text}")
                 }
             }
-            Err(_) => format!(
-                "[stopped after reaching the {}-turn limit without finishing]",
-                self.cfg.max_turns
+            Err(error) => format!(
+                "[stopped after reaching the {max_turns}-turn limit; summary failed: {error:#}]"
             ),
+        };
+        self.record_summary(&text);
+        text
+    }
+}
+
+struct TurnEndGuard {
+    bus: EventBus,
+    agent_id: String,
+    usage: Usage,
+}
+
+impl Drop for TurnEndGuard {
+    fn drop(&mut self) {
+        self.bus.emit(AgentEvent::TurnEnd {
+            agent_id: self.agent_id.clone(),
+            usage: self.usage,
+        });
+    }
+}
+
+async fn until_cancelled<T>(
+    own: &std::sync::atomic::AtomicBool,
+    parent: Option<&Arc<std::sync::atomic::AtomicBool>>,
+    future: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    tokio::pin!(future);
+    loop {
+        if cancel_requested(own, parent) {
+            return None;
+        }
+        tokio::select! {
+            biased;
+            output = &mut future => return Some(output),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(25)) => {}
         }
     }
 }
 
-/// Whether a provider error string indicates the request exceeded the model's
-/// context window (so a reactive compaction + retry is worth attempting).
-/// How the agent loop should react to a provider error, decided from its message
-/// text (the errors flowing here are all `String`/`anyhow` — a typed error at the
-/// provider source is a separate, larger change). Classification is centralized
-/// here instead of scattered `msg.contains(...)` checks, and tightened so a stray
-/// digit run like "1500 tokens" no longer reads as an HTTP 500.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ProviderErrorKind {
-    /// Context-length rejection → compact history and retry once.
     Overflow,
-    /// Rate limit / overload / transient network hiccup → back off and retry.
     Transient,
-    /// Anything else → fatal, propagate to the caller.
     Fatal,
 }
 
-/// Whether `hay` contains `code` as a standalone HTTP status token (bounded by a
-/// non-digit or the string edge on both sides), so "500" matches "http 500" /
-/// "error 500" / "status: 500" but NOT "1500 tokens" or "cost 5008".
-fn has_status_code(hay: &str, code: &str) -> bool {
-    let bytes = hay.as_bytes();
-    let mut from = 0;
-    while let Some(pos) = hay[from..].find(code) {
-        let start = from + pos;
-        let end = start + code.len();
-        let left_ok = start == 0 || !bytes[start - 1].is_ascii_digit();
-        let right_ok = end == bytes.len() || !bytes[end].is_ascii_digit();
-        if left_ok && right_ok {
-            return true;
-        }
-        from = start + 1;
-    }
-    false
-}
-
-/// Classify a provider error message into the loop's reaction. Overflow is checked
-/// before Transient so a length rejection compacts rather than blindly retrying.
+/// Overflow precedes transient errors so length rejections compact before retrying.
 fn classify_error(msg: &str) -> ProviderErrorKind {
     let m = msg.to_ascii_lowercase();
 
-    // Context-length rejections — specific phrases, no false-positive risk.
     let overflow = m.contains("context length")
         || m.contains("context_length")
         || m.contains("maximum context")
+        || m.contains("context_window_exceeded")
+        || m.contains("exceeds the context window")
         || m.contains("too many tokens")
         || m.contains("prompt is too long")
         || m.contains("reduce the length")
@@ -1042,41 +1098,19 @@ fn classify_error(msg: &str) -> ProviderErrorKind {
         return ProviderErrorKind::Overflow;
     }
 
-    // Transient: rate limits, overload, retryable HTTP statuses (as whole tokens),
-    // timeouts, and dropped streams. "connection" alone is too broad, so require a
-    // network qualifier alongside it.
-    let transient = m.contains("rate limit")
-        || m.contains("overloaded")
-        || m.contains("timeout")
-        || m.contains("timed out")
-        || m.contains("stream ended")
-        || ["429", "500", "502", "503", "529"]
-            .iter()
-            .any(|c| has_status_code(&m, c))
-        || (m.contains("connection")
-            && (m.contains("reset")
-                || m.contains("refused")
-                || m.contains("closed")
-                || m.contains("error")
-                || m.contains("aborted")));
-    if transient {
+    if is_transient_error(&m) {
         return ProviderErrorKind::Transient;
     }
 
     ProviderErrorKind::Fatal
 }
 
-/// The result of [`Agent::stream_completion`]: a finished completion, or a clean
-/// stop because the run was interrupted mid-stream.
 enum StreamOutcome {
     Completed(Completion),
-    Interrupted,
+    Interrupted(String),
 }
 
-/// Execute one tool call, emit its result event, and return the tool_result block.
-/// `is_error` comes from the typed Result, not from sniffing the text. `hooks`
-/// gate/rewrite the call: a `PreToolUse` deny skips execution, and `PostToolUse`
-/// hooks fold the recorded output.
+/// `is_error` comes from the typed result, never from output text.
 #[allow(clippy::too_many_arguments)]
 async fn run_one(
     tools: &ToolRegistry,
@@ -1088,28 +1122,23 @@ async fn run_one(
     name: String,
     input: serde_json::Value,
 ) -> ContentBlock {
-    // If the streamed/returned tool arguments failed to parse as JSON, the codec
-    // tagged them with a sentinel rather than silently substituting `{}` (which
-    // used to make the tool fail downstream with a misleading "missing field"
-    // error the model couldn't diagnose). Surface the real cause so it retries
-    // with well-formed arguments.
+    // Malformed streamed arguments must not execute as empty input.
     let (mut content, is_error) =
         if let Some(explain) = crate::providers::codec::tool_input_parse_error(&input) {
-            (explain, true)
+            (ToolOutput::from(explain), true)
         } else {
-            // PreToolUse hooks: may deny (skip execution) or rewrite the input.
             match hooks.run_pre(&name, input).await {
-                Err(reason) => (reason, true),
+                Err(reason) => (reason.into(), true),
                 Ok(input) => match tools.execute(&name, input, ctx).await {
                     Ok(output) => (output, false),
-                    Err(e) => (e.wire(), true),
+                    Err(e) => (e.into_output(), true),
                 },
             }
         };
-    // PostToolUse hooks: may rewrite the recorded output (e.g. redact secrets).
     if !hooks.post.is_empty() {
         content = hooks.run_post(&name, content, is_error).await;
     }
+    content = crate::agent::output::bound_tool_output(content, &ctx.jobs);
     bus.emit(AgentEvent::ToolResult {
         agent_id: agent_id.to_string(),
         tool_use_id: id.clone(),
@@ -1124,563 +1153,1886 @@ async fn run_one(
 }
 
 #[cfg(test)]
-mod classify_tests {
-    use super::{classify_error, ProviderErrorKind};
+mod tests {
+    use super::*;
 
-    #[test]
-    fn overflow_phrases_classify_as_overflow() {
-        for m in [
-            "This model's maximum context length is 200000 tokens",
-            "prompt is too long",
-            "reduce the length of the messages",
-            "input tokens exceed the limit",
-        ] {
-            assert_eq!(classify_error(m), ProviderErrorKind::Overflow, "{m}");
+    mod run {
+        use super::*;
+        use crate::agent::team::{mailbox, AgentMessage};
+        use crate::core::types::ToolSpec;
+        use crate::test_support::agent::{
+            completion, config, text, tool, ScriptProvider, Step, Summary,
+        };
+        use crate::tools::registry::{Tool, ToolResult};
+        use async_trait::async_trait;
+        use serde_json::{json, Value};
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        use std::sync::Mutex;
+        use std::time::Duration;
+        use tokio::sync::Notify;
+
+        const BOUND: Duration = Duration::from_secs(2);
+
+        fn agent(provider: Arc<dyn Provider>) -> Agent {
+            let mut cfg = config(provider);
+            cfg.max_turns = 3;
+            Agent::new(cfg)
         }
-    }
 
-    #[test]
-    fn transient_statuses_and_phrases_classify_as_transient() {
-        for m in [
-            "HTTP 500: internal server error",
-            "error 502 bad gateway",
-            "status: 503",
-            "429 Too Many Requests",
-            "the model is overloaded",
-            "rate limit exceeded",
-            "request timed out",
-            "stream ended unexpectedly",
-            "connection reset by peer",
-        ] {
-            assert_eq!(classify_error(m), ProviderErrorKind::Transient, "{m}");
-        }
-    }
-
-    #[test]
-    fn digit_run_containing_500_is_not_a_status_code() {
-        // Regression: `contains("500")` used to force a spurious retry on messages
-        // that merely mention a number containing 500.
-        assert_eq!(
-            classify_error("model produced 1500 tokens but the schema was invalid"),
-            ProviderErrorKind::Fatal,
-        );
-        assert_eq!(
-            classify_error("cost was 5008 microcents"),
-            ProviderErrorKind::Fatal,
-        );
-    }
-
-    #[test]
-    fn bare_connection_word_is_not_transient() {
-        // "connection" needs a network qualifier (reset/refused/closed/error/…).
-        assert_eq!(
-            classify_error("the tool returned a database connection handle"),
-            ProviderErrorKind::Fatal,
-        );
-        assert_eq!(
-            classify_error("connection refused"),
-            ProviderErrorKind::Transient,
-        );
-    }
-
-    #[test]
-    fn provider_stream_drop_messages_are_retryable() {
-        // Contract: the transport-failure messages the providers emit on a dropped
-        // stream (openai.rs / anthropic.rs / responses.rs) must classify as Transient
-        // so the loop retries instead of surfacing a fabricated success. They embed
-        // "stream ended" so the classification holds regardless of the reqwest tail.
-        for m in [
-            "openai stream ended: error decoding response body",
-            "anthropic stream ended: connection reset by peer",
-            "responses stream ended: unexpected EOF during chunked read",
-        ] {
-            assert_eq!(classify_error(m), ProviderErrorKind::Transient, "{m}");
-        }
-    }
-
-    #[test]
-    fn unknown_errors_are_fatal() {
-        assert_eq!(classify_error("invalid api key"), ProviderErrorKind::Fatal,);
-        assert_eq!(classify_error(""), ProviderErrorKind::Fatal);
-    }
-}
-
-#[cfg(test)]
-mod cancel_tests {
-    use super::cancel_requested;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
-
-    #[test]
-    fn own_flag_cancels() {
-        let own = AtomicBool::new(false);
-        assert!(!cancel_requested(&own, None));
-        own.store(true, Ordering::Relaxed);
-        assert!(cancel_requested(&own, None));
-    }
-
-    #[test]
-    fn parent_flag_cascades_to_child() {
-        // A child's own flag is clear, but cancelling the parent (root) must make
-        // the child observe cancellation — the core of #5.
-        let parent = Arc::new(AtomicBool::new(false));
-        let child_own = AtomicBool::new(false);
-        assert!(!cancel_requested(&child_own, Some(&parent)));
-        parent.store(true, Ordering::Relaxed);
-        assert!(cancel_requested(&child_own, Some(&parent)));
-    }
-
-    #[test]
-    fn childs_own_run_start_clear_does_not_undo_parent_cancel() {
-        // A child clears its OWN flag at each turn start; that must not resurrect it
-        // once the parent has been cancelled (the "won't die" bug).
-        let parent = Arc::new(AtomicBool::new(true));
-        let child_own = AtomicBool::new(false); // freshly cleared at turn start
-        assert!(cancel_requested(&child_own, Some(&parent)));
-    }
-}
-
-#[cfg(test)]
-mod structured_tests {
-    use super::{Agent, AgentConfig, DEFAULT_MAX_TURNS};
-    use crate::core::events::EventBus;
-    use crate::providers::mock::{MockProvider, MockReply, MockRule};
-    use crate::providers::provider::Provider;
-    use crate::tools::registry::ToolRegistry;
-    use serde_json::json;
-    use std::sync::Arc;
-
-    /// Build a minimal root-ish agent over a given provider, with an empty tool set.
-    fn agent_with(provider: Arc<dyn Provider>) -> Agent {
-        Agent::new(AgentConfig {
-            provider,
-            tools: ToolRegistry::new(None),
-            bus: EventBus::new(),
-            system: None,
-            cwd: ".".to_string(),
-            max_turns: DEFAULT_MAX_TURNS,
-            id: Some("root".to_string()),
-            context_window: 200_000,
-            compact_threshold: 0.8,
-            keep_recent: 6,
-            jobs: crate::tools::jobs::JobRegistry::new(),
-            user_asker: None,
-            lsp: None,
-            inbox: None,
-            team: None,
-            name: "root".to_string(),
-            depth: 0,
-            parent_cancel: None,
-            cancel: None,
-            hooks: crate::agent::hooks::Hooks::default(),
-        })
-    }
-
-    #[tokio::test]
-    async fn turn_limit_summary_is_retained_and_reset_on_the_next_run() {
-        let provider = MockProvider::new(vec![MockRule {
-            needle: "finish now".into(),
-            reply: MockReply::Text("complete".into()),
-        }])
-        .with_default(MockReply::ToolCall {
-            name: "missing".into(),
-            input: json!({}),
-        });
-        let mut agent = agent_with(Arc::new(provider.clone()));
-        agent.cfg.max_turns = 1;
-        let text = agent.run("keep going").await.unwrap();
-        assert_eq!(agent.turn_limit_summary(), Some(text.as_str()));
-        assert_eq!(provider.call_count(), 2);
-        assert_eq!(agent.run("finish now").await.unwrap(), "complete");
-        assert!(agent.turn_limit_summary().is_none());
-    }
-
-    #[tokio::test]
-    async fn structured_retry_does_not_restart_an_exhausted_budget() {
-        let provider = MockProvider::new(vec![]).with_default(MockReply::ToolCall {
-            name: "missing".into(),
-            input: json!({}),
-        });
-        let mut agent = agent_with(Arc::new(provider.clone()));
-        agent.cfg.max_turns = 1;
-        assert!(agent
-            .run_structured("keep going", json!({"type":"object"}))
-            .await
-            .is_err());
-        assert!(agent.turn_limit_summary().is_some());
-        assert_eq!(provider.call_count(), 2);
-        assert!(agent
-            .tool_specs()
-            .iter()
-            .all(|tool| tool.name != "structured_output"));
-    }
-
-    #[tokio::test]
-    async fn structured_run_captures_the_tool_call() {
-        // The model's first move is to call structured_output with a valid object.
-        let schema = json!({
-            "type": "object",
-            "required": ["answer"],
-            "properties": { "answer": {"type": "string"} }
-        });
-        let provider = MockProvider::new(vec![MockRule {
-            needle: "structured_output".to_string(),
-            reply: MockReply::ToolCall {
-                name: "structured_output".to_string(),
-                input: json!({"answer": "42"}),
-            },
-        }]);
-        let mut agent = agent_with(Arc::new(provider));
-        let out = agent
-            .run_structured("what is the answer?", schema)
-            .await
-            .unwrap();
-        assert_eq!(out, json!({"answer": "42"}));
-    }
-
-    #[tokio::test]
-    async fn structured_run_errors_when_never_called() {
-        // The model just talks and never calls the tool — after the retry we get Err.
-        let schema = json!({ "type": "object", "required": ["answer"] });
-        let provider = MockProvider::new(vec![]).with_default(MockReply::Text("hi".into()));
-        let mut agent = agent_with(Arc::new(provider));
-        assert!(agent.run_structured("go", schema).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn cancel_is_observed_promptly_while_the_stream_is_parked() {
-        // Regression for the quit-hang: a provider stream that takes a long time to
-        // yield its first event must not keep `run()` from noticing a cancel. The run
-        // loop polls its cancel flag on a short interval even while parked on
-        // `rx.recv()`, so setting the flag stops the turn well before the stream would
-        // have produced anything. Without the poll, this test would take ~30s.
-        let provider = MockProvider::new(vec![]).with_delay(std::time::Duration::from_secs(30));
-        let mut agent = agent_with(Arc::new(provider));
-        let cancel = agent.cancel_handle();
-
-        // Fire the cancel shortly after the run starts (once it's parked on recv).
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-        });
-
-        // The run must return quickly (interrupted), not wait out the 30s stream.
-        let res = tokio::time::timeout(std::time::Duration::from_secs(3), agent.run("go")).await;
-        assert!(res.is_ok(), "cancel must break the parked stream promptly");
-        assert_eq!(res.unwrap().unwrap(), "[interrupted]");
-    }
-
-    #[tokio::test]
-    async fn truncated_response_recovers_a_bounded_number_of_times_then_stops() {
-        // A provider that ALWAYS returns a MaxTokens-truncated tool call (as the
-        // 4096-cap bug did) must not loop forever: the output-truncation recovery
-        // retries with a raised cap a bounded number of times, then lets the turn
-        // proceed (the parse-error path handles the partial). The whole run must
-        // TERMINATE — a regression here would hang the test via the timeout.
-        let provider = MockProvider::new(vec![]).with_default(MockReply::Truncated {
-            name: "some_tool".to_string(),
-            // Truncated JSON — exactly the sentinel `parse_tool_input` produces.
-            input: json!({ "__bob_tool_args_parse_error__": { "raw": "{\"x\":", "error": "eof" } }),
-            output_tokens: 4096,
-        });
-        let provider = Arc::new(provider);
-        // A tiny max_turns so that, once recovery is exhausted, the loop still exits
-        // promptly instead of grinding to 200 turns.
-        let mut agent = Agent::new(AgentConfig {
-            provider: provider.clone(),
-            tools: ToolRegistry::new(None),
-            bus: EventBus::new(),
-            system: None,
-            cwd: ".".to_string(),
-            max_turns: 4,
-            id: Some("root".to_string()),
-            context_window: 200_000,
-            compact_threshold: 0.8,
-            keep_recent: 6,
-            jobs: crate::tools::jobs::JobRegistry::new(),
-            user_asker: None,
-            lsp: None,
-            inbox: None,
-            team: None,
-            name: "root".to_string(),
-            depth: 0,
-            parent_cancel: None,
-            cancel: None,
-            hooks: crate::agent::hooks::Hooks::default(),
-        });
-        // Must return (not hang). The exact text isn't important — that it completes
-        // is. The 10s guard turns a regression (infinite loop) into a failure.
-        let res = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            agent.run("do something big"),
-        )
-        .await;
-        assert!(res.is_ok(), "run must terminate, not loop on truncation");
-        assert!(res.unwrap().is_ok());
-        // Recovery is bounded: at most (max_turns) turns × a small constant of
-        // recovery retries — nowhere near an unbounded loop.
-        assert!(
-            provider.call_count() <= 12,
-            "expected a bounded number of provider calls, got {}",
-            provider.call_count()
-        );
-    }
-}
-
-/// End-to-end agent-loop tests: a real turn that calls a tool, feeds the result
-/// back, and finishes — driven entirely by MockProvider + a fake tool, asserting
-/// the loop terminates and the transcript/events are what a frontend would render.
-#[cfg(test)]
-mod e2e_tests {
-    use super::{Agent, AgentConfig, DEFAULT_MAX_TURNS};
-    use crate::core::events::{AgentEvent, EventBus};
-    use crate::core::types::{Role, ToolSpec};
-    use crate::providers::mock::{MockProvider, MockReply, MockRule};
-    use crate::tools::registry::{Tool, ToolContext, ToolRegistry, ToolResult};
-    use async_trait::async_trait;
-    use serde_json::{json, Value};
-    use std::sync::{Arc, Mutex};
-
-    /// A trivial tool that records the input it was called with and echoes a fixed
-    /// result — enough to exercise the full tool-call → tool-result → text turn.
-    struct EchoTool {
-        seen: Arc<Mutex<Vec<Value>>>,
-    }
-
-    #[async_trait]
-    impl Tool for EchoTool {
-        fn spec(&self) -> ToolSpec {
-            ToolSpec {
-                name: "echo".to_string(),
-                description: "echo back".to_string(),
-                input_schema: json!({"type": "object"}),
-            }
-        }
-        async fn execute(&self, input: Value, _ctx: &ToolContext) -> ToolResult {
-            self.seen.lock().unwrap().push(input.clone());
-            Ok(format!("echoed: {}", input["msg"].as_str().unwrap_or("")))
-        }
-        fn is_read_only(&self) -> bool {
-            true
-        }
-    }
-
-    fn agent_with_echo(
-        provider: Arc<dyn crate::providers::provider::Provider>,
-        bus: EventBus,
-    ) -> (Agent, Arc<Mutex<Vec<Value>>>) {
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let mut tools = ToolRegistry::new(None);
-        tools.add(Arc::new(EchoTool { seen: seen.clone() }));
-        let agent = Agent::new(AgentConfig {
-            provider,
-            tools,
-            bus,
-            system: None,
-            cwd: ".".to_string(),
-            max_turns: DEFAULT_MAX_TURNS,
-            id: Some("root".to_string()),
-            context_window: 200_000,
-            compact_threshold: 0.8,
-            keep_recent: 6,
-            jobs: crate::tools::jobs::JobRegistry::new(),
-            user_asker: None,
-            lsp: None,
-            inbox: None,
-            team: None,
-            name: "root".to_string(),
-            depth: 0,
-            parent_cancel: None,
-            cancel: None,
-            hooks: crate::agent::hooks::Hooks::default(),
-        });
-        (agent, seen)
-    }
-
-    #[tokio::test]
-    async fn full_turn_calls_a_tool_then_finishes() {
-        // The model calls `echo` once (keyed off the user prompt), then — seeing the
-        // tool result — replies with final text. This is the canonical agent loop.
-        // The model calls `echo` once (keyed off the user prompt), then — once the
-        // tool result comes back (a Tool-role message whose `.text()` is empty, so
-        // the "please echo" rule no longer matches) — falls through to the default
-        // reply with final text.
-        let provider = MockProvider::new(vec![MockRule {
-            needle: "please echo".to_string(),
-            reply: MockReply::ToolCall {
-                name: "echo".to_string(),
-                input: json!({"msg": "hello"}),
-            },
-        }])
-        .with_default(MockReply::Text("all done".to_string()));
-
-        // Capture the event stream a frontend would render.
-        let bus = EventBus::new();
-        let kinds = Arc::new(Mutex::new(Vec::<String>::new()));
-        {
-            let kinds = kinds.clone();
-            bus.on(Arc::new(move |e: &AgentEvent| {
-                kinds.lock().unwrap().push(e.kind().to_string());
+        fn capture(agent: &Agent) -> Arc<Mutex<Vec<AgentEvent>>> {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let recorded = events.clone();
+            agent.bus().on(Arc::new(move |event| {
+                recorded.lock().unwrap().push(event.clone());
             }));
+            events
         }
 
-        let (mut agent, seen) = agent_with_echo(Arc::new(provider), bus);
-        let out = agent.run("please echo").await.unwrap();
+        async fn bounded_run(agent: &mut Agent, prompt: &str, budget: u32) -> RunOutcome {
+            tokio::time::timeout(BOUND, agent.run_with_budget(prompt, budget))
+                .await
+                .expect("run must settle promptly")
+                .unwrap()
+        }
 
-        // The final assistant text is returned.
-        assert_eq!(out, "all done");
-        // The tool actually ran, with the model's input.
-        let seen = seen.lock().unwrap();
-        assert_eq!(seen.len(), 1);
-        assert_eq!(seen[0]["msg"], "hello");
+        #[tokio::test]
+        async fn live_memory_refreshes_after_save_forget_and_external_updates() {
+            use crate::core::memory::{
+                InMemoryMemories, MemoryRepository, MemoryScope, SqliteMemories,
+            };
+            use crate::test_support::TestDir;
+            use crate::tools::memory::MemoryTool;
 
-        // History ends coherently: user → assistant(tool_use) → tool(result) →
-        // assistant(text). The last message is the final assistant turn.
-        let msgs = agent.messages();
-        assert_eq!(msgs.first().unwrap().role, Role::User);
-        assert_eq!(msgs.last().unwrap().role, Role::Assistant);
-        assert_eq!(msgs.last().unwrap().text(), "all done");
+            const BASE: &str = "Preserve human instructions and verify changes.";
+            const SAVED: &str = "Live saved preference.";
+            const EXTERNAL: &str = "External update between turns.";
 
-        // The event stream carried the turn: a tool call, a tool result, and a
-        // final message — the signals the TUI/remote render from.
-        let kinds = kinds.lock().unwrap();
-        assert!(kinds.iter().any(|k| k == "ToolCall"), "kinds: {kinds:?}");
-        assert!(kinds.iter().any(|k| k == "ToolResult"), "kinds: {kinds:?}");
-        assert!(kinds.iter().any(|k| k == "TurnEnd"), "kinds: {kinds:?}");
-    }
+            for sqlite in [false, true] {
+                let dir = TestDir::new();
+                let repository: Arc<dyn MemoryRepository> = if sqlite {
+                    Arc::new(SqliteMemories {
+                        path: dir.join("memory.db"),
+                    })
+                } else {
+                    Arc::new(InMemoryMemories::default())
+                };
+                let scope = MemoryScope::project(dir.path()).unwrap();
+                let mut cfg = config(Arc::new(ScriptProvider::new(vec![])));
+                cfg.cwd = dir.path().to_string_lossy().into_owned();
+                cfg.system = Some(BASE.into());
+                cfg.tools.add(Arc::new(MemoryTool {
+                    repository: repository.clone(),
+                }));
+                let mut agent = Agent::new(cfg);
+                agent.set_memory_repository(Some(repository.clone()));
+                let old = repository
+                    .remember(&scope, "Added after the agent was built.")
+                    .unwrap();
+                let provider = Arc::new(ScriptProvider::new(vec![
+                    Step::Complete(vec![ContentBlock::ToolUse {
+                        id: "save".into(),
+                        name: "memory".into(),
+                        input: json!({"content": SAVED}),
+                    }]),
+                    Step::Complete(vec![text("saved")]),
+                    Step::Complete(vec![ContentBlock::ToolUse {
+                        id: "forget".into(),
+                        name: "memory".into(),
+                        input: json!({"action": "forget", "id": old.id}),
+                    }]),
+                    Step::Complete(vec![text("forgotten")]),
+                    Step::Complete(vec![text("external update seen")]),
+                ]));
+                agent.set_provider(provider.clone());
 
-    #[tokio::test]
-    async fn plain_text_turn_returns_immediately() {
-        // No tool call: the model answers directly and the loop ends in one turn.
-        let provider = MockProvider::new(vec![]).with_default(MockReply::Text("hi there".into()));
-        let (mut agent, _seen) = agent_with_echo(Arc::new(provider), EventBus::new());
-        let out = agent.run("hello").await.unwrap();
-        assert_eq!(out, "hi there");
-        // user + assistant only.
-        assert_eq!(agent.messages().len(), 2);
-    }
+                assert_eq!(
+                    bounded_run(&mut agent, "save a preference", 3).await.text,
+                    "saved"
+                );
+                assert_eq!(
+                    bounded_run(&mut agent, "forget the earlier fact", 3)
+                        .await
+                        .text,
+                    "forgotten"
+                );
+                repository.remember(&scope, EXTERNAL).unwrap();
+                assert_eq!(
+                    bounded_run(&mut agent, "check current memory", 3)
+                        .await
+                        .text,
+                    "external update seen"
+                );
+                provider.assert_exhausted();
 
-    // ---- hooks ----
-    use crate::agent::hooks::{Hooks, PostToolUse, PreToolDecision, PreToolUse};
-
-    /// Build an echo-tool agent with a specific hook set.
-    fn agent_with_hooks(
-        provider: Arc<dyn crate::providers::provider::Provider>,
-        hooks: Hooks,
-    ) -> (Agent, Arc<Mutex<Vec<Value>>>) {
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let mut tools = ToolRegistry::new(None);
-        tools.add(Arc::new(EchoTool { seen: seen.clone() }));
-        let agent = Agent::new(AgentConfig {
-            provider,
-            tools,
-            bus: EventBus::new(),
-            system: None,
-            cwd: ".".to_string(),
-            max_turns: DEFAULT_MAX_TURNS,
-            id: Some("root".to_string()),
-            context_window: 200_000,
-            compact_threshold: 0.8,
-            keep_recent: 6,
-            jobs: crate::tools::jobs::JobRegistry::new(),
-            user_asker: None,
-            lsp: None,
-            inbox: None,
-            team: None,
-            name: "root".to_string(),
-            depth: 0,
-            parent_cancel: None,
-            cancel: None,
-            hooks,
-        });
-        (agent, seen)
-    }
-
-    fn echo_provider() -> MockProvider {
-        // Calls `echo` once on the first prompt, then finishes with text.
-        MockProvider::new(vec![MockRule {
-            needle: "go".to_string(),
-            reply: MockReply::ToolCall {
-                name: "echo".to_string(),
-                input: json!({"msg": "hi"}),
-            },
-        }])
-        .with_default(MockReply::Text("done".into()))
-    }
-
-    struct DenyEcho;
-    #[async_trait]
-    impl PreToolUse for DenyEcho {
-        async fn on_pre_tool(&self, tool: &str, _input: &Value) -> PreToolDecision {
-            if tool == "echo" {
-                PreToolDecision::Deny("blocked by policy".into())
-            } else {
-                PreToolDecision::Proceed(_input.clone())
+                let systems = provider.systems.lock().unwrap();
+                assert_eq!(systems.len(), 5);
+                for (index, system) in systems.iter().enumerate() {
+                    let system = system.as_ref().unwrap();
+                    assert_eq!(system.matches("# Learned memory").count(), 1);
+                    assert_eq!(system.matches(BASE).count(), 1);
+                    assert!(system.ends_with(BASE));
+                    for (fact, present) in [
+                        (old.content.as_str(), index < 3),
+                        (SAVED, index >= 1),
+                        (EXTERNAL, index == 4),
+                    ] {
+                        assert_eq!(
+                            system.matches(fact).count(),
+                            usize::from(present),
+                            "request {index}: {fact}"
+                        );
+                    }
+                }
             }
         }
-    }
 
-    #[tokio::test]
-    async fn pre_tool_hook_denies_and_tool_never_runs() {
-        let hooks = Hooks {
-            pre: vec![Arc::new(DenyEcho)],
-            post: vec![],
-        };
-        let (mut agent, seen) = agent_with_hooks(Arc::new(echo_provider()), hooks);
-        agent.run("go").await.unwrap();
-        // The tool was blocked before executing.
-        assert!(seen.lock().unwrap().is_empty(), "denied tool must not run");
-    }
-
-    struct RewriteMsg;
-    #[async_trait]
-    impl PreToolUse for RewriteMsg {
-        async fn on_pre_tool(&self, _tool: &str, input: &Value) -> PreToolDecision {
-            let mut v = input.clone();
-            v["msg"] = json!("rewritten");
-            PreToolDecision::Proceed(v)
+        #[test]
+        fn warnings_fire_at_boundaries_once_and_rearm_after_usage_drops() {
+            let mut agent = agent(Arc::new(ScriptProvider::new(vec![])));
+            agent.cfg.context_window = 1000;
+            let events = capture(&agent);
+            for used in [699, 700, 700, 849, 850, 949, 950, 1200] {
+                agent.warn_context(used);
+            }
+            agent.rearm_context_warning(850);
+            agent.warn_context(850);
+            agent.warn_context(950);
+            agent.rearm_context_warning(699);
+            agent.warn_context(700);
+            let observed: Vec<_> = events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|event| match event {
+                    AgentEvent::ContextWarning {
+                        used_tokens,
+                        context_window,
+                        pct,
+                        ..
+                    } => Some((*used_tokens, *context_window, *pct)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                observed,
+                vec![
+                    (700, 1000, 70),
+                    (850, 1000, 85),
+                    (950, 1000, 95),
+                    (950, 1000, 95),
+                    (700, 1000, 70)
+                ]
+            );
         }
-    }
 
-    #[tokio::test]
-    async fn pre_tool_hook_rewrites_the_input() {
-        let hooks = Hooks {
-            pre: vec![Arc::new(RewriteMsg)],
-            post: vec![],
-        };
-        let (mut agent, seen) = agent_with_hooks(Arc::new(echo_provider()), hooks);
-        agent.run("go").await.unwrap();
-        // The tool saw the hook's rewritten input, not the model's original.
-        assert_eq!(seen.lock().unwrap()[0]["msg"], "rewritten");
-    }
-
-    struct ShoutOutput;
-    #[async_trait]
-    impl PostToolUse for ShoutOutput {
-        async fn on_post_tool(&self, _tool: &str, output: String, _is_error: bool) -> String {
-            output.to_uppercase()
+        #[test]
+        fn loading_distinct_histories_clears_stale_usage_without_losing_transcript() {
+            let mut agent = agent(Arc::new(ScriptProvider::new(vec![])));
+            agent.context_estimate.observe(
+                Usage {
+                    input_tokens: 9000,
+                    ..Usage::default()
+                },
+                0,
+            );
+            agent.warned_pct = 95;
+            let full = vec![
+                Message::user_text("original request"),
+                Message::user_text("follow-up"),
+            ];
+            let working = vec![Message::user_text("saved context")];
+            agent.load_histories(full.clone(), working.clone());
+            assert_eq!(
+                serde_json::to_value(agent.messages()).unwrap(),
+                serde_json::to_value(full).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(agent.working_messages()).unwrap(),
+                serde_json::to_value(&working).unwrap()
+            );
+            assert_eq!(
+                agent.context_usage().0,
+                crate::agent::compaction::estimate_history_tokens(&working)
+            );
+            assert_eq!(agent.warned_pct, 0);
         }
-    }
 
-    #[tokio::test]
-    async fn post_tool_hook_rewrites_the_output() {
-        let hooks = Hooks {
-            pre: vec![],
-            post: vec![Arc::new(ShoutOutput)],
-        };
-        // Capture the tool-result event to inspect the recorded output.
-        let (agent_provider, recorded) = (Arc::new(echo_provider()), Arc::new(Mutex::new(None)));
-        let (mut agent, _seen) = agent_with_hooks(agent_provider, hooks);
-        {
-            let recorded = recorded.clone();
-            agent.bus().on(Arc::new(move |e: &AgentEvent| {
-                if let AgentEvent::ToolResult { output, .. } = e {
-                    *recorded.lock().unwrap() = Some(output.clone());
+        #[tokio::test]
+        async fn cancellation_gate_never_polls_work_when_either_flag_is_already_set() {
+            for (own, parent) in [(true, false), (false, true), (true, true)] {
+                let own = AtomicBool::new(own);
+                let parent = Arc::new(AtomicBool::new(parent));
+                let polled = AtomicBool::new(false);
+                let result = until_cancelled(&own, Some(&parent), async {
+                    polled.store(true, Ordering::Relaxed);
+                    42
+                })
+                .await;
+                assert_eq!(result, None);
+                assert!(!polled.load(Ordering::Relaxed));
+            }
+            assert_eq!(
+                until_cancelled(&AtomicBool::new(false), None, async { 42 }).await,
+                Some(42)
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn cancellation_gate_drops_pending_work_for_local_and_parent_cancellation() {
+            struct Dropped(Arc<AtomicBool>);
+            impl Drop for Dropped {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::Relaxed);
+                }
+            }
+            for cancel_parent in [false, true] {
+                let own = AtomicBool::new(false);
+                let parent = Arc::new(AtomicBool::new(false));
+                let started = Notify::new();
+                let dropped = Arc::new(AtomicBool::new(false));
+                let work = async {
+                    let _guard = Dropped(dropped.clone());
+                    started.notify_one();
+                    std::future::pending::<()>().await;
+                };
+                let (result, ()) = tokio::time::timeout(BOUND, async {
+                    tokio::join!(until_cancelled(&own, Some(&parent), work), async {
+                        started.notified().await;
+                        if cancel_parent {
+                            parent.store(true, Ordering::Relaxed);
+                        } else {
+                            own.store(true, Ordering::Relaxed);
+                        }
+                    })
+                })
+                .await
+                .expect("pending work must be cancelled");
+                assert_eq!(result, None);
+                assert!(dropped.load(Ordering::Relaxed));
+                assert_eq!(own.load(Ordering::Relaxed), !cancel_parent);
+                assert_eq!(parent.load(Ordering::Relaxed), cancel_parent);
+            }
+        }
+
+        #[tokio::test]
+        async fn typed_completion_does_not_parse_status_from_text() {
+            let provider = Arc::new(ScriptProvider::new(vec![Step::Complete(vec![text(
+                "[interrupted] [turn limit reached]",
+            )])]));
+            let mut agent = agent(provider);
+            let outcome = bounded_run(&mut agent, "go", 1).await;
+            assert_eq!(outcome.stop_reason, RunStopReason::Completed);
+            assert_eq!(outcome.turns, 1);
+            assert_eq!(outcome.text, "[interrupted] [turn limit reached]");
+            assert!(agent.turn_limit_summary().is_none());
+        }
+
+        #[tokio::test]
+        async fn typed_runs_preserve_cancel_flags_legacy_clears_only_own() {
+            for (name, own, parent) in [
+                ("uncancelled root", false, None),
+                ("cancelled root", true, None),
+                ("uncancelled child", false, Some(false)),
+                ("child own cancellation", true, Some(false)),
+                ("parent cancellation", false, Some(true)),
+                ("both cancellations", true, Some(true)),
+            ] {
+                let cancelled = own || parent == Some(true);
+                let expected_calls = usize::from(!cancelled) + usize::from(parent != Some(true));
+                let provider = Arc::new(ScriptProvider::new(
+                    (0..expected_calls)
+                        .map(|_| Step::Complete(vec![text("done")]))
+                        .collect(),
+                ));
+                let mut agent = agent(provider.clone());
+                agent.cancel.store(own, Ordering::Relaxed);
+                agent.cfg.parent_cancel = parent.map(|value| Arc::new(AtomicBool::new(value)));
+                assert_eq!(
+                    cancel_requested(&agent.cancel, agent.cfg.parent_cancel.as_ref()),
+                    cancelled,
+                    "{name}"
+                );
+                let outcome = bounded_run(&mut agent, "go", 3).await;
+                assert_eq!(
+                    outcome.stop_reason,
+                    if cancelled {
+                        RunStopReason::Cancelled
+                    } else {
+                        RunStopReason::Completed
+                    },
+                    "{name}"
+                );
+                assert_eq!(outcome.turns, u32::from(!cancelled), "{name}");
+                assert_eq!(
+                    provider.calls.load(Ordering::Relaxed),
+                    usize::from(!cancelled),
+                    "{name}"
+                );
+                assert_eq!(agent.cancel.load(Ordering::Relaxed), own, "{name}");
+                assert_eq!(
+                    tokio::time::timeout(BOUND, agent.run("go"))
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    if parent == Some(true) {
+                        "[interrupted]"
+                    } else {
+                        "done"
+                    },
+                    "{name}",
+                );
+                assert!(!agent.cancel.load(Ordering::Relaxed), "{name}");
+                assert_eq!(
+                    agent
+                        .cfg
+                        .parent_cancel
+                        .as_ref()
+                        .map(|flag| flag.load(Ordering::Relaxed)),
+                    parent,
+                    "{name}"
+                );
+                assert_eq!(
+                    provider.calls.load(Ordering::Relaxed),
+                    expected_calls,
+                    "{name}"
+                );
+                provider.assert_exhausted();
+            }
+        }
+
+        #[tokio::test]
+        async fn remaining_budget_across_coordination_wakes_never_restarts() {
+            let provider = Arc::new(
+                ScriptProvider::new(vec![
+                    Step::Complete(vec![text("first")]),
+                    Step::Complete(vec![tool("second", "missing")]),
+                ])
+                .with_summary(Summary::Complete),
+            );
+            let mut agent = agent(provider.clone());
+            agent.cfg.max_turns = 2;
+            let (inbox, sender) = mailbox();
+            agent.cfg.inbox = Some(inbox);
+            let mut remaining = agent.turn_budget();
+            let first = bounded_run(&mut agent, "go", remaining).await;
+            remaining -= first.turns;
+            sender
+                .send(AgentMessage {
+                    kind: crate::agent::team::AgentMessageKind::Actionable,
+                    from: "child".into(),
+                    text: "finished".into(),
+                })
+                .unwrap();
+            assert!(agent.has_pending_coordination());
+            let wake = bounded_run(&mut agent, "", remaining).await;
+            remaining -= wake.turns;
+            assert_eq!(wake.stop_reason, RunStopReason::TurnLimit);
+            assert_eq!(remaining, 0);
+            let calls = provider.calls.load(Ordering::Relaxed);
+            let zero = bounded_run(&mut agent, "", remaining).await;
+            assert_eq!(zero.stop_reason, RunStopReason::TurnLimit);
+            assert_eq!(zero.turns, 0);
+            assert_eq!(provider.calls.load(Ordering::Relaxed), calls);
+            assert_eq!(agent.turn_limit_summary(), Some(zero.text.as_str()));
+            assert_eq!(agent.messages().last().unwrap().text(), zero.text);
+            assert!(agent
+                .messages()
+                .iter()
+                .any(|m| m.text() == "[message from child]: finished"));
+        }
+
+        #[tokio::test]
+        async fn coordination_arriving_during_completion_consumes_another_iteration() {
+            let provider = Arc::new(ScriptProvider::new(vec![
+                Step::Complete(vec![text("first")]),
+                Step::Complete(vec![text("synthesized")]),
+            ]));
+            let mut agent = agent(provider);
+            let (inbox, sender) = mailbox();
+            agent.cfg.inbox = Some(inbox);
+            agent.bus().on(Arc::new(move |event| {
+                if matches!(event, AgentEvent::Message { message, .. } if message.text() == "first")
+                {
+                    sender
+                        .send(AgentMessage {
+                            kind: crate::agent::team::AgentMessageKind::Actionable,
+                            from: "child".into(),
+                            text: "result".into(),
+                        })
+                        .unwrap();
                 }
             }));
+            let outcome = bounded_run(&mut agent, "go", 2).await;
+            assert_eq!(outcome.stop_reason, RunStopReason::Completed);
+            assert_eq!(outcome.turns, 2);
+            assert_eq!(outcome.text, "synthesized");
         }
-        agent.run("go").await.unwrap();
-        // EchoTool returns "echoed: hi"; the post hook uppercased it.
-        assert_eq!(recorded.lock().unwrap().as_deref(), Some("ECHOED: HI"),);
+
+        #[tokio::test]
+        async fn capped_budget_records_summary_history_events_and_usage_then_resets() {
+            let provider = Arc::new(
+                ScriptProvider::new(vec![
+                    Step::Complete(vec![tool("one", "missing")]),
+                    Step::Complete(vec![text("done")]),
+                ])
+                .with_summary(Summary::Complete),
+            );
+            let mut agent = agent(provider.clone());
+            agent.cfg.max_turns = 1;
+            let events = capture(&agent);
+            let outcome = bounded_run(&mut agent, "go", 20).await;
+            assert_eq!(outcome.turns, 1);
+            assert_eq!(outcome.stop_reason, RunStopReason::TurnLimit);
+            assert_eq!(outcome.text, "[turn limit reached] saved handoff");
+            assert_eq!(agent.turn_limit_summary(), Some(outcome.text.as_str()));
+            assert_eq!(agent.history.last().unwrap().text(), outcome.text);
+            assert_eq!(agent.messages().last().unwrap().text(), outcome.text);
+            assert_eq!(provider.calls.load(Ordering::Relaxed), 2);
+            {
+                let events = events.lock().unwrap();
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|e| matches!(e, AgentEvent::Completion { .. }))
+                        .count(),
+                    2
+                );
+                assert_eq!(events.iter().filter(|e| matches!(e, AgentEvent::Message { message, .. } if message.text() == outcome.text)).count(), 1);
+                let usage = events
+                    .iter()
+                    .find_map(|e| match e {
+                        AgentEvent::TurnEnd { usage, .. } => Some(usage),
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(usage.input_tokens, 20);
+                assert_eq!(usage.output_tokens, 10);
+                assert_eq!(usage.cache_creation_input_tokens, 4);
+                assert_eq!(usage.cache_read_input_tokens, 6);
+            }
+            assert_eq!(agent.run("finish").await.unwrap(), "done");
+            assert!(agent.turn_limit_summary().is_none());
+            assert_eq!(provider.calls.load(Ordering::Relaxed), 3);
+            provider.assert_exhausted();
+        }
+
+        #[tokio::test]
+        async fn zero_budget_never_calls_provider_and_records_a_local_stop() {
+            let provider = Arc::new(ScriptProvider::new(vec![]));
+            let mut agent = agent(provider.clone());
+            let events = capture(&agent);
+            let outcome = bounded_run(&mut agent, "go", 0).await;
+            assert_eq!(outcome.stop_reason, RunStopReason::TurnLimit);
+            assert_eq!(outcome.turns, 0);
+            assert_eq!(provider.calls.load(Ordering::Relaxed), 0);
+            assert_eq!(agent.history.last().unwrap().text(), outcome.text);
+            assert_eq!(agent.turn_limit_summary(), Some(outcome.text.as_str()));
+            let events = events.lock().unwrap();
+            assert!(events.iter().any(
+            |e| matches!(e, AgentEvent::Message { message, .. } if message.text() == outcome.text)
+        ));
+            assert!(!events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Completion { .. })));
+        }
+
+        #[tokio::test]
+        async fn drain_coordination_retains_late_reports_without_provider_or_budget() {
+            let provider = Arc::new(ScriptProvider::new(vec![]));
+            let mut agent = agent(provider.clone());
+            let events = capture(&agent);
+            let (inbox, sender) = mailbox();
+            agent.cfg.inbox = Some(inbox);
+            let outcome = bounded_run(&mut agent, "go", 0).await;
+            agent.cancel.store(true, Ordering::Relaxed);
+            sender
+                .send(AgentMessage {
+                    kind: crate::agent::team::AgentMessageKind::Actionable,
+                    from: "child".into(),
+                    text: "partial result".into(),
+                })
+                .unwrap();
+            agent.drain_coordination();
+            agent.drain_coordination();
+            assert!(!agent.has_outstanding_coordination());
+            assert_eq!(provider.calls.load(Ordering::Relaxed), 0);
+            assert_eq!(
+                agent.history.last().unwrap().text(),
+                "[message from child]: partial result"
+            );
+            assert_eq!(
+                agent.messages().last().unwrap().text(),
+                "[message from child]: partial result"
+            );
+            assert_eq!(agent.turn_limit_summary(), Some(outcome.text.as_str()));
+            assert_eq!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(
+                    |e| matches!(e, AgentEvent::AgentMessage { text, .. } if text == "partial result")
+                )
+                .count(),
+            1
+        );
+        }
+
+        #[tokio::test]
+        async fn cancellation_before_tool_dispatch_still_emits_paired_results() {
+            let provider = Arc::new(ScriptProvider::new(vec![Step::Complete(vec![tool(
+                "one", "later",
+            )])]));
+            let mut agent = agent(provider);
+            let (_, calls) = add_tool(&mut agent, "later", false, false);
+            let events = capture(&agent);
+            let cancel = agent.cancel_handle();
+            agent.bus().on(Arc::new(move |event| {
+                if matches!(event, AgentEvent::Message { .. }) {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            }));
+            let outcome = bounded_run(&mut agent, "go", 1).await;
+            assert_eq!(outcome.stop_reason, RunStopReason::Cancelled);
+            assert_eq!(calls.load(Ordering::Relaxed), 0);
+            assert!(
+                matches!(&agent.messages().last().unwrap().content[0], ContentBlock::ToolResult { tool_use_id, is_error: Some(true), .. } if tool_use_id == "one")
+            );
+            assert_eq!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(
+                    |e| matches!(e, AgentEvent::ToolResult { tool_use_id, .. } if tool_use_id == "one")
+                )
+                .count(),
+            1
+        );
+        }
+
+        #[tokio::test]
+        async fn cancellation_interrupts_provider_startup() {
+            let provider = Arc::new(ScriptProvider::new(vec![Step::Pending]));
+            let mut agent = agent(provider.clone());
+            let cancel = agent.cancel_handle();
+            let (outcome, ()) = tokio::join!(bounded_run(&mut agent, "go", 3), async {
+                provider.started.notified().await;
+                cancel.store(true, Ordering::Relaxed);
+            });
+            assert_eq!(outcome.stop_reason, RunStopReason::Cancelled);
+            assert_eq!(outcome.turns, 1);
+            assert_eq!(provider.calls.load(Ordering::Relaxed), 1);
+        }
+
+        #[tokio::test]
+        async fn cancellation_preserves_partial_stream_in_history_and_events() {
+            let provider = Arc::new(ScriptProvider::new(vec![Step::Partial]));
+            let mut agent = agent(provider);
+            let events = capture(&agent);
+            let cancel = agent.cancel_handle();
+            agent.bus().on(Arc::new(move |event| {
+                if matches!(event, AgentEvent::TextDelta { .. }) {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            }));
+            let outcome = bounded_run(&mut agent, "go", 3).await;
+            assert_eq!(outcome.stop_reason, RunStopReason::Cancelled);
+            assert_eq!(outcome.text, "partial answer");
+            assert_eq!(agent.history.last().unwrap().text(), outcome.text);
+            assert_eq!(agent.messages().last().unwrap().text(), outcome.text);
+            assert!(events.lock().unwrap().iter().any(
+            |e| matches!(e, AgentEvent::Message { message, .. } if message.text() == outcome.text)
+        ));
+        }
+
+        fn failed_stream(partial: &str, error: &str) -> Step {
+            Step::Events(vec![
+                StreamEvent::TextDelta {
+                    text: partial.into(),
+                },
+                StreamEvent::Error {
+                    message: error.into(),
+                },
+            ])
+        }
+
+        fn assert_recorded_text(agent: &Agent, events: &[AgentEvent], expected: &str) {
+            for history in [&agent.history[..], agent.messages()] {
+                assert_eq!(history.len(), 2);
+                assert_eq!(history[0].role, Role::User);
+                assert_eq!(history[1].role, Role::Assistant);
+                assert!(
+                    matches!(&history[1].content[..], [ContentBlock::Text { text }] if text == expected)
+                );
+            }
+            let messages: Vec<_> = events
+                .iter()
+                .filter_map(|event| match event {
+                    AgentEvent::Message { message, .. } => Some(message),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].role, Role::Assistant);
+            assert!(
+                matches!(&messages[0].content[..], [ContentBlock::Text { text }] if text == expected)
+            );
+            assert!(!events.iter().any(|event| matches!(
+                event,
+                AgentEvent::ToolCall { .. } | AgentEvent::ToolResult { .. }
+            )));
+        }
+
+        fn assert_clean_retry_requests(provider: &ScriptProvider, expected_calls: usize) {
+            assert_eq!(provider.calls.load(Ordering::Relaxed), expected_calls);
+            let requests = provider.requests.lock().unwrap();
+            assert_eq!(requests.len(), expected_calls);
+            for messages in requests.iter() {
+                assert_eq!(messages.len(), 1);
+                assert_eq!(messages[0].role, Role::User);
+                assert_eq!(messages[0].text(), "go");
+            }
+        }
+
+        #[tokio::test]
+        async fn fatal_stream_error_preserves_only_partial_text_once() {
+            let provider = Arc::new(ScriptProvider::new(vec![Step::Events(vec![
+                StreamEvent::TextDelta {
+                    text: "partial ".into(),
+                },
+                StreamEvent::ToolUseStart {
+                    id: "unfinished".into(),
+                    name: "missing".into(),
+                },
+                StreamEvent::ToolUseInputDelta {
+                    id: "unfinished".into(),
+                    partial_json: "{\"x\":".into(),
+                },
+                StreamEvent::TextDelta {
+                    text: "answer".into(),
+                },
+                StreamEvent::Error {
+                    message: "invalid api key".into(),
+                },
+            ])]));
+            let mut agent = agent(provider.clone());
+            let events = capture(&agent);
+            let error = tokio::time::timeout(BOUND, agent.run_with_budget("go", 3))
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(error.to_string(), "invalid api key");
+            assert_clean_retry_requests(&provider, 1);
+            let events = events.lock().unwrap();
+            assert_recorded_text(&agent, &events, "partial answer");
+            assert!(!events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::StreamRetry { .. })));
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, AgentEvent::TurnEnd { .. }))
+                    .count(),
+                1
+            );
+        }
+
+        #[tokio::test]
+        async fn closed_stream_retries_boundedly_and_preserves_only_final_partial_text() {
+            let provider = Arc::new(ScriptProvider::new(
+                (0..11).map(|_| Step::Partial).collect(),
+            ));
+            let mut agent = agent(provider.clone());
+            agent.skip_retry_backoff = true;
+            let events = capture(&agent);
+            let error = tokio::time::timeout(BOUND, agent.run_with_budget("go", 3))
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "provider request failed after 10 retries: stream ended without completion"
+            );
+            assert_clean_retry_requests(&provider, 11);
+            let events = events.lock().unwrap();
+            assert_recorded_text(&agent, &events, "partial answer");
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, AgentEvent::StreamRetry { .. }))
+                    .count(),
+                10
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, AgentEvent::TurnEnd { .. }))
+                    .count(),
+                1
+            );
+        }
+
+        #[tokio::test]
+        async fn transient_partial_stream_then_success_records_only_completed_message() {
+            let provider = Arc::new(ScriptProvider::new(vec![
+                failed_stream("discarded partial", "HTTP 503"),
+                Step::Events(vec![
+                    StreamEvent::TextDelta {
+                        text: "complete answer".into(),
+                    },
+                    StreamEvent::MessageStop {
+                        completion: completion(vec![text("complete answer")]),
+                    },
+                ]),
+            ]));
+            let mut agent = agent(provider.clone());
+            agent.skip_retry_backoff = true;
+            let events = capture(&agent);
+            let outcome = bounded_run(&mut agent, "go", 3).await;
+            assert_eq!(outcome.stop_reason, RunStopReason::Completed);
+            assert_eq!(outcome.turns, 1);
+            assert_eq!(outcome.text, "complete answer");
+            assert_clean_retry_requests(&provider, 2);
+            let events = events.lock().unwrap();
+            assert_recorded_text(&agent, &events, "complete answer");
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, AgentEvent::StreamRetry { .. }))
+                    .count(),
+                1
+            );
+        }
+
+        #[tokio::test]
+        async fn exhausted_transient_retries_record_only_last_partial_once() {
+            for final_startup_error in [false, true] {
+                let mut steps: Vec<_> = (1..=10)
+                    .map(|attempt| failed_stream(&format!("partial attempt {attempt}"), "HTTP 503"))
+                    .collect();
+                steps.push(if final_startup_error {
+                    Step::Transient
+                } else {
+                    failed_stream("partial attempt 11", "HTTP 503")
+                });
+                let provider = Arc::new(ScriptProvider::new(steps));
+                let mut agent = agent(provider.clone());
+                agent.skip_retry_backoff = true;
+                let events = capture(&agent);
+                let error = tokio::time::timeout(BOUND, agent.run_with_budget("go", 3))
+                    .await
+                    .unwrap()
+                    .unwrap_err();
+                assert_eq!(
+                    error.to_string(),
+                    "provider request failed after 10 retries: HTTP 503"
+                );
+                assert_clean_retry_requests(&provider, 11);
+                let events = events.lock().unwrap();
+                let expected = if final_startup_error {
+                    "partial attempt 10"
+                } else {
+                    "partial attempt 11"
+                };
+                assert_recorded_text(&agent, &events, expected);
+                let retries: Vec<_> = events
+                    .iter()
+                    .filter_map(|event| match event {
+                        AgentEvent::StreamRetry {
+                            attempt,
+                            max_attempts,
+                            ..
+                        } => Some((*attempt, *max_attempts)),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    retries,
+                    (1..=10).map(|attempt| (attempt, 10)).collect::<Vec<_>>()
+                );
+                assert!(matches!(events.last(), Some(AgentEvent::TurnEnd { .. })));
+                assert!(matches!(
+                    events.get(events.len() - 2),
+                    Some(AgentEvent::Message { .. })
+                ));
+            }
+        }
+
+        #[tokio::test]
+        async fn fatal_retry_without_text_does_not_record_a_discarded_attempt() {
+            let provider = Arc::new(ScriptProvider::new(vec![
+                failed_stream("discarded partial", "HTTP 503"),
+                Step::Events(vec![StreamEvent::Error {
+                    message: "invalid api key".into(),
+                }]),
+            ]));
+            let mut agent = agent(provider.clone());
+            agent.skip_retry_backoff = true;
+            let events = capture(&agent);
+            let error = tokio::time::timeout(BOUND, agent.run_with_budget("go", 3))
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(error.to_string(), "invalid api key");
+            assert_clean_retry_requests(&provider, 2);
+            assert_eq!(agent.history.len(), 1);
+            assert_eq!(agent.messages().len(), 1);
+            assert!(!events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Message { .. })));
+        }
+
+        struct TestTool {
+            name: &'static str,
+            read_only: bool,
+            pending: bool,
+            started: Arc<Notify>,
+            calls: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl Tool for TestTool {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: self.name.into(),
+                    description: "test".into(),
+                    input_schema: json!({"type":"object"}),
+                }
+            }
+            fn is_read_only(&self) -> bool {
+                self.read_only
+            }
+            async fn execute(&self, _input: Value, _ctx: &ToolContext) -> ToolResult {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                self.started.notify_one();
+                if self.pending {
+                    std::future::pending().await
+                } else {
+                    Ok("completed read".into())
+                }
+            }
+        }
+
+        fn add_tool(
+            agent: &mut Agent,
+            name: &'static str,
+            read_only: bool,
+            pending: bool,
+        ) -> (Arc<Notify>, Arc<AtomicUsize>) {
+            let started = Arc::new(Notify::new());
+            let calls = Arc::new(AtomicUsize::new(0));
+            agent.cfg.tools.add(Arc::new(TestTool {
+                name,
+                read_only,
+                pending,
+                started: started.clone(),
+                calls: calls.clone(),
+            }));
+            (started, calls)
+        }
+
+        #[tokio::test]
+        async fn reported_usage_can_trigger_compaction_before_the_local_estimate() {
+            let provider = Arc::new(
+                ScriptProvider::new(vec![Step::Complete(vec![text("done")])])
+                    .with_summary(Summary::Complete),
+            );
+            let mut agent = agent(provider);
+            agent.cfg.context_window = 8192;
+            agent.load_history(vec![Message {
+                role: Role::Assistant,
+                content: vec![text(&"old work ".repeat(1000))],
+            }]);
+            let estimated = agent.context_usage().0;
+            agent.context_estimate.observe(
+                Usage {
+                    input_tokens: 7200,
+                    ..Usage::default()
+                },
+                estimated,
+            );
+            let events = capture(&agent);
+            assert_eq!(agent.run("continue").await.unwrap(), "done");
+            assert!(events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Compaction { .. })));
+            assert!(agent.context_usage().0 < 7200);
+        }
+
+        #[tokio::test]
+        async fn manual_compaction_emits_event_even_when_message_count_is_unchanged() {
+            let mut agent = agent(Arc::new(
+                ScriptProvider::new(vec![]).with_summary(Summary::Complete),
+            ));
+            let original = vec![Message {
+                role: Role::Assistant,
+                content: vec![text(&"old work ".repeat(2000))],
+            }];
+            agent.load_history(original.clone());
+            let events = capture(&agent);
+            let (did, before, after) = agent.compact().await.unwrap();
+            assert!(did);
+            assert!(after < before);
+            assert_eq!(agent.working_messages().len(), original.len());
+            assert_eq!(
+                serde_json::to_value(agent.messages()).unwrap(),
+                serde_json::to_value(&original).unwrap()
+            );
+            assert!(matches!(
+                events.lock().unwrap().as_slice(),
+                [AgentEvent::Compaction {
+                    replaced_upto: 1,
+                    ..
+                }]
+            ));
+            assert!(agent.context_usage().0 < before);
+        }
+
+        #[tokio::test]
+        async fn failed_auto_compaction_preserves_history_and_never_sends_oversized_request() {
+            for (name, fail_at) in [("first chunk", 1), ("after successful chunk", 2)] {
+                let mut script = ScriptProvider::new(vec![]);
+                if fail_at == 2 {
+                    script = script.with_summary(Summary::Complete);
+                }
+                let provider = Arc::new(script.with_summary(Summary::Error));
+                let mut agent = agent(provider.clone());
+                agent.cfg.context_window = 4000;
+                let mut original = vec![Message {
+                    role: Role::Assistant,
+                    content: vec![text(&"old work ".repeat(3000))],
+                }];
+                agent.load_history(original.clone());
+                original.push(Message::user_text("continue"));
+                let events = capture(&agent);
+                let error = agent.run("continue").await.unwrap_err().to_string();
+                assert!(error.contains("compaction failed"), "{name}: {error}");
+                assert!(error.contains("HTTP 401"), "{name}: {error}");
+                for history in [agent.messages(), agent.working_messages()] {
+                    assert_eq!(
+                        serde_json::to_value(history).unwrap(),
+                        serde_json::to_value(&original).unwrap(),
+                        "{name}"
+                    );
+                }
+                assert_eq!(provider.calls.load(Ordering::Relaxed), fail_at, "{name}");
+                provider.assert_exhausted();
+                assert!(provider.requests.lock().unwrap().is_empty());
+                assert!(!events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|event| matches!(event, AgentEvent::Compaction { .. })));
+            }
+        }
+
+        #[tokio::test]
+        async fn cancellation_during_manual_compaction_is_atomic_and_retryable() {
+            let provider = Arc::new(ScriptProvider::new(vec![]).with_summary(Summary::Pending));
+            let mut agent = agent(provider.clone());
+            agent.load_history(vec![Message {
+                role: Role::Assistant,
+                content: vec![text(&"old work ".repeat(2000))],
+            }]);
+            let original = serde_json::to_value(agent.messages()).unwrap();
+            let events = capture(&agent);
+            let cancel = agent.cancel_handle();
+            let (result, ()) = tokio::time::timeout(BOUND, async {
+                tokio::join!(agent.compact(), async {
+                    provider.started.notified().await;
+                    cancel.store(true, Ordering::Relaxed);
+                })
+            })
+            .await
+            .unwrap();
+            assert!(result.unwrap_err().to_string().contains("cancelled"));
+            assert_eq!(
+                serde_json::to_value(agent.working_messages()).unwrap(),
+                original
+            );
+            assert_eq!(serde_json::to_value(agent.messages()).unwrap(), original);
+            assert!(events.lock().unwrap().is_empty());
+            agent.set_provider(Arc::new(
+                ScriptProvider::new(vec![]).with_summary(Summary::Complete),
+            ));
+            assert!(agent.compact().await.unwrap().0);
+        }
+
+        #[tokio::test]
+        async fn overflow_recovery_compacts_once_and_retries_smaller_context() {
+            for streaming_error in [false, true] {
+                let first = if streaming_error {
+                    Step::Events(vec![StreamEvent::Error {
+                        message: "Your input exceeds the context window of this model.".into(),
+                    }])
+                } else {
+                    Step::Overflow
+                };
+                let provider = Arc::new(
+                    ScriptProvider::new(vec![first, Step::Complete(vec![text("done")])])
+                        .with_summary(Summary::Complete),
+                );
+                let mut agent = agent(provider.clone());
+                agent.load_history(vec![Message {
+                    role: Role::Assistant,
+                    content: vec![text(&"old work ".repeat(2000))],
+                }]);
+                let events = capture(&agent);
+                assert_eq!(agent.run("continue").await.unwrap(), "done");
+                let requests = provider.requests.lock().unwrap();
+                assert_eq!(requests.len(), 2);
+                assert!(
+                    crate::agent::compaction::estimate_history_tokens(&requests[1])
+                        < crate::agent::compaction::estimate_history_tokens(&requests[0])
+                );
+                assert_eq!(requests[1].last().unwrap().text(), "continue");
+                assert_eq!(agent.messages().len(), 3);
+                assert_eq!(
+                    events
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|event| matches!(event, AgentEvent::Compaction { .. }))
+                        .count(),
+                    1
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn repeated_overflow_is_bounded_without_retrying_unchanged_context() {
+            let provider = Arc::new(
+                ScriptProvider::new(vec![Step::Overflow, Step::Overflow])
+                    .with_summary(Summary::Complete),
+            );
+            let mut agent = agent(provider.clone());
+            agent.load_history(vec![Message {
+                role: Role::Assistant,
+                content: vec![text(&"old work ".repeat(2000))],
+            }]);
+            assert!(agent
+                .run("continue")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds the context window"));
+            assert_eq!(provider.requests.lock().unwrap().len(), 2);
+
+            let provider = Arc::new(ScriptProvider::new(vec![Step::Overflow]));
+            let mut short = self::agent(provider.clone());
+            assert!(short
+                .run("hello")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("no history could be compacted"));
+            assert_eq!(provider.requests.lock().unwrap().len(), 1);
+        }
+
+        #[test]
+        fn context_warning_does_not_wrap_above_255_percent() {
+            let mut agent = agent(Arc::new(ScriptProvider::new(vec![])));
+            let events = capture(&agent);
+            agent.warn_context(6_400_000);
+            assert!(matches!(
+                events.lock().unwrap().as_slice(),
+                [AgentEvent::ContextWarning {
+                    used_tokens: 6_400_000,
+                    pct: 95,
+                    ..
+                }]
+            ));
+        }
+
+        #[tokio::test]
+        async fn cancellation_of_pending_mutation_pairs_all_calls_and_skips_later_tools() {
+            let provider = Arc::new(ScriptProvider::new(vec![Step::Complete(vec![
+                tool("one", "pending"),
+                tool("two", "later"),
+            ])]));
+            let mut agent = agent(provider);
+            let (started, _) = add_tool(&mut agent, "pending", false, true);
+            let (_, later_calls) = add_tool(&mut agent, "later", false, false);
+            let events = capture(&agent);
+            let cancel = agent.cancel_handle();
+            let (outcome, ()) = tokio::join!(bounded_run(&mut agent, "go", 3), async {
+                started.notified().await;
+                cancel.store(true, Ordering::Relaxed);
+            });
+            assert_eq!(outcome.stop_reason, RunStopReason::Cancelled);
+            assert_eq!(later_calls.load(Ordering::Relaxed), 0);
+            let results = &agent.messages().last().unwrap().content;
+            assert_eq!(results.len(), 2);
+            assert!(results.iter().all(|r| matches!(
+                r,
+                ContentBlock::ToolResult {
+                    is_error: Some(true),
+                    ..
+                }
+            )));
+            let events = events.lock().unwrap();
+            for id in ["one", "two"] {
+                assert_eq!(
+                events
+                    .iter()
+                    .filter(
+                        |e| matches!(e, AgentEvent::ToolCall { tool_use_id, .. } if tool_use_id == id)
+                    )
+                    .count(),
+                1
+            );
+                assert_eq!(
+                events
+                    .iter()
+                    .filter(
+                        |e| matches!(e, AgentEvent::ToolResult { tool_use_id, .. } if tool_use_id == id)
+                    )
+                    .count(),
+                1
+            );
+            }
+        }
+
+        #[tokio::test]
+        async fn cancellation_preserves_completed_concurrent_reads_without_duplicate_results() {
+            let provider = Arc::new(ScriptProvider::new(vec![Step::Complete(vec![
+                tool("pending", "pending"),
+                tool("done", "done"),
+                tool("later", "later"),
+            ])]));
+            let mut agent = agent(provider);
+            let (_, pending_calls) = add_tool(&mut agent, "pending", true, true);
+            add_tool(&mut agent, "done", true, false);
+            let (_, later_calls) = add_tool(&mut agent, "later", false, false);
+            let events = capture(&agent);
+            let cancel = agent.cancel_handle();
+            agent.bus().on(Arc::new(move |event| {
+            if matches!(event, AgentEvent::ToolResult { tool_use_id, .. } if tool_use_id == "done") {
+                cancel.store(true, Ordering::Relaxed);
+            }
+        }));
+            let outcome = bounded_run(&mut agent, "go", 3).await;
+            assert_eq!(outcome.stop_reason, RunStopReason::Cancelled);
+            assert_eq!(pending_calls.load(Ordering::Relaxed), 1);
+            assert_eq!(later_calls.load(Ordering::Relaxed), 0);
+            let results = &agent.messages().last().unwrap().content;
+            assert_eq!(results.len(), 3);
+            assert!(
+                matches!(&results[1], ContentBlock::ToolResult { tool_use_id, content, is_error: Some(false) } if tool_use_id == "done" && content.as_text() == Some("completed read"))
+            );
+            assert!(
+                matches!(&results[0], ContentBlock::ToolResult { tool_use_id, is_error: Some(true), .. } if tool_use_id == "pending")
+            );
+            let events = events.lock().unwrap();
+            for id in ["pending", "done", "later"] {
+                assert_eq!(
+                events
+                    .iter()
+                    .filter(
+                        |e| matches!(e, AgentEvent::ToolResult { tool_use_id, .. } if tool_use_id == id)
+                    )
+                    .count(),
+                1
+            );
+            }
+        }
+
+        #[tokio::test]
+        async fn cancellation_during_retry_backoff_does_not_start_another_request() {
+            let provider = Arc::new(ScriptProvider::new(vec![Step::Transient]));
+            let mut agent = agent(provider.clone());
+            let cancel = agent.cancel_handle();
+            agent.bus().on(Arc::new(move |event| {
+                if matches!(event, AgentEvent::StreamRetry { .. }) {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            }));
+            let outcome = bounded_run(&mut agent, "go", 3).await;
+            assert_eq!(outcome.stop_reason, RunStopReason::Cancelled);
+            assert_eq!(provider.calls.load(Ordering::Relaxed), 1);
+        }
+
+        #[tokio::test]
+        async fn cancellation_interrupts_an_already_pending_backoff() {
+            let mut agent = agent(Arc::new(ScriptProvider::new(vec![])));
+            let cancel = agent.cancel_handle();
+            let started = Notify::new();
+            tokio::time::timeout(BOUND, async {
+                tokio::join!(
+                    async {
+                        started.notify_one();
+                        agent.backoff().await;
+                    },
+                    async {
+                        started.notified().await;
+                        cancel.store(true, Ordering::Relaxed);
+                    }
+                );
+            })
+            .await
+            .expect("cancel must interrupt the ten-second retry delay");
+            assert!(agent.is_cancelled());
+            assert_eq!(
+                bounded_run(&mut agent, "", 0).await.stop_reason,
+                RunStopReason::Cancelled
+            );
+        }
+
+        #[tokio::test]
+        async fn cancellation_interrupts_wind_down_and_keeps_completed_tool_results() {
+            let provider = Arc::new(
+                ScriptProvider::new(vec![Step::Complete(vec![tool("one", "missing")])])
+                    .with_summary(Summary::Pending),
+            );
+            let mut agent = agent(provider.clone());
+            let events = capture(&agent);
+            let cancel = agent.cancel_handle();
+            let (outcome, ()) = tokio::join!(bounded_run(&mut agent, "go", 1), async {
+                provider.started.notified().await;
+                cancel.store(true, Ordering::Relaxed);
+            });
+            assert_eq!(outcome.stop_reason, RunStopReason::Cancelled);
+            assert_eq!(outcome.turns, 1);
+            assert!(agent.turn_limit_summary().is_none());
+            assert_eq!(agent.messages().last().unwrap().role, Role::Tool);
+            assert_eq!(provider.calls.load(Ordering::Relaxed), 2);
+            assert_eq!(
+                events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|e| matches!(e, AgentEvent::Completion { .. }))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    mod structured {
+        use super::*;
+        use crate::test_support::agent::{
+            completion, config, text, tool, ScriptProvider, Step, Summary,
+        };
+        use serde_json::json;
+        use std::time::Duration;
+
+        #[tokio::test]
+        async fn structured_retry_does_not_restart_an_exhausted_budget() {
+            let provider = Arc::new(
+                ScriptProvider::new(vec![Step::Complete(vec![tool("missing", "missing")])])
+                    .with_summary(Summary::Complete),
+            );
+            let mut cfg = config(provider.clone());
+            cfg.max_turns = 1;
+            let mut agent = Agent::new(cfg);
+            assert!(agent
+                .run_structured("keep going", json!({"type":"object"}))
+                .await
+                .is_err());
+            assert!(agent.turn_limit_summary().is_some());
+            assert_eq!(provider.calls.load(Ordering::Relaxed), 2);
+            provider.assert_exhausted();
+            assert!(agent
+                .tool_specs()
+                .iter()
+                .all(|tool| tool.name != "structured_output"));
+        }
+
+        #[tokio::test]
+        async fn structured_run_captures_the_tool_call() {
+            let schema = json!({
+                "type": "object",
+                "required": ["answer"],
+                "properties": { "answer": {"type": "string"} }
+            });
+            let provider = Arc::new(ScriptProvider::new(vec![
+                Step::Complete(vec![ContentBlock::ToolUse {
+                    id: "answer".into(),
+                    name: "structured_output".into(),
+                    input: json!({"answer":"42"}),
+                }]),
+                Step::Complete(vec![text("done")]),
+            ]));
+            let mut agent = Agent::new(config(provider.clone()));
+            let out = agent
+                .run_structured("what is the answer?", schema)
+                .await
+                .unwrap();
+            assert_eq!(out, json!({"answer": "42"}));
+            provider.assert_exhausted();
+            assert!(agent
+                .tool_specs()
+                .iter()
+                .all(|tool| tool.name != "structured_output"));
+        }
+
+        #[tokio::test]
+        async fn structured_run_errors_when_never_called() {
+            let provider = Arc::new(ScriptProvider::new(vec![
+                Step::Complete(vec![text("hi")]),
+                Step::Complete(vec![text("still no result")]),
+            ]));
+            let mut agent = Agent::new(config(provider.clone()));
+            assert!(agent
+                .run_structured("go", json!({"type":"object", "required":["answer"]}))
+                .await
+                .is_err());
+            provider.assert_exhausted();
+            assert_eq!(provider.calls.load(Ordering::Relaxed), 2);
+            assert!(agent
+                .tool_specs()
+                .iter()
+                .all(|tool| tool.name != "structured_output"));
+        }
+
+        #[tokio::test]
+        async fn cancel_is_observed_promptly_while_the_stream_is_parked() {
+            let provider = Arc::new(ScriptProvider::new(vec![Step::Parked]));
+            let mut agent = Agent::new(config(provider.clone()));
+            let cancel = agent.cancel_handle();
+            let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::join!(agent.run("go"), async {
+                    provider.started.notified().await;
+                    cancel.store(true, Ordering::Relaxed);
+                })
+            })
+            .await
+            .expect("cancel must break the parked stream promptly");
+            assert_eq!(result.unwrap(), "[interrupted]");
+            assert_eq!(provider.calls.load(Ordering::Relaxed), 1);
+            provider.assert_exhausted();
+        }
+
+        fn truncated(id: &str, produced: u64) -> Step {
+            let mut reply = completion(vec![ContentBlock::ToolUse {
+                id: id.into(),
+                name: "some_tool".into(),
+                input: json!({ "__bob_tool_args_parse_error__": { "raw": "{", "error": "eof" } }),
+            }]);
+            reply.stop_reason = StopReason::MaxTokens;
+            reply.usage.output_tokens = produced;
+            Step::Events(vec![StreamEvent::MessageStop { completion: reply }])
+        }
+
+        #[tokio::test]
+        async fn truncated_response_recovers_a_bounded_number_of_times_then_stops() {
+            for (name, finishes) in [("recovered", true), ("persistent truncation", false)] {
+                let mut script = ScriptProvider::new(vec![
+                    truncated("discarded-1", 4096),
+                    truncated("discarded-2", 6000),
+                    truncated("retained-3", 7000),
+                    if finishes {
+                        Step::Complete(vec![text("done")])
+                    } else {
+                        truncated("retained-4", 8000)
+                    },
+                ]);
+                if !finishes {
+                    script = script.with_summary(Summary::Complete);
+                }
+                let provider = Arc::new(script);
+                let mut cfg = config(provider.clone());
+                cfg.max_turns = 4;
+                let mut agent = Agent::new(cfg);
+                let outcome = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    agent.run_with_budget("do something big", 4),
+                )
+                .await
+                .expect("truncation recovery must terminate")
+                .unwrap();
+                assert_eq!(outcome.turns, 4, "{name}");
+                assert_eq!(
+                    outcome.stop_reason,
+                    if finishes {
+                        RunStopReason::Completed
+                    } else {
+                        RunStopReason::TurnLimit
+                    },
+                    "{name}"
+                );
+                assert_eq!(
+                    *provider.caps.lock().unwrap(),
+                    vec![None, Some(8192), Some(12000), None],
+                    "{name}"
+                );
+                let requests = provider.requests.lock().unwrap();
+                for request in &requests[..3] {
+                    assert_eq!(
+                        request.len(),
+                        1,
+                        "discarded truncation entered history: {name}"
+                    );
+                    assert_eq!(request[0].text(), "do something big");
+                }
+                assert_eq!(requests[3].len(), 3, "{name}");
+                for history in [agent.messages(), agent.working_messages()] {
+                    assert_eq!(history.len(), if finishes { 4 } else { 6 }, "{name}");
+                    let encoded = serde_json::to_string(history).unwrap();
+                    assert!(!encoded.contains("discarded-"), "{name}");
+                    assert!(
+                        matches!(&history[1].content[0], ContentBlock::ToolUse { id, .. } if id == "retained-3")
+                    );
+                    assert!(
+                        matches!(&history[2].content[0], ContentBlock::ToolResult { tool_use_id, is_error: Some(true), .. } if tool_use_id == "retained-3")
+                    );
+                    assert_eq!(history.last().unwrap().text(), outcome.text, "{name}");
+                }
+                assert_eq!(
+                    provider.calls.load(Ordering::Relaxed),
+                    if finishes { 4 } else { 5 },
+                    "{name}"
+                );
+                provider.assert_exhausted();
+            }
+        }
+    }
+
+    mod e2e {
+        use super::Agent;
+        use crate::core::events::{AgentEvent, EventBus};
+        use crate::core::types::{ContentBlock, Role, ToolOutput, ToolSpec};
+        use crate::test_support::agent::{config, text, ScriptProvider, Step};
+        use crate::tools::registry::{Tool, ToolContext, ToolResult};
+        use async_trait::async_trait;
+        use serde_json::{json, Value};
+        use std::sync::{Arc, Mutex};
+
+        struct EchoTool {
+            seen: Arc<Mutex<Vec<Value>>>,
+        }
+
+        #[async_trait]
+        impl Tool for EchoTool {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: "echo".to_string(),
+                    description: "echo back".to_string(),
+                    input_schema: json!({"type": "object"}),
+                }
+            }
+            async fn execute(&self, input: Value, _ctx: &ToolContext) -> ToolResult {
+                self.seen.lock().unwrap().push(input.clone());
+                Ok(format!("echoed: {}", input["msg"].as_str().unwrap_or("")).into())
+            }
+            fn is_read_only(&self) -> bool {
+                true
+            }
+        }
+
+        fn agent_with_echo(
+            provider: Arc<dyn crate::providers::provider::Provider>,
+            bus: EventBus,
+        ) -> (Agent, Arc<Mutex<Vec<Value>>>) {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let mut cfg = config(provider);
+            cfg.tools.add(Arc::new(EchoTool { seen: seen.clone() }));
+            cfg.bus = bus;
+            let agent = Agent::new(cfg);
+            (agent, seen)
+        }
+
+        #[tokio::test]
+        async fn full_turn_calls_a_tool_then_finishes() {
+            let provider = Arc::new(echo_script("hello", "all done"));
+
+            let bus = EventBus::new();
+            let kinds = Arc::new(Mutex::new(Vec::<String>::new()));
+            {
+                let kinds = kinds.clone();
+                bus.on(Arc::new(move |e: &AgentEvent| {
+                    kinds.lock().unwrap().push(e.kind().to_string());
+                }));
+            }
+
+            let (mut agent, seen) = agent_with_echo(provider.clone(), bus);
+            let out = agent.run("please echo").await.unwrap();
+
+            assert_eq!(out, "all done");
+            provider.assert_exhausted();
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 1);
+            assert_eq!(seen[0]["msg"], "hello");
+
+            let msgs = agent.messages();
+            assert_eq!(msgs.len(), 4);
+            assert_eq!(msgs.first().unwrap().role, Role::User);
+            assert!(
+                matches!(&msgs[1].content[0], ContentBlock::ToolUse { id, .. } if id == "echo-call")
+            );
+            assert!(
+                matches!(&msgs[2].content[0], ContentBlock::ToolResult { tool_use_id, content, is_error: Some(false) } if tool_use_id == "echo-call" && content.as_text() == Some("echoed: hello"))
+            );
+            assert_eq!(msgs.last().unwrap().role, Role::Assistant);
+            assert_eq!(msgs.last().unwrap().text(), "all done");
+
+            let kinds = kinds.lock().unwrap();
+            assert!(kinds.iter().any(|k| k == "ToolCall"), "kinds: {kinds:?}");
+            assert!(kinds.iter().any(|k| k == "ToolResult"), "kinds: {kinds:?}");
+            assert!(kinds.iter().any(|k| k == "TurnEnd"), "kinds: {kinds:?}");
+        }
+
+        use crate::agent::hooks::{Hooks, PostToolUse, PreToolDecision, PreToolUse};
+
+        fn agent_with_hooks(
+            provider: Arc<dyn crate::providers::provider::Provider>,
+            hooks: Hooks,
+        ) -> (Agent, Arc<Mutex<Vec<Value>>>) {
+            let (mut agent, seen) = agent_with_echo(provider, EventBus::new());
+            agent.cfg.hooks = hooks;
+            (agent, seen)
+        }
+
+        fn echo_provider() -> ScriptProvider {
+            echo_script("hi", "done")
+        }
+
+        fn echo_script(message: &str, reply: &str) -> ScriptProvider {
+            ScriptProvider::new(vec![
+                Step::Complete(vec![ContentBlock::ToolUse {
+                    id: "echo-call".into(),
+                    name: "echo".into(),
+                    input: json!({"msg":message}),
+                }]),
+                Step::Complete(vec![text(reply)]),
+            ])
+        }
+
+        struct DenyEcho;
+        #[async_trait]
+        impl PreToolUse for DenyEcho {
+            async fn on_pre_tool(&self, tool: &str, _input: &Value) -> PreToolDecision {
+                if tool == "echo" {
+                    PreToolDecision::Deny("blocked by policy".into())
+                } else {
+                    PreToolDecision::Proceed(_input.clone())
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn pre_tool_hook_denies_and_tool_never_runs() {
+            let hooks = Hooks {
+                pre: vec![Arc::new(DenyEcho)],
+                post: vec![],
+            };
+            let (mut agent, seen) = agent_with_hooks(Arc::new(echo_provider()), hooks);
+            agent.run("go").await.unwrap();
+            assert!(seen.lock().unwrap().is_empty(), "denied tool must not run");
+            assert!(
+                matches!(&agent.messages()[2].content[0], ContentBlock::ToolResult { content, is_error: Some(true), .. } if content.as_text().unwrap().contains("blocked by policy"))
+            );
+        }
+
+        struct RewriteMsg;
+        #[async_trait]
+        impl PreToolUse for RewriteMsg {
+            async fn on_pre_tool(&self, _tool: &str, input: &Value) -> PreToolDecision {
+                let mut v = input.clone();
+                v["msg"] = json!("rewritten");
+                PreToolDecision::Proceed(v)
+            }
+        }
+
+        #[tokio::test]
+        async fn pre_tool_hook_rewrites_the_input() {
+            let hooks = Hooks {
+                pre: vec![Arc::new(RewriteMsg)],
+                post: vec![],
+            };
+            let (mut agent, seen) = agent_with_hooks(Arc::new(echo_provider()), hooks);
+            agent.run("go").await.unwrap();
+            assert_eq!(seen.lock().unwrap()[0]["msg"], "rewritten");
+        }
+
+        #[tokio::test]
+        async fn shell_hook_rewrites_reach_history_events_and_retained_pages() {
+            use crate::core::types::{ShellOutput, ShellStream};
+            use crate::tools::registry::ToolError;
+
+            struct ShellFixture;
+            #[async_trait]
+            impl Tool for ShellFixture {
+                fn spec(&self) -> ToolSpec {
+                    ToolSpec {
+                        name: "shell_fixture".into(),
+                        description: String::new(),
+                        input_schema: json!({"type":"object"}),
+                    }
+                }
+                async fn execute(&self, _: Value, _: &ToolContext) -> ToolResult {
+                    let text = format!("private-token {} end", "🦀".repeat(4000));
+                    Err(
+                        ToolError::failed("command failed").with_output(ShellOutput {
+                            exit_code: Some(7),
+                            stdout: ShellStream {
+                                total_bytes: text.len() as u64,
+                                text,
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        }),
+                    )
+                }
+            }
+            struct Redact(bool);
+            #[async_trait]
+            impl PostToolUse for Redact {
+                async fn on_post_tool(
+                    &self,
+                    _: &str,
+                    output: ToolOutput,
+                    is_error: bool,
+                ) -> ToolOutput {
+                    assert!(is_error);
+                    let ToolOutput::Shell(mut shell) = output else {
+                        panic!("hook must receive structured data")
+                    };
+                    assert_eq!(shell.exit_code, Some(7));
+                    if self.0 {
+                        "entire result withheld".into()
+                    } else {
+                        shell.stdout.text =
+                            shell.stdout.text.replace("private-token", "[redacted]");
+                        ToolOutput::Shell(shell)
+                    }
+                }
+            }
+            for replace in [false, true] {
+                let provider = Arc::new(ScriptProvider::new(vec![
+                    Step::Complete(vec![ContentBlock::ToolUse {
+                        id: "shell".into(),
+                        name: "shell_fixture".into(),
+                        input: json!({}),
+                    }]),
+                    Step::Complete(vec![text("done")]),
+                ]));
+                let mut cfg = config(provider.clone());
+                cfg.tools.add(Arc::new(ShellFixture));
+                cfg.hooks.post.push(Arc::new(Redact(replace)));
+                let recorded = Arc::new(Mutex::new(None));
+                let events = recorded.clone();
+                cfg.bus.on(Arc::new(move |event| {
+                    if let AgentEvent::ToolResult {
+                        output, is_error, ..
+                    } = event
+                    {
+                        assert!(*is_error);
+                        *events.lock().unwrap() = Some(output.clone());
+                    }
+                }));
+                let jobs = cfg.jobs.clone();
+                let mut agent = Agent::new(cfg);
+                agent.run("run the check").await.unwrap();
+                let ContentBlock::ToolResult {
+                    content,
+                    is_error: Some(true),
+                    ..
+                } = &agent.messages()[2].content[0]
+                else {
+                    panic!("failed tool result expected")
+                };
+                assert_eq!(recorded.lock().unwrap().as_ref(), Some(content));
+                let requests = provider.requests.lock().unwrap();
+                let sent = requests
+                    .last()
+                    .unwrap()
+                    .iter()
+                    .flat_map(|message| &message.content)
+                    .find_map(|block| {
+                        if let ContentBlock::ToolResult { content, .. } = block {
+                            Some(content)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap();
+                assert_eq!(sent, content);
+                match content {
+                    ToolOutput::Text(text) => assert_eq!(text, "entire result withheld"),
+                    ToolOutput::Shell(shell) => {
+                        assert_eq!(shell.exit_code, Some(7));
+                        assert!(shell.stdout.truncated);
+                        let page = jobs
+                            .output_page(shell.stdout.output_id.as_ref().unwrap(), 0, 24_000)
+                            .unwrap();
+                        assert!(page.text.starts_with("[redacted]"));
+                        assert!(!page.text.contains("private-token"));
+                        assert!(page.text.ends_with(" end"));
+                    }
+                }
+                assert!(!content.model_text().contains("private-token"));
+            }
+        }
+
+        struct ShoutOutput;
+        #[async_trait]
+        impl PostToolUse for ShoutOutput {
+            async fn on_post_tool(
+                &self,
+                _tool: &str,
+                output: ToolOutput,
+                _is_error: bool,
+            ) -> ToolOutput {
+                output.as_text().unwrap().to_uppercase().into()
+            }
+        }
+
+        #[tokio::test]
+        async fn post_tool_hook_rewrites_the_output() {
+            let hooks = Hooks {
+                pre: vec![],
+                post: vec![Arc::new(ShoutOutput)],
+            };
+            let (agent_provider, recorded) =
+                (Arc::new(echo_provider()), Arc::new(Mutex::new(None)));
+            let (mut agent, _seen) = agent_with_hooks(agent_provider, hooks);
+            {
+                let recorded = recorded.clone();
+                agent.bus().on(Arc::new(move |e: &AgentEvent| {
+                    if let AgentEvent::ToolResult { output, .. } = e {
+                        *recorded.lock().unwrap() = Some(output.clone());
+                    }
+                }));
+            }
+            agent.run("go").await.unwrap();
+            assert_eq!(
+                recorded
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(ToolOutput::as_text),
+                Some("ECHOED: HI"),
+            );
+        }
+    }
+
+    mod classify {
+        use super::{classify_error, has_status_code, ProviderErrorKind};
+
+        #[test]
+        fn status_matching_skips_embedded_numbers_and_finds_later_standalone_codes() {
+            for code in ["429", "500", "502", "503", "529"] {
+                for message in [
+                    code.to_owned(),
+                    format!("HTTP ({code}): failure"),
+                    format!("1{code} then HTTP {code}"),
+                ] {
+                    assert!(has_status_code(&message, code), "{message}");
+                    assert_eq!(
+                        classify_error(&message),
+                        ProviderErrorKind::Transient,
+                        "{message}"
+                    );
+                }
+                for message in [
+                    format!("1{code}"),
+                    format!("{code}0"),
+                    format!("1{code}0"),
+                    format!("1{code} and {code}0"),
+                    format!("é{code}🦀"),
+                    format!("EOF while parsing an object at line 1 column {code}"),
+                ] {
+                    assert!(!has_status_code(&message, code), "{message}");
+                    assert_eq!(
+                        classify_error(&message),
+                        ProviderErrorKind::Fatal,
+                        "{message}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn overflow_takes_precedence_over_retryable_statuses_and_case() {
+            for message in [
+                "HTTP 503: CONTEXT_LENGTH_EXCEEDED",
+                "429: PROMPT IS TOO LONG",
+                "Connection reset: input TOKENS EXCEED the limit",
+            ] {
+                assert_eq!(
+                    classify_error(message),
+                    ProviderErrorKind::Overflow,
+                    "{message}"
+                );
+            }
+            for message in [
+                "HTTP 401: invalid API key",
+                "HTTP 403: forbidden",
+                "HTTP 400: invalid schema",
+                "HTTP 404: model not found",
+            ] {
+                assert_eq!(
+                    classify_error(message),
+                    ProviderErrorKind::Fatal,
+                    "{message}"
+                );
+            }
+        }
+
+        #[test]
+        fn overflow_phrases_classify_as_overflow() {
+            for m in [
+                "This model's maximum context length is 200000 tokens",
+                "prompt is too long",
+                "reduce the length of the messages",
+                "input tokens exceed the limit",
+                "responses 400 Bad Request: Your input exceeds the context window of this model.",
+                "context_window_exceeded",
+            ] {
+                assert_eq!(classify_error(m), ProviderErrorKind::Overflow, "{m}");
+            }
+        }
+
+        #[test]
+        fn transient_statuses_and_phrases_classify_as_transient() {
+            for m in [
+                "HTTP 500: internal server error",
+                "error 502 bad gateway",
+                "status: 503",
+                "429 Too Many Requests",
+                "the model is overloaded",
+                "rate limit exceeded",
+                "request timed out",
+                "stream ended unexpectedly",
+                "connection reset by peer",
+            ] {
+                assert_eq!(classify_error(m), ProviderErrorKind::Transient, "{m}");
+            }
+        }
+
+        #[test]
+        fn bare_connection_word_is_not_transient() {
+            assert_eq!(
+                classify_error("the tool returned a database connection handle"),
+                ProviderErrorKind::Fatal,
+            );
+            assert_eq!(
+                classify_error("connection refused"),
+                ProviderErrorKind::Transient,
+            );
+        }
+
+        #[test]
+        fn provider_stream_drop_messages_are_retryable() {
+            for m in [
+                "openai stream ended: error decoding response body",
+                "anthropic stream ended: connection reset by peer",
+                "responses stream ended: unexpected EOF during chunked read",
+            ] {
+                assert_eq!(classify_error(m), ProviderErrorKind::Transient, "{m}");
+            }
+        }
+
+        #[test]
+        fn unknown_errors_are_fatal() {
+            assert_eq!(classify_error("invalid api key"), ProviderErrorKind::Fatal,);
+            assert_eq!(classify_error(""), ProviderErrorKind::Fatal);
+        }
     }
 }

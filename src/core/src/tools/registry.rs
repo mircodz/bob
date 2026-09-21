@@ -1,8 +1,7 @@
-//! A tool is its provider-agnostic spec plus an execute function. The registry
-//! gates every call through the permission engine before running it.
+//! Validates tool inputs and applies configured permissions before execution.
 
 use crate::core::permissions::{parse_bash, PermissionEngine, PermissionRequest};
-use crate::core::types::ToolSpec;
+use crate::core::types::{ToolOutput, ToolSpec};
 use crate::tools::file_tracker::FileTracker;
 use crate::tools::jobs::JobRegistry;
 use crate::tools::todo::TodoStore;
@@ -11,9 +10,6 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// A question the model poses to the user (via `ask_user` or `exit_plan`): a
-/// title, an optional detail/body (Markdown), and labeled options. The user
-/// picks one (or types their own answer).
 #[derive(Clone, Debug)]
 pub struct UserQuery {
     pub title: String,
@@ -23,8 +19,7 @@ pub struct UserQuery {
     pub allow_other: bool,
 }
 
-/// Supplied by the UI: pose a question to the human, return the chosen answer
-/// text (an option label, or free-text). None means the user dismissed it.
+/// Returns an option label or free text; `None` means the user dismissed it.
 #[async_trait]
 pub trait UserAsker: Send + Sync {
     async fn ask(&self, query: &UserQuery) -> Option<String>;
@@ -36,34 +31,20 @@ pub struct ToolContext {
     pub cwd: String,
     pub files: Arc<FileTracker>,
     pub todos: Arc<TodoStore>,
-    /// Registry of background jobs (started via the `task` tool with
-    /// background:true, polled via job_status/job_output).
     pub jobs: JobRegistry,
-    /// UI hook for asking the user a question (ask_user / exit_plan). None in
-    /// headless contexts — tools handle that by returning a note.
+    /// Interaction tools return Unavailable when no UI hook is supplied.
     pub user_asker: Option<Arc<dyn UserAsker>>,
-    /// Language servers for this project (None if no lsp_servers configured).
-    /// The `lsp` tool routes files to the right server via this manager.
     pub lsp: Option<Arc<crate::lsp::LspManager>>,
-    /// Coordination context: this agent's name, spawn depth, and the shared team
-    /// roster, so the coordination tools (spawn_agent / send_message /
-    /// list_agents) know who is calling and can address other agents. None when
-    /// the agent is not part of a team (the simple `task` path).
     pub coord: Option<CoordContext>,
-    /// The permission engine, so tools that change the interaction MODE (the
-    /// `enter_plan` tool switching into read-only plan mode) can do so. None in
-    /// contexts without a permission engine.
+    /// Supplied by the registry; mode-changing tools use the same engine.
     pub permissions: Option<Arc<PermissionEngine>>,
 }
 
-/// The calling agent's coordination context, threaded to the coordination tools.
 #[derive(Clone)]
 pub struct CoordContext {
-    /// This agent's own name in the team.
     pub name: String,
-    /// This agent's spawn depth (root = 0). Children are `depth + 1`.
+    /// Root is 0; children are `depth + 1`.
     pub depth: usize,
-    /// The shared team roster.
     pub team: crate::agent::team::AgentRegistry,
 }
 
@@ -71,46 +52,31 @@ pub struct CoordContext {
 pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
     async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult;
-    /// Whether this tool only *observes* state (never mutates the workspace or
-    /// shared state). Read-only tools can run concurrently with siblings in one
-    /// turn, and are the set an `explore` agent is limited to. Defaults to false
-    /// (the conservative choice); read-only tools override to true. This is the
-    /// SINGLE source of truth for "is this tool read-only" — the agent loop's
-    /// concurrency split and the explore-subset both consume it, so they can't
-    /// drift. (Permission auto-allow is a separate, broader notion — see policies.)
+    /// True only for tools that do not mutate workspace or shared state.
+    /// Controls concurrency and explore membership; auto-allow is a separate policy.
     fn is_read_only(&self) -> bool {
         false
     }
-    /// Optionally produce a human-readable preview of what this call *would* do,
-    /// computed WITHOUT side effects. Shown in the permission prompt before the
-    /// user approves. Edit/write tools return a ```diff block; most return None.
+    /// Permission-prompt preview; must not have side effects.
     fn preview(&self, _input: &Value, _ctx: &ToolContext) -> Option<String> {
         None
     }
 }
 
-/// A tool's outcome: `Ok` carries the success text shown to the model; `Err`
-/// carries a typed failure. This replaces the old `"error:"` string convention —
-/// the agent loop derives `is_error` from the variant, not by sniffing text, so a
-/// `read_file` on a file that literally contains "error:" is no longer misread as
-/// a failure.
-pub type ToolResult = Result<String, ToolError>;
+/// Failure is determined by the variant, never by the output text.
+pub type ToolResult = Result<ToolOutput, ToolError>;
 
-/// The category of a tool failure. Lets the model and UI branch on *why* a call
-/// failed (retry a path, fix an argument, ask the user) instead of parsing prose.
+pub(crate) const SHELL_STREAM_TEXT_LIMIT: usize = 12_000;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolErrorKind {
-    /// A referenced file/symbol/agent doesn't exist.
     NotFound,
-    /// The call's arguments were missing or malformed.
     InvalidInput,
-    /// The permission engine (or the OS) denied the action.
     PermissionDenied,
-    /// The operation timed out.
     Timeout,
-    /// A required facility isn't available here (no LSP, no UI, no team).
+    /// A required facility is absent (LSP, UI, team).
     Unavailable,
-    /// A catch-all runtime failure (a command exited non-zero, IO error, etc.).
+    /// Unclassified runtime failure.
     Failed,
 }
 
@@ -128,11 +94,11 @@ impl ToolErrorKind {
     }
 }
 
-/// A typed tool failure: a category plus a human-readable message.
 #[derive(Clone, Debug)]
 pub struct ToolError {
     pub kind: ToolErrorKind,
     pub message: String,
+    pub output: Option<ToolOutput>,
 }
 
 impl ToolError {
@@ -140,6 +106,7 @@ impl ToolError {
         ToolError {
             kind,
             message: message.into(),
+            output: None,
         }
     }
     pub fn not_found(message: impl Into<String>) -> Self {
@@ -161,8 +128,17 @@ impl ToolError {
         ToolError::new(ToolErrorKind::Failed, message)
     }
 
-    /// The text the model sees in a `tool_result` block: `"<kind>: <message>"`.
-    /// The prefix gives the model a machine-stable category to reason about.
+    pub fn with_output(mut self, output: impl Into<ToolOutput>) -> Self {
+        self.output = Some(output.into());
+        self
+    }
+
+    pub fn into_output(self) -> ToolOutput {
+        self.output
+            .unwrap_or_else(|| ToolOutput::Text(format!("{}: {}", self.kind.slug(), self.message)))
+    }
+
+    /// Model-visible wire format: `"<kind>: <message>"`.
     pub fn wire(&self) -> String {
         format!("{}: {}", self.kind.slug(), self.message)
     }
@@ -189,6 +165,7 @@ impl From<std::io::Error> for ToolError {
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
     order: Vec<String>,
+    schemas: HashMap<String, Result<Arc<crate::tools::schema::CompiledSchema>, String>>,
     permissions: Option<Arc<PermissionEngine>>,
 }
 
@@ -197,21 +174,23 @@ impl ToolRegistry {
         ToolRegistry {
             tools: HashMap::new(),
             order: Vec::new(),
+            schemas: HashMap::new(),
             permissions,
         }
     }
 
-    /// Register a tool. First registration wins: if a tool with the same name is
-    /// already present, the new one is IGNORED and `false` is returned. This makes
-    /// trusted built-ins un-shadowable — an MCP server (whose tool names are
-    /// server-controlled) can't replace an auto-approved built-in by colliding on
-    /// its name and inheriting its trust. Assembly registers built-ins/LSP/coord
-    /// first, then MCP + extra tools, so a collision drops the untrusted late one.
+    /// First registration wins; collisions return false. Register trusted tools
+    /// before MCP/extra tools so untrusted names cannot inherit built-in trust.
     pub fn add(&mut self, tool: Arc<dyn Tool>) -> bool {
-        let name = tool.spec().name;
+        let spec = tool.spec();
+        let name = spec.name;
         if self.tools.contains_key(&name) {
             return false;
         }
+        self.schemas.insert(
+            name.clone(),
+            crate::tools::schema::CompiledSchema::compile(&spec.input_schema).map(Arc::new),
+        );
         self.order.push(name.clone());
         self.tools.insert(name, tool);
         true
@@ -221,19 +200,12 @@ impl ToolRegistry {
         self.tools.get(name).cloned()
     }
 
-    /// Whether the named tool is read-only (only observes state). Unknown tools are
-    /// treated as NOT read-only — the conservative default. Single source of truth
-    /// via `Tool::is_read_only`, consumed by the agent loop's concurrency split and
-    /// the explore-subset below.
+    /// Unknown tools are conservatively treated as mutating.
     pub fn is_read_only(&self, name: &str) -> bool {
         self.tools.get(name).is_some_and(|t| t.is_read_only())
     }
 
-    /// A new registry containing only the read-only tools from this one — reads,
-    /// searches, navigation, web. Used to build the `explore` subagent, which must
-    /// not mutate the workspace. Mutating tools (edit, write, bash, etc.) are
-    /// dropped, so an explore agent physically cannot change anything. Membership
-    /// comes from `Tool::is_read_only` — one source of truth.
+    /// Confines explore agents to tools marked read-only.
     pub fn read_only_subset(&self) -> ToolRegistry {
         let mut out = ToolRegistry::new(self.permissions.clone());
         for name in &self.order {
@@ -246,10 +218,7 @@ impl ToolRegistry {
         out
     }
 
-    /// A registry containing only the tools whose names appear in `names` — used to
-    /// confine a named subagent definition to an explicit tool allow-list. Names
-    /// that match no registered tool are silently skipped (a caller's allow-list
-    /// may reference tools this build doesn't have).
+    /// Applies a subagent's tool allow-list; unknown names are skipped.
     pub fn subset(&self, names: &[String]) -> ToolRegistry {
         let mut out = ToolRegistry::new(self.permissions.clone());
         for name in &self.order {
@@ -275,7 +244,45 @@ impl ToolRegistry {
             None => return Err(ToolError::not_found(format!("unknown tool \"{}\"", name))),
         };
 
-        // Gate every call through the permission engine, if configured.
+        let schema = self
+            .schemas
+            .get(name)
+            .expect("registered tool has schema")
+            .as_ref()
+            .map_err(|error| ToolError::invalid_input(format!("invalid tool schema: {error}")))?;
+        schema.validate(&input).map_err(ToolError::invalid_input)?;
+
+        // Recheck path resolution after human approval; a symlink may have moved.
+        let path_snapshot = if matches!(
+            name,
+            "read_file"
+                | "write_file"
+                | "edit_file"
+                | "multi_edit"
+                | "list_dir"
+                | "glob"
+                | "grep"
+                | "lsp"
+                | "rename_symbol"
+                | "code_action"
+        ) {
+            input
+                .get("filePath")
+                .or_else(|| input.get("path"))
+                .and_then(Value::as_str)
+                .or_else(|| matches!(name, "list_dir" | "glob" | "grep").then_some("."))
+                .map(|path| {
+                    let resolved = crate::core::policies::resolve_workspace_path(
+                        std::path::Path::new(&ctx.cwd),
+                        std::path::Path::new(path),
+                    )?;
+                    Ok::<_, std::io::Error>((path.to_owned(), resolved))
+                })
+                .transpose()?
+        } else {
+            None
+        };
+
         if let Some(perms) = &self.permissions {
             let bash = if name == "bash" {
                 let cmd = input.get("command").and_then(|c| c.as_str()).unwrap_or("");
@@ -283,8 +290,6 @@ impl ToolRegistry {
             } else {
                 None
             };
-            // Compute a side-effect-free preview (e.g. the diff for an edit) so
-            // the prompt can show what will happen before the user approves.
             let preview = tool.preview(&input, ctx);
             let req = PermissionRequest {
                 tool: name.to_string(),
@@ -292,15 +297,11 @@ impl ToolRegistry {
                 cwd: ctx.cwd.clone(),
                 bash,
                 preview,
-                // Name the requester when it's a spawned/workflow team member, so a
-                // fan-out's prompts show WHO is asking. Root asks as itself → None.
                 agent: ctx
                     .coord
                     .as_ref()
                     .map(|c| c.name.clone())
                     .filter(|n| n != crate::agent::agent::ROOT_AGENT_ID),
-                // The registry is the single source of truth for read-only status;
-                // Plan mode gates on this so mutating tools are confined by default.
                 read_only: tool.is_read_only(),
             };
             if !perms.check(&req).await {
@@ -311,8 +312,17 @@ impl ToolRegistry {
             }
         }
 
-        // Thread the permission engine into the context so mode-changing tools
-        // (enter_plan) can reach it, then run the tool.
+        if let Some((path, approved)) = path_snapshot {
+            let current = crate::core::policies::resolve_workspace_path(
+                std::path::Path::new(&ctx.cwd),
+                std::path::Path::new(&path),
+            )?;
+            if current != approved {
+                return Err(ToolError::permission_denied(
+                    "path target changed during approval; retry for the new target",
+                ));
+            }
+        }
         let mut ctx = ctx.clone();
         ctx.permissions = self.permissions.clone();
         tool.execute(input, &ctx).await
@@ -322,11 +332,10 @@ impl ToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::types::ToolSpec;
+    use crate::test_support::files::FileFixture;
+    use crate::tools::builtin::ReadFileTool;
     use serde_json::json;
 
-    /// A stub tool whose `execute` returns its own tag, so a collision test can tell
-    /// which implementation is registered under a given name.
     struct StubTool {
         name: &'static str,
         tag: &'static str,
@@ -342,26 +351,255 @@ mod tests {
             }
         }
         async fn execute(&self, _input: Value, _ctx: &ToolContext) -> ToolResult {
-            Ok(self.tag.to_string())
+            Ok(self.tag.into())
         }
     }
 
-    #[test]
-    fn first_registration_wins_and_reports_collision() {
+    struct ValidatedTool {
+        schema: Value,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        previews: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Tool for ValidatedTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "validated".into(),
+                description: String::new(),
+                input_schema: self.schema.clone(),
+            }
+        }
+        async fn execute(&self, _: Value, _: &ToolContext) -> ToolResult {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok("executed".into())
+        }
+        fn preview(&self, _: &Value, _: &ToolContext) -> Option<String> {
+            self.previews
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some("preview".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_tool_inputs_are_rejected_before_execution() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let previews = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let permissions = Arc::new(PermissionEngine::new(
+            crate::core::permissions::Decision::Allow,
+            None,
+        ));
+        let mut registry = ToolRegistry::new(Some(permissions));
+        registry.add(Arc::new(ValidatedTool {
+            schema: json!({
+                "type":"object", "required":["content"],
+                "properties":{"content":{"type":"string"}}, "additionalProperties":false
+            }),
+            calls: calls.clone(),
+            previews: previews.clone(),
+        }));
+        let fixture = FileFixture::new();
+        let ctx = &fixture.ctx;
+        for input in [
+            Value::Null,
+            json!([]),
+            json!("not an object"),
+            json!({}),
+            json!({"content":null}),
+            json!({"content":12}),
+            json!({"content":"ok","extra":true}),
+        ] {
+            assert_eq!(
+                registry
+                    .execute("validated", input, ctx)
+                    .await
+                    .unwrap_err()
+                    .kind,
+                ToolErrorKind::InvalidInput
+            );
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(previews.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            registry
+                .execute("validated", json!({"content":""}), ctx)
+                .await
+                .unwrap()
+                .as_text(),
+            Some("executed")
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(previews.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn first_registration_wins_and_executes_retained_builtin() {
+        let fixture = FileFixture::new();
+        fixture.write("file", "trusted builtin content");
         let mut reg = ToolRegistry::new(None);
-        assert!(reg.add(Arc::new(StubTool {
-            name: "read_file",
-            tag: "builtin",
-        })));
-        // A later tool with the same name (e.g. a shadowing MCP tool) is rejected.
+        assert!(reg.add(Arc::new(ReadFileTool)));
         assert!(!reg.add(Arc::new(StubTool {
             name: "read_file",
             tag: "mcp-impostor",
         })));
-        // The original implementation is the one still registered.
-        let tool = reg.get("read_file").expect("tool present");
-        // spec name unchanged; order not duplicated.
-        assert_eq!(reg.order.iter().filter(|n| *n == "read_file").count(), 1);
-        assert_eq!(tool.spec().name, "read_file");
+        assert_eq!(
+            reg.specs().iter().filter(|s| s.name == "read_file").count(),
+            1
+        );
+        let output = reg
+            .execute("read_file", json!({"path":"file"}), &fixture.ctx)
+            .await
+            .unwrap();
+        assert_eq!(
+            output.as_text().unwrap().lines().next(),
+            Some("     1\ttrusted builtin content")
+        );
+        assert!(fixture.ctx.files.fully_read(
+            &fixture.dir.join("file").to_string_lossy(),
+            "trusted builtin content"
+        ));
+        assert_eq!(
+            reg.execute("read_file", json!({}), &fixture.ctx)
+                .await
+                .unwrap_err()
+                .kind,
+            ToolErrorKind::InvalidInput
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_schema_unknown_tool_and_permission_denial_never_execute() {
+        use crate::core::permissions::Decision;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let fixture = FileFixture::new();
+        for (schema, decision, expected, expected_previews) in [
+            (
+                json!({"type":"not-a-type"}),
+                Decision::Allow,
+                ToolErrorKind::InvalidInput,
+                0,
+            ),
+            (
+                json!({"$ref":"https://example.invalid/schema"}),
+                Decision::Allow,
+                ToolErrorKind::InvalidInput,
+                0,
+            ),
+            (
+                json!({"type":"object"}),
+                Decision::Deny,
+                ToolErrorKind::PermissionDenied,
+                1,
+            ),
+        ] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let previews = Arc::new(AtomicUsize::new(0));
+            let mut registry =
+                ToolRegistry::new(Some(Arc::new(PermissionEngine::new(decision, None))));
+            registry.add(Arc::new(ValidatedTool {
+                schema,
+                calls: calls.clone(),
+                previews: previews.clone(),
+            }));
+            let error = registry
+                .execute("validated", json!({}), &fixture.ctx)
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind, expected);
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(previews.load(Ordering::SeqCst), expected_previews);
+            let error = registry
+                .execute("missing", json!({}), &fixture.ctx)
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind, ToolErrorKind::NotFound);
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(previews.load(Ordering::SeqCst), expected_previews);
+        }
+    }
+
+    #[tokio::test]
+    async fn subsets_preserve_registration_order_identity_and_permission_gating() {
+        use crate::core::permissions::Decision;
+        use crate::tools::web::WebFetchTool;
+
+        let permissions = Arc::new(PermissionEngine::new(Decision::Deny, None));
+        let mut registry = ToolRegistry::new(Some(permissions.clone()));
+        registry.add(Arc::new(ReadFileTool));
+        registry.add(Arc::new(StubTool {
+            name: "mutating",
+            tag: "must not run",
+        }));
+        registry.add(Arc::new(WebFetchTool));
+        let readonly = registry.read_only_subset();
+        let selected = registry.subset(&[
+            "web_fetch".into(),
+            "missing".into(),
+            "mutating".into(),
+            "web_fetch".into(),
+        ]);
+        assert_eq!(
+            readonly
+                .specs()
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
+            ["read_file", "web_fetch"]
+        );
+        assert_eq!(
+            selected
+                .specs()
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
+            ["mutating", "web_fetch"]
+        );
+        assert!(!registry.is_read_only("missing"));
+        assert!(!registry.is_read_only("mutating"));
+        assert!(registry.is_read_only("read_file"));
+        assert!(readonly.get("mutating").is_none());
+        assert!(Arc::ptr_eq(
+            &selected.get("web_fetch").unwrap(),
+            &registry.get("web_fetch").unwrap()
+        ));
+        for subset in [&readonly, &selected] {
+            assert!(Arc::ptr_eq(
+                subset.permissions.as_ref().unwrap(),
+                &permissions
+            ));
+        }
+        let fixture = FileFixture::new();
+        assert_eq!(
+            selected
+                .execute("mutating", json!({}), &fixture.ctx)
+                .await
+                .unwrap_err()
+                .kind,
+            ToolErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn io_errors_keep_actionable_categories_and_wire_prefixes() {
+        for (io_kind, kind, slug) in [
+            (
+                std::io::ErrorKind::NotFound,
+                ToolErrorKind::NotFound,
+                "not_found",
+            ),
+            (
+                std::io::ErrorKind::PermissionDenied,
+                ToolErrorKind::PermissionDenied,
+                "permission_denied",
+            ),
+            (std::io::ErrorKind::Other, ToolErrorKind::Failed, "failed"),
+        ] {
+            let error = ToolError::from(std::io::Error::new(io_kind, "detail"));
+            assert_eq!(error.kind, kind);
+            assert_eq!(error.message, "detail");
+            assert_eq!(error.wire(), format!("{slug}: detail"));
+            assert_eq!(error.to_string(), error.wire());
+        }
     }
 }

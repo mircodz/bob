@@ -1,8 +1,5 @@
-//! Streamable-HTTP MCP transport: JSON-RPC 2.0 over HTTP POST. Each request is a
-//! POST to the server URL; the response is either a single JSON object or an SSE
-//! stream (`text/event-stream`) whose events carry the JSON-RPC reply. We track
-//! the `Mcp-Session-Id` the server assigns on initialize and echo it back, and
-//! attach the OAuth bearer token (refreshing it when it has expired).
+//! Streamable HTTP uses JSON-RPC POSTs with JSON or SSE replies.
+//! Echo the server's `Mcp-Session-Id` on subsequent messages.
 
 use super::Transport;
 use crate::core::config::{McpOAuthConfig, McpServerConfig};
@@ -30,21 +27,16 @@ impl HttpTransport {
             url,
             server: cfg.name.clone(),
             oauth: cfg.oauth.clone(),
-            // Match the stdio transport's 30s ceiling: without a timeout a server
-            // that accepts the POST but never emits its JSON-RPC reply (or holds an
-            // SSE stream open) would hang the tool call — and the turn — forever, so
-            // the tool_result is never appended and everything after it is lost.
+            // Bound the full response lifetime, including SSE streams that never close.
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+                .build()?,
             session_id: Mutex::new(None),
             next_id: AtomicI64::new(1),
         })
     }
 
-    /// Fetch a valid bearer token if this server uses OAuth, else fall back to a
-    /// stored static token (e.g. a PAT), else None.
+    /// OAuth takes precedence over stored static tokens; refresh errors propagate.
     async fn token(&self) -> anyhow::Result<Option<String>> {
         match &self.oauth {
             Some(oauth) => Ok(Some(
@@ -54,7 +46,6 @@ impl HttpTransport {
         }
     }
 
-    /// POST a JSON-RPC message and return the raw HTTP response.
     async fn post(&self, msg: &Value) -> anyhow::Result<reqwest::Response> {
         let mut req = self
             .client
@@ -72,8 +63,7 @@ impl HttpTransport {
     }
 }
 
-/// Extract the JSON-RPC reply matching `id` from an HTTP response that is either
-/// a single JSON object or an SSE stream of events.
+/// Match the request ID in either JSON or SSE; do not wait for SSE EOF after a reply.
 async fn read_reply(resp: reqwest::Response, id: i64) -> anyhow::Result<Value> {
     let is_sse = resp
         .headers()
@@ -84,71 +74,172 @@ async fn read_reply(resp: reqwest::Response, id: i64) -> anyhow::Result<Value> {
 
     if !is_sse {
         let v: Value = resp.json().await?;
+        anyhow::ensure!(
+            is_reply(&v, id),
+            "MCP HTTP response did not match request {}",
+            id
+        );
         return Ok(v);
     }
 
-    // SSE: collect events, keep the one whose id matches (or the first with a
-    // result/error if the server omits the id).
     let mut found: Option<Value> = None;
-    crate::providers::sse::parse_sse(resp, |event| {
-        if found.is_some() {
-            return;
-        }
-        let matches_id = event.get("id").and_then(|v| v.as_i64()) == Some(id);
-        let has_reply = event.get("result").is_some() || event.get("error").is_some();
-        if matches_id || has_reply {
-            found = Some(event);
-        }
-    })
+    crate::providers::sse::parse_sse_control(
+        resp,
+        |event| {
+            if let crate::providers::sse::SseEvent::Json(event) = event {
+                if is_reply(&event, id) {
+                    found = Some(event);
+                    return std::ops::ControlFlow::Break(());
+                }
+            }
+            std::ops::ControlFlow::Continue(())
+        },
+        std::time::Duration::from_secs(30),
+    )
     .await?;
     found.ok_or_else(|| anyhow::anyhow!("MCP HTTP stream ended without a reply"))
+}
+
+fn is_reply(value: &Value, id: i64) -> bool {
+    value["id"].as_i64() == Some(id)
+        && value.get("method").is_none()
+        && (value.get("result").is_some() || value.get("error").is_some())
 }
 
 #[async_trait]
 impl Transport for HttpTransport {
     async fn request(&self, method: &str, params: Value) -> anyhow::Result<Value> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let msg = json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": params
-        });
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+            let msg = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": method,
+                "params": params
+            });
 
-        let resp = self.post(&msg).await?;
+            let resp = self.post(&msg).await?;
 
-        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-            anyhow::bail!(
-                "MCP server '{}' requires authorization; run `bob mcp login {}`",
-                self.server,
-                self.server
-            );
-        }
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("MCP HTTP {} error: {} {}", self.server, status, body);
-        }
+            if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+                anyhow::bail!(
+                    "MCP server '{}' requires authorization; run `bob mcp login {}`",
+                    self.server,
+                    self.server
+                );
+            }
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                anyhow::bail!("MCP HTTP {} error: {} {}", self.server, status, body);
+            }
 
-        // Capture the session id the server assigns (usually on initialize).
-        if let Some(sid) = resp
-            .headers()
-            .get("mcp-session-id")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string())
-        {
-            *self.session_id.lock().unwrap() = Some(sid);
-        }
+            if let Some(sid) = resp
+                .headers()
+                .get("mcp-session-id")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+            {
+                *self.session_id.lock().unwrap() = Some(sid);
+            }
 
-        let reply = read_reply(resp, id).await?;
-        if let Some(err) = reply.get("error") {
-            anyhow::bail!("MCP error: {}", err);
-        }
-        Ok(reply.get("result").cloned().unwrap_or(Value::Null))
+            let reply = read_reply(resp, id).await?;
+            if let Some(err) = reply.get("error") {
+                anyhow::bail!("MCP error: {}", err);
+            }
+            Ok(reply.get("result").cloned().unwrap_or(Value::Null))
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("MCP request '{}' timed out", method))?
     }
 
     async fn notify(&self, method: &str, params: Value) {
         let msg = json!({ "jsonrpc": "2.0", "method": method, "params": params });
-        let _ = self.post(&msg).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(30), self.post(&msg)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::http::response;
+    use std::time::Duration;
+
+    #[test]
+    fn reply_matching_requires_exact_integer_id_and_a_response_member() {
+        for result in [
+            Value::Null,
+            json!(false),
+            json!(0),
+            json!([]),
+            json!({"text":"ok"}),
+        ] {
+            assert!(is_reply(
+                &json!({"jsonrpc":"2.0","id":7,"result":result}),
+                7
+            ));
+        }
+        assert!(is_reply(
+            &json!({"id":7,"error":{"code":-32601,"message":"unknown method"}}),
+            7
+        ));
+        for value in [
+            Value::Null,
+            json!([]),
+            json!({"id":7}),
+            json!({"id":8,"result":null}),
+            json!({"id":"7","result":null}),
+            json!({"id":7.5,"result":null}),
+            json!({"id":null,"result":null}),
+            json!({"result":null}),
+            json!({"id":7,"method":"server/request","result":null}),
+            json!({"id":7,"method":"server/request","error":{"code":-1}}),
+        ] {
+            assert!(!is_reply(&value, 7), "unexpected reply: {value}");
+        }
+    }
+
+    #[tokio::test]
+    async fn matching_sse_reply_returns_while_stream_stays_open() {
+        let body = "data: {\"id\":9,\"result\":\"wrong\"}\n\ndata: {\"result\":\"missing\"}\n\ndata: {\"method\":\"notice\"}\n\ndata: {\"id\":7,\"result\":\"right\"}\n\n";
+        let (response, _release) = response("text/event-stream", body, true).await;
+        let reply = tokio::time::timeout(Duration::from_secs(1), read_reply(response, 7))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply["result"], "right");
+    }
+
+    #[tokio::test]
+    async fn json_requires_exact_id_and_response_shape() {
+        for body in [
+            r#"{"id":8,"result":1}"#,
+            r#"{"result":1}"#,
+            r#"{"id":7,"method":"request"}"#,
+        ] {
+            let (response, _) = response("application/json", body, false).await;
+            assert!(read_reply(response, 7).await.is_err());
+        }
+        let (response, _) =
+            response("application/json", r#"{"id":7,"error":{"code":-1}}"#, false).await;
+        assert!(read_reply(response, 7)
+            .await
+            .unwrap()
+            .get("error")
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn sse_eof_without_matching_reply_is_error() {
+        let (response, _) = response(
+            "text/event-stream",
+            "data: {\"id\":8,\"result\":1}\n\n",
+            false,
+        )
+        .await;
+        assert!(read_reply(response, 7)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("without a reply"));
     }
 }

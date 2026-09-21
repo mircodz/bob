@@ -1,6 +1,3 @@
-//! A growing multi-line text input with emacs editing, prompt history, and
-//! Claude-style collapsed paste placeholders.
-
 use crossterm::event::KeyCode;
 
 #[derive(Default)]
@@ -9,12 +6,11 @@ pub struct Input {
     /// Cursor position as a char index.
     cursor: usize,
     history: Vec<String>,
-    /// Cursor into history when browsing (None = editing a fresh line).
+    /// None while editing a fresh line.
     hist_idx: Option<usize>,
     /// Stashed in-progress line while browsing history.
     stash: String,
-    /// Large pastes are collapsed to a placeholder in `buf`; the full text is
-    /// stored here keyed by id, and re-expanded at submit time.
+    /// Placeholder id → full text, expanded on submit.
     pastes: Vec<(usize, String)>,
     paste_seq: usize,
 }
@@ -28,18 +24,12 @@ impl Input {
         &self.buf
     }
 
-    /// Wrap the buffer to `width` columns, returning the visual rows (content
-    /// only, without any prompt prefix) and the cursor's (row, col) within them.
-    /// Wrapping happens on hard newlines AND at the width boundary, char-based —
-    /// crucially, the cursor is computed in the SAME pass, so the rendered text
-    /// and the cursor can never disagree (the old split-brain wrap/cursor bug).
+    /// Return rows and cursor (row, display column), computed in one wrapping pass.
     pub fn wrapped(&self, width: usize) -> (Vec<String>, usize, usize) {
         use unicode_width::UnicodeWidthChar;
         let width = width.max(1);
         let chars: Vec<char> = self.buf.chars().collect();
         let mut rows: Vec<String> = vec![String::new()];
-        // Columns are DISPLAY width (wide glyphs = 2 cells), so wrapping + the
-        // reported cursor column line up with what the terminal actually shows.
         let mut col = 0usize;
         let mut cur_row = 0usize;
         let mut cur_col = 0usize;
@@ -51,10 +41,7 @@ impl Input {
             } else {
                 ch.width().unwrap_or(0)
             };
-            // Soft-wrap BEFORE placing (or locating the cursor at) this char, so a
-            // char at the boundary — and a cursor sitting before it — both land on
-            // the fresh row rather than at an off-screen column. A 2-cell glyph
-            // wraps when it would cross the edge, not just when col == width.
+            // Wrap before locating the cursor so it follows the glyph onto the new row.
             if ch != '\n' && col + w > width && col > 0 {
                 rows.push(String::new());
                 col = 0;
@@ -73,7 +60,6 @@ impl Input {
             }
         }
 
-        // Cursor at the very end of the buffer.
         if !cursor_set {
             if col >= width {
                 rows.push(String::new());
@@ -87,7 +73,6 @@ impl Input {
         (rows, cur_row, cur_col)
     }
 
-    /// The text to actually send: buffer with paste placeholders expanded.
     pub fn resolved_text(&self) -> String {
         let mut out = self.buf.clone();
         for (id, content) in &self.pastes {
@@ -99,16 +84,12 @@ impl Input {
         out
     }
 
-    /// If the cursor sits inside an `@…` token (an `@` with no whitespace
-    /// between it and the cursor), return `(start_char, query)` where
-    /// `start_char` is the char index of the `@` and `query` is the text after
-    /// it up to the cursor. Used to drive `@file` completion.
+    /// Return the `@` char index and query up to the cursor, bounded by whitespace.
     pub fn at_token(&self) -> Option<(usize, String)> {
         let chars: Vec<char> = self.buf.chars().collect();
         if self.cursor > chars.len() {
             return None;
         }
-        // Scan left from the cursor for a whitespace boundary or an '@'.
         let mut i = self.cursor;
         while i > 0 {
             let c = chars[i - 1];
@@ -140,8 +121,6 @@ impl Input {
         self.cursor = self.buf.chars().count();
     }
 
-    /// Handle a bracketed paste. Small single-line pastes go in inline; large or
-    /// multi-line pastes are collapsed to a `[Pasted text #N +L lines]` marker.
     pub fn paste(&mut self, text: &str) {
         let lines = text.split('\n').count();
         if lines <= 1 && text.chars().count() <= 120 {
@@ -185,7 +164,6 @@ impl Input {
         self.buf.chars().count()
     }
 
-    // --- cursor movement ---
     pub fn move_home(&mut self) {
         self.cursor = 0;
     }
@@ -203,7 +181,6 @@ impl Input {
         }
     }
 
-    /// Index of the start of the word at/just before the cursor.
     fn prev_word_boundary(&self) -> usize {
         let chars: Vec<char> = self.buf.chars().collect();
         let mut i = self.cursor;
@@ -216,7 +193,6 @@ impl Input {
         i
     }
 
-    /// Index of the end of the word at/just after the cursor.
     fn next_word_boundary(&self) -> usize {
         let chars: Vec<char> = self.buf.chars().collect();
         let len = chars.len();
@@ -237,7 +213,6 @@ impl Input {
         self.cursor = self.next_word_boundary();
     }
 
-    // --- deletion ---
     fn delete_range(&mut self, from: usize, to: usize) {
         let (a, b) = (from.min(to), from.max(to));
         let start = self.byte_at(a);
@@ -259,26 +234,21 @@ impl Input {
             self.delete_range(self.cursor, self.cursor + 1);
         }
     }
-    /// Ctrl+K: kill from cursor to end of line.
     pub fn kill_to_end(&mut self) {
         let end = self.len_chars();
         self.delete_range(self.cursor, end);
     }
-    /// Ctrl+U: kill from start of line to cursor.
     pub fn kill_to_start(&mut self) {
         self.delete_range(0, self.cursor);
     }
-    /// Ctrl+W / Alt+Backspace: kill the word before the cursor.
     pub fn kill_word_left(&mut self) {
         let from = self.prev_word_boundary();
         self.delete_range(from, self.cursor);
     }
-    /// Alt+D: kill the word after the cursor.
     pub fn kill_word_right(&mut self) {
         let to = self.next_word_boundary();
         self.delete_range(self.cursor, to);
     }
-    /// Ctrl+T: transpose the two characters around the cursor.
     pub fn transpose(&mut self) {
         let len = self.len_chars();
         if len < 2 {
@@ -299,7 +269,6 @@ impl Input {
         self.cursor = (i + 1).min(len);
     }
 
-    /// Delete the character before the cursor (Backspace).
     fn backspace(&mut self) {
         if self.cursor > 0 {
             let start = self.byte_at(self.cursor - 1);
@@ -311,11 +280,8 @@ impl Input {
 
     pub fn on_key(&mut self, code: KeyCode) {
         match code {
-            // Windows conhost (and terminals without the enhanced key protocol)
-            // deliver Backspace/Delete as control chars (BS \u{8}, DEL \u{7f})
-            // rather than KeyCode::Backspace/Delete. Route them to deletion and
-            // drop any other control char so it can't be inserted as a blank/box
-            // glyph (the "backspace prints spaces" bug).
+            // Conhost and legacy terminals may encode Backspace as BS or DEL.
+            // Other controls must not enter the display buffer.
             KeyCode::Char('\u{8}') | KeyCode::Char('\u{7f}') => self.backspace(),
             KeyCode::Char(ch) if ch.is_control() => {}
             KeyCode::Char(ch) => {
@@ -347,7 +313,6 @@ impl Input {
         }
     }
 
-    /// Commit the current line to history and clear.
     pub fn submit(&mut self) {
         let text = self.buf.trim().to_string();
         if !text.is_empty() && self.history.last() != Some(&text) {
@@ -384,7 +349,6 @@ impl Input {
                 self.set(&self.history[i + 1].clone());
             }
             Some(_) => {
-                // Past the end → restore the stashed in-progress line.
                 self.hist_idx = None;
                 let stash = self.stash.clone();
                 self.set(&stash);
@@ -393,7 +357,6 @@ impl Input {
     }
 }
 
-/// The collapsed marker shown in the input for a large paste.
 fn placeholder(id: usize, content: &str) -> String {
     let lines = content.split('\n').count();
     format!("[Pasted text #{} +{} lines]", id, lines)
@@ -403,68 +366,264 @@ fn placeholder(id: usize, content: &str) -> String {
 mod tests {
     use super::*;
 
-    fn typed(s: &str) -> Input {
-        let mut i = Input::new();
-        i.set(s);
-        i
+    #[test]
+    fn unicode_edits_preserve_suffix_and_character_cursor() {
+        let mut input = Input::new();
+        input.set("a界é🦀z");
+        input.move_left();
+        input.move_left();
+        input.on_key(KeyCode::Char('λ'));
+        assert_eq!((input.text(), input.cursor), ("a界éλ🦀z", 4));
+        input.on_key(KeyCode::Backspace);
+        assert_eq!((input.text(), input.cursor), ("a界é🦀z", 3));
+        input.on_key(KeyCode::Delete);
+        assert_eq!((input.text(), input.cursor), ("a界éz", 3));
+        input.delete_left();
+        input.delete_right();
+        assert_eq!((input.text(), input.cursor), ("a界", 2));
+        input.move_right();
+        input.delete_right();
+        assert_eq!((input.text(), input.cursor), ("a界", 2));
+        input.move_home();
+        input.move_left();
+        input.delete_left();
+        assert_eq!((input.text(), input.cursor), ("a界", 0));
     }
 
     #[test]
-    fn short_line_no_wrap() {
-        let i = typed("hello");
-        let (rows, r, c) = i.wrapped(20);
-        assert_eq!(rows, vec!["hello"]);
-        assert_eq!((r, c), (0, 5)); // cursor at end
+    fn word_motion_and_kills_respect_unicode_whitespace_and_keep_suffix() {
+        let mut input = Input::new();
+        input.set("éclair\u{2003}日本\tfin");
+        input.move_word_left();
+        assert_eq!(input.cursor, 10);
+        input.kill_word_left();
+        assert_eq!((input.text(), input.cursor), ("éclair\u{2003}fin", 7));
+        input.move_home();
+        input.move_word_right();
+        assert_eq!(input.cursor, 6);
+        input.kill_word_right();
+        assert_eq!((input.text(), input.cursor), ("éclair", 6));
+        input.move_left();
+        input.kill_to_start();
+        assert_eq!((input.text(), input.cursor), ("r", 0));
+        input.kill_to_end();
+        assert_eq!((input.text(), input.cursor), ("", 0));
     }
 
     #[test]
-    fn hard_newline_splits_rows() {
-        let i = typed("ab\ncd");
-        let (rows, r, c) = i.wrapped(20);
-        assert_eq!(rows, vec!["ab", "cd"]);
-        assert_eq!((r, c), (1, 2));
-    }
-
-    #[test]
-    fn soft_wrap_at_width() {
-        let i = typed("abcdef"); // width 3 → "abc" / "def"
-        let (rows, r, c) = i.wrapped(3);
-        // The cursor sits at the end of an exactly-full row, so a fresh empty row
-        // is added for it to rest on (standard editor behavior).
-        assert_eq!(rows, vec!["abc", "def", ""]);
-        assert_eq!((r, c), (2, 0));
-    }
-
-    #[test]
-    fn soft_wrap_cursor_not_at_end() {
-        let mut i = typed("abcdefg"); // width 3 → abc/def/g
-        i.move_home();
-        for _ in 0..4 {
-            i.move_right(); // cursor after 'd'
+    fn transpose_handles_interior_end_and_short_buffers() {
+        for (text, cursor, expected, expected_cursor) in [
+            ("", 0, "", 0),
+            ("界", 1, "界", 1),
+            ("é界z", 0, "é界z", 0),
+            ("é界z", 1, "界éz", 2),
+            ("é界z", 3, "éz界", 3),
+        ] {
+            let mut input = Input::new();
+            input.set(text);
+            input.cursor = cursor;
+            input.transpose();
+            assert_eq!((input.text(), input.cursor), (expected, expected_cursor));
         }
-        let (rows, r, c) = i.wrapped(3);
-        assert_eq!(rows, vec!["abc", "def", "g"]);
-        assert_eq!((r, c), (1, 1)); // after 'd' on row 1
     }
 
     #[test]
-    fn cursor_mid_buffer_tracks_wrap() {
-        let mut i = typed("abcdef");
-        // Move cursor to just after 'c' (index 3): should be row 1 col 0 with a
-        // width-3 wrap, since the boundary pushes to the next row.
-        i.move_home();
-        for _ in 0..3 {
-            i.move_right();
+    fn control_key_encodings_delete_without_inserting_controls() {
+        for key in [
+            KeyCode::Backspace,
+            KeyCode::Char('\u{8}'),
+            KeyCode::Char('\u{7f}'),
+        ] {
+            let mut input = Input::new();
+            input.set("é界x");
+            input.move_left();
+            input.on_key(key);
+            assert_eq!((input.text(), input.cursor), ("éx", 1));
+            for ch in ['\0', '\n', '\r', '\t', '\u{1b}', '\u{9d}'] {
+                input.on_key(KeyCode::Char(ch));
+                assert_eq!((input.text(), input.cursor), ("éx", 1));
+            }
         }
-        let (_, r, c) = i.wrapped(3);
-        assert_eq!((r, c), (1, 0));
     }
 
     #[test]
-    fn trailing_newline_gives_empty_row() {
-        let i = typed("a\n");
-        let (rows, r, c) = i.wrapped(20);
-        assert_eq!(rows, vec!["a", ""]);
-        assert_eq!((r, c), (1, 0));
+    fn completion_uses_character_offsets_and_preserves_text_after_cursor() {
+        let mut input = Input::new();
+        input.set("界 @srcé suffix");
+        input.move_home();
+        for _ in 0..7 {
+            input.move_right();
+        }
+        assert_eq!(input.at_token(), Some((2, "srcé".into())));
+        input.replace_at_token(2, "日本.rs");
+        assert_eq!((input.text(), input.cursor), ("界 @日本.rs suffix", 8));
+        input.move_right();
+        assert_eq!(input.at_token(), None);
+        input.move_home();
+        assert_eq!(input.at_token(), None);
+    }
+
+    #[test]
+    fn paste_threshold_counts_characters_and_expands_multiple_markers_in_place() {
+        let mut input = Input::new();
+        let short = "界".repeat(120);
+        input.paste(&short);
+        assert_eq!(input.text(), short);
+        input.set("before  after");
+        input.move_home();
+        for _ in 0..7 {
+            input.move_right();
+        }
+        let long = "é".repeat(121);
+        input.paste(&long);
+        input.paste("日本\n語\n");
+        assert_eq!(
+            input.text(),
+            "before [Pasted text #1 +1 lines][Pasted text #2 +3 lines] after"
+        );
+        assert_eq!(
+            input.resolved_text(),
+            format!("before {long}日本\n語\n after")
+        );
+        input.submit();
+        assert_eq!(input.text(), "");
+        assert_eq!(input.cursor, 0);
+        assert!(input.pastes.is_empty());
+        input.paste("a\rb");
+        assert_eq!(input.resolved_text(), "ab");
+    }
+
+    #[test]
+    fn history_deduplicates_adjacent_entries_and_restores_unicode_draft() {
+        let mut input = Input::new();
+        for text in ["  first  ", "first", " \n ", "日本"] {
+            input.set(text);
+            input.submit();
+        }
+        assert_eq!(input.history, vec!["first", "日本"]);
+        input.set("draft é");
+        for expected in ["日本", "first", "first"] {
+            input.history_prev();
+            assert_eq!(input.text(), expected);
+            assert_eq!(input.cursor, expected.chars().count());
+        }
+        for expected in ["日本", "draft é", "draft é"] {
+            input.history_next();
+            assert_eq!(input.text(), expected);
+            assert_eq!(input.cursor, expected.chars().count());
+        }
+        input.history_prev();
+        input.on_key(KeyCode::Char('!'));
+        input.history_next();
+        assert_eq!(input.text(), "日本!");
+        assert_eq!(input.hist_idx, None);
+    }
+
+    #[test]
+    fn wrapping_tracks_end_cursor_across_line_and_display_boundaries() {
+        for (label, text, width, expected_rows, expected_cursor) in [
+            ("short line", "hello", 20, vec!["hello"], (0, 5)),
+            ("hard newline", "ab\ncd", 20, vec!["ab", "cd"], (1, 2)),
+            (
+                "exact soft wrap",
+                "abcdef",
+                3,
+                vec!["abc", "def", ""],
+                (2, 0),
+            ),
+            ("trailing newline", "a\n", 20, vec!["a", ""], (1, 0)),
+            (
+                "wide glyph wraps before edge",
+                "a界b",
+                2,
+                vec!["a", "界", "b"],
+                (2, 1),
+            ),
+            (
+                "combining mark has no columns",
+                "e\u{301}x",
+                2,
+                vec!["e\u{301}x", ""],
+                (1, 0),
+            ),
+            ("empty input", "", 3, vec![""], (0, 0)),
+            (
+                "zero width clamps to one",
+                "ab",
+                0,
+                vec!["a", "b", ""],
+                (2, 0),
+            ),
+        ] {
+            let mut input = Input::new();
+            input.set(text);
+            let (rows, row, column) = input.wrapped(width);
+            assert_eq!(rows, expected_rows, "{label}: rows");
+            assert_eq!((row, column), expected_cursor, "{label}: cursor");
+        }
+    }
+
+    #[test]
+    fn wrapping_tracks_interior_cursor_at_character_not_byte_offsets() {
+        for (label, text, width, cursor, expected_rows, expected_cursor) in [
+            (
+                "inside soft row",
+                "abcdefg",
+                3,
+                4,
+                vec!["abc", "def", "g"],
+                (1, 1),
+            ),
+            (
+                "at soft boundary",
+                "abcdef",
+                3,
+                3,
+                vec!["abc", "def"],
+                (1, 0),
+            ),
+            (
+                "before wide glyph",
+                "a界b",
+                2,
+                1,
+                vec!["a", "界", "b"],
+                (1, 0),
+            ),
+            (
+                "after wide glyph",
+                "a界b",
+                2,
+                2,
+                vec!["a", "界", "b"],
+                (2, 0),
+            ),
+            (
+                "after combining mark",
+                "e\u{301}xy",
+                2,
+                2,
+                vec!["e\u{301}x", "y"],
+                (0, 1),
+            ),
+            (
+                "before hard newline",
+                "ab\ncd",
+                2,
+                2,
+                vec!["ab", "cd"],
+                (0, 2),
+            ),
+        ] {
+            let mut input = Input::new();
+            input.set(text);
+            input.move_home();
+            for _ in 0..cursor {
+                input.move_right();
+            }
+            let (rows, row, column) = input.wrapped(width);
+            assert_eq!(rows, expected_rows, "{label}: rows");
+            assert_eq!((row, column), expected_cursor, "{label}: cursor");
+        }
     }
 }
