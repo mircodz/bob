@@ -281,6 +281,30 @@ async fn apply_and_report(
             expected: Some(before.clone()),
         })
         .collect();
+    let mut report = String::new();
+    let mut files_changed = 0;
+    let mut total_added = 0;
+    let mut total_removed = 0;
+    for (path, before, after, _, _) in &prepared {
+        if before == after {
+            continue;
+        }
+        let full = diff_lines(before, after);
+        let (added, removed) = diff_stat(&full);
+        total_added += added;
+        total_removed += removed;
+        files_changed += 1;
+        report.push_str(&format!(
+            "```diff {}\n{}\n```\n",
+            path.display(),
+            format_unified(&compact_diff(&full, 2))
+        ));
+    }
+    let output = format!(
+        "changed {} file(s) (+{} -{})\n{}",
+        files_changed, total_added, total_removed, report
+    )
+    .into();
     let batch = prepare_batch(ctx, requests).await?;
     let committed = {
         let _sync = client
@@ -299,64 +323,17 @@ async fn apply_and_report(
         }
         batch.commit()
     };
-    let mut sync_errors = Vec::new();
     for (path, _, _, _, _) in &prepared {
-        match read_regular(path) {
-            Ok(actual) => {
-                ctx.files.record_write(&path.to_string_lossy());
-                if let Err(error) = client.sync_file(path, &actual).await {
-                    sync_errors.push(format!("{}: {}", path.display(), error));
-                }
-                if let Some(other) = manager.client_for(path) {
-                    if other.name() != client.name() {
-                        if let Err(error) = other.sync_file(path, &actual).await {
-                            sync_errors.push(format!("{}: {}", path.display(), error));
-                        }
-                    }
-                }
+        ctx.files.record_write(&path.to_string_lossy());
+        client.defer_sync_file(path);
+        if let Some(other) = manager.client_for(path) {
+            if other.name() != client.name() {
+                other.defer_sync_file(path);
             }
-            Err(error) => sync_errors.push(format!("{}: {}", path.display(), error)),
         }
     }
-    if let Err(mut error) = committed {
-        if !sync_errors.is_empty() {
-            error.message.push_str(&format!(
-                "; document sync failed: {}",
-                sync_errors.join("; ")
-            ));
-        }
-        return Err(error);
-    }
-    if !sync_errors.is_empty() {
-        return Err(ToolError::failed(format!(
-            "disk edits committed; rollback not attempted; document sync failed: {}",
-            sync_errors.join("; ")
-        )));
-    }
-    let mut report = String::new();
-    let mut files_changed = 0;
-    let mut total_added = 0;
-    let mut total_removed = 0;
-    for (path, before, after, _, _) in prepared {
-        if before == after {
-            continue;
-        }
-        let full = diff_lines(&before, &after);
-        let (added, removed) = diff_stat(&full);
-        total_added += added;
-        total_removed += removed;
-        files_changed += 1;
-        report.push_str(&format!(
-            "```diff {}\n{}\n```\n",
-            path.display(),
-            format_unified(&compact_diff(&full, 2))
-        ));
-    }
-    Ok(format!(
-        "changed {} file(s) (+{} -{})\n{}",
-        files_changed, total_added, total_removed, report
-    )
-    .into())
+    committed?;
+    Ok(output)
 }
 
 pub struct CodeActionTool {

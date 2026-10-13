@@ -6,7 +6,7 @@ use crate::providers::provider::{ModelEntry, Provider, StreamTimeouts};
 use crate::providers::sse::{parse_sse_control, SseEvent};
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -173,6 +173,7 @@ impl Provider for ResponsesProvider {
             let mut text = String::new();
             // Tool calls accumulate by output index → (call_id, name, args).
             let mut tools: BTreeMap<i64, (String, String, String)> = BTreeMap::new();
+            let mut unfinished_tools = BTreeSet::new();
             // Echo opaque reasoning verbatim for store:false continuity.
             let mut reasoning: BTreeMap<i64, Value> = BTreeMap::new();
             // Preserve text placement relative to reasoning and tool calls.
@@ -187,6 +188,38 @@ impl Provider for ResponsesProvider {
                         return ControlFlow::Break(());
                     };
                     let kind = evt["type"].as_str().unwrap_or("");
+                    let invalid_arguments = match kind {
+                        "response.function_call_arguments.delta" => {
+                            evt.get("delta").is_some_and(|value| !value.is_string())
+                        }
+                        "response.function_call_arguments.done" => {
+                            evt.get("arguments").is_some_and(|value| !value.is_string())
+                        }
+                        "response.output_item.added" | "response.output_item.done" => {
+                            evt["item"]["type"] == "function_call"
+                                && evt["item"]
+                                    .get("arguments")
+                                    .is_some_and(|value| !value.is_string())
+                        }
+                        "response.completed" => {
+                            evt["response"]["output"].as_array().is_some_and(|output| {
+                                output.iter().any(|item| {
+                                    item["type"] == "function_call"
+                                        && item
+                                            .get("arguments")
+                                            .is_some_and(|value| !value.is_string())
+                                })
+                            })
+                        }
+                        _ => false,
+                    };
+                    if invalid_arguments {
+                        terminal_seen = true;
+                        let _ = tx.send(StreamEvent::Error {
+                            message: format!("responses: {kind} tool arguments must be a string"),
+                        });
+                        return ControlFlow::Break(());
+                    }
                     match kind {
                         "response.output_text.delta" => {
                             if let Some(d) = evt["delta"].as_str() {
@@ -206,6 +239,14 @@ impl Provider for ResponsesProvider {
                                 reasoning.insert(idx, item.clone());
                             } else if item["type"] == "function_call" {
                                 let idx = evt["output_index"].as_i64().unwrap_or(0);
+                                if matches!(
+                                    item["status"].as_str(),
+                                    Some("in_progress" | "incomplete")
+                                ) {
+                                    unfinished_tools.insert(idx);
+                                } else {
+                                    unfinished_tools.remove(&idx);
+                                }
                                 tools.insert(
                                     idx,
                                     (
@@ -228,7 +269,10 @@ impl Provider for ResponsesProvider {
                                         name: name.clone(),
                                     });
                                 }
-                                tools.insert(idx, (call_id, name, String::new()));
+                                let arguments =
+                                    item["arguments"].as_str().unwrap_or("").to_string();
+                                tools.insert(idx, (call_id, name, arguments));
+                                unfinished_tools.remove(&idx);
                             }
                         }
                         "response.function_call_arguments.delta" => {
@@ -279,6 +323,7 @@ impl Provider for ResponsesProvider {
                                 text.clear();
                                 text_index = None;
                                 tools.clear();
+                                unfinished_tools.clear();
                                 reasoning.clear();
                                 for (idx, item) in output.iter().enumerate() {
                                     let idx = idx as i64;
@@ -325,6 +370,11 @@ impl Provider for ResponsesProvider {
                             }
                             if truncated {
                                 tools.clear();
+                            } else if !unfinished_tools.is_empty() {
+                                let _ = tx.send(StreamEvent::Error {
+                                    message: "responses completed with unfinished tool call".into(),
+                                });
+                                return ControlFlow::Break(());
                             }
 
                             let mut content: Vec<ContentBlock> = Vec::new();
@@ -344,7 +394,10 @@ impl Provider for ResponsesProvider {
                             }
                             for (idx, (id, name, args)) in &tools {
                                 let input = match crate::providers::codec::complete_tool_input(
-                                    id, name, args,
+                                    id,
+                                    name,
+                                    args,
+                                    &opts.tools,
                                 ) {
                                     Ok(input) => input,
                                     Err(error) => {
@@ -827,6 +880,271 @@ mod tests {
                 )
                 .with_stream_timeouts(timeouts),
             )
+        }
+
+        async fn collect_tool_frames(frames: &[Value]) -> Vec<StreamEvent> {
+            use crate::agent::team::AgentRegistry;
+            use crate::tools::builtin::{ListDirTool, ReadFileTool};
+            use crate::tools::coordinate::ListAgentsTool;
+            use crate::tools::registry::Tool;
+
+            let options = GenerateOptions {
+                tools: vec![
+                    ListAgentsTool {
+                        team: AgentRegistry::new(),
+                    }
+                    .spec(),
+                    ReadFileTool.spec(),
+                    ListDirTool.spec(),
+                ],
+                ..Default::default()
+            };
+            let body = frames
+                .iter()
+                .map(|frame| format!("data: {frame}\n\n"))
+                .collect::<String>();
+            let (base, server) = serve(&body, false).await;
+            let events = collect_with_options(responses(base, deadlines()), options).await;
+            server.await.unwrap();
+            events
+        }
+
+        fn tool_frames(name: &str, arguments: Option<Value>) -> [Vec<Value>; 4] {
+            let mut item = json!({"type":"function_call","call_id":"call1","name":name});
+            let added = json!({"type":"response.output_item.added","output_index":0,"item":item});
+            let mut done = json!({"type":"response.function_call_arguments.done","output_index":0});
+            let mut delta =
+                json!({"type":"response.function_call_arguments.delta","output_index":0});
+            if let Some(arguments) = arguments {
+                item["arguments"] = arguments.clone();
+                done["arguments"] = arguments.clone();
+                delta["delta"] = arguments;
+            }
+            let completed = json!({"type":"response.completed","response":{}});
+            [
+                vec![json!({"type":"response.completed","response":{"output":[item]}})],
+                vec![
+                    added.clone(),
+                    json!({"type":"response.output_item.done","output_index":0,"item":item}),
+                    completed.clone(),
+                ],
+                vec![added.clone(), done, completed.clone()],
+                vec![added, delta, completed],
+            ]
+        }
+
+        #[tokio::test]
+        async fn initial_arguments_are_preserved_before_finalization() {
+            for (initial, delta, succeeds) in [
+                (r#"{"path":"src"}"#, None, true),
+                (r#"{"path":""#, Some("src\"}"), true),
+                ("{", None, false),
+            ] {
+                let mut frames = vec![json!({"type":"response.output_item.added","output_index":0,
+                    "item":{"type":"function_call","call_id":"call1","name":"list_dir","arguments":initial}})];
+                if let Some(delta) = delta {
+                    frames.push(json!({"type":"response.function_call_arguments.delta","output_index":0,"delta":delta}));
+                }
+                frames.push(json!({"type":"response.completed","response":{}}));
+                let events = collect_tool_frames(&frames).await;
+                if succeeds {
+                    assert!(
+                        !events
+                            .iter()
+                            .any(|event| matches!(event, StreamEvent::Error { .. })),
+                        "{events:?}"
+                    );
+                    assert!(events.iter().any(|event| matches!(event,
+                        StreamEvent::MessageStop { completion }
+                            if matches!(completion.message.content.as_slice(),
+                                [ContentBlock::ToolUse { input, .. }] if *input == json!({"path":"src"}))
+                    )), "{events:?}");
+                } else {
+                    assert_error(&events);
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn unfinished_items_preserve_token_limit_text_and_usage() {
+            for with_final_output in [false, true] {
+                let item = json!({"type":"function_call","call_id":"call1","name":"list_agents","arguments":"","status":"incomplete"});
+                let mut response = json!({"incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":10,"output_tokens":20}});
+                if with_final_output {
+                    response["output"] = json!([
+                        {"type":"message","content":[{"type":"output_text","text":"partial"}]}, item
+                    ]);
+                }
+                let frames = [
+                    json!({"type":"response.output_text.delta","output_index":0,"delta":"partial"}),
+                    json!({"type":"response.output_item.done","output_index":1,"item":item}),
+                    json!({"type":"response.incomplete","response":response}),
+                ];
+                let events = collect_tool_frames(&frames).await;
+                assert!(
+                    !events
+                        .iter()
+                        .any(|event| matches!(event, StreamEvent::Error { .. })),
+                    "{events:?}"
+                );
+                let completion = events
+                    .iter()
+                    .find_map(|event| match event {
+                        StreamEvent::MessageStop { completion } => Some(completion),
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(completion.stop_reason, StopReason::MaxTokens);
+                assert_eq!(completion.usage.input_tokens, 10);
+                assert_eq!(completion.usage.output_tokens, 20);
+                assert!(
+                    matches!(completion.message.content.as_slice(), [ContentBlock::Text { text }] if text == "partial")
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn advertised_no_argument_calls_complete_across_response_paths() {
+            for arguments in [None, Some(json!("")), Some(json!("{}"))] {
+                for frames in tool_frames("list_agents", arguments) {
+                    let events = collect_tool_frames(&frames).await;
+                    assert_eq!(
+                        events
+                            .iter()
+                            .filter(|event| matches!(event, StreamEvent::MessageStop { .. }))
+                            .count(),
+                        1,
+                        "{events:?}"
+                    );
+                    assert!(
+                        !events
+                            .iter()
+                            .any(|event| matches!(event, StreamEvent::Error { .. })),
+                        "{events:?}"
+                    );
+                    let completion = events
+                        .iter()
+                        .find_map(|event| match event {
+                            StreamEvent::MessageStop { completion } => Some(completion),
+                            _ => None,
+                        })
+                        .unwrap();
+                    assert_eq!(completion.stop_reason, StopReason::ToolUse);
+                    assert_eq!(
+                        serde_json::to_value(&completion.message).unwrap(),
+                        json!({
+                            "role":"assistant","content":[
+                                {"type":"tool_use","id":"call1","name":"list_agents","input":{}}
+                            ]
+                        })
+                    );
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn invalid_arguments_do_not_become_empty_calls() {
+            for arguments in [
+                json!("{"),
+                json!(" "),
+                json!("[]"),
+                json!("null"),
+                Value::Null,
+                json!({}),
+            ] {
+                for frames in tool_frames("list_agents", Some(arguments)) {
+                    assert_error(&collect_tool_frames(&frames).await);
+                }
+            }
+            for value in [Value::Null, json!({})] {
+                let frames = [
+                    json!({"type":"response.output_item.added","output_index":0,"item":{
+                        "type":"function_call","call_id":"call1","name":"list_agents","arguments":value
+                    }}),
+                    json!({"type":"response.completed","response":{}}),
+                ];
+                assert_error(&collect_tool_frames(&frames).await);
+            }
+            for name in ["unknown_tool", "read_file"] {
+                for arguments in [None, Some(json!(""))] {
+                    for frames in tool_frames(name, arguments) {
+                        assert_error(&collect_tool_frames(&frames).await);
+                    }
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn authoritative_empty_arguments_replace_partial_arguments() {
+            let added = json!({"type":"response.output_item.added","output_index":0,
+                "item":{"type":"function_call","call_id":"call1","name":"list_agents"}});
+            let partial = json!({"type":"response.function_call_arguments.delta","output_index":0,"delta":"{"});
+            for final_frames in tool_frames("list_agents", Some(json!("")))
+                .into_iter()
+                .take(3)
+            {
+                let mut frames = vec![added.clone(), partial.clone()];
+                frames.extend(
+                    final_frames
+                        .into_iter()
+                        .filter(|frame| frame["type"] != "response.output_item.added"),
+                );
+                let events = collect_tool_frames(&frames).await;
+                assert!(
+                    !events
+                        .iter()
+                        .any(|event| matches!(event, StreamEvent::Error { .. })),
+                    "{events:?}"
+                );
+                assert!(
+                    events.iter().any(|event| matches!(event,
+                        StreamEvent::MessageStop { completion }
+                            if completion.stop_reason == StopReason::ToolUse
+                                && matches!(completion.message.content.as_slice(),
+                                    [ContentBlock::ToolUse { input, .. }] if *input == json!({}))
+                    )),
+                    "{events:?}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn empty_calls_still_require_finished_responses() {
+            for status in ["in_progress", "incomplete"] {
+                let frames = [json!({"type":"response.completed","response":{"output":[{
+                    "type":"function_call","call_id":"call1","name":"list_agents","status":status
+                }]}})];
+                assert_error(&collect_tool_frames(&frames).await);
+                let frames = [
+                    json!({"type":"response.output_item.done","output_index":0,"item":{
+                        "type":"function_call","call_id":"call1","name":"list_agents","status":status
+                    }}),
+                    json!({"type":"response.completed","response":{}}),
+                ];
+                assert_error(&collect_tool_frames(&frames).await);
+            }
+            let mut frames = tool_frames("list_agents", None)[3].clone();
+            frames.pop();
+            assert_error(&collect_tool_frames(&frames).await);
+            frames.push(json!({"type":"response.incomplete","response":{
+                "incomplete_details":{"reason":"max_output_tokens"},
+                "output":[{"type":"function_call","call_id":"call1","name":"list_agents","arguments":""}]
+            }}));
+            let events = collect_tool_frames(&frames).await;
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, StreamEvent::Error { .. })),
+                "{events:?}"
+            );
+            assert!(
+                events.iter().any(|event| matches!(event,
+                    StreamEvent::MessageStop { completion }
+                        if completion.stop_reason == StopReason::MaxTokens
+                            && completion.message.content.is_empty()
+                )),
+                "{events:?}"
+            );
         }
 
         #[tokio::test]

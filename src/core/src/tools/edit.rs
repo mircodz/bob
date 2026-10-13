@@ -143,11 +143,12 @@ impl Tool for EditFileTool {
             }],
         )
         .await?;
+        let result = edit_result(path, &content, &updated).into();
         let written = batch.commit()?;
         ctx.files
             .record_content(&written[0].to_string_lossy(), &updated, fully_known);
-        crate::tools::lsp::sync_after_edit(&ctx.lsp, &written[0], &updated).await;
-        Ok(edit_result(path, &content, &updated).into())
+        crate::tools::lsp::sync_after_edit(&ctx.lsp, &written[0]);
+        Ok(result)
     }
 
     fn preview(&self, input: &Value, ctx: &ToolContext) -> Option<String> {
@@ -244,11 +245,12 @@ impl Tool for MultiEditTool {
             }],
         )
         .await?;
+        let result = edit_result(path, &original, &content).into();
         let written = batch.commit()?;
         ctx.files
             .record_content(&written[0].to_string_lossy(), &content, fully_known);
-        crate::tools::lsp::sync_after_edit(&ctx.lsp, &written[0], &content).await;
-        Ok(edit_result(path, &original, &content).into())
+        crate::tools::lsp::sync_after_edit(&ctx.lsp, &written[0]);
+        Ok(result)
     }
 
     fn preview(&self, input: &Value, ctx: &ToolContext) -> Option<String> {

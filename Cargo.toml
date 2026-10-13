@@ -14,7 +14,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 futures = "0.3"
-async-trait = "0.1"
+async-trait = "0.1.92"
 regex = "1"
 glob = "0.3"
 dirs = "5"

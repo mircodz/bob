@@ -484,7 +484,7 @@ fn finalize(
             } else {
                 tool_json[i].clone()
             };
-            *input = crate::providers::codec::complete_tool_input(id, name, &raw)?;
+            *input = crate::providers::codec::complete_tool_input(id, name, &raw, &[])?;
         }
     }
     let content: Vec<ContentBlock> = blocks.iter().flatten().cloned().collect();

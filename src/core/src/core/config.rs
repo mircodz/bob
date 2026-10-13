@@ -104,6 +104,8 @@ pub struct BobConfig {
     /// TUI color theme (e.g. "dark", "light", "catppuccin"). Unknown → dark.
     #[serde(default)]
     pub theme: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bash_executable: Option<std::path::PathBuf>,
     pub permissions: PermissionsConfig,
     #[serde(default)]
     pub provider_timeouts: ProviderTimeoutsConfig,
@@ -122,6 +124,7 @@ impl Default for BobConfig {
             system: None,
             max_turns: Some(crate::agent::agent::DEFAULT_MAX_TURNS),
             theme: None,
+            bash_executable: None,
             permissions: PermissionsConfig {
                 default: "ask".to_string(),
                 allow_bash: [
@@ -151,6 +154,7 @@ struct PartialConfig {
     system: Option<String>,
     max_turns: Option<u32>,
     theme: Option<String>,
+    bash_executable: Option<std::path::PathBuf>,
     permissions: Option<PartialPermissions>,
     provider_timeouts: Option<PartialProviderTimeouts>,
     mcp_servers: Option<Vec<PartialMcpServer>>,
@@ -368,6 +372,7 @@ fn merge(mut base: BobConfig, over: PartialConfig) -> BobConfig {
         system: over.system.or(base.system),
         max_turns: over.max_turns.or(base.max_turns),
         theme: over.theme.or(base.theme),
+        bash_executable: over.bash_executable.or(base.bash_executable),
         permissions: base.permissions,
         provider_timeouts: base.provider_timeouts,
         mcp_servers: base.mcp_servers,
@@ -1441,6 +1446,43 @@ mod tests {
             replace_named_server(&mut invalid, "mcp_servers", "same", replacement).unwrap_err();
         assert_eq!(error.to_string(), "mcp_servers must be an array of tables");
         assert_eq!(invalid.to_string(), before);
+    }
+
+    #[test]
+    fn bash_executable_inherits_global_and_nearest_project_override() {
+        let root = TestDir::new();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("nested/deep")).unwrap();
+        let global_path = root.join("global Git/bin/bash.exe");
+        let project_path = root.join("project Git 終/bin/bash.exe");
+        let global = merge(
+            BobConfig::default(),
+            toml::from_str(&format!("bash_executable = '{}'", global_path.display())).unwrap(),
+        );
+        let cwd = root.join("nested/deep");
+        assert_eq!(
+            load_project_config(global.clone(), &cwd)
+                .unwrap()
+                .bash_executable,
+            Some(global_path),
+        );
+        std::fs::write(
+            root.join(".bob.config.toml"),
+            format!("bash_executable = '{}'", project_path.display()),
+        )
+        .unwrap();
+        std::fs::write(root.join("nested/.bob.config.toml"), "model = 'nearest'").unwrap();
+        let config = load_project_config(global.clone(), &cwd).unwrap();
+        assert_eq!(config.bash_executable, Some(project_path));
+        assert_eq!(config.model, "nearest");
+        std::fs::write(
+            root.join("nested/.bob.config.toml"),
+            "bash_executable = 'relative/bash'",
+        )
+        .unwrap();
+        let config = load_project_config(global, &cwd).unwrap();
+        let shell = crate::core::shell::BashShell::resolve(&cwd, config.bash_executable.as_deref());
+        assert!(shell.executable().unwrap_err().contains("must be absolute"));
     }
 
     #[test]

@@ -5,7 +5,6 @@ use crate::agent::team::{mailbox, AgentRegistry, AgentStatus, MAX_TEAM_SIZE};
 use crate::core::events::{AgentEvent, EventBus};
 use crate::providers::provider::Provider;
 use crate::tools::registry::ToolRegistry;
-use futures::FutureExt;
 use serde::Serialize;
 use serde_json::Value;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -351,6 +350,7 @@ pub async fn agent(ctx: &WorkflowContext, spec: AgentSpec) -> AgentOutcome {
         memory: ctx.memory.clone(),
     });
 
+    let child_cancel = child.cancel_handle();
     let work = async {
         match spec.schema.clone() {
             Some(schema) => child.run_structured(&spec.prompt, schema).await,
@@ -360,9 +360,9 @@ pub async fn agent(ctx: &WorkflowContext, spec: AgentSpec) -> AgentOutcome {
                 .map(|text| serde_json::json!({ "text": text })),
         }
     };
-    let outcome = std::panic::AssertUnwindSafe(handle.run_until_stopped(ctx.cancel.clone(), work))
-        .catch_unwind()
-        .await;
+    let outcome =
+        crate::core::panic::catch(handle.run_until_stopped(ctx.cancel.clone(), child_cancel, work))
+            .await;
     let mutations_settled = child.settle_owned_mutations().await;
     let (mut output, mut error, cancelled) = match outcome {
         Ok(Some(Ok(output))) => (Some(output), None, child.is_cancelled()),

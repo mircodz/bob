@@ -173,6 +173,7 @@ impl Tool for SpawnAgentTool {
         let parent_cancel = self.deps.env.parent_cancel.clone();
         tokio::spawn(async move {
             let mut child = child;
+            let child_cancel = child.cancel_handle();
             let driver = async {
                 let mut remaining = child.turn_budget();
                 let mut result = child.run_with_budget(&task, remaining).await?;
@@ -196,20 +197,30 @@ impl Tool for SpawnAgentTool {
                         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     }
                 }
-                Ok::<_, anyhow::Error>(result.text)
+                result.into_completed_text()
             };
-            let outcome = handle.run_until_stopped(parent_cancel, driver).await;
+            let outcome = crate::core::panic::catch(handle.run_until_stopped(
+                parent_cancel,
+                child_cancel,
+                driver,
+            ))
+            .await;
             if !child.settle_owned_mutations().await {
                 child.bus().emit(crate::core::events::AgentEvent::Error {
                     agent_id: child.id.clone(),
                     message: "memory mutation cleanup timed out; changes may still complete".into(),
                 });
             }
-            let cancelled = outcome.is_none() || child.is_cancelled();
+            let cancelled = matches!(outcome, Ok(None)) || child.is_cancelled();
             let (failed, result) = match outcome {
-                Some(Ok(out)) => (child.turn_limit_summary().is_some(), out),
-                Some(Err(e)) => (true, format!("error: {e}")),
-                None => (false, "[cancelled]".into()),
+                Ok(Some(Ok(out))) => (false, out),
+                Ok(Some(Err(e))) => (true, format!("error: {e}")),
+                Ok(None) => (false, "[cancelled]".into()),
+                Err(_) => (
+                    true,
+                    "error: agent panicked; outcome unknown, inspect changes before retrying"
+                        .into(),
+                ),
             };
             lifecycle.finish_with_output(failed && !cancelled, cancelled, &result);
         });

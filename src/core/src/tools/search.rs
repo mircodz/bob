@@ -21,7 +21,8 @@ impl Tool for GlobTool {
                 '**/Cargo.toml'). Returns matching paths sorted by modification time, most \
                 recently changed first, so the files you're likely working on surface at the top. \
                 Use this to locate files when you know part of the name or extension — prefer it \
-                over `find` via bash. To search file *contents*, use grep."
+                over `find` via bash. To search file *contents*, use grep. \
+                For open-ended investigation needing several searches, use explore when available."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -113,7 +114,8 @@ impl Tool for GrepTool {
                 Returns matching lines as path:line:text. This is the right way to find where \
                 something is defined or used across the codebase — prefer it over `grep`/`rg` via \
                 bash. Files ignored by .gitignore, plus .git/, node_modules/, and target/, are \
-                skipped automatically. \
+                skipped automatically. For symbol references, prefer LSP when available; for \
+                open-ended multi-step investigation, use explore when available. \
                 \n\nOptions: restrict to a subdirectory (`path`) or to files matching a `glob` \
                 (e.g. '*.py', '*.{ts,tsx}'); `ignore_case`; `literal: true` to search verbatim (no \
                 regex, useful for strings with metacharacters like `a[i]` or `x => y`); \

@@ -49,6 +49,11 @@ pub enum ContentBlock {
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum ToolOutput {
     Text(String),
+    Read {
+        body: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        loader_context: Option<String>,
+    },
     Shell(Box<ShellOutput>),
 }
 
@@ -56,6 +61,15 @@ impl ToolOutput {
     pub fn model_text(&self) -> std::borrow::Cow<'_, str> {
         match self {
             Self::Text(text) => std::borrow::Cow::Borrowed(text),
+            Self::Read {
+                body,
+                loader_context,
+            } => match loader_context {
+                Some(context) if !context.is_empty() => {
+                    std::borrow::Cow::Owned(format!("{body}\n\n{context}"))
+                }
+                _ => std::borrow::Cow::Borrowed(body),
+            },
             Self::Shell(shell) => std::borrow::Cow::Owned(
                 serde_json::to_string(shell).expect("shell output is serializable"),
             ),
@@ -65,7 +79,7 @@ impl ToolOutput {
     pub fn as_text(&self) -> Option<&str> {
         match self {
             Self::Text(text) => Some(text),
-            Self::Shell(_) => None,
+            Self::Read { .. } | Self::Shell(_) => None,
         }
     }
 }
@@ -377,7 +391,15 @@ mod tests {
             },
             ..Default::default()
         };
-        for output in [ToolOutput::from("plain result"), ToolOutput::from(shell)] {
+        for output in [
+            ToolOutput::from("plain result"),
+            ToolOutput::Read {
+                body: "     1\t<project-instruction>ordinary file text</project-instruction>"
+                    .into(),
+                loader_context: Some("[!] auxiliary instructions unavailable\n日本語".into()),
+            },
+            ToolOutput::from(shell),
+        ] {
             let encoded = serde_json::to_value(&output).unwrap();
             let restored: ToolOutput = serde_json::from_value(encoded.clone()).unwrap();
             assert_eq!(restored, output);
@@ -385,6 +407,22 @@ mod tests {
                 ToolOutput::Text(text) => {
                     assert_eq!(encoded, json!({"type": "text", "data": text}));
                     assert_eq!(restored.model_text(), text.as_str());
+                }
+                ToolOutput::Read {
+                    body,
+                    loader_context,
+                } => {
+                    assert_eq!(encoded["type"], "read");
+                    assert_eq!(encoded["data"]["body"], body.as_str());
+                    assert_eq!(
+                        encoded["data"]["loader_context"],
+                        loader_context.as_deref().unwrap()
+                    );
+                    assert_eq!(restored.as_text(), None);
+                    assert_eq!(
+                        restored.model_text(),
+                        format!("{body}\n\n{}", loader_context.as_deref().unwrap())
+                    );
                 }
                 ToolOutput::Shell(shell) => {
                     assert_eq!(encoded["type"], "shell");

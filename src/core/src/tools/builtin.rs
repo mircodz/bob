@@ -1,6 +1,6 @@
-use crate::core::types::ToolSpec;
+use crate::core::types::{ToolOutput, ToolSpec};
 use crate::tools::filesystem::{self, WriteRequest, MAX_OUTPUT_BYTES};
-use crate::tools::registry::{Tool, ToolContext, ToolError, ToolResult};
+use crate::tools::registry::{Tool, ToolContext, ToolError, ToolErrorKind, ToolResult};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -58,9 +58,25 @@ impl Tool for ReadFileTool {
             ));
         }
         let full = filesystem::workspace_path(&ctx.cwd, Path::new(path))?;
-        let text = filesystem::read_regular(&full)?;
-        let instructions =
-            crate::core::project_context::scoped_read_instructions(Path::new(&ctx.cwd), &full)?;
+        let text = filesystem::read_regular(&full).map_err(|error| {
+            if error.kind == ToolErrorKind::NotFound {
+                ToolError::not_found(format!(
+                    "File not found: {}. Use glob to locate candidate paths, or grep for the requested symbol or text if the file may have moved. A filename-only search cannot establish that the source is absent.",
+                    full.display()
+                ))
+            } else {
+                error
+            }
+        })?;
+        let loader_context = match crate::core::project_context::scoped_read_instructions(
+            Path::new(&ctx.cwd),
+            &full,
+        ) {
+            Ok(instructions) => (!instructions.is_empty()).then_some(instructions),
+            Err(error) => Some(format!(
+                "[!] Auxiliary project instructions could not be loaded: {error}. The requested file body is available; applicable instructions may be missing."
+            )),
+        };
         let start = offset - 1;
         let mut out = String::new();
         let mut visible = Vec::new();
@@ -143,11 +159,10 @@ impl Tool for ReadFileTool {
             ctx.files
                 .record_visible(&full.to_string_lossy(), &text, visible);
         }
-        if !instructions.is_empty() {
-            out.push_str("\n\n");
-            out.push_str(&instructions);
-        }
-        Ok(out.into())
+        Ok(ToolOutput::Read {
+            body: out,
+            loader_context,
+        })
     }
 }
 
@@ -204,11 +219,12 @@ impl Tool for WriteFileTool {
             }],
         )
         .await?;
+        let output = format!("wrote {} bytes to {}", content.len(), path).into();
         let written = batch.commit()?;
         ctx.files
             .record_content(&written[0].to_string_lossy(), content, true);
-        crate::tools::lsp::sync_after_edit(&ctx.lsp, &written[0], content).await;
-        Ok(format!("wrote {} bytes to {}", content.len(), path).into())
+        crate::tools::lsp::sync_after_edit(&ctx.lsp, &written[0]);
+        Ok(output)
     }
 
     fn preview(&self, input: &Value, ctx: &ToolContext) -> Option<String> {
@@ -318,15 +334,72 @@ mod tests {
             .execute(json!({"path":"log"}), &fixture.ctx)
             .await
             .unwrap();
-        assert!(result
-            .as_text()
-            .unwrap()
-            .contains("error: mismatched types"));
+        assert!(result.model_text().contains("error: mismatched types"));
         let error = ReadFileTool
             .execute(json!({"path":"missing"}), &fixture.ctx)
             .await
             .unwrap_err();
         assert_eq!(error.kind, ToolErrorKind::NotFound);
+    }
+
+    #[tokio::test]
+    async fn auxiliary_instruction_errors_preserve_the_read_and_recover_on_reread() {
+        for invalid in [vec![0xff, 0xfe], vec![b'x'; 64 * 1024 + 1]] {
+            let fixture = Fixture::new();
+            std::fs::create_dir(fixture.dir.join(".git")).unwrap();
+            let path = fixture.write("file.rs", "fn main() {}\n");
+            let instructions = fixture.dir.join("AGENTS.md");
+            std::fs::write(&instructions, invalid).unwrap();
+            let output = ReadFileTool
+                .execute(json!({"path":"file.rs"}), &fixture.ctx)
+                .await
+                .unwrap();
+            let ToolOutput::Read {
+                body,
+                loader_context,
+            } = &output
+            else {
+                panic!("read output lost its typed context");
+            };
+            assert_eq!(body, "     1\tfn main() {}");
+            let warning = loader_context.as_ref().unwrap();
+            assert!(warning.starts_with("[!] Auxiliary project instructions could not be loaded:"));
+            assert!(warning.contains("AGENTS.md"));
+            assert!(warning.contains("applicable instructions may be missing"));
+            assert!(fixture
+                .ctx
+                .files
+                .fully_read(&path.to_string_lossy(), "fn main() {}\n"));
+            assert_eq!(
+                ReadFileTool
+                    .execute(json!({"path":"missing"}), &fixture.ctx)
+                    .await
+                    .unwrap_err()
+                    .kind,
+                ToolErrorKind::NotFound,
+            );
+            std::fs::write(fixture.dir.join("invalid.rs"), [0xff]).unwrap();
+            assert!(ReadFileTool
+                .execute(json!({"path":"invalid.rs"}), &fixture.ctx)
+                .await
+                .is_err());
+
+            std::fs::write(&instructions, "Use scoped rules.").unwrap();
+            let recovered = ReadFileTool
+                .execute(json!({"path":"file.rs"}), &fixture.ctx)
+                .await
+                .unwrap();
+            let ToolOutput::Read {
+                body: recovered_body,
+                loader_context: Some(context),
+            } = recovered
+            else {
+                panic!("expected recovered instructions");
+            };
+            assert_eq!(&recovered_body, body);
+            assert!(context.contains("Use scoped rules."));
+            assert!(context.ends_with("</project-instruction>"));
+        }
     }
 
     #[tokio::test]
@@ -389,7 +462,7 @@ mod tests {
             .execute(json!({"path":"long"}), &fixture.ctx)
             .await
             .unwrap();
-        assert!(output.as_text().unwrap().contains("line truncated"));
+        assert!(output.model_text().contains("line truncated"));
         assert!(WriteFileTool
             .execute(json!({"path":"long","content":"new"}), &fixture.ctx)
             .await
@@ -399,7 +472,7 @@ mod tests {
             .execute(json!({"path":"many","limit":999999}), &fixture.ctx)
             .await
             .unwrap();
-        assert!(output.as_text().unwrap().contains("output truncated"));
+        assert!(output.model_text().contains("output truncated"));
         assert!(WriteFileTool
             .execute(json!({"path":"many","content":"new"}), &fixture.ctx)
             .await
@@ -448,10 +521,9 @@ mod tests {
                 .await
                 .unwrap();
             assert!(first
-                .as_text()
-                .unwrap()
+                .model_text()
                 .contains("offset=1 and column_offset=2001"));
-            assert!(!first.as_text().unwrap().contains("ax"));
+            assert!(!first.model_text().contains("ax"));
             assert!(WriteFileTool
                 .execute(write.clone(), &fixture.ctx)
                 .await
@@ -463,8 +535,8 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(last.as_text().unwrap().lines().next().unwrap(), "     1\tx");
-            assert!(!last.as_text().unwrap().contains("line truncated"));
+            assert_eq!(last.model_text().lines().next().unwrap(), "     1\tx");
+            assert!(!last.model_text().contains("line truncated"));
             WriteFileTool.execute(write, &fixture.ctx).await.unwrap();
         }
     }
@@ -478,11 +550,8 @@ mod tests {
             .execute(json!({"path":"long","column_offset":4001}), &fixture.ctx)
             .await
             .unwrap();
-        assert_eq!(
-            tail.as_text().unwrap().lines().next().unwrap(),
-            "     1\t終"
-        );
-        assert!(tail.as_text().unwrap().contains("     2\tnext"));
+        assert_eq!(tail.model_text().lines().next().unwrap(), "     1\t終");
+        assert!(tail.model_text().contains("     2\tnext"));
         assert!(WriteFileTool
             .execute(write.clone(), &fixture.ctx)
             .await
@@ -492,10 +561,9 @@ mod tests {
             .await
             .unwrap();
         assert!(first
-            .as_text()
-            .unwrap()
+            .model_text()
             .contains(&format!("{}... [line truncated", "é🙂".repeat(1000))));
-        assert!(first.as_text().unwrap().contains("column_offset=2001"));
+        assert!(first.model_text().contains("column_offset=2001"));
         assert!(WriteFileTool
             .execute(write.clone(), &fixture.ctx)
             .await
@@ -508,10 +576,9 @@ mod tests {
             .await
             .unwrap();
         assert!(middle
-            .as_text()
-            .unwrap()
+            .model_text()
             .contains(&format!("{}... [line truncated", "é🙂".repeat(1000))));
-        assert!(middle.as_text().unwrap().contains("column_offset=4001"));
+        assert!(middle.model_text().contains("column_offset=4001"));
         WriteFileTool.execute(write, &fixture.ctx).await.unwrap();
     }
 
@@ -555,12 +622,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            output
-                .as_text()
-                .unwrap()
-                .lines()
-                .take(2)
-                .collect::<Vec<_>>(),
+            output.model_text().lines().take(2).collect::<Vec<_>>(),
             ["     1\t\u{301}🙂終", "     2\tnext"]
         );
         assert!(!fixture
@@ -574,7 +636,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(output.as_text().unwrap().lines().next(), Some("     1\t"));
+        assert_eq!(output.model_text().lines().next(), Some("     1\t"));
         assert!(!fixture
             .ctx
             .files
@@ -601,18 +663,16 @@ mod tests {
             .unwrap();
         assert_eq!(
             output
-                .as_text()
-                .unwrap()
+                .model_text()
                 .lines()
                 .filter(|line| line.contains('\t'))
                 .count(),
             130
         );
         assert!(output
-            .as_text()
-            .unwrap()
+            .model_text()
             .contains("use offset=131 and limit to read further"));
-        assert!(!output.as_text().unwrap().contains("line truncated"));
+        assert!(!output.model_text().contains("line truncated"));
         assert!(!fixture
             .ctx
             .files
@@ -622,14 +682,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            tail.as_text()
-                .unwrap()
+            tail.model_text()
                 .lines()
                 .filter(|line| line.contains('\t'))
                 .count(),
             2
         );
-        assert!(!tail.as_text().unwrap().contains("truncated"));
+        assert!(!tail.model_text().contains("truncated"));
         assert!(fixture
             .ctx
             .files
@@ -735,12 +794,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            output
-                .as_text()
-                .unwrap()
-                .lines()
-                .take(2)
-                .collect::<Vec<_>>(),
+            output.model_text().lines().take(2).collect::<Vec<_>>(),
             ["     1\text", "     2\tnext"]
         );
         assert!(WriteFileTool

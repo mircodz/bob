@@ -3093,12 +3093,18 @@ mod tests {
                     assert!(app.running);
                     app.apply_agent_event(&event);
                 }
-                assert_eq!(app.turn_done_rx.try_recv().unwrap(), None);
+                assert_eq!(
+                    app.turn_done_rx.try_recv().unwrap(),
+                    TurnCompletion::default()
+                );
                 assert!(app.turn_done_rx.try_recv().is_err());
                 assert!(app.compaction_completion.is_none());
                 let next = app.view.begin_compaction();
                 app.finish_compaction(next, Ok((false, 100, 100)));
-                assert_eq!(app.turn_done_rx.try_recv().unwrap(), None);
+                assert_eq!(
+                    app.turn_done_rx.try_recv().unwrap(),
+                    TurnCompletion::default()
+                );
                 assert!(!app
                     .view
                     .cells

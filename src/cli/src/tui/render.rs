@@ -313,6 +313,7 @@ struct PreparedTool {
     command: Option<Vec<Line<'static>>>,
     exit_status: Option<String>,
     output_refs: Vec<String>,
+    loader_context: Option<String>,
     shell: bool,
     output: PreparedOutput,
 }
@@ -396,12 +397,21 @@ impl PreparedCell {
                     None
                 };
                 let text_output = output.as_ref().and_then(ToolOutput::as_text);
+                let loader_context = match output {
+                    Some(ToolOutput::Read { loader_context, .. }) if expanded => loader_context
+                        .as_deref()
+                        .map(|text| safe_display_text(text).into_owned()),
+                    _ => None,
+                };
                 let shell = name == "bash" || matches!(output, Some(ToolOutput::Shell(_)));
                 let (exit_status, body) = match output {
                     Some(ToolOutput::Shell(shell)) => (
                         shell_status(shell),
                         Some(Cow::Owned(shell_display_text(shell))),
                     ),
+                    Some(ToolOutput::Read { body, .. }) => {
+                        (None, Some(Cow::Borrowed(body.as_str())))
+                    }
                     _ => (None, text_output.map(Cow::Borrowed)),
                 };
                 let output_refs = match output {
@@ -461,6 +471,7 @@ impl PreparedCell {
                         command,
                         exit_status,
                         output_refs,
+                        loader_context,
                         shell,
                         output,
                     }),
@@ -819,6 +830,23 @@ fn render_tool(
         for row in wrap_plain(reference, width.saturating_sub(8).max(1)) {
             out.push(Line::from(Span::styled(
                 format!("    {row}"),
+                Style::default().fg(Palette::FAINT()),
+            )));
+        }
+    }
+
+    if let Some(context) = &prepared.loader_context {
+        let rows = wrap_plain_limited(context, width.saturating_sub(8).max(1), EXPANDED_MAX + 1);
+        let clipped = rows.len() > EXPANDED_MAX;
+        for row in rows.into_iter().take(EXPANDED_MAX) {
+            out.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled(row, Style::default().fg(Palette::FAINT())),
+            ]));
+        }
+        if clipped {
+            out.push(Line::from(Span::styled(
+                "    … loader context display truncated",
                 Style::default().fg(Palette::FAINT()),
             )));
         }
@@ -1274,6 +1302,62 @@ mod tests {
                 .to_string()
                 .contains("final diagnostic"));
         }
+    }
+
+    #[test]
+    fn expanded_reads_keep_context_visible_independently_of_body_clipping_and_cache() {
+        let mut cell = Cell::Tool {
+            id: "read".into(),
+            name: "read_file".into(),
+            input: json!({"path":"file.rs"}),
+            status: ToolStatus::Ok,
+            output: Some(ToolOutput::Read {
+                body: "     1\tfile text\n".repeat(600),
+                loader_context: Some(
+                    "[!] Instructions omitted; recover with job_output output_7".into(),
+                ),
+            }),
+            expanded: true,
+        };
+        let rendered = |cell: &Cell| {
+            let mut lines = Vec::new();
+            render_cell(cell, 100, &mut lines);
+            lines
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let text = rendered(&cell);
+        assert!(text.contains("file text"));
+        assert!(text.contains("[!] Instructions omitted; recover with job_output output_7"));
+        assert!(text.contains("more lines"));
+        let before = cell.fingerprint();
+        if let Cell::Tool {
+            output: Some(ToolOutput::Read { loader_context, .. }),
+            ..
+        } = &mut cell
+        {
+            *loader_context =
+                Some("<project-instruction>\nscoped rules\n</project-instruction>".into());
+        }
+        assert_ne!(cell.fingerprint(), before);
+        let text = rendered(&cell);
+        assert!(text.contains("scoped rules"));
+        assert!(text.contains("</project-instruction>"));
+        let before = cell.fingerprint();
+        if let Cell::Tool {
+            output: Some(ToolOutput::Read { body, .. }),
+            ..
+        } = &mut cell
+        {
+            *body = "     1\tupdated body".into();
+        }
+        assert_ne!(cell.fingerprint(), before);
+        assert!(rendered(&cell).contains("updated body"));
+        let mut compact = Vec::new();
+        PreparedCell::compact_tool(&cell).render(&cell, 100, &mut compact);
+        assert_eq!(compact.len(), 1);
     }
 
     #[test]

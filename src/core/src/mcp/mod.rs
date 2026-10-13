@@ -87,11 +87,12 @@ impl McpClient {
         Ok(out)
     }
 
-    async fn call_tool(&self, name: &str, args: Value) -> anyhow::Result<String> {
+    async fn call_tool(&self, name: &str, args: Value) -> ToolResult {
         let result = self
             .transport
             .request("tools/call", json!({ "name": name, "arguments": args }))
-            .await?;
+            .await
+            .map_err(|error| ToolError::failed(error.to_string()))?;
         let parts = result
             .get("content")
             .and_then(|c| c.as_array())
@@ -110,9 +111,15 @@ impl McpClient {
             .and_then(|v| v.as_bool())
             .unwrap_or(false)
         {
-            Ok(format!("error: {}", text))
+            if text.is_empty() {
+                Err(ToolError::failed(
+                    "MCP server reported a tool error without content",
+                ))
+            } else {
+                Err(ToolError::failed("MCP server reported a tool error").with_output(text))
+            }
         } else {
-            Ok(text)
+            Ok(text.into())
         }
     }
 }
@@ -131,11 +138,7 @@ impl Tool for McpTool {
     }
 
     async fn execute(&self, input: Value, _ctx: &ToolContext) -> ToolResult {
-        self.client
-            .call_tool(&self.raw_name, input)
-            .await
-            .map(Into::into)
-            .map_err(|e| ToolError::failed(e.to_string()))
+        self.client.call_tool(&self.raw_name, input).await
     }
 }
 
@@ -267,10 +270,111 @@ mod tests {
             ]})),
         }]);
         assert_eq!(
-            client.call_tool("inspect", json!({})).await.unwrap(),
+            client
+                .call_tool("inspect", json!({}))
+                .await
+                .unwrap()
+                .model_text(),
             format!("first\nsecond\n{image}\n\n{resource}\nlast")
         );
         assert!(transport.0.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn application_errors_preserve_content_and_failure_status() {
+        let resource =
+            json!({"type":"resource","resource":{"uri":"file:///fixture.rs","text":"details"}});
+        for error_flag in [Some(true), Some(false), None] {
+            let mut reply = json!({"content":[{"type":"text","text":"server feedback"}, resource]});
+            if let Some(value) = error_flag {
+                reply["isError"] = json!(value);
+            }
+            let (client, transport) = scripted_client(vec![ExpectedRequest {
+                method: "tools/call",
+                params: json!({"name":"run","arguments":{}}),
+                reply: Ok(reply),
+            }]);
+            let tool = McpTool {
+                client,
+                raw_name: "run".into(),
+                spec: ToolSpec {
+                    name: "fixture_run".into(),
+                    description: String::new(),
+                    input_schema: json!({"type":"object"}),
+                },
+            };
+            let ctx = crate::test_support::files::tool_context(std::path::Path::new("."));
+            let result = tool.execute(json!({}), &ctx).await;
+            assert_eq!(result.is_err(), error_flag == Some(true));
+            let output = result.unwrap_or_else(ToolError::into_output);
+            assert_eq!(output.model_text(), format!("server feedback\n{resource}"));
+            assert!(transport.0.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn application_error_reaches_events_and_the_next_model_request() {
+        use crate::agent::agent::Agent;
+        use crate::core::events::AgentEvent;
+        use crate::core::types::ContentBlock;
+        use crate::test_support::agent::{config, text, tool, ScriptProvider, Step};
+
+        let (client, _) = scripted_client(vec![ExpectedRequest {
+            method: "tools/call",
+            params: json!({"name":"run","arguments":{}}),
+            reply: Ok(
+                json!({"isError":true,"content":[{"type":"text","text":"permission missing on server"}]}),
+            ),
+        }]);
+        let provider = Arc::new(ScriptProvider::new(vec![
+            Step::Complete(vec![tool("call-1", "fixture_run")]),
+            Step::Complete(vec![text("The server rejected the operation.")]),
+        ]));
+        let mut cfg = config(provider.clone());
+        cfg.tools.add(Arc::new(McpTool {
+            client,
+            raw_name: "run".into(),
+            spec: ToolSpec {
+                name: "fixture_run".into(),
+                description: String::new(),
+                input_schema: json!({"type":"object"}),
+            },
+        }));
+        let results = Arc::new(Mutex::new(Vec::new()));
+        let captured = results.clone();
+        cfg.bus.on(Arc::new(move |event| {
+            if let AgentEvent::ToolResult {
+                output, is_error, ..
+            } = event
+            {
+                captured
+                    .lock()
+                    .unwrap()
+                    .push((output.model_text().into_owned(), *is_error));
+            }
+        }));
+        Agent::new(cfg).run("Run the operation").await.unwrap();
+        assert_eq!(
+            *results.lock().unwrap(),
+            vec![("permission missing on server".into(), true)]
+        );
+        let requests = provider.requests.lock().unwrap();
+        assert!(requests[1].iter().flat_map(|message| &message.content).any(|block| {
+            matches!(block, ContentBlock::ToolResult { tool_use_id, content, is_error: Some(true) }
+                if tool_use_id == "call-1" && content.model_text() == "permission missing on server")
+        }));
+        provider.assert_exhausted();
+    }
+
+    #[tokio::test]
+    async fn empty_application_error_is_not_an_empty_success() {
+        let (client, _) = scripted_client(vec![ExpectedRequest {
+            method: "tools/call",
+            params: json!({"name":"run","arguments":{}}),
+            reply: Ok(json!({"isError":true,"content":[]})),
+        }]);
+        let error = client.call_tool("run", json!({})).await.unwrap_err();
+        assert!(error.into_output().model_text().contains("without content"));
     }
 
     #[tokio::test]

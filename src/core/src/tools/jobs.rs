@@ -1,7 +1,6 @@
 use crate::core::types::{ShellOutcome, ShellOutput, ShellPage, ShellStream, ToolOutput, ToolSpec};
 use crate::tools::registry::{Tool, ToolContext, ToolError, ToolResult, SHELL_STREAM_TEXT_LIMIT};
 use async_trait::async_trait;
-use futures::FutureExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
@@ -99,6 +98,10 @@ fn retain_job_output(output: ToolOutput) -> (ToolOutput, usize) {
     match output {
         ToolOutput::Text(text) => {
             let retained = retain_text(text, JOB_OUTPUT_LIMIT);
+            (retained.text.into(), retained.total_bytes)
+        }
+        output @ ToolOutput::Read { .. } => {
+            let retained = retain_text(output.model_text().into_owned(), JOB_OUTPUT_LIMIT);
             (retained.text.into(), retained.total_bytes)
         }
         ToolOutput::Shell(mut shell) => {
@@ -381,8 +384,11 @@ impl JobRegistry {
             }
             mutations.retain(|mutation| !mutation.handle.is_finished());
             let handle = tokio::task::spawn_blocking(move || {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
-                    .unwrap_or_else(|_| Err(ToolError::failed("blocking mutation panicked")));
+                let result = crate::core::panic::catch_sync(work)
+                    .unwrap_or_else(|_| Err(ToolError::new(
+                        crate::tools::registry::ToolErrorKind::Panic,
+                        "blocking mutation panicked; outcome unknown, changes may have taken effect; inspect state before retrying",
+                    )));
                 let _ = sender.send(result);
             });
             let abort = AbortQueued(handle.abort_handle());
@@ -534,8 +540,7 @@ impl JobRegistry {
         let registry = self.clone();
         let job_id = id.clone();
         let handle = tokio::spawn(async move {
-            let (status, result) = std::panic::AssertUnwindSafe(work)
-                .catch_unwind()
+            let (status, result) = crate::core::panic::catch(work)
                 .await
                 .map(|(status, result)| (status, result.into()))
                 .unwrap_or_else(|_| (JobStatus::Failed, "background job panicked".into()));
@@ -799,11 +804,24 @@ impl JobRegistry {
     }
 
     pub fn retain_output(&self, content: String) -> String {
+        self.insert_artifact(retain_text(content, ARTIFACT_LIMIT))
+    }
+
+    pub(crate) fn retain_complete_output(&self, content: String) -> Option<String> {
+        if content.len() > ARTIFACT_BUDGET {
+            return None;
+        }
+        Some(self.insert_artifact(RetainedOutput {
+            total_bytes: content.len(),
+            text: content,
+        }))
+    }
+
+    fn insert_artifact(&self, retained: RetainedOutput) -> String {
         let id = format!(
             "output_{}",
             self.counter.fetch_add(1, Ordering::Relaxed) + 1
         );
-        let retained = retain_text(content, ARTIFACT_LIMIT);
         let mut artifacts = self.artifacts.lock().unwrap();
         while artifacts.bytes + retained.text.len() > ARTIFACT_BUDGET
             || artifacts.entries.len() >= 128
@@ -833,6 +851,13 @@ impl JobRegistry {
         let job = jobs.get(id)?;
         let output = match &job.output {
             ToolOutput::Text(text) => page(job.status, text, job.total_bytes, offset, limit),
+            output @ ToolOutput::Read { .. } => page(
+                job.status,
+                &output.model_text(),
+                job.total_bytes,
+                offset,
+                limit,
+            ),
             ToolOutput::Shell(shell) => shell_page(id, job.status, shell, offset, limit),
         };
         if job.status != JobStatus::Running && output.next_offset.is_none() {
@@ -2057,6 +2082,33 @@ mod tests {
             assert!(jobs.output_page("output_90", 0, 100).is_none());
             assert!(jobs.is_settled());
             assert!(jobs.output_page("output_91", 0, 100).is_some());
+        }
+
+        #[test]
+        fn complete_attachments_respect_shared_retention_budget_without_partial_storage() {
+            let jobs = JobRegistry::new();
+            let small = jobs.retain_output("earlier output".into());
+            assert!(jobs
+                .retain_complete_output("x".repeat(ARTIFACT_BUDGET + 1))
+                .is_none());
+            assert_eq!(
+                jobs.output_page(&small, 0, 100).unwrap().text,
+                "earlier output"
+            );
+            let complete = jobs
+                .retain_complete_output("界".repeat(ARTIFACT_BUDGET / 3))
+                .unwrap();
+            assert!(jobs.output_page(&small, 0, 100).is_none());
+            let page = jobs.output_page(&complete, 0, 100).unwrap();
+            assert!(!page.truncated);
+            assert_eq!(page.retained_bytes, ARTIFACT_BUDGET / 3 * 3);
+            let newest = jobs.retain_output("new output".into());
+            assert!(jobs.output_page(&complete, 0, 100).is_none());
+            assert_eq!(
+                jobs.output_page(&newest, 0, 100).unwrap().text,
+                "new output"
+            );
+            assert!(jobs.artifacts.lock().unwrap().bytes <= ARTIFACT_BUDGET);
         }
 
         #[test]

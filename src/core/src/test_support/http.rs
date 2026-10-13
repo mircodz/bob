@@ -53,8 +53,15 @@ pub(crate) async fn serve(body: &str, hold_open: bool) -> (String, tokio::task::
 }
 
 pub(crate) async fn collect(provider: Arc<dyn Provider>) -> Vec<StreamEvent> {
+    collect_with_options(provider, GenerateOptions::default()).await
+}
+
+pub(crate) async fn collect_with_options(
+    provider: Arc<dyn Provider>,
+    options: GenerateOptions,
+) -> Vec<StreamEvent> {
     tokio::time::timeout(Duration::from_secs(3), async {
-        let mut rx = provider.stream(GenerateOptions::default()).await.unwrap();
+        let mut rx = provider.stream(options).await.unwrap();
         let mut events = Vec::new();
         while let Some(event) = rx.recv().await {
             events.push(event);

@@ -1,14 +1,14 @@
 use crate::agent::agent::{
-    build_subagent, SubagentSpec, EXPLORE_MAX_TURNS, ROOT_AGENT_ID, SUBAGENT_MAX_TURNS,
+    build_subagent, RunStopReason, RunStopped, SubagentSpec, EXPLORE_MAX_TURNS, ROOT_AGENT_ID,
+    SUBAGENT_MAX_TURNS,
 };
 use crate::agent::env::AgentEnv;
 use crate::agent::lifecycle::SubagentLifecycle;
 use crate::agent::team::{mailbox, AgentStatus};
 use crate::core::types::ToolSpec;
 use crate::tools::jobs::JobStatus;
-use crate::tools::registry::{Tool, ToolContext, ToolError, ToolResult};
+use crate::tools::registry::{Tool, ToolContext, ToolError, ToolErrorKind, ToolResult};
 use async_trait::async_trait;
-use futures::FutureExt;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -40,17 +40,20 @@ impl Tool for TaskTool {
         ToolSpec {
             name: "task".to_string(),
             description: format!(
-                "Run independent tasks in fresh agents and return their results together. \
-                Use direct tools for simple known-path or symbol lookups; use explore early for \
-                open-ended read-only investigation. Agents do not inherit your conversation: provide the necessary \
-                facts, exact scope, and expected deliverable. Give parallel editors non-overlapping \
-                file ownership and leave workspace-wide verification to one owner. \
+                "Run independent implementation or review tasks in fresh agents and return their results together. \
+                Use direct tools for known-path or symbol lookups. For repository investigation, use explore \
+                instead, including parallel explore calls for independent questions. Agents do not inherit \
+                your conversation: supply the scope, prior findings and failed approaches, and expected \
+                deliverable. Give parallel editors non-overlapping file ownership and leave \
+                workspace-wide verification to one owner. Preserve successful sibling results if a task \
+                fails; retry only the unresolved scope. \
                 By default this call waits for every result. Set background:true only when \
                 useful independent work can continue; it returns job IDs for later collection \
                 with job_output. Do not detach merely to poll or run sleeps. \
                 Live agents can receive send_message or stop_agent using IDs from list_agents. \
-                Task agents cannot spawn further agents. For research or review, set read_only:true \
-                to exclude shell and editing tools. subagent_type selects a listed definition.{}",
+                Task agents cannot spawn further agents. For review or other deliverables that must \
+                not mutate files, set read_only:true to exclude shell and editing tools. \
+                subagent_type selects a listed definition.{}",
                 self.env.definitions_help()
             ),
             input_schema: json!({
@@ -177,15 +180,23 @@ impl Tool for TaskTool {
             .with_handle(handle.clone());
             let parent_cancel = self.env.parent_cancel.clone();
             let run = async move {
-                let outcome = std::panic::AssertUnwindSafe(
-                    handle.run_until_stopped(parent_cancel, child.run(&prompt)),
-                )
-                .catch_unwind()
+                let outcome = crate::core::panic::catch(handle.run_until_stopped(
+                    parent_cancel,
+                    child.cancel_handle(),
+                    child.run(&prompt),
+                ))
                 .await;
+                let panicked = match &outcome {
+                    Err(_) => true,
+                    Ok(Some(Err(error))) => error
+                        .downcast_ref::<RunStopped>()
+                        .is_some_and(|stopped| stopped.0.stop_reason == RunStopReason::ToolPanic),
+                    _ => false,
+                };
                 let mutations_settled = child.settle_owned_mutations().await;
                 let cancelled = matches!(outcome, Ok(None)) || child.is_cancelled();
                 let (mut failed, mut output) = match outcome {
-                    Ok(Some(Ok(out))) => (child.turn_limit_summary().is_some(), out),
+                    Ok(Some(Ok(out))) => (false, out),
                     Ok(Some(Err(error))) => (true, format!("error: {error}")),
                     Ok(None) => (false, "[cancelled]".into()),
                     Err(_) => (true, "error: subagent panicked".into()),
@@ -204,15 +215,23 @@ impl Tool for TaskTool {
                 if status == JobStatus::Cancelled && mutations_settled {
                     output = "[cancelled]".into();
                 }
-                (status, output)
+                (status, output, panicked)
             };
             if background {
-                background_work.push((id.clone(), "task".into(), description.clone(), run));
+                background_work.push((
+                    id.clone(),
+                    "task".into(),
+                    description.clone(),
+                    async move {
+                        let (status, output, _) = run.await;
+                        (status, output)
+                    },
+                ));
                 ids.push(format!("{id} ({description})"));
             } else {
                 work.push(async move {
-                    let (status, output) = run.await;
-                    (status, format!("### {description}\n{output}"))
+                    let (status, output, panicked) = run.await;
+                    (status, format!("### {description}\n{output}"), panicked)
                 });
             }
         }
@@ -230,13 +249,18 @@ impl Tool for TaskTool {
             .into());
         }
         let results = futures::future::join_all(work).await;
-        let failed = results.iter().any(|(status, _)| *status != JobStatus::Done);
+        let failed = results
+            .iter()
+            .any(|(status, _, _)| *status != JobStatus::Done);
+        let panicked = results.iter().any(|(_, _, panicked)| *panicked);
         let output = results
             .into_iter()
-            .map(|(_, output)| output)
+            .map(|(_, output, _)| output)
             .collect::<Vec<_>>()
             .join("\n\n");
-        if failed {
+        if panicked {
+            Err(ToolError::new(ToolErrorKind::Panic, output))
+        } else if failed {
             Err(ToolError::failed(output))
         } else {
             Ok(output.into())
@@ -249,10 +273,16 @@ const EXPLORE_SYSTEM: &str = "You are bob's read-only code explorer. Answer the 
     only the read-only tools exposed to you. Do not run shell commands, modify files, or \
     delegate further. Start from the supplied file or symbol and follow the code that \
     controls the behavior. Widen the search only to resolve a specific unanswered question, \
-    and match its depth to the caller's request. Reuse findings rather than repeating \
-    searches. Return concise findings with file:line references, relevant relationships, \
-    and any remaining uncertainty. Distinguish observed behavior from hypotheses; if \
-    evidence is missing, say so. Return a synthesized answer, not a transcript of tool use.";
+    and match its depth to the caller's request. Use glob for paths, grep for file contents, \
+    and LSP for symbols when available. Parallelize independent probes. Narrow or page truncated \
+    results before claiming something is absent. On a failed query, use the error to correct \
+    it rather than repeating it unchanged; respect permission and mode restrictions. \
+    Reuse findings and stop when the evidence answers the question. Return concise findings \
+    with file:line references, relevant relationships, \
+    and any remaining uncertainty. When the caller is preparing an implementation, identify \
+    relevant reusable functions, types, or analogous existing features you found; do not \
+    expand into an unrelated survey just to find a precedent. Distinguish observed behavior \
+    from hypotheses; if evidence is missing, say so. Return a synthesized answer, not a transcript of tool use.";
 
 pub struct ExploreTool {
     pub env: AgentEnv,
@@ -269,13 +299,13 @@ impl Tool for ExploreTool {
             name: "explore".to_string(),
             description: "Investigate a repository question in a fresh read-only agent and \
                 return a concise answer with file:line evidence. Use early for open-ended or \
-                multi-component questions that clearly need more than 3 search queries or would \
-                crowd the main conversation with investigation details. Do not first exhaust \
-                direct searches; also use when directed search proves insufficient. Examples: \
+                multi-component questions likely to need several searches. Do not first exhaust \
+                direct searches; also use when directed search grows into an investigation. \
+                Run parallel explore calls for independent questions rather than a read-only task batch. Examples: \
                 trace authentication from the CLI through provider selection and token refresh, \
                 or map how errors propagate across the runtime and UI. For simple known-path \
                 or symbol lookups, use direct read/search/LSP tools instead. Supply a self-contained \
-                query, scope, and requested depth: quick, medium, or very thorough. \
+                query, scope, prior findings, and requested depth: quick, medium, or very thorough. \
                 This call waits for the result. The child uses the parent model, not a separate \
                 cheaper model, and cannot edit, run shell commands, or delegate further."
                 .to_string(),
@@ -352,15 +382,26 @@ impl Tool for ExploreTool {
             hooks: self.env.hooks.clone(),
             memory: self.env.memory.clone(),
         });
-        let outcome = handle
-            .run_until_stopped(self.env.parent_cancel.clone(), child.run(&query))
-            .await;
+        let outcome = crate::core::panic::catch(handle.run_until_stopped(
+            self.env.parent_cancel.clone(),
+            child.cancel_handle(),
+            child.run(&query),
+        ))
+        .await;
+        let panicked = match &outcome {
+            Err(_) => true,
+            Ok(Some(Err(error))) => error
+                .downcast_ref::<RunStopped>()
+                .is_some_and(|stopped| stopped.0.stop_reason == RunStopReason::ToolPanic),
+            _ => false,
+        };
         let mutations_settled = child.settle_owned_mutations().await;
-        let cancelled = outcome.is_none() || child.is_cancelled();
+        let cancelled = matches!(outcome, Ok(None)) || child.is_cancelled();
         let (failed, output) = match outcome {
-            Some(Ok(out)) => (child.turn_limit_summary().is_some(), out),
-            Some(Err(e)) => (true, format!("error: {e}")),
-            None => (false, "[cancelled]".into()),
+            Ok(Some(Ok(out))) => (false, out),
+            Ok(Some(Err(e))) => (true, format!("error: {e}")),
+            Ok(None) => (false, "[cancelled]".into()),
+            Err(_) => (true, "error: explorer panicked; outcome unknown".into()),
         };
         let status = lifecycle.finish((failed || !mutations_settled) && !cancelled, cancelled);
         if !mutations_settled {
@@ -368,7 +409,9 @@ impl Tool for ExploreTool {
                 "memory mutation cleanup timed out; changes may still complete",
             ));
         }
-        if status == AgentStatus::Done {
+        if panicked {
+            Err(ToolError::new(ToolErrorKind::Panic, output))
+        } else if status == AgentStatus::Done {
             Ok(output.into())
         } else if status == AgentStatus::Cancelled {
             Err(ToolError::failed("[cancelled]"))
@@ -915,7 +958,9 @@ mod tests {
             env.provider = Arc::new(ToolsetProvider {
                 tools: tools.clone(),
             });
-            for tool in crate::tools::builtin_tools() {
+            for tool in crate::tools::builtin_tools(Arc::new(
+                crate::core::shell::BashShell::resolve(std::path::Path::new("."), None),
+            )) {
                 env.subagent_tools.add(tool);
             }
             env.subagent_tools
@@ -1919,7 +1964,9 @@ mod tests {
             let mut permissions = PermissionEngine::new(Decision::Allow, None);
             permissions.add(crate::core::policies::deny_tools(vec!["write_file".into()]));
             env.subagent_tools = ToolRegistry::new(Some(Arc::new(permissions)));
-            for tool in crate::tools::builtin_tools() {
+            for tool in crate::tools::builtin_tools(Arc::new(
+                crate::core::shell::BashShell::resolve(std::path::Path::new("."), None),
+            )) {
                 env.subagent_tools.add(tool);
             }
             env.definitions =
@@ -2160,6 +2207,7 @@ mod tests {
                     team: AgentRegistry::new(),
                     cwd: dir.path().to_string_lossy().into_owned(),
                     system_prompt: String::new(),
+                    shell: Arc::new(crate::core::shell::BashShell::resolve(dir.path(), None)),
                     mcp_tools: impostors(),
                     extra_tools: impostors(),
                     lsp: None,

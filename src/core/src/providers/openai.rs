@@ -330,7 +330,14 @@ impl Provider for OpenAiProvider {
                                     entry.1 = n.to_string();
                                 }
                             }
-                            if let Some(args) = tc["function"]["arguments"].as_str() {
+                            if let Some(args) = tc["function"].get("arguments") {
+                                let Some(args) = args.as_str() else {
+                                    protocol_error = Some(format!(
+                                        "openai: arguments for {} must be a JSON string",
+                                        entry.1
+                                    ));
+                                    return ControlFlow::Break(());
+                                };
                                 entry.2.push_str(args);
                                 let _ = tx.send(StreamEvent::ToolUseInputDelta {
                                     id: entry.0.clone(),
@@ -369,22 +376,32 @@ impl Provider for OpenAiProvider {
                 });
                 return;
             };
+            if finish == "content_filter" {
+                let _ = tx.send(StreamEvent::Error {
+                    message: "openai completion blocked by content_filter".into(),
+                });
+                return;
+            }
             let mut content: Vec<ContentBlock> = Vec::new();
             if !text.is_empty() {
                 content.push(ContentBlock::Text { text });
             }
             if finish != "length" {
                 for (_, (id, name, args)) in tool_acc {
-                    let input =
-                        match crate::providers::codec::complete_tool_input(&id, &name, &args) {
-                            Ok(input) => input,
-                            Err(error) => {
-                                let _ = tx.send(StreamEvent::Error {
-                                    message: format!("openai: {error}"),
-                                });
-                                return;
-                            }
-                        };
+                    let input = match crate::providers::codec::complete_tool_input(
+                        &id,
+                        &name,
+                        &args,
+                        &opts.tools,
+                    ) {
+                        Ok(input) => input,
+                        Err(error) => {
+                            let _ = tx.send(StreamEvent::Error {
+                                message: format!("openai: {error}"),
+                            });
+                            return;
+                        }
+                    };
                     content.push(ContentBlock::ToolUse { id, name, input });
                 }
             }
@@ -920,6 +937,137 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, StreamEvent::Error { .. })));
             server.await.unwrap();
+        }
+
+        fn tool_options() -> GenerateOptions {
+            use crate::tools::registry::Tool;
+            GenerateOptions {
+                tools: vec![
+                    crate::tools::coordinate::ListAgentsTool {
+                        team: Default::default(),
+                    }
+                    .spec(),
+                    crate::tools::builtin::ReadFileTool.spec(),
+                ],
+                ..Default::default()
+            }
+        }
+
+        #[tokio::test]
+        async fn chat_empty_arguments_follow_the_advertised_tool_schema() {
+            for (name, arguments, succeeds) in [
+                ("list_agents", None, true),
+                ("list_agents", Some(json!("")), true),
+                ("list_agents", Some(json!("{}")), true),
+                ("list_agents", Some(json!("{")), false),
+                ("list_agents", Some(json!(" ")), false),
+                ("list_agents", Some(json!("[]")), false),
+                ("list_agents", Some(json!(null)), false),
+                ("list_agents", Some(json!({})), false),
+                ("read_file", None, false),
+                ("read_file", Some(json!("")), false),
+                ("unknown_tool", Some(json!("")), false),
+            ] {
+                let mut function = json!({"name": name});
+                if let Some(arguments) = arguments {
+                    function["arguments"] = arguments;
+                }
+                let delta = json!({"choices":[{"delta":{"tool_calls":[{
+                    "index":0,"id":"call-1","function":function
+                }]},"finish_reason":"tool_calls"}]});
+                let body = format!("data: {delta}\n\ndata: [DONE]\n\n");
+                let (base, server) = serve(&body, false).await;
+                let events = collect_with_options(chat(base, deadlines()), tool_options()).await;
+                if succeeds {
+                    assert!(
+                        !events
+                            .iter()
+                            .any(|event| matches!(event, StreamEvent::Error { .. })),
+                        "{events:?}"
+                    );
+                    let completions: Vec<_> = events
+                        .iter()
+                        .filter_map(|event| match event {
+                            StreamEvent::MessageStop { completion } => Some(completion),
+                            _ => None,
+                        })
+                        .collect();
+                    assert_eq!(completions.len(), 1, "{events:?}");
+                    assert_eq!(completions[0].stop_reason, StopReason::ToolUse);
+                    assert_eq!(
+                        serde_json::to_value(&completions[0].message).unwrap(),
+                        json!({
+                            "role":"assistant","content":[{"type":"tool_use","id":"call-1","name":"list_agents","input":{}}]
+                        })
+                    );
+                } else {
+                    assert_error(&events);
+                }
+                server.await.unwrap();
+            }
+        }
+
+        #[tokio::test]
+        async fn chat_empty_calls_do_not_change_fragmented_sibling_arguments() {
+            let first = json!({"choices":[{"delta":{"tool_calls":[
+                {"index":0,"id":"list","function":{"name":"list_agents","arguments":""}},
+                {"index":1,"id":"read","function":{"name":"read_file","arguments":"{\"path\":\"src/"}}
+            ]}}]});
+            let last = json!({"choices":[{"delta":{"tool_calls":[
+                {"index":1,"function":{"arguments":"日本語.rs\"}"}}
+            ]},"finish_reason":"tool_calls"}]});
+            let body = format!("data: {first}\n\ndata: {last}\n\ndata: [DONE]\n\n");
+            let (base, server) = serve(&body, false).await;
+            let events = collect_with_options(chat(base, deadlines()), tool_options()).await;
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, StreamEvent::Error { .. })),
+                "{events:?}"
+            );
+            let completion = events
+                .iter()
+                .find_map(|event| match event {
+                    StreamEvent::MessageStop { completion } => Some(completion),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(&completion.message).unwrap(),
+                json!({
+                    "role":"assistant","content":[
+                        {"type":"tool_use","id":"list","name":"list_agents","input":{}},
+                        {"type":"tool_use","id":"read","name":"read_file","input":{"path":"src/日本語.rs"}}
+                    ]
+                })
+            );
+            server.await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn chat_empty_calls_still_require_successful_stream_termination() {
+            for finish in [None, Some("length"), Some("content_filter")] {
+                let delta = json!({"choices":[{"delta":{"tool_calls":[
+                    {"index":0,"id":"call-1","function":{"name":"list_agents"}}
+                ]},"finish_reason":finish}]});
+                let body = format!("data: {delta}\n\ndata: [DONE]\n\n");
+                let (base, server) = serve(&body, false).await;
+                let events = collect_with_options(chat(base, deadlines()), tool_options()).await;
+                if finish == Some("length") {
+                    let completion = events
+                        .iter()
+                        .find_map(|event| match event {
+                            StreamEvent::MessageStop { completion } => Some(completion),
+                            _ => None,
+                        })
+                        .unwrap();
+                    assert_eq!(completion.stop_reason, StopReason::MaxTokens);
+                    assert!(completion.message.content.is_empty());
+                } else {
+                    assert_error(&events);
+                }
+                server.await.unwrap();
+            }
         }
 
         #[tokio::test]

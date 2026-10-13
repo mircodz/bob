@@ -198,8 +198,14 @@ impl AgentHandle {
     pub async fn run_until_stopped<F: std::future::Future>(
         &self,
         parent_cancel: Arc<AtomicBool>,
+        child_cancel: Arc<AtomicBool>,
         work: F,
     ) -> Option<F::Output> {
+        if self.cancellation_requested() || parent_cancel.load(Ordering::Relaxed) {
+            child_cancel.store(true, Ordering::Relaxed);
+            return None;
+        }
+        tokio::pin!(work);
         let stopped = async {
             loop {
                 if self.cancellation_requested() || parent_cancel.load(Ordering::Relaxed) {
@@ -213,8 +219,11 @@ impl AgentHandle {
         };
         tokio::select! {
             biased;
-            _ = stopped => None,
-            result = work => Some(result),
+            _ = stopped => {
+                child_cancel.store(true, Ordering::Relaxed);
+                tokio::time::timeout(std::time::Duration::from_secs(1), &mut work).await.ok()
+            },
+            result = &mut work => Some(result),
         }
     }
 
@@ -815,9 +824,11 @@ mod tests {
             let handle = team.register("worker".into(), 1, "root".into(), tx);
             team.stop("root", "worker").unwrap();
             let result = handle
-                .run_until_stopped(Arc::new(AtomicBool::new(false)), async {
-                    panic!("stopped work must not start")
-                })
+                .run_until_stopped(
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(AtomicBool::new(false)),
+                    async { panic!("stopped work must not start") },
+                )
                 .await;
             assert!(result.is_none());
             let (_i, tx) = mailbox();
@@ -827,17 +838,21 @@ mod tests {
             let entered = started.clone();
             let run = tokio::spawn(async move {
                 worker
-                    .run_until_stopped(Arc::new(AtomicBool::new(false)), async move {
-                        entered.notify_one();
-                        std::future::pending::<()>().await
-                    })
+                    .run_until_stopped(
+                        Arc::new(AtomicBool::new(false)),
+                        Arc::new(AtomicBool::new(false)),
+                        async move {
+                            entered.notify_one();
+                            std::future::pending::<()>().await
+                        },
+                    )
                     .await
             });
             tokio::time::timeout(std::time::Duration::from_secs(1), started.notified())
                 .await
                 .expect("work must be polled before stop");
             team.stop("root", "waiting").unwrap();
-            assert!(tokio::time::timeout(std::time::Duration::from_secs(1), run)
+            assert!(tokio::time::timeout(std::time::Duration::from_secs(2), run)
                 .await
                 .unwrap()
                 .unwrap()

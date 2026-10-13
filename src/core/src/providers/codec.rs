@@ -2,7 +2,8 @@
 
 use serde_json::Value;
 
-use crate::core::types::StopReason;
+use crate::core::types::{StopReason, ToolSpec};
+use crate::tools::schema::CompiledSchema;
 
 pub enum BlockWire {
     Emit(Value),
@@ -31,9 +32,28 @@ impl BlockWire {
 /// Parse-error sentinel recognized by the agent loop before tool execution.
 pub const TOOL_ARGS_PARSE_ERROR_KEY: &str = "__bob_tool_args_parse_error__";
 
-pub(crate) fn complete_tool_input(id: &str, name: &str, raw: &str) -> anyhow::Result<Value> {
+pub(crate) fn complete_tool_input(
+    id: &str,
+    name: &str,
+    raw: &str,
+    tools: &[ToolSpec],
+) -> anyhow::Result<Value> {
     if id.is_empty() || name.is_empty() {
         anyhow::bail!("tool call missing id or name");
+    }
+    if raw.is_empty() {
+        let empty = serde_json::json!({});
+        if tools
+            .iter()
+            .find(|tool| tool.name == name)
+            .is_some_and(|tool| {
+                CompiledSchema::compile(&tool.input_schema)
+                    .and_then(|schema| schema.validate(&empty))
+                    .is_ok()
+            })
+        {
+            return Ok(empty);
+        }
     }
     let value: Value = serde_json::from_str(raw).map_err(|error| {
         anyhow::anyhow!("incomplete or malformed arguments for {name}: {error}")
@@ -113,13 +133,15 @@ mod tests {
     fn complete_calls_require_identity_and_object_arguments() {
         for (id, name) in [("", "read_file"), ("call-1", ""), ("", "")] {
             assert_eq!(
-                complete_tool_input(id, name, "{}").unwrap_err().to_string(),
+                complete_tool_input(id, name, "{}", &[])
+                    .unwrap_err()
+                    .to_string(),
                 "tool call missing id or name"
             );
         }
         for raw in ["null", "[]", "42", "true", "\"text\""] {
             assert_eq!(
-                complete_tool_input("call-1", "read_file", raw)
+                complete_tool_input("call-1", "read_file", raw, &[])
                     .unwrap_err()
                     .to_string(),
                 "arguments for read_file must be a JSON object",
@@ -127,13 +149,13 @@ mod tests {
             );
         }
         for raw in ["", " ", "{", "{\"path\":", "{} trailing", "{\"x\":1,}"] {
-            let error = complete_tool_input("call-1", "read_file", raw).unwrap_err();
+            let error = complete_tool_input("call-1", "read_file", raw, &[]).unwrap_err();
             assert!(error
                 .to_string()
                 .contains("incomplete or malformed arguments for read_file"));
         }
         assert_eq!(
-            complete_tool_input("call-1", "list", " {} \n").unwrap(),
+            complete_tool_input("call-1", "list", " {} \n", &[]).unwrap(),
             json!({})
         );
         assert_eq!(
@@ -141,10 +163,48 @@ mod tests {
                 "call-2",
                 "read_file",
                 r#"{"path":"日本語/😀.rs","options":{"lines":[1,3],"literal":"a\nb\"c"}}"#,
+                &[],
             )
             .unwrap(),
             json!({"path":"日本語/😀.rs","options":{"lines":[1,3],"literal":"a\nb\"c"}})
         );
+    }
+
+    #[test]
+    fn empty_arguments_require_an_advertised_schema_that_accepts_an_empty_object() {
+        for (input_schema, accepts_empty) in [
+            (json!({"type":"object","properties":{}}), true),
+            (
+                json!({"type":"object","properties":{"limit":{"type":"integer"}}}),
+                true,
+            ),
+            (json!({"type":"object","required":["path"]}), false),
+            (json!({"type":"object","minProperties":1}), false),
+            (json!({"allOf":[{"required":["path"]}]}), false),
+            (
+                json!({"$defs":{"input":{"required":["path"]}},"$ref":"#/$defs/input"}),
+                false,
+            ),
+            (json!({"type":"not-a-type"}), false),
+            (json!({"$ref":"https://example.invalid/schema"}), false),
+        ] {
+            let tools = [ToolSpec {
+                name: "inspection".into(),
+                description: String::new(),
+                input_schema,
+            }];
+            let result = complete_tool_input("call-1", "inspection", "", &tools);
+            assert_eq!(result.is_ok(), accepts_empty, "{:?}", tools[0]);
+            if let Ok(value) = result {
+                assert_eq!(value, json!({}));
+            }
+            for raw in [" ", "{", "{} trailing", "null", "[]"] {
+                assert!(complete_tool_input("call-1", "inspection", raw, &tools).is_err());
+            }
+            assert!(complete_tool_input("call-1", "unadvertised", "", &tools).is_err());
+            assert!(complete_tool_input("", "inspection", "", &tools).is_err());
+            assert!(complete_tool_input("call-1", "", "", &tools).is_err());
+        }
     }
 
     #[test]

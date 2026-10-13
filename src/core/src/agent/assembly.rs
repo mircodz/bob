@@ -22,6 +22,7 @@ pub struct RootAgentParams {
     pub jobs: JobRegistry,
     pub team: AgentRegistry,
     pub cwd: String,
+    pub shell: Arc<crate::core::shell::BashShell>,
     pub system_prompt: String,
     /// Configured MCP tools (already connected), namespaced `<server>.<tool>`.
     pub mcp_tools: Vec<Arc<dyn Tool>>,
@@ -38,7 +39,7 @@ pub struct RootAgentParams {
 fn build_subagent_tools(p: &RootAgentParams) -> ToolRegistry {
     let mut tools = ToolRegistry::new(Some(p.permissions.clone()));
     // First registration wins: reserve trusted names before MCP and custom tools.
-    for t in crate::tools::builtin_tools() {
+    for t in crate::tools::builtin_tools(p.shell.clone()) {
         tools.add(t);
     }
     if let Some(repository) = &p.memory {
@@ -80,7 +81,7 @@ pub fn build_root_agent(p: RootAgentParams) -> Agent {
 
     let mut tools = ToolRegistry::new(Some(p.permissions.clone()));
     // Reserve trusted names, including delegation tools, before untrusted tools.
-    for t in crate::tools::builtin_tools() {
+    for t in crate::tools::builtin_tools(p.shell.clone()) {
         tools.add(t);
     }
     if let Some(repository) = &p.memory {

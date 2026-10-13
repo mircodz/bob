@@ -1,11 +1,20 @@
 use crate::core::process::{ManagedProcess, ProcessOutput};
+use crate::core::shell::BashShell;
 use crate::core::types::{ShellOutcome, ShellOutput, ShellStream, ToolSpec};
 use crate::tools::jobs::JobStatus;
 use crate::tools::registry::{Tool, ToolContext, ToolError, ToolResult};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-pub struct BashTool;
+pub struct BashTool {
+    shell: std::sync::Arc<BashShell>,
+}
+
+impl BashTool {
+    pub fn new(shell: std::sync::Arc<BashShell>) -> Self {
+        Self { shell }
+    }
+}
 
 #[async_trait]
 impl Tool for BashTool {
@@ -42,6 +51,11 @@ impl Tool for BashTool {
         let command = input["command"].as_str().unwrap_or("").to_string();
         let cwd = ctx.cwd.clone();
         if input["run_in_background"].as_bool().unwrap_or(false) {
+            let executable = self
+                .shell
+                .executable()
+                .map_err(ToolError::failed)?
+                .to_path_buf();
             let id = ctx.jobs.next_id();
             let bg_cmd = command.clone();
             let accepted = ctx.jobs.spawn_cancellable(
@@ -55,7 +69,7 @@ impl Tool for BashTool {
                             ..ShellOutput::default()
                         }.into());
                     }
-                    let mut process = match spawn_shell(&bg_cmd, &cwd) {
+                    let mut process = match spawn_shell(&executable, &bg_cmd, &cwd) {
                         Ok(process) => process,
                         Err(error) => {
                             return (JobStatus::Failed, format!("failed to run: {error}").into())
@@ -106,8 +120,9 @@ impl Tool for BashTool {
             ),
             _ => None,
         };
-        let mut process =
-            spawn_shell(&command, &cwd).map_err(|error| ToolError::failed(error.to_string()))?;
+        let executable = self.shell.executable().map_err(ToolError::failed)?;
+        let mut process = spawn_shell(executable, &command, &cwd)
+            .map_err(|error| ToolError::failed(error.to_string()))?;
         let output = if let Some(duration) = timeout {
             match tokio::time::timeout(duration, process.collect_output(14_000)).await {
                 Ok(result) => result,
@@ -142,9 +157,13 @@ impl Tool for BashTool {
     }
 }
 
-fn spawn_shell(command: &str, cwd: &str) -> std::io::Result<ManagedProcess> {
+fn spawn_shell(
+    executable: &std::path::Path,
+    command: &str,
+    cwd: &str,
+) -> std::io::Result<ManagedProcess> {
     ManagedProcess::spawn(
-        tokio::process::Command::new("bash")
+        tokio::process::Command::new(executable)
             .arg("-c")
             .arg(command)
             .current_dir(cwd)
@@ -152,6 +171,15 @@ fn spawn_shell(command: &str, cwd: &str) -> std::io::Result<ManagedProcess> {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped()),
     )
+    .map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!(
+                "could not start Bash executable '{}' in working directory '{cwd}': {error}",
+                executable.display()
+            ),
+        )
+    })
 }
 
 fn shell_output(output: ProcessOutput, outcome: ShellOutcome) -> ShellOutput {
@@ -198,7 +226,15 @@ mod tests {
         match output {
             ToolOutput::Shell(output) => *output,
             ToolOutput::Text(text) => panic!("expected shell output, got {text}"),
+            ToolOutput::Read { body, .. } => panic!("expected shell output, got read: {body}"),
         }
+    }
+
+    fn bash() -> BashTool {
+        BashTool::new(Arc::new(BashShell::resolve(
+            std::path::Path::new("."),
+            None,
+        )))
     }
 
     fn context() -> ToolContext {
@@ -263,7 +299,7 @@ mod tests {
     #[tokio::test]
     async fn unrepresentable_timeout_is_rejected_before_shell_launch() {
         let ctx = context();
-        let error = BashTool
+        let error = bash()
             .execute(json!({"command":"unused", "timeout":1e100}), &ctx)
             .await
             .unwrap_err();
@@ -275,15 +311,15 @@ mod tests {
         assert!(ctx.jobs.list().is_empty());
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn identical_nonempty_output_preserves_success_and_failure() {
         let ctx = context();
-        let success = BashTool
+        let success = bash()
             .execute(json!({"command": "printf identical; exit 0"}), &ctx)
             .await
             .unwrap();
-        let failure = BashTool
+        let failure = bash()
             .execute(json!({"command": "printf identical; exit 7"}), &ctx)
             .await
             .unwrap_err();
@@ -300,7 +336,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn signal_termination_is_not_an_unknown_exit_code() {
-        let error = BashTool
+        let error = bash()
             .execute(
                 json!({"command": "printf signal; kill -TERM $$"}),
                 &context(),
@@ -317,7 +353,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn timeout_is_terminal_and_typed() {
-        let error = BashTool
+        let error = bash()
             .execute(
                 json!({"command": "printf before; printf error >&2; sleep 60", "timeout": 0.2}),
                 &context(),
@@ -335,11 +371,11 @@ mod tests {
         assert_eq!(output.stderr.total_bytes, 5);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn background_output_is_bounded_and_pageable() {
         let ctx = context();
-        BashTool.execute(json!({"command": "printf '%300000s' x; printf tail; printf 'stderr終' >&2; exit 9", "run_in_background": true}), &ctx).await.unwrap();
+        bash().execute(json!({"command": "printf '%300000s' x; printf tail; printf 'stderr終' >&2; exit 9", "run_in_background": true}), &ctx).await.unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while ctx.jobs.status_of("job_1") == Some(JobStatus::Running) {
                 tokio::task::yield_now().await;
@@ -398,8 +434,12 @@ mod tests {
             "bash",
             "cancel".into(),
             move |mut cancel| async move {
-                let mut process =
-                    spawn_shell("printf before; printf error >&2; sleep 60", ".").unwrap();
+                let mut process = spawn_shell(
+                    bash().shell.executable().unwrap(),
+                    "printf before; printf error >&2; sleep 60",
+                    ".",
+                )
+                .unwrap();
                 let mut collection = Box::pin(process.collect_output(100_000));
                 assert!(tokio::time::timeout(
                     std::time::Duration::from_millis(200),
@@ -432,10 +472,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unavailable_shell_rejects_foreground_and_background_without_a_job() {
+        let root = crate::test_support::TestDir::new();
+        let tool = BashTool::new(Arc::new(BashShell::resolve(
+            &root,
+            Some(&root.join("missing Bash 終.exe")),
+        )));
+        let ctx = context();
+        for background in [false, true] {
+            let error = tool
+                .execute(
+                    json!({
+                        "command": "printf should-not-run",
+                        "run_in_background": background,
+                    }),
+                    &ctx,
+                )
+                .await
+                .unwrap_err();
+            assert!(error.message.contains("bash_executable"));
+            assert!(error.message.contains("missing Bash 終.exe"));
+            assert!(ctx.jobs.list().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_failure_names_selected_executable_and_working_directory() {
+        let root = crate::test_support::TestDir::new();
+        let tool = bash();
+        let executable = tool
+            .shell
+            .executable()
+            .expect("native Bash required for shell tests");
+        let mut ctx = context();
+        ctx.cwd = root.join("missing cwd 終").to_string_lossy().into_owned();
+        let error = tool
+            .execute(json!({"command": "printf unused"}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(error.message.contains(&executable.display().to_string()));
+        assert!(error.message.contains(&ctx.cwd));
+        tool.execute(
+            json!({"command": "printf unused", "run_in_background": true}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        wait_for_job(&ctx).await;
+        let page = ctx.jobs.output_page("job_1", 0, 24_000).unwrap();
+        assert_eq!(page.status, JobStatus::Failed);
+        assert!(page.text.contains(&executable.display().to_string()));
+        assert!(page.text.contains(&ctx.cwd));
+        assert!(ctx.jobs.shutdown().await);
+    }
+
+    async fn wait_for_job(ctx: &ToolContext) {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            while ctx.jobs.status_of("job_1") == Some(JobStatus::Running) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background shell should finish");
+    }
+
+    #[tokio::test]
+    async fn foreground_and_background_share_explicit_shell_and_unicode_cwd() {
+        let root = crate::test_support::TestDir::new();
+        let cwd = root.join("working directory 終");
+        std::fs::create_dir(&cwd).unwrap();
+        std::fs::write(cwd.join("input file 終"), "fixture").unwrap();
+        let discovered = BashShell::resolve(&cwd, None);
+        let executable = discovered
+            .executable()
+            .expect("native Bash required for shell tests");
+        let selected = Arc::new(BashShell::resolve(&cwd, Some(executable)));
+        let foreground = BashTool::new(selected.clone());
+        let background = BashTool::new(selected.clone());
+        assert!(Arc::ptr_eq(&foreground.shell, &background.shell));
+        let mut ctx = context();
+        ctx.cwd = cwd.to_string_lossy().into_owned();
+        let command = "[[ -n \"$BASH_VERSION\" && -f 'input file 終' ]] || exit 3; printf '%s\\n' \"$BASH\"; printf 'stdout 終'; printf 'stderr 終' >&2; exit 7";
+        let error = foreground
+            .execute(json!({"command": command}), &ctx)
+            .await
+            .unwrap_err();
+        let direct = shell(error.into_output());
+        background
+            .execute(json!({"command": command, "run_in_background": true}), &ctx)
+            .await
+            .unwrap();
+        wait_for_job(&ctx).await;
+        let page = ctx.jobs.output_page("job_1", 0, 24_000).unwrap();
+        assert_eq!(page.status, JobStatus::Failed);
+        let retained = page.shell.unwrap();
+        assert_eq!(direct.exit_code, Some(7));
+        assert_eq!(retained.exit_code, direct.exit_code);
+        assert_eq!(retained.outcome, ShellOutcome::Exited);
+        assert_eq!(retained.stdout.text, direct.stdout.text);
+        assert_eq!(retained.stderr.text, "stderr 終");
+        assert_eq!(retained.stdout.total_bytes, direct.stdout.total_bytes);
+        assert!(direct.stdout.text.ends_with("stdout 終"));
+        assert!(!direct.stdout.truncated);
+        assert!(ctx.jobs.shutdown().await);
+    }
+
+    #[tokio::test]
     async fn closed_registry_rejects_background_launch() {
         let ctx = context();
         assert!(ctx.jobs.shutdown().await);
-        assert!(BashTool
+        assert!(bash()
             .execute(
                 json!({"command": "unused", "run_in_background": true}),
                 &ctx

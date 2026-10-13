@@ -1,5 +1,6 @@
 //! LSP over stdio uses Content-Length framing, unlike MCP's newline-delimited stdio.
 
+mod command;
 mod positions;
 pub(crate) mod transport;
 pub(crate) mod workspace_edit;
@@ -7,9 +8,10 @@ pub use positions::PositionEncoding;
 
 use crate::core::config::LspServerConfig;
 use crate::core::process::ManagedProcess;
+use command::resolve_command;
 use serde_json::{json, Value};
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -63,9 +65,26 @@ struct LspInner {
     generation: AtomicU64,
     documents: Mutex<HashMap<String, DocumentSnapshot>>,
     sync_lock: tokio::sync::Mutex<()>,
+    pending_sync: Mutex<PendingSync>,
     encoding: Mutex<PositionEncoding>,
     health: Mutex<Health>,
     code_action_kinds: Mutex<Vec<String>>,
+}
+
+#[derive(Default)]
+struct PendingSync {
+    queue: VecDeque<SyncWork>,
+    running: bool,
+}
+
+enum SyncWork {
+    Deferred(PathBuf),
+    Explicit {
+        path: PathBuf,
+        text: String,
+        completion: tokio::sync::oneshot::Sender<anyhow::Result<SyncStamp>>,
+    },
+    Barrier(tokio::sync::oneshot::Sender<()>),
 }
 
 impl LspClient {
@@ -96,8 +115,7 @@ impl LspClient {
         let mut child = ManagedProcess::spawn(&mut command).map_err(|e| {
             anyhow::anyhow!(
                 "failed to start LSP '{}' (command '{}'): {}. \
-                 Ensure it's installed and on PATH — if it lives in ~/.cargo/bin or \
-                 another dir, launch bob with that dir on PATH.",
+                 Ensure it's installed and its executable directory is on PATH.",
                 cfg.name,
                 cfg.command,
                 e
@@ -122,6 +140,7 @@ impl LspClient {
             generation: AtomicU64::new(0),
             documents: Mutex::new(HashMap::new()),
             sync_lock: tokio::sync::Mutex::new(()),
+            pending_sync: Mutex::new(PendingSync::default()),
             encoding: Mutex::new(PositionEncoding::Utf16),
             health: Mutex::new(Health::Starting),
             code_action_kinds: Mutex::new(Vec::new()),
@@ -185,8 +204,100 @@ impl LspClient {
 
     /// Call before document requests so the server sees the latest text and version.
     pub async fn sync_file(&self, path: &Path, text: &str) -> anyhow::Result<SyncStamp> {
+        let (completion, result) = tokio::sync::oneshot::channel();
+        self.enqueue_sync(SyncWork::Explicit {
+            path: path.to_path_buf(),
+            text: text.to_string(),
+            completion,
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(15), result)
+            .await
+            .map_err(|_| anyhow::anyhow!("document synchronization timed out"))?
+            .map_err(|_| anyhow::anyhow!("document synchronization stopped"))?
+    }
+
+    pub(crate) fn defer_sync_file(&self, path: &Path) {
+        self.enqueue_sync(SyncWork::Deferred(path.to_path_buf()));
+    }
+
+    async fn sync_barrier(&self) -> anyhow::Result<()> {
+        let (completion, result) = tokio::sync::oneshot::channel();
+        self.enqueue_sync(SyncWork::Barrier(completion));
+        tokio::time::timeout(std::time::Duration::from_secs(15), result)
+            .await
+            .map_err(|_| anyhow::anyhow!("document synchronization timed out"))?
+            .map_err(|_| anyhow::anyhow!("document synchronization stopped"))
+    }
+
+    fn enqueue_sync(&self, sync: SyncWork) {
+        let mut pending = self.inner.pending_sync.lock().unwrap();
+        if let SyncWork::Deferred(path) | SyncWork::Explicit { path, .. } = &sync {
+            let start = pending
+                .queue
+                .iter()
+                .rposition(|queued| !matches!(queued, SyncWork::Deferred(_)))
+                .map_or(0, |index| index + 1);
+            let mut index = 0;
+            pending.queue.retain(|queued| {
+                let keep = index < start
+                    || !matches!(queued, SyncWork::Deferred(queued_path) if queued_path == path);
+                index += 1;
+                keep
+            });
+        }
+        pending.queue.push_back(sync);
+        if pending.running {
+            return;
+        }
+        pending.running = true;
+        let weak = Arc::downgrade(&self.inner);
+        tokio::spawn(async move {
+            while let Some(inner) = weak.upgrade() {
+                let client = LspClient { inner };
+                let sync = {
+                    let mut pending = client.inner.pending_sync.lock().unwrap();
+                    let Some(sync) = pending.queue.pop_front() else {
+                        pending.running = false;
+                        return;
+                    };
+                    sync
+                };
+                match sync {
+                    SyncWork::Deferred(path) => {
+                        let _ = client.send_document_sync(&path, None).await;
+                    }
+                    SyncWork::Explicit {
+                        path,
+                        text,
+                        completion,
+                    } => {
+                        let result = client.send_document_sync(&path, Some(&text)).await;
+                        let _ = completion.send(result);
+                    }
+                    SyncWork::Barrier(completion) => {
+                        let _ = completion.send(());
+                    }
+                }
+            }
+        });
+    }
+
+    async fn send_document_sync(
+        &self,
+        path: &Path,
+        text: Option<&str>,
+    ) -> anyhow::Result<SyncStamp> {
         tokio::time::timeout(std::time::Duration::from_secs(15), async {
             let _sync = self.inner.sync_lock.lock().await;
+            let disk_text;
+            let text = match text {
+                Some(text) => text,
+                None => {
+                    disk_text = crate::tools::filesystem::read_regular(path)
+                        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                    &disk_text
+                }
+            };
             let uri = path_to_uri(path);
             let version = self.document_snapshot(path).map_or(1, |doc| doc.version + 1);
             let generation = self.inner.generation.load(Ordering::Acquire);
@@ -286,53 +397,9 @@ impl LspClient {
     }
 
     pub async fn request(&self, method: &str, params: Value) -> anyhow::Result<Value> {
+        self.sync_barrier().await?;
         self.inner.connection.request(method, params).await
     }
-}
-
-/// Preserve explicit paths and PATH precedence; probe install dirs missed by GUI launches.
-fn resolve_command(command: &str) -> std::path::PathBuf {
-    let as_path = Path::new(command);
-    if as_path.is_absolute() || command.contains('/') {
-        return as_path.to_path_buf();
-    }
-    if let Ok(path_var) = std::env::var("PATH") {
-        for dir in std::env::split_paths(&path_var) {
-            if is_executable(&dir.join(command)) {
-                return as_path.to_path_buf();
-            }
-        }
-    }
-    let home = dirs::home_dir();
-    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-    if let Some(h) = &home {
-        candidates.push(h.join(".cargo/bin").join(command));
-        candidates.push(h.join(".local/bin").join(command));
-        candidates.push(h.join("go/bin").join(command));
-    }
-    candidates.push(std::path::PathBuf::from("/opt/homebrew/bin").join(command));
-    candidates.push(std::path::PathBuf::from("/usr/local/bin").join(command));
-    candidates.push(std::path::PathBuf::from("/usr/bin").join(command));
-    for c in candidates {
-        if is_executable(&c) {
-            return c;
-        }
-    }
-    as_path.to_path_buf()
-}
-
-#[cfg(unix)]
-fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
-}
-
-/// Non-Unix executability is deferred to process creation.
-#[cfg(not(unix))]
-fn is_executable(path: &Path) -> bool {
-    path.is_file()
 }
 
 /// Correlate replies and update diagnostic/progress state without owning the client.
@@ -582,6 +649,7 @@ mod tests {
             generation: AtomicU64::new(0),
             documents: Mutex::new(HashMap::new()),
             sync_lock: tokio::sync::Mutex::new(()),
+            pending_sync: Mutex::new(PendingSync::default()),
             encoding: Mutex::new(PositionEncoding::Utf16),
             health: Mutex::new(Health::Ready),
             code_action_kinds: Mutex::new(Vec::new()),
@@ -596,6 +664,13 @@ mod tests {
             .write_all(format!("Content-Length: {}\r\n\r\n{}", body.len(), body).as_bytes())
             .await
             .unwrap();
+    }
+
+    async fn receive_frame(reader: &mut BufReader<impl AsyncRead + Unpin>) -> Value {
+        tokio::time::timeout(Duration::from_secs(2), read_frame(reader))
+            .await
+            .expect("expected a document notification")
+            .unwrap()
     }
 
     #[tokio::test]
@@ -723,6 +798,7 @@ mod tests {
             )
             .await
             .unwrap();
+        let opened = receive_frame(&mut reader).await;
         ReadFileTool
             .execute(json!({"path":"sample.rs"}), &ctx)
             .await
@@ -734,6 +810,7 @@ mod tests {
             )
             .await
             .unwrap();
+        let changed = receive_frame(&mut reader).await;
         let multi = MultiEditTool
             .execute(
                 json!({"path":"sample.rs","edits":[{"old_string":"n = 2","new_string":"n = 3"}]}),
@@ -745,12 +822,12 @@ mod tests {
             assert!(!result.as_text().unwrap().contains("<diagnostics>"));
             assert!(!result.as_text().unwrap().contains("cached diagnostic"));
         }
-        for (version, number) in [(1, 1), (2, 2), (3, 3)] {
-            let message =
-                tokio::time::timeout(std::time::Duration::from_secs(2), read_frame(&mut reader))
-                    .await
-                    .unwrap()
-                    .unwrap();
+        let changed_again = receive_frame(&mut reader).await;
+        for (message, (version, number)) in
+            [opened, changed, changed_again]
+                .into_iter()
+                .zip([(1, 1), (2, 2), (3, 3)])
+        {
             assert_eq!(message["params"]["textDocument"]["version"], version);
             let text = if version == 1 {
                 assert_eq!(message["method"], "textDocument/didOpen");
@@ -763,6 +840,257 @@ mod tests {
         }
         assert_eq!(client.diagnostics_for(&file).len(), 1);
         client.inner.connection.disconnect();
+    }
+
+    #[tokio::test]
+    async fn committed_writes_and_edits_return_success_while_sync_is_stalled() {
+        let (directory, client, _server, ctx) = fixture_context();
+        let file = directory.join("sample.rs");
+        let lock = client.lock_documents().await.unwrap();
+        let results = tokio::time::timeout(Duration::from_secs(1), async {
+            let written = WriteFileTool
+                .execute(json!({"path":"sample.rs","content":"one"}), &ctx)
+                .await
+                .unwrap();
+            let edited = EditFileTool
+                .execute(
+                    json!({"path":"sample.rs","old_string":"one","new_string":"two"}),
+                    &ctx,
+                )
+                .await
+                .unwrap();
+            let multi = MultiEditTool
+                .execute(
+                    json!({"path":"sample.rs","edits":[{"old_string":"two","new_string":"three"}]}),
+                    &ctx,
+                )
+                .await
+                .unwrap();
+            [written, edited, multi]
+        })
+        .await
+        .expect("committed mutations must not wait for document synchronization");
+        assert!(results[0].as_text().unwrap().starts_with("wrote "));
+        assert!(results[1]
+            .as_text()
+            .unwrap()
+            .starts_with("edited sample.rs"));
+        assert!(results[2]
+            .as_text()
+            .unwrap()
+            .starts_with("edited sample.rs"));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "three");
+        assert!(ctx.files.fully_read(&file.to_string_lossy(), "three"));
+        assert!(client.document_snapshot(&file).is_none());
+        drop(lock);
+        client.sync_file(&file, "three").await.unwrap();
+        assert_eq!(client.document_snapshot(&file).unwrap().text, "three");
+    }
+
+    #[tokio::test]
+    async fn deferred_edits_coalesce_without_crossing_explicit_sync_order() {
+        let (client, server) = fixture_client();
+        let directory = TestDir::new();
+        let file = directory.join("sample.rs");
+        let lock = client.lock_documents().await.unwrap();
+        directory.write("sample.rs", "in flight");
+        client.defer_sync_file(&file);
+        tokio::task::yield_now().await;
+        assert!(client.inner.pending_sync.lock().unwrap().queue.is_empty());
+        directory.write("sample.rs", "superseded edit");
+        client.defer_sync_file(&file);
+        let mut explicit = Box::pin(client.sync_file(&file, "explicit"));
+        assert!(futures::poll!(&mut explicit).is_pending());
+        directory.write("sample.rs", "later edit");
+        client.defer_sync_file(&file);
+        directory.write("sample.rs", "latest edit");
+        client.defer_sync_file(&file);
+        assert_eq!(client.inner.pending_sync.lock().unwrap().queue.len(), 2);
+        drop(lock);
+        let stamp = explicit.await.unwrap();
+        client.sync_barrier().await.unwrap();
+        let snapshot = client.document_snapshot(&file).unwrap();
+        assert_eq!(snapshot.text, "latest edit");
+        assert_eq!(snapshot.version, stamp.version + 1);
+        let mut reader = BufReader::new(server);
+        for (version, text) in [(1, "latest edit"), (2, "explicit"), (3, "latest edit")] {
+            let message = receive_frame(&mut reader).await;
+            assert_eq!(message["params"]["textDocument"]["version"], version);
+            let actual = if version == 1 {
+                &message["params"]["textDocument"]["text"]
+            } else {
+                &message["params"]["contentChanges"][0]["text"]
+            };
+            assert_eq!(actual, text);
+        }
+    }
+
+    #[tokio::test]
+    async fn reversed_commit_enqueue_order_syncs_current_disk() {
+        use crate::tools::filesystem::{prepare_batch, WriteRequest};
+
+        for drain_newer in [false, true] {
+            let (directory, client, server, ctx) = fixture_context();
+            let file = directory.join("a.rs");
+            let mut reader = BufReader::new(server);
+            client.sync_file(&file, "old").await.unwrap();
+            assert_eq!(
+                receive_frame(&mut reader).await["method"],
+                "textDocument/didOpen"
+            );
+
+            let earlier = prepare_batch(
+                &ctx,
+                vec![WriteRequest {
+                    path: PathBuf::from("a.rs"),
+                    resolved: file.clone(),
+                    expected: Some("old".into()),
+                    content: "first commit".into(),
+                }],
+            )
+            .await
+            .unwrap()
+            .commit()
+            .unwrap();
+            ctx.files.record_read(&file.to_string_lossy());
+            EditFileTool
+                .execute(
+                    json!({"path":"a.rs","old_string":"first commit","new_string":"second commit"}),
+                    &ctx,
+                )
+                .await
+                .unwrap();
+            if drain_newer {
+                client.sync_barrier().await.unwrap();
+                let changed = receive_frame(&mut reader).await;
+                assert_eq!(
+                    changed["params"]["contentChanges"][0]["text"],
+                    "second commit"
+                );
+            }
+
+            crate::tools::lsp::sync_after_edit(&ctx.lsp, &earlier[0]);
+            client.sync_barrier().await.unwrap();
+            let changed = receive_frame(&mut reader).await;
+            assert_eq!(changed["method"], "textDocument/didChange");
+            assert_eq!(
+                changed["params"]["contentChanges"][0]["text"],
+                "second commit"
+            );
+            assert_eq!(
+                changed["params"]["textDocument"]["version"],
+                if drain_newer { 3 } else { 2 }
+            );
+            let disk = std::fs::read_to_string(&file).unwrap();
+            assert_eq!(disk, "second commit");
+            assert_eq!(client.document_snapshot(&file).unwrap().text, disk);
+        }
+    }
+
+    #[tokio::test]
+    async fn workspace_symbols_waits_for_pending_changes_even_with_later_enqueues() {
+        let (directory, client, server, ctx) = fixture_context();
+        let file = directory.join("a.rs");
+        let mut reader = BufReader::new(server);
+        client.sync_file(&file, "old").await.unwrap();
+        assert_eq!(
+            receive_frame(&mut reader).await["method"],
+            "textDocument/didOpen"
+        );
+        let lock = client.lock_documents().await.unwrap();
+        client.defer_sync_file(&directory.join("b.rs"));
+        tokio::task::yield_now().await;
+        assert!(client.inner.pending_sync.lock().unwrap().queue.is_empty());
+        ctx.files.record_read(&file.to_string_lossy());
+        EditFileTool
+            .execute(
+                json!({"path":"a.rs","old_string":"old","new_string":"new"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let tool = crate::tools::lsp::LspTool::new(ctx.lsp.clone().unwrap());
+        let mut query =
+            Box::pin(tool.execute(json!({"operation":"workspace_symbols","query":"new"}), &ctx));
+        assert!(futures::poll!(&mut query).is_pending());
+        client.defer_sync_file(&file);
+        {
+            let pending = client.inner.pending_sync.lock().unwrap();
+            assert_eq!(pending.queue.len(), 3);
+            assert!(matches!(&pending.queue[0], SyncWork::Deferred(path) if path == &file));
+            assert!(matches!(&pending.queue[1], SyncWork::Barrier(_)));
+            assert!(matches!(&pending.queue[2], SyncWork::Deferred(path) if path == &file));
+        }
+        drop(lock);
+        let server = async {
+            assert_eq!(
+                receive_frame(&mut reader).await["method"],
+                "textDocument/didOpen"
+            );
+            let changed = receive_frame(&mut reader).await;
+            assert_eq!(changed["method"], "textDocument/didChange");
+            assert_eq!(changed["params"]["textDocument"]["uri"], path_to_uri(&file));
+            assert_eq!(changed["params"]["contentChanges"][0]["text"], "new");
+            let mut request = receive_frame(&mut reader).await;
+            if request["method"] == "textDocument/didChange" {
+                assert_eq!(request["params"]["contentChanges"][0]["text"], "new");
+                request = receive_frame(&mut reader).await;
+            }
+            assert_eq!(request["method"], "workspace/symbol");
+            assert_eq!(request["params"]["query"], "new");
+            send_frame(reader.get_mut(), json!({"id":request["id"],"result":[]})).await;
+        };
+        let (result, ()) = tokio::join!(query, server);
+        assert_eq!(result.unwrap().as_text().unwrap(), "No matching symbols.");
+    }
+
+    #[tokio::test]
+    async fn cancelling_explicit_sync_does_not_interrupt_an_in_flight_notification() {
+        let (client, server) = fixture_client();
+        let directory = TestDir::new();
+        let file = directory.join("sample.rs");
+        let text = "x".repeat(128 * 1024);
+        let mut explicit = Box::pin(client.sync_file(&file, &text));
+        assert!(futures::poll!(&mut explicit).is_pending());
+        tokio::task::yield_now().await;
+        assert!(client.document_snapshot(&file).is_none());
+        drop(explicit);
+        let mut reader = BufReader::new(server);
+        let message = receive_frame(&mut reader).await;
+        assert_eq!(message["params"]["textDocument"]["text"], text);
+        client
+            .sync_file(&directory.join("barrier.rs"), "barrier")
+            .await
+            .unwrap();
+        assert_eq!(client.document_snapshot(&file).unwrap().text, text);
+        assert!(!client.inner.connection.is_closed());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn explicit_sync_keeps_its_fifteen_second_deadline() {
+        let (client, _server) = fixture_client();
+        let directory = TestDir::new();
+        let _lock = client.lock_documents().await.unwrap();
+        let started = tokio::time::Instant::now();
+        let error = client
+            .sync_file(&directory.join("sample.rs"), "text")
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("timed out"));
+        assert_eq!(started.elapsed(), Duration::from_secs(15));
+        assert!(!client.inner.connection.is_closed());
+    }
+
+    #[tokio::test]
+    async fn unstarted_sync_worker_does_not_keep_a_dropped_client_alive() {
+        let (client, _server) = fixture_client();
+        let directory = TestDir::new();
+        let weak = Arc::downgrade(&client.inner);
+        client.defer_sync_file(&directory.join("sample.rs"));
+        drop(client);
+        assert!(weak.upgrade().is_none());
+        tokio::task::yield_now().await;
     }
 
     fn fixture_context() -> (TestDir, LspClient, tokio::io::DuplexStream, ToolContext) {
@@ -832,6 +1160,9 @@ mod tests {
                     json!({"id":message["id"],"result":result}),
                 )
                 .await;
+                if scenario == "closed_after_reply" && count == 2 {
+                    break;
+                }
             }
         });
         let tool = RenameSymbolTool::new(ctx.lsp.clone().unwrap());
@@ -846,16 +1177,24 @@ mod tests {
         )
         .await
         .unwrap();
-        if scenario == "success" {
+        if matches!(scenario, "success" | "closed_after_reply") {
             assert!(outcome
                 .unwrap()
                 .as_text()
                 .unwrap()
                 .contains("changed 2 file(s)"));
+            if scenario == "success" {
+                client
+                    .sync_file(&directory.join("barrier.rs"), "barrier")
+                    .await
+                    .unwrap();
+            }
             for file in ["a.rs", "b.rs"] {
                 let path = directory.0.join(file);
                 assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
-                assert_eq!(client.document_snapshot(&path).unwrap().text, "new");
+                if scenario == "success" {
+                    assert_eq!(client.document_snapshot(&path).unwrap().text, "new");
+                }
             }
         } else {
             assert!(outcome.is_err(), "{scenario} must not report success");
@@ -908,6 +1247,11 @@ mod tests {
     #[tokio::test]
     async fn unopened_targets_use_one_bounded_preparation_pass() {
         rename_scenario("success").await;
+    }
+
+    #[tokio::test]
+    async fn committed_rename_reports_success_when_post_edit_sync_disconnects() {
+        rename_scenario("closed_after_reply").await;
     }
 
     #[tokio::test]

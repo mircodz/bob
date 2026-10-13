@@ -169,6 +169,13 @@ impl Cell {
                         std::mem::discriminant(output).hash(&mut h);
                         match output {
                             ToolOutput::Text(text) => text.hash(&mut h),
+                            ToolOutput::Read {
+                                body,
+                                loader_context,
+                            } => {
+                                body.hash(&mut h);
+                                loader_context.hash(&mut h);
+                            }
                             ToolOutput::Shell(shell) => {
                                 shell.exit_code.hash(&mut h);
                                 shell.signal.hash(&mut h);
@@ -371,21 +378,41 @@ pub fn apply_content_event(cells: &mut Vec<Cell>, event: &AgentEvent, include_me
                 });
             }
         }
-        AgentEvent::Message { message, .. } => {
-            let retried = finish_retries(cells);
-            let draft = if retried {
-                retry_draft_in(cells)
-            } else {
-                open_assistant_in(cells)
-            };
-            if let Some(Cell::Assistant { text, open }) = draft {
-                if retried {
-                    *text = message.text();
+        AgentEvent::Message { message, .. } if message.role == Role::Assistant => {
+            let authoritative = message.text();
+            finish_retries(cells);
+            let start = cells
+                .iter()
+                .rposition(|cell| {
+                    matches!(
+                        cell,
+                        Cell::Assistant { open: false, .. } | Cell::Tool { .. } | Cell::User(_)
+                    )
+                })
+                .map_or(0, |index| index + 1);
+            let drafts: Vec<_> = cells
+                .iter()
+                .enumerate()
+                .skip(start)
+                .filter_map(|(index, cell)| {
+                    matches!(cell, Cell::Assistant { open: true, .. }).then_some(index)
+                })
+                .collect();
+            if let Some(&first) = drafts.first() {
+                for &index in drafts.iter().skip(1).rev() {
+                    cells.remove(index);
                 }
-                *open = false;
-            } else if retried && !message.text().is_empty() {
+                if authoritative.is_empty() {
+                    cells.remove(first);
+                } else {
+                    cells[first] = Cell::Assistant {
+                        text: authoritative,
+                        open: false,
+                    };
+                }
+            } else if !authoritative.is_empty() {
                 cells.push(Cell::Assistant {
-                    text: message.text(),
+                    text: authoritative,
                     open: false,
                 });
             }
@@ -400,8 +427,10 @@ pub fn apply_content_event(cells: &mut Vec<Cell>, event: &AgentEvent, include_me
             }
         }
         AgentEvent::TurnEnd { .. } => {
-            if let Some(Cell::Assistant { open, .. }) = open_assistant_in(cells) {
-                *open = false;
+            for cell in cells.iter_mut() {
+                if let Cell::Assistant { open, .. } = cell {
+                    *open = false;
+                }
             }
         }
         AgentEvent::ToolCall {
@@ -1124,6 +1153,128 @@ mod tests {
     }
 
     #[test]
+    fn authoritative_messages_render_once_live_and_replayed_with_or_without_deltas() {
+        use super::super::team::AgentTranscripts;
+        use bob_core::core::types::Usage;
+
+        for draft in [None, Some("incomplete draft"), Some("handoff complete")] {
+            let mut events = Vec::new();
+            for agent_id in ["root", "worker"] {
+                for content in [
+                    vec![ContentBlock::ToolUse {
+                        id: "read".into(),
+                        name: "read_file".into(),
+                        input: serde_json::json!({"path":"file.rs"}),
+                    }],
+                    vec![ContentBlock::Thinking {
+                        thinking: "private".into(),
+                        signature: "sig".into(),
+                    }],
+                ] {
+                    events.push(AgentEvent::Message {
+                        agent_id: agent_id.into(),
+                        message: Message {
+                            role: Role::Assistant,
+                            content,
+                        },
+                    });
+                }
+                if let Some(text) = draft {
+                    events.push(AgentEvent::TextDelta {
+                        agent_id: agent_id.into(),
+                        text: text.into(),
+                    });
+                }
+                events.push(AgentEvent::Message {
+                    agent_id: agent_id.into(),
+                    message: Message {
+                        role: Role::Assistant,
+                        content: vec![ContentBlock::Text {
+                            text: "handoff complete".into(),
+                        }],
+                    },
+                });
+                events.push(AgentEvent::TurnEnd {
+                    agent_id: agent_id.into(),
+                    usage: Usage::default(),
+                });
+            }
+            let mut live = ViewModel::new();
+            let mut teams = AgentTranscripts::new();
+            for event in &events {
+                live.apply(event);
+                teams.apply(event, None);
+            }
+            let events: Vec<AgentEvent> =
+                serde_json::from_str(&serde_json::to_string(&events).unwrap()).unwrap();
+            let mut replay = ViewModel::new();
+            for event in &events {
+                replay.apply(event);
+            }
+            replay.reset_after_replay();
+            let replayed_teams = AgentTranscripts::replay(&events);
+            for cells in [
+                &live.cells,
+                &replay.cells,
+                &teams.get("worker").unwrap().cells,
+                &replayed_teams.get("worker").unwrap().cells,
+            ] {
+                assert_eq!(cells.len(), 1);
+                assert!(
+                    matches!(&cells[0], Cell::Assistant { text, open: false } if text == "handoff complete")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn authoritative_message_reconciles_fragments_around_agent_messages() {
+        use super::super::team::AgentTranscripts;
+        let events = vec![
+            AgentEvent::TextDelta {
+                agent_id: "worker".into(),
+                text: "hello ".into(),
+            },
+            AgentEvent::UserMessageQueued {
+                to: "worker".into(),
+                text: "keep checking".into(),
+            },
+            AgentEvent::TextDelta {
+                agent_id: "worker".into(),
+                text: "world".into(),
+            },
+            AgentEvent::Message {
+                agent_id: "worker".into(),
+                message: Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: "hello world".into(),
+                    }],
+                },
+            },
+        ];
+        let mut live = AgentTranscripts::new();
+        for event in &events {
+            live.apply(event, None);
+        }
+        let replay = AgentTranscripts::replay(&events);
+        for threads in [&live, &replay] {
+            let cells = &threads.get("worker").unwrap().cells;
+            let answers: Vec<_> = cells
+                .iter()
+                .filter_map(|cell| match cell {
+                    Cell::Assistant { text, open } => Some((text.as_str(), *open)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(answers, vec![("hello world", false)]);
+            assert!(cells.iter().any(|cell| matches!(cell,
+                Cell::AgentMsg { from, text } if from == "user" && text == "keep checking"
+            )));
+        }
+    }
+
+    #[test]
     fn retries_replace_drafts_but_preserve_authoritative_cancelled_or_failed_partials() {
         use super::super::team::AgentTranscripts;
         use bob_core::core::types::Usage;
@@ -1448,6 +1599,14 @@ mod tests {
             ("bash", shell(7, "failure output"), true),
             ("bash", ToolOutput::from("permission denied"), true),
             ("grep", ToolOutput::from("source.rs:42:match"), false),
+            (
+                "read_file",
+                ToolOutput::Read {
+                    body: "     1\tfn main() {}".into(),
+                    loader_context: Some("[!] Auxiliary instructions unavailable".into()),
+                },
+                false,
+            ),
             ("job_status", shell(7, "hidden job status"), true),
             ("job_output", shell(0, "hidden job output"), false),
         ];
@@ -1537,7 +1696,10 @@ mod tests {
                     panic!("expected tool")
                 };
                 assert_eq!(output.as_ref(), Some(expected_output));
-                assert_eq!(cell.is_visible(), matches!(*name, "bash" | "grep"));
+                assert_eq!(
+                    cell.is_visible(),
+                    matches!(*name, "bash" | "grep" | "read_file")
+                );
             }
         }
     }

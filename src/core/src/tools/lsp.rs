@@ -471,10 +471,10 @@ fn uri_to_rel(uri: &str) -> String {
         .unwrap_or_else(|| uri.to_string())
 }
 
-/// Syncs edits without collecting diagnostics or waiting for analysis.
-pub async fn sync_after_edit(lsp: &Option<Arc<LspManager>>, file: &Path, text: &str) {
+/// Enqueues best-effort synchronization without delaying committed edit results.
+pub fn sync_after_edit(lsp: &Option<Arc<LspManager>>, file: &Path) {
     if let Some(client) = lsp.as_ref().and_then(|manager| manager.client_for(file)) {
-        let _ = client.sync_file(file, text).await;
+        client.defer_sync_file(file);
     }
 }
 

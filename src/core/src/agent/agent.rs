@@ -124,6 +124,8 @@ pub enum RunStopReason {
     Cancelled,
     TurnLimit,
     TimedOut,
+    OutputLimit,
+    ToolPanic,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -131,6 +133,35 @@ pub struct RunOutcome {
     pub text: String,
     pub stop_reason: RunStopReason,
     pub turns: u32,
+}
+
+#[derive(Debug)]
+pub struct RunStopped(pub RunOutcome);
+
+impl std::fmt::Display for RunStopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let reason = match self.0.stop_reason {
+            RunStopReason::Completed => "completed",
+            RunStopReason::Cancelled => "cancelled",
+            RunStopReason::TurnLimit => "turn limit reached",
+            RunStopReason::TimedOut => "timed out",
+            RunStopReason::OutputLimit => "output limit reached",
+            RunStopReason::ToolPanic => "tool panicked",
+        };
+        write!(f, "agent stopped ({reason}): {}", self.0.text)
+    }
+}
+
+impl std::error::Error for RunStopped {}
+
+impl RunOutcome {
+    pub fn into_completed_text(self) -> anyhow::Result<String> {
+        if self.stop_reason == RunStopReason::Completed {
+            Ok(self.text)
+        } else {
+            Err(RunStopped(self).into())
+        }
+    }
 }
 
 pub struct Agent {
@@ -406,7 +437,9 @@ impl Agent {
 
     pub async fn run(&mut self, prompt: &str) -> anyhow::Result<String> {
         self.cancel.store(false, Ordering::Relaxed);
-        Ok(self.run_with_budget(prompt, self.turn_budget()).await?.text)
+        self.run_with_budget(prompt, self.turn_budget())
+            .await?
+            .into_completed_text()
     }
 
     /// Run without resetting cancellation, consuming at most the supplied budget.
@@ -459,6 +492,7 @@ impl Agent {
         };
         let mut final_text = String::new();
         let mut finished = false;
+        let mut failure = None;
 
         let mut max_tokens_override: Option<u32> = None;
         let mut truncation_recoveries: u32 = 0;
@@ -494,13 +528,37 @@ impl Agent {
 
             self.record_usage(completion.usage, &mut turn.usage);
 
-            // Retry truncation before recording history; discarded calls must not leak in.
-            if let Some(bumped) =
-                self.truncation_retry_cap(&completion, truncation_recoveries, max_tokens_override)
-            {
-                truncation_recoveries += 1;
-                max_tokens_override = Some(bumped);
-                continue;
+            if completion_truncated(&completion) {
+                if turns < max_turns {
+                    if let Some(bumped) = self.truncation_retry_cap(
+                        &completion,
+                        truncation_recoveries,
+                        max_tokens_override,
+                    ) {
+                        truncation_recoveries += 1;
+                        max_tokens_override = Some(bumped);
+                        continue;
+                    }
+                }
+                let mut message = completion.message.clone();
+                message
+                    .content
+                    .retain(|block| !matches!(block, ContentBlock::ToolUse { .. }));
+                final_text = format!(
+                    "[output limit reached; response incomplete and no truncated tool calls were executed]\n{}",
+                    message.text(),
+                );
+                if !message.content.is_empty() {
+                    self.history.push(message.clone());
+                    self.full_history.push(message.clone());
+                    self.cfg.bus.emit(AgentEvent::Message {
+                        agent_id: self.id.clone(),
+                        message,
+                    });
+                }
+                self.record_summary("[output limit reached; response incomplete]");
+                failure = Some(RunStopReason::OutputLimit);
+                break;
             }
             // Recovery overrides must not carry into the next turn.
             max_tokens_override = None;
@@ -574,20 +632,33 @@ impl Agent {
                 break;
             }
 
-            let results = self.execute_tool_uses(&ctx, &tool_uses).await;
+            let (results, panicked) = self.execute_tool_uses(&ctx, &tool_uses).await;
             let msg = Message {
                 role: Role::Tool,
                 content: results,
             };
             self.history.push(msg.clone());
             self.full_history.push(msg);
+            if panicked {
+                final_text = "[stopped after a tool panic; outcome unknown, changes may have taken effect. Inspect state before retrying.]".into();
+                self.record_summary(&final_text);
+                failure = Some(RunStopReason::ToolPanic);
+                break;
+            }
         }
 
         // One tool-less handoff is allowed after budget exhaustion.
-        if !finished && final_text.is_empty() && !self.is_cancelled() && max_turns > 0 {
+        if failure.is_none()
+            && !finished
+            && final_text.is_empty()
+            && !self.is_cancelled()
+            && max_turns > 0
+        {
             final_text = self.wind_down(max_turns, &mut turn.usage).await;
         }
-        let stop_reason = if self.is_cancelled() {
+        let stop_reason = if let Some(reason) = failure {
+            reason
+        } else if self.is_cancelled() {
             if final_text.is_empty() {
                 final_text = "[interrupted]".to_string();
             }
@@ -619,7 +690,7 @@ impl Agent {
         &self,
         ctx: &ToolContext,
         tool_uses: &[(String, String, serde_json::Value)],
-    ) -> Vec<ContentBlock> {
+    ) -> (Vec<ContentBlock>, bool) {
         for (id, name, input) in tool_uses {
             self.cfg.bus.emit(AgentEvent::ToolCall {
                 agent_id: self.id.clone(),
@@ -634,18 +705,28 @@ impl Agent {
                 concurrent.push(self.run_tool(ctx, id, name, input));
             }
         }
-        let mut concurrent_results = futures::future::join_all(concurrent).await.into_iter();
-        let mut results: Vec<ContentBlock> = Vec::with_capacity(tool_uses.len());
+        let concurrent_results = futures::future::join_all(concurrent).await;
+        let mut panicked = concurrent_results.iter().any(|(_, panicked)| *panicked);
+        let mut concurrent_results = concurrent_results.into_iter();
+        let mut results = Vec::with_capacity(tool_uses.len());
         for (id, name, input) in tool_uses {
             if self.cfg.tools.is_read_only(name) {
-                if let Some(r) = concurrent_results.next() {
-                    results.push(r);
+                if let Some((result, _)) = concurrent_results.next() {
+                    results.push(result);
                 }
+            } else if panicked {
+                results.push(self.tool_result(
+                    id,
+                    "not executed: an earlier tool panicked; inspect state before retrying".into(),
+                    true,
+                ));
             } else {
-                results.push(self.run_tool(ctx, id, name, input).await);
+                let (result, failed) = self.run_tool(ctx, id, name, input).await;
+                panicked |= failed;
+                results.push(result);
             }
         }
-        results
+        (results, panicked)
     }
 
     async fn run_tool(
@@ -654,60 +735,92 @@ impl Agent {
         id: &str,
         name: &str,
         input: &serde_json::Value,
-    ) -> ContentBlock {
-        if name == "structured_output" {
-            if let Some(sink) = &self.structured_sink {
-                sink.lock().unwrap().take();
-            }
-        }
-        if let Some(result) = until_cancelled(
-            &self.cancel,
-            self.cfg.parent_cancel.as_ref(),
-            run_one(
-                &self.cfg.tools,
-                &self.cfg.bus,
-                &self.cfg.hooks,
-                &self.id,
-                ctx,
-                id.to_string(),
-                name.to_string(),
-                input.clone(),
-            ),
-        )
-        .await
-        {
+    ) -> (ContentBlock, bool) {
+        use crate::tools::registry::{ToolError, ToolErrorKind};
+        let work = async {
             if name == "structured_output" {
-                *self.structured_error.lock().unwrap() = match &result {
-                    ContentBlock::ToolResult {
-                        content,
-                        is_error: Some(true),
-                        ..
-                    } => Some(content.model_text().into_owned()),
-                    _ => None,
-                };
+                if let Some(sink) = &self.structured_sink {
+                    sink.lock().unwrap().take();
+                }
             }
-            return result;
-        }
-        let mutations_settled = self.settle_owned_mutations().await;
-        let content = if mutations_settled {
-            if name == "memory" {
-                "interrupted by user; any memory mutation already started has settled and may have taken effect"
+            if let Some(explain) = crate::providers::codec::tool_input_parse_error(input) {
+                return Err(ToolError::invalid_input(explain));
+            }
+            let input = self
+                .cfg
+                .hooks
+                .run_pre(name, input.clone())
+                .await
+                .map_err(ToolError::failed)?;
+            self.cfg.tools.execute(name, input, ctx).await
+        };
+        let started = !self.is_cancelled();
+        let work = crate::core::panic::catch(work);
+        tokio::pin!(work);
+        let outcome =
+            until_cancelled(&self.cancel, self.cfg.parent_cancel.as_ref(), &mut work).await;
+        let outcome =
+            if started && outcome.is_none() && matches!(name, "task" | "explore" | "workflow") {
+                tokio::time::timeout(std::time::Duration::from_secs(2), &mut work)
+                    .await
+                    .ok()
             } else {
-                "interrupted by user"
+                outcome
+            };
+        let (mut content, is_error, mut panicked) = match outcome {
+            Some(Ok(Ok(output))) => (output, false, false),
+            Some(Ok(Err(error))) => {
+                let panicked = error.kind == ToolErrorKind::Panic;
+                (error.into_output(), true, panicked)
             }
-        } else {
-            "interrupted, but memory mutation cleanup exceeded its deadline; changes may still complete"
-        }.to_string();
+            Some(Err(_)) => ("panic: tool execution panicked; outcome unknown, changes may have taken effect; do not automatically retry".into(), true, true),
+            None => {
+                let settled = self.settle_owned_mutations().await;
+                let text = if !settled {
+                    "interrupted, but memory mutation cleanup exceeded its deadline; changes may still complete"
+                } else if name == "memory" {
+                    "interrupted by user; any memory mutation already started has settled and may have taken effect"
+                } else {
+                    "interrupted by user"
+                };
+                return (self.tool_result(id, text.into(), true), false);
+            }
+        };
+        if !panicked && !self.cfg.hooks.post.is_empty() {
+            let post =
+                crate::core::panic::catch(self.cfg.hooks.run_post(name, content.clone(), is_error));
+            match until_cancelled(&self.cancel, self.cfg.parent_cancel.as_ref(), post).await {
+                Some(Ok(output)) => content = output,
+                Some(Err(_)) => panicked = true,
+                None => {}
+            }
+        }
+        if name == "structured_output" {
+            *self.structured_error.lock().unwrap() =
+                is_error.then(|| content.model_text().into_owned());
+        }
+        let bounded = crate::core::panic::catch(async {
+            crate::agent::output::bound_tool_output(content.clone(), &ctx.jobs)
+        })
+        .await;
+        match bounded {
+            Ok(output) => content = output,
+            Err(_) => panicked = true,
+        }
+        (self.tool_result(id, content, is_error), panicked)
+    }
+
+    fn tool_result(&self, id: &str, content: ToolOutput, is_error: bool) -> ContentBlock {
         self.cfg.bus.emit(AgentEvent::ToolResult {
             agent_id: self.id.clone(),
             tool_use_id: id.to_string(),
-            output: content.clone().into(),
-            is_error: true,
+            output: content.clone(),
+            is_error,
         });
         ContentBlock::ToolResult {
             tool_use_id: id.to_string(),
-            content: content.into(),
-            is_error: Some(true),
+            content,
+            is_error: Some(is_error),
         }
     }
 
@@ -722,18 +835,14 @@ impl Agent {
         if recoveries >= MAX_TRUNCATION_RECOVERIES {
             return None;
         }
-        let truncated_tool_args = completion.message.content.iter().any(|b| {
-            matches!(b, ContentBlock::ToolUse { input, .. }
-                if crate::providers::codec::tool_input_parse_error(input).is_some())
-        });
-        if completion.stop_reason != StopReason::MaxTokens && !truncated_tool_args {
+        if !completion_truncated(completion) {
             return None;
         }
         let ceiling = crate::providers::provider::max_output_tokens_for(self.cfg.provider.model());
-        let produced = completion.usage.output_tokens as u32;
-        let bumped = produced.saturating_mul(2).max(8_192).min(ceiling);
-        // Retry only with more output room; otherwise retain the actionable parse error.
-        (Some(bumped) != current_override && bumped > produced).then_some(bumped)
+        let produced = u32::try_from(completion.usage.output_tokens).unwrap_or(u32::MAX);
+        let previous = current_override.unwrap_or(produced).max(produced);
+        let bumped = previous.saturating_mul(2).max(8_192).min(ceiling);
+        (bumped > previous).then_some(bumped)
     }
 
     /// Capture a schema-validated result through a temporary tool, nudging once
@@ -1110,46 +1219,12 @@ enum StreamOutcome {
     Interrupted(String),
 }
 
-/// `is_error` comes from the typed result, never from output text.
-#[allow(clippy::too_many_arguments)]
-async fn run_one(
-    tools: &ToolRegistry,
-    bus: &EventBus,
-    hooks: &crate::agent::hooks::Hooks,
-    agent_id: &str,
-    ctx: &ToolContext,
-    id: String,
-    name: String,
-    input: serde_json::Value,
-) -> ContentBlock {
-    // Malformed streamed arguments must not execute as empty input.
-    let (mut content, is_error) =
-        if let Some(explain) = crate::providers::codec::tool_input_parse_error(&input) {
-            (ToolOutput::from(explain), true)
-        } else {
-            match hooks.run_pre(&name, input).await {
-                Err(reason) => (reason.into(), true),
-                Ok(input) => match tools.execute(&name, input, ctx).await {
-                    Ok(output) => (output, false),
-                    Err(e) => (e.into_output(), true),
-                },
-            }
-        };
-    if !hooks.post.is_empty() {
-        content = hooks.run_post(&name, content, is_error).await;
-    }
-    content = crate::agent::output::bound_tool_output(content, &ctx.jobs);
-    bus.emit(AgentEvent::ToolResult {
-        agent_id: agent_id.to_string(),
-        tool_use_id: id.clone(),
-        output: content.clone(),
-        is_error,
-    });
-    ContentBlock::ToolResult {
-        tool_use_id: id,
-        content,
-        is_error: Some(is_error),
-    }
+fn completion_truncated(completion: &Completion) -> bool {
+    completion.stop_reason == StopReason::MaxTokens
+        || completion.message.content.iter().any(|block| {
+            matches!(block, ContentBlock::ToolUse { input, .. }
+                if crate::providers::codec::tool_input_parse_error(input).is_some())
+        })
 }
 
 #[cfg(test)]
@@ -1171,15 +1246,15 @@ mod tests {
         use std::time::Duration;
         use tokio::sync::Notify;
 
-        const BOUND: Duration = Duration::from_secs(2);
+        pub(super) const BOUND: Duration = Duration::from_secs(2);
 
-        fn agent(provider: Arc<dyn Provider>) -> Agent {
+        pub(super) fn agent(provider: Arc<dyn Provider>) -> Agent {
             let mut cfg = config(provider);
             cfg.max_turns = 3;
             Agent::new(cfg)
         }
 
-        fn capture(agent: &Agent) -> Arc<Mutex<Vec<AgentEvent>>> {
+        pub(super) fn capture(agent: &Agent) -> Arc<Mutex<Vec<AgentEvent>>> {
             let events = Arc::new(Mutex::new(Vec::new()));
             let recorded = events.clone();
             agent.bus().on(Arc::new(move |event| {
@@ -1188,7 +1263,11 @@ mod tests {
             events
         }
 
-        async fn bounded_run(agent: &mut Agent, prompt: &str, budget: u32) -> RunOutcome {
+        pub(super) async fn bounded_run(
+            agent: &mut Agent,
+            prompt: &str,
+            budget: u32,
+        ) -> RunOutcome {
             tokio::time::timeout(BOUND, agent.run_with_budget(prompt, budget))
                 .await
                 .expect("run must settle promptly")
@@ -1469,18 +1548,20 @@ mod tests {
                     "{name}"
                 );
                 assert_eq!(agent.cancel.load(Ordering::Relaxed), own, "{name}");
-                assert_eq!(
-                    tokio::time::timeout(BOUND, agent.run("go"))
-                        .await
-                        .unwrap()
-                        .unwrap(),
-                    if parent == Some(true) {
-                        "[interrupted]"
-                    } else {
-                        "done"
-                    },
-                    "{name}",
-                );
+                let result = tokio::time::timeout(BOUND, agent.run("go")).await.unwrap();
+                if parent == Some(true) {
+                    assert!(
+                        result
+                            .unwrap_err()
+                            .downcast_ref::<RunStopped>()
+                            .is_some_and(
+                                |stopped| stopped.0.stop_reason == RunStopReason::Cancelled
+                            ),
+                        "{name}"
+                    );
+                } else {
+                    assert_eq!(result.unwrap(), "done", "{name}");
+                }
                 assert!(!agent.cancel.load(Ordering::Relaxed), "{name}");
                 assert_eq!(
                     agent
@@ -2415,9 +2496,7 @@ mod tests {
 
     mod structured {
         use super::*;
-        use crate::test_support::agent::{
-            completion, config, text, tool, ScriptProvider, Step, Summary,
-        };
+        use crate::test_support::agent::{config, text, tool, ScriptProvider, Step, Summary};
         use serde_json::json;
         use std::time::Duration;
 
@@ -2503,9 +2582,380 @@ mod tests {
             })
             .await
             .expect("cancel must break the parked stream promptly");
-            assert_eq!(result.unwrap(), "[interrupted]");
+            assert!(result
+                .unwrap_err()
+                .downcast_ref::<RunStopped>()
+                .is_some_and(|stopped| stopped.0.stop_reason == RunStopReason::Cancelled));
             assert_eq!(provider.calls.load(Ordering::Relaxed), 1);
             provider.assert_exhausted();
+        }
+    }
+
+    mod reliability {
+        use super::run::{agent, bounded_run, capture, BOUND};
+        use super::*;
+        use crate::agent::team::mailbox;
+        use crate::core::types::ToolSpec;
+        use crate::test_support::agent::{completion, config, text, tool, ScriptProvider, Step};
+        use crate::tools::registry::{Tool, ToolResult};
+        use async_trait::async_trait;
+        use serde_json::{json, Value};
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        use tokio::sync::Notify;
+
+        #[tokio::test]
+        async fn read_loader_context_survives_dispatch_and_hook_replacement() {
+            struct ReplaceRead;
+            #[async_trait]
+            impl crate::agent::hooks::PostToolUse for ReplaceRead {
+                async fn on_post_tool(
+                    &self,
+                    _: &str,
+                    output: ToolOutput,
+                    is_error: bool,
+                ) -> ToolOutput {
+                    assert!(!is_error);
+                    assert!(matches!(
+                        output,
+                        ToolOutput::Read {
+                            loader_context: Some(_),
+                            ..
+                        }
+                    ));
+                    "replacement output".into()
+                }
+            }
+            for case in ["valid", "malformed", "oversized", "replaced"] {
+                let dir = crate::test_support::TestDir::new();
+                std::fs::create_dir(dir.join(".git")).unwrap();
+                std::fs::write(dir.join("file.rs"), "source body").unwrap();
+                let instructions = match case {
+                    "malformed" => vec![0xff],
+                    "oversized" => vec![b'x'; 64 * 1024 + 1],
+                    _ => b"Scoped project convention".to_vec(),
+                };
+                std::fs::write(dir.join("AGENTS.md"), instructions).unwrap();
+                let provider = Arc::new(ScriptProvider::new(vec![
+                    Step::Complete(vec![ContentBlock::ToolUse {
+                        id: "read".into(),
+                        name: "read_file".into(),
+                        input: json!({"path":"file.rs"}),
+                    }]),
+                    Step::Complete(vec![text("done")]),
+                ]));
+                let mut cfg = config(provider.clone());
+                cfg.cwd = dir.path().to_string_lossy().into_owned();
+                cfg.tools.add(Arc::new(crate::tools::builtin::ReadFileTool));
+                if case == "replaced" {
+                    cfg.hooks.post.push(Arc::new(ReplaceRead));
+                }
+                let mut agent = Agent::new(cfg);
+                let events = capture(&agent);
+                assert_eq!(
+                    bounded_run(&mut agent, "read source", 3).await.stop_reason,
+                    RunStopReason::Completed
+                );
+                let ContentBlock::ToolResult {
+                    content,
+                    is_error: Some(false),
+                    ..
+                } = &agent.messages()[2].content[0]
+                else {
+                    panic!("successful read result expected")
+                };
+                if case == "replaced" {
+                    assert_eq!(content.model_text(), "replacement output");
+                } else {
+                    let ToolOutput::Read {
+                        body,
+                        loader_context: Some(context),
+                    } = content
+                    else {
+                        panic!("typed read expected")
+                    };
+                    assert_eq!(body, "     1\tsource body");
+                    assert!(context.contains(if case == "valid" {
+                        "Scoped project convention"
+                    } else {
+                        "[!] Auxiliary project instructions could not be loaded"
+                    }));
+                    assert!(content.model_text().contains(context));
+                }
+                let events = events.lock().unwrap();
+                let output = events
+                    .iter()
+                    .find_map(|event| match event {
+                        AgentEvent::ToolResult {
+                            output,
+                            is_error: false,
+                            ..
+                        } => Some(output),
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(output, content);
+                let requests = provider.requests.lock().unwrap();
+                assert!(
+                    matches!(&requests[1][2].content[0], ContentBlock::ToolResult { content: sent, is_error: Some(false), .. } if sent == content)
+                );
+                provider.assert_exhausted();
+            }
+        }
+
+        struct ReliabilityTool {
+            name: &'static str,
+            read_only: bool,
+            panics: bool,
+            calls: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl Tool for ReliabilityTool {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: self.name.into(),
+                    description: String::new(),
+                    input_schema: json!({"type":"object"}),
+                }
+            }
+            fn is_read_only(&self) -> bool {
+                self.read_only
+            }
+            async fn execute(&self, _: Value, ctx: &ToolContext) -> ToolResult {
+                tokio::task::yield_now().await;
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                if !self.read_only {
+                    std::fs::write(std::path::Path::new(&ctx.cwd).join(self.name), "committed")?;
+                }
+                assert!(!self.panics, "simulated tool panic after work");
+                Ok("known success".into())
+            }
+        }
+
+        #[tokio::test]
+        async fn tool_panics_preserve_siblings_and_never_replay_mutations() {
+            for read_only in [true, false] {
+                let dir = crate::test_support::TestDir::new();
+                let calls = Arc::new(AtomicUsize::new(0));
+                let skipped = Arc::new(AtomicUsize::new(0));
+                let provider = Arc::new(ScriptProvider::new(vec![Step::Complete(vec![
+                    tool("ok", "read_ok"),
+                    tool("panic", "panic_tool"),
+                    tool("skip", "unstarted"),
+                ])]));
+                let mut cfg = config(provider.clone());
+                cfg.cwd = dir.path().to_string_lossy().into_owned();
+                for (name, readonly, panics, count) in [
+                    ("read_ok", true, false, Arc::new(AtomicUsize::new(0))),
+                    ("panic_tool", read_only, true, calls.clone()),
+                    ("unstarted", false, false, skipped.clone()),
+                ] {
+                    cfg.tools.add(Arc::new(ReliabilityTool {
+                        name,
+                        read_only: readonly,
+                        panics,
+                        calls: count,
+                    }));
+                }
+                let mut agent = Agent::new(cfg);
+                let events = capture(&agent);
+                let outcome = bounded_run(&mut agent, "go", 3).await;
+                assert_eq!(outcome.stop_reason, RunStopReason::ToolPanic);
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                assert_eq!(skipped.load(Ordering::SeqCst), 0);
+                assert_eq!(provider.calls.load(Ordering::Relaxed), 1);
+                if !read_only {
+                    assert_eq!(
+                        std::fs::read_to_string(dir.join("panic_tool")).unwrap(),
+                        "committed"
+                    );
+                }
+                let results = &agent.messages()[2].content;
+                assert_eq!(results.len(), 3);
+                for (block, id, error) in [
+                    (&results[0], "ok", false),
+                    (&results[1], "panic", true),
+                    (&results[2], "skip", true),
+                ] {
+                    assert!(
+                        matches!(block, ContentBlock::ToolResult { tool_use_id, is_error: Some(actual), .. } if tool_use_id == id && *actual == error)
+                    );
+                }
+                assert!(
+                    matches!(&results[0], ContentBlock::ToolResult { content, .. } if content.model_text() == "known success")
+                );
+                let events = events.lock().unwrap();
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|e| matches!(e, AgentEvent::ToolResult { .. }))
+                        .count(),
+                    3
+                );
+                assert!(matches!(events.last(), Some(AgentEvent::TurnEnd { .. })));
+                provider.assert_exhausted();
+            }
+        }
+
+        struct HangingPostHook(Arc<Notify>);
+        #[async_trait]
+        impl crate::agent::hooks::PostToolUse for HangingPostHook {
+            async fn on_post_tool(&self, _: &str, _: ToolOutput, _: bool) -> ToolOutput {
+                self.0.notify_one();
+                std::future::pending().await
+            }
+        }
+
+        #[tokio::test]
+        async fn cancellation_during_posthook_preserves_committed_result_in_root_and_child() {
+            for child_stop in [false, true] {
+                let dir = crate::test_support::TestDir::new();
+                let entered = Arc::new(Notify::new());
+                let provider = Arc::new(ScriptProvider::new(vec![Step::Complete(vec![tool(
+                    "write",
+                    "committed_file",
+                )])]));
+                let mut cfg = config(provider.clone());
+                cfg.cwd = dir.path().to_string_lossy().into_owned();
+                cfg.tools.add(Arc::new(ReliabilityTool {
+                    name: "committed_file",
+                    read_only: false,
+                    panics: false,
+                    calls: Arc::new(AtomicUsize::new(0)),
+                }));
+                cfg.hooks
+                    .post
+                    .push(Arc::new(HangingPostHook(entered.clone())));
+                let mut agent = Agent::new(cfg);
+                let cancel = agent.cancel_handle();
+                let events = capture(&agent);
+                let team = crate::agent::team::AgentRegistry::new();
+                let (_, tx) = mailbox();
+                let handle = team.register("child".into(), 1, "root".into(), tx);
+                let work = async {
+                    if child_stop {
+                        handle
+                            .run_until_stopped(
+                                Arc::new(AtomicBool::new(false)),
+                                cancel.clone(),
+                                agent.run_with_budget("go", 3),
+                            )
+                            .await
+                            .unwrap()
+                    } else {
+                        agent.run_with_budget("go", 3).await
+                    }
+                };
+                let (result, ()) = tokio::time::timeout(BOUND, async {
+                    tokio::join!(work, async {
+                        entered.notified().await;
+                        if child_stop {
+                            team.stop("root", "child").unwrap();
+                        } else {
+                            cancel.store(true, Ordering::Relaxed);
+                        }
+                    })
+                })
+                .await
+                .unwrap();
+                assert_eq!(result.unwrap().stop_reason, RunStopReason::Cancelled);
+                assert_eq!(
+                    std::fs::read_to_string(dir.join("committed_file")).unwrap(),
+                    "committed"
+                );
+                assert!(
+                    matches!(&agent.messages()[2].content[0], ContentBlock::ToolResult { content, is_error: Some(false), .. } if content.model_text() == "known success")
+                );
+                assert!(events.lock().unwrap().iter().any(|e| matches!(e, AgentEvent::ToolResult { output, is_error: false, .. } if output.model_text() == "known success")));
+                provider.assert_exhausted();
+            }
+        }
+
+        #[tokio::test]
+        async fn inline_task_preserves_child_commit_on_cancel_and_propagates_panic() {
+            for panics in [false, true] {
+                let dir = crate::test_support::TestDir::new();
+                let cancel = Arc::new(AtomicBool::new(false));
+                let entered = Arc::new(Notify::new());
+                let child_provider = Arc::new(ScriptProvider::new(vec![
+                    Step::Complete(vec![tool("commit", "child_commit")]),
+                    Step::Complete(vec![text("successful sibling")]),
+                ]));
+                let provider = Arc::new(ScriptProvider::new(vec![Step::Complete(vec![
+                    ContentBlock::ToolUse {
+                        id: "task-call".into(),
+                        name: "task".into(),
+                        input: json!({"tasks":[
+                            {"description":"first", "prompt":"commit"},
+                            {"description":"second", "prompt":"answer"},
+                        ]}),
+                    },
+                ])]));
+                let mut cfg = config(provider.clone());
+                cfg.cancel = Some(cancel.clone());
+                cfg.cwd = dir.path().to_string_lossy().into_owned();
+                let mut tools = ToolRegistry::new(None);
+                tools.add(Arc::new(ReliabilityTool {
+                    name: "child_commit",
+                    read_only: false,
+                    panics,
+                    calls: Arc::new(AtomicUsize::new(0)),
+                }));
+                let mut hooks = crate::agent::hooks::Hooks::default();
+                if !panics {
+                    hooks.post.push(Arc::new(HangingPostHook(entered.clone())));
+                }
+                cfg.tools.add(Arc::new(crate::tools::task::TaskTool {
+                    env: crate::agent::env::AgentEnv {
+                        provider: child_provider.clone(),
+                        subagent_tools: tools,
+                        bus: cfg.bus.clone(),
+                        cwd: cfg.cwd.clone(),
+                        subagent_system: None,
+                        jobs: cfg.jobs.clone(),
+                        team: crate::agent::team::AgentRegistry::new(),
+                        lsp: None,
+                        parent_cancel: cancel.clone(),
+                        definitions: Default::default(),
+                        hooks,
+                        memory: None,
+                    },
+                }));
+                let mut agent = Agent::new(cfg);
+                let events = capture(&agent);
+                let (outcome, ()) =
+                    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                        tokio::join!(agent.run_with_budget("delegate", 3), async {
+                            if !panics {
+                                entered.notified().await;
+                                cancel.store(true, Ordering::Relaxed);
+                            }
+                        })
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    outcome.unwrap().stop_reason,
+                    if panics {
+                        RunStopReason::ToolPanic
+                    } else {
+                        RunStopReason::Cancelled
+                    }
+                );
+                assert_eq!(
+                    std::fs::read_to_string(dir.join("child_commit")).unwrap(),
+                    "committed"
+                );
+                if panics {
+                    assert!(
+                        matches!(&agent.messages()[2].content[0], ContentBlock::ToolResult { content, .. } if content.model_text().contains("successful sibling"))
+                    );
+                } else {
+                    assert!(events.lock().unwrap().iter().any(|e| matches!(e, AgentEvent::ToolResult { tool_use_id, output, is_error: false, .. } if tool_use_id == "commit" && output.model_text() == "known success")));
+                }
+                provider.assert_exhausted();
+                child_provider.assert_exhausted();
+            }
         }
 
         fn truncated(id: &str, produced: u64) -> Step {
@@ -2521,73 +2971,79 @@ mod tests {
 
         #[tokio::test]
         async fn truncated_response_recovers_a_bounded_number_of_times_then_stops() {
-            for (name, finishes) in [("recovered", true), ("persistent truncation", false)] {
-                let mut script = ScriptProvider::new(vec![
+            for finishes in [false, true] {
+                let provider = Arc::new(ScriptProvider::new(vec![
                     truncated("discarded-1", 4096),
                     truncated("discarded-2", 6000),
-                    truncated("retained-3", 7000),
                     if finishes {
                         Step::Complete(vec![text("done")])
                     } else {
-                        truncated("retained-4", 8000)
+                        truncated("discarded-3", 7000)
                     },
-                ]);
-                if !finishes {
-                    script = script.with_summary(Summary::Complete);
-                }
-                let provider = Arc::new(script);
-                let mut cfg = config(provider.clone());
-                cfg.max_turns = 4;
-                let mut agent = Agent::new(cfg);
-                let outcome = tokio::time::timeout(
-                    Duration::from_secs(2),
-                    agent.run_with_budget("do something big", 4),
-                )
-                .await
-                .expect("truncation recovery must terminate")
-                .unwrap();
-                assert_eq!(outcome.turns, 4, "{name}");
+                ]));
+                let mut agent = agent(provider.clone());
+                let outcome = bounded_run(&mut agent, "do something big", 3).await;
+                assert_eq!(outcome.turns, 3);
                 assert_eq!(
                     outcome.stop_reason,
                     if finishes {
                         RunStopReason::Completed
                     } else {
-                        RunStopReason::TurnLimit
-                    },
-                    "{name}"
+                        RunStopReason::OutputLimit
+                    }
                 );
                 assert_eq!(
                     *provider.caps.lock().unwrap(),
-                    vec![None, Some(8192), Some(12000), None],
-                    "{name}"
+                    vec![None, Some(8192), Some(16000)]
                 );
-                let requests = provider.requests.lock().unwrap();
-                for request in &requests[..3] {
-                    assert_eq!(
-                        request.len(),
-                        1,
-                        "discarded truncation entered history: {name}"
-                    );
-                    assert_eq!(request[0].text(), "do something big");
+                for request in provider.requests.lock().unwrap().iter() {
+                    assert_eq!(request.len(), 1);
                 }
-                assert_eq!(requests[3].len(), 3, "{name}");
                 for history in [agent.messages(), agent.working_messages()] {
-                    assert_eq!(history.len(), if finishes { 4 } else { 6 }, "{name}");
-                    let encoded = serde_json::to_string(history).unwrap();
-                    assert!(!encoded.contains("discarded-"), "{name}");
-                    assert!(
-                        matches!(&history[1].content[0], ContentBlock::ToolUse { id, .. } if id == "retained-3")
-                    );
-                    assert!(
-                        matches!(&history[2].content[0], ContentBlock::ToolResult { tool_use_id, is_error: Some(true), .. } if tool_use_id == "retained-3")
-                    );
-                    assert_eq!(history.last().unwrap().text(), outcome.text, "{name}");
+                    assert!(!history.iter().flat_map(|m| &m.content).any(|b| matches!(
+                        b,
+                        ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. }
+                    )));
                 }
-                assert_eq!(
-                    provider.calls.load(Ordering::Relaxed),
-                    if finishes { 4 } else { 5 },
-                    "{name}"
-                );
+                assert_eq!(provider.calls.load(Ordering::Relaxed), 3);
+                provider.assert_exhausted();
+            }
+        }
+
+        #[tokio::test]
+        async fn provider_shaped_text_only_max_tokens_is_not_success_and_keeps_usage() {
+            for budget in [1, 3] {
+                let mut reply = completion(vec![text("partial answer")]);
+                reply.stop_reason = StopReason::MaxTokens;
+                reply.usage.output_tokens = 4096;
+                let provider = Arc::new(ScriptProvider::new(
+                    (0..budget)
+                        .map(|_| {
+                            Step::Events(vec![StreamEvent::MessageStop {
+                                completion: reply.clone(),
+                            }])
+                        })
+                        .collect(),
+                ));
+                let mut agent = agent(provider.clone());
+                let events = capture(&agent);
+                let outcome = bounded_run(&mut agent, "go", budget).await;
+                assert_eq!(outcome.stop_reason, RunStopReason::OutputLimit);
+                assert!(outcome.text.contains("partial answer"));
+                assert_eq!(outcome.turns, budget);
+                assert!(outcome.into_completed_text().is_err());
+                let events = events.lock().unwrap();
+                let usage = events
+                    .iter()
+                    .find_map(|event| match event {
+                        AgentEvent::TurnEnd { usage, .. } => Some(*usage),
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(usage.output_tokens, 4096 * u64::from(budget));
+                assert_eq!(usage.cache_creation_input_tokens, 2 * u64::from(budget));
+                assert_eq!(usage.cache_read_input_tokens, 3 * u64::from(budget));
+                assert_eq!(usage.input_tokens, 10 * u64::from(budget));
                 provider.assert_exhausted();
             }
         }
@@ -2854,6 +3310,7 @@ mod tests {
                     .unwrap();
                 assert_eq!(sent, content);
                 match content {
+                    ToolOutput::Read { .. } => panic!("expected shell output"),
                     ToolOutput::Text(text) => assert_eq!(text, "entire result withheld"),
                     ToolOutput::Shell(shell) => {
                         assert_eq!(shell.exit_code, Some(7));

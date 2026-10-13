@@ -697,20 +697,120 @@ mod tests {
     }
 
     #[cfg(windows)]
+    #[test]
+    fn windows_descendant_fixture() {
+        let Ok(pid_file) = std::env::var("BOB_PROCESS_FIXTURE_PID_FILE") else {
+            return;
+        };
+        if std::env::var_os("BOB_PROCESS_FIXTURE_CHILD").is_some() {
+            println!("descendant stdout");
+            eprintln!("descendant stderr");
+            std::fs::write(pid_file, std::process::id().to_string()).unwrap();
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        } else {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "core::process::tests::windows_descendant_fixture",
+                    "--nocapture",
+                ])
+                .env("BOB_PROCESS_FIXTURE_CHILD", "1")
+                .spawn()
+                .unwrap();
+            child.wait().unwrap();
+        }
+    }
+
+    #[cfg(windows)]
     #[tokio::test]
-    async fn windows_owned_job_terminates_suspended_spawn() {
-        let mut process = ManagedProcess::spawn(Command::new("powershell").args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "Start-Sleep -Seconds 60",
-        ]))
-        .unwrap();
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(20), process.wait())
+    async fn windows_owned_job_cleans_up_descendants_on_timeout_and_drop() {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+
+        fn handle(pid: u32) -> OwnedHandle {
+            let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+            assert!(
+                !raw.is_null(),
+                "open fixture process {pid}: {}",
+                io::Error::last_os_error()
+            );
+            unsafe { OwnedHandle::from_raw_handle(raw) }
+        }
+
+        async fn assert_exited(handle: &OwnedHandle) {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let mut code = 0;
+                    assert_ne!(
+                        unsafe { GetExitCodeProcess(handle.as_raw_handle(), &mut code) },
+                        0
+                    );
+                    if code != 259 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("owned descendant must terminate");
+        }
+
+        for drop_process in [false, true] {
+            let root = crate::test_support::TestDir::new();
+            let pid_file = root.join("descendant pid 終");
+            let mut process = ManagedProcess::spawn(
+                Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "core::process::tests::windows_descendant_fixture",
+                        "--nocapture",
+                    ])
+                    .env("BOB_PROCESS_FIXTURE_PID_FILE", &pid_file)
+                    .env_remove("BOB_PROCESS_FIXTURE_CHILD")
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped()),
+            )
+            .unwrap();
+            let parent = handle(process.id().unwrap());
+            let descendant_pid = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                loop {
+                    if let Ok(text) = std::fs::read_to_string(&pid_file) {
+                        if let Ok(pid) = text.parse::<u32>() {
+                            break pid;
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("native descendant should start");
+            let descendant = handle(descendant_pid);
+            if drop_process {
+                drop(process);
+            } else {
+                assert!(tokio::time::timeout(
+                    std::time::Duration::from_millis(20),
+                    process.collect_output(4096),
+                )
                 .await
-                .is_err()
-        );
-        assert!(!process.terminate_and_wait().await.unwrap().success());
+                .is_err());
+                let output = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    process.terminate_and_collect(4096),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert!(!output.status.success());
+                assert!(output.stdout.text().contains("descendant stdout"));
+                assert!(output.stderr.text().contains("descendant stderr"));
+                assert!(!output.stdout.incomplete);
+                assert!(!output.stderr.incomplete);
+            }
+            assert_exited(&parent).await;
+            assert_exited(&descendant).await;
+        }
     }
 }

@@ -9,4 +9,6 @@ pub(crate) mod lifecycle;
 pub(crate) mod output;
 pub(crate) mod profiles;
 pub mod prompt;
+#[cfg(test)]
+mod prompt_eval;
 pub mod team;

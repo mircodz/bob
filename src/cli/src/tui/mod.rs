@@ -12,13 +12,12 @@ mod scrollback;
 mod session_ui;
 mod team;
 mod terminal;
-use terminal::restore_terminal;
 pub(super) use terminal::TerminalGuard;
 mod theme;
 mod view;
 mod widgets;
 
-use bob_core::agent::agent::Agent;
+use bob_core::agent::agent::{Agent, RunStopReason};
 use bob_core::core::config::BobConfig;
 use bob_core::core::events::{AgentEvent, EventBus};
 use bob_core::core::permissions::{
@@ -289,20 +288,65 @@ async fn git_branch(path: &std::path::Path) -> Option<String> {
     }
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TurnCompletion {
+    error: Option<String>,
+    stopped: bool,
+    panicked: bool,
+}
+
+impl TurnCompletion {
+    fn from_outcome(outcome: bob_core::agent::agent::RunOutcome) -> Self {
+        let has_summary = matches!(
+            outcome.stop_reason,
+            RunStopReason::Completed
+                | RunStopReason::OutputLimit
+                | RunStopReason::TurnLimit
+                | RunStopReason::ToolPanic
+        );
+        Self {
+            error: (!has_summary).then_some(outcome.text),
+            stopped: outcome.stop_reason != RunStopReason::Completed,
+            panicked: false,
+        }
+    }
+
+    fn panicked() -> Self {
+        Self {
+            error: Some("Root agent panicked; outcome unknown and changes may have taken effect. Automatic work is stopped. Exit and restart Bob before continuing; inspect changes before retrying.".into()),
+            stopped: true,
+            panicked: true,
+        }
+    }
+}
+
 fn spawn_turn(
     agent: &Arc<Mutex<Agent>>,
-    done_tx: &mpsc::UnboundedSender<Option<String>>,
+    done_tx: &mpsc::UnboundedSender<TurnCompletion>,
     text: String,
 ) -> tokio::task::JoinHandle<()> {
     let agent = agent.clone();
     let done_tx = done_tx.clone();
     tokio::spawn(async move {
-        let mut a = agent.lock().await;
-        let err = match a.run(&text).await {
-            Ok(_) => None,
-            Err(e) => Some(e.to_string()),
+        let result = bob_core::core::panic::catch(async {
+            let mut agent = agent.lock().await;
+            agent
+                .cancel_handle()
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            let budget = agent.turn_budget();
+            agent.run_with_budget(&text, budget).await
+        })
+        .await;
+        let completion = match result {
+            Ok(Ok(outcome)) => TurnCompletion::from_outcome(outcome),
+            Ok(Err(error)) => TurnCompletion {
+                error: Some(error.to_string()),
+                stopped: true,
+                panicked: false,
+            },
+            Err(_) => TurnCompletion::panicked(),
         };
-        let _ = done_tx.send(err);
+        let _ = done_tx.send(completion);
     })
 }
 
@@ -314,6 +358,9 @@ enum BgOutcome {
     Compacted {
         cell: usize,
         result: Result<(bool, usize, usize), String>,
+    },
+    CompactionPanicked {
+        cell: usize,
     },
     SessionSaveFailed(String),
 }
@@ -390,8 +437,12 @@ pub async fn run(
         Some(bob_core::lsp::LspManager::start(&config.lsp_servers, &cwd))
     };
 
+    let shell = Arc::new(bob_core::core::shell::BashShell::resolve(
+        &cwd,
+        config.bash_executable.as_deref(),
+    ));
     let system_prompt =
-        bob_core::agent::prompt::build_system_prompt(config.system.as_deref(), &cwd);
+        bob_core::agent::prompt::build_system_prompt(config.system.as_deref(), &cwd, &shell);
     let memory = store.memory_repository();
 
     let mut agent =
@@ -403,6 +454,7 @@ pub async fn run(
             team: team.clone(),
             cwd: cwd.to_string_lossy().to_string(),
             system_prompt: system_prompt.clone(),
+            shell,
             mcp_tools: mcp_tools.clone(),
             extra_tools: Vec::new(),
             lsp: lsp.clone(),
@@ -439,6 +491,12 @@ pub async fn run(
 
     // Activate the restore guard before any fallible terminal setup.
     let _guard = TerminalGuard::activate()?;
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if !bob_core::core::panic::is_contained() {
+            default_hook(info);
+        }
+    }));
     let mut stdout = std::io::stdout();
     execute!(
         stdout,
@@ -446,14 +504,6 @@ pub async fn run(
         EnableBracketedPaste,
         EnableMouseCapture
     )?;
-    // Restore before the panic hook prints the backtrace.
-    {
-        let default_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            restore_terminal();
-            default_hook(info);
-        }));
-    }
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -574,6 +624,10 @@ pub async fn run(
                         match outcome {
                             KeyOutcome::Quit => break 'outer Ok(()),
                             KeyOutcome::Submit(text) => {
+                                if app.runtime_failed {
+                                    app.notify("Root runtime failed; exit and restart Bob before continuing");
+                                    continue 'outer;
+                                }
                                 if let Some(id) = app.focused_agent.clone() {
                                     app.send_agent_message(&id, &text);
                                 } else if app.running {
@@ -682,6 +736,10 @@ pub async fn run(
                                 }
                             }
                             KeyOutcome::Compact => {
+                                if app.runtime_failed {
+                                    app.notify("Root runtime failed; exit and restart Bob before continuing");
+                                    continue 'outer;
+                                }
                                 if app.running {
                                     app.view.push_notice(
                                         "finish the current turn first".into(),
@@ -695,9 +753,13 @@ pub async fn run(
                                     app.stick_to_bottom();
                                     let agent = agent.clone();
                                     root_turn = Some(spawn_bg(&app.bg_tx, async move {
-                                        let mut a = agent.lock().await;
-                                        let result = a.compact().await.map_err(|error| format!("{error:#}"));
-                                        BgOutcome::Compacted { cell, result }
+                                        match bob_core::core::panic::catch(async {
+                                            let mut a = agent.lock().await;
+                                            a.compact().await.map_err(|error| format!("{error:#}"))
+                                        }).await {
+                                            Ok(result) => BgOutcome::Compacted { cell, result },
+                                            Err(_) => BgOutcome::CompactionPanicked { cell },
+                                        }
                                     }));
                                 }
                             }
@@ -746,10 +808,16 @@ pub async fn run(
                     purpose: QueryPurpose::Tool(q.resp),
                 });
             }
-            Some(err) = app.turn_done_rx.recv() => {
+            Some(completion) = app.turn_done_rx.recv() => {
                 dirty = true;
                 app.view.busy = false;
-                if let Some(msg) = err {
+                app.runtime_failed |= completion.panicked;
+                if completion.stopped {
+                    app.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                    app.queue.clear();
+                    app.agent_team.stop_descendants("root");
+                }
+                if let Some(msg) = completion.error {
                     app.view.push_notice(format!("error: {}", msg));
                     app.stick_to_bottom();
                 }
@@ -757,7 +825,9 @@ pub async fn run(
                     app.apply_session_event(&mut session, &event);
                 }
                 let a = agent.lock().await;
-                app.context_usage = Some(a.context_usage());
+                if !app.runtime_failed {
+                    app.context_usage = Some(a.context_usage());
+                }
                 session.messages = a.messages().to_vec();
                 session.grants = permissions.export_grants();
                 if let Some(todos) = &app.todos {
@@ -788,7 +858,8 @@ pub async fn run(
                 }
                 drop(a);
                 if let Some(job_id) = app.detached_job.take() {
-                    app.jobs.finish(&job_id, bob_core::tools::jobs::JobStatus::Done, "turn finished".to_string());
+                    let status = if completion.stopped { bob_core::tools::jobs::JobStatus::Failed } else { bob_core::tools::jobs::JobStatus::Done };
+                    app.jobs.finish(&job_id, status, "turn finished".to_string());
                 }
                 app.current_prompt = None;
                 match app.queue.pop_front() {
@@ -816,7 +887,7 @@ pub async fn run(
                     dirty = true;
                 }
                 // Resume idle work for completion notices, but never revive a cancelled turn.
-                if !app.running && !app.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                if !app.runtime_failed && !app.running && !app.cancel.load(std::sync::atomic::Ordering::Relaxed) {
                     let finished = app.jobs.take_finished();
                     if !finished.is_empty() {
                         let list = finished
@@ -962,6 +1033,7 @@ struct App {
     /// Prompts submitted while a turn is running, sent in order once it frees.
     queue: std::collections::VecDeque<String>,
     running: bool,
+    runtime_failed: bool,
     compaction_completion: Option<usize>,
     /// If the running turn has been detached (Ctrl+B), the job id tracking it.
     detached_job: Option<String>,
@@ -981,8 +1053,8 @@ struct App {
     reasoning: bob_core::core::types::ReasoningEffort,
     /// Config provider id; Copilot and OpenAI both report "openai" through the trait.
     provider_id: String,
-    turn_done_tx: mpsc::UnboundedSender<Option<String>>,
-    turn_done_rx: mpsc::UnboundedReceiver<Option<String>>,
+    turn_done_tx: mpsc::UnboundedSender<TurnCompletion>,
+    turn_done_rx: mpsc::UnboundedReceiver<TurnCompletion>,
     bg_tx: mpsc::UnboundedSender<BgOutcome>,
     bg_rx: mpsc::UnboundedReceiver<BgOutcome>,
     turn_started: Option<std::time::Instant>,
@@ -1071,6 +1143,7 @@ impl App {
             file_at: None,
             queue: std::collections::VecDeque::new(),
             running: false,
+            runtime_failed: false,
             compaction_completion: None,
             detached_job: None,
             current_prompt: None,
@@ -1226,6 +1299,14 @@ impl App {
                 self.refresh_file_menu();
             }
             BgOutcome::Compacted { cell, result } => self.finish_compaction(cell, result),
+            BgOutcome::CompactionPanicked { cell } => {
+                self.view.finish_compaction(
+                    cell,
+                    Err("compaction panicked; history may be incomplete".into()),
+                );
+                self.compaction_completion = None;
+                let _ = self.turn_done_tx.send(TurnCompletion::panicked());
+            }
             BgOutcome::SessionSaveFailed(e) => {
                 self.view
                     .push_notice(format!("warning: couldn't save session: {e}"));
@@ -1247,7 +1328,7 @@ impl App {
                 Some(Cell::Compaction { done: false, .. })
             ) {
                 self.compaction_completion = None;
-                let _ = self.turn_done_tx.send(None);
+                let _ = self.turn_done_tx.send(TurnCompletion::default());
             }
         }
     }
@@ -2848,6 +2929,84 @@ mod pty_tests {
 mod tests {
     use super::test_support::test_app;
     use super::*;
+
+    #[test]
+    fn authoritative_stop_summaries_are_not_repeated_as_notices() {
+        for stop_reason in [
+            RunStopReason::Completed,
+            RunStopReason::TurnLimit,
+            RunStopReason::OutputLimit,
+            RunStopReason::ToolPanic,
+            RunStopReason::Cancelled,
+        ] {
+            let completion = TurnCompletion::from_outcome(bob_core::agent::agent::RunOutcome {
+                text: "authoritative handoff".into(),
+                stop_reason,
+                turns: 1,
+            });
+            assert_eq!(
+                completion.error.is_some(),
+                stop_reason == RunStopReason::Cancelled
+            );
+            assert_eq!(completion.stopped, stop_reason != RunStopReason::Completed);
+            assert!(!completion.panicked);
+        }
+    }
+
+    #[tokio::test]
+    async fn root_panic_sends_completion_and_releases_agent_mutex() {
+        use bob_core::agent::agent::{build_subagent, SubagentSpec};
+        use bob_core::core::types::{Completion, GenerateOptions, StreamEvent};
+
+        struct PanicProvider;
+        #[async_trait]
+        impl Provider for PanicProvider {
+            fn name(&self) -> &str {
+                "panic"
+            }
+            fn model(&self) -> &str {
+                "panic-model"
+            }
+            async fn generate(&self, _: GenerateOptions) -> anyhow::Result<Completion> {
+                panic!("unexpected generation")
+            }
+            async fn stream(
+                &self,
+                _: GenerateOptions,
+            ) -> anyhow::Result<mpsc::UnboundedReceiver<StreamEvent>> {
+                tokio::task::yield_now().await;
+                panic!("provider worker panic")
+            }
+        }
+        let agent = Arc::new(Mutex::new(build_subagent(SubagentSpec {
+            provider: Arc::new(PanicProvider),
+            tools: bob_core::tools::registry::ToolRegistry::new(None),
+            bus: EventBus::new(),
+            system: None,
+            cwd: ".".into(),
+            jobs: bob_core::tools::jobs::JobRegistry::new(),
+            lsp: None,
+            name: "root".into(),
+            max_turns: 3,
+            depth: 0,
+            inbox: None,
+            team: None,
+            parent_cancel: None,
+            hooks: Default::default(),
+            memory: None,
+        })));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let worker = spawn_turn(&agent, &tx, "go".into());
+        let completion = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(completion.panicked && completion.stopped);
+        assert!(completion.error.unwrap().contains("Exit and restart"));
+        assert!(agent.try_lock().is_ok());
+        worker.await.unwrap();
+        assert!(rx.try_recv().is_err());
+    }
 
     fn question(
         title: &str,

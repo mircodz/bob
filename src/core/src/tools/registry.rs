@@ -78,6 +78,7 @@ pub enum ToolErrorKind {
     Unavailable,
     /// Unclassified runtime failure.
     Failed,
+    Panic,
 }
 
 impl ToolErrorKind {
@@ -90,6 +91,7 @@ impl ToolErrorKind {
             ToolErrorKind::Timeout => "timeout",
             ToolErrorKind::Unavailable => "unavailable",
             ToolErrorKind::Failed => "failed",
+            ToolErrorKind::Panic => "panic",
         }
     }
 }
@@ -239,6 +241,15 @@ impl ToolRegistry {
     }
 
     pub async fn execute(&self, name: &str, input: Value, ctx: &ToolContext) -> ToolResult {
+        crate::core::panic::catch(self.execute_inner(name, input, ctx))
+            .await
+            .unwrap_or_else(|_| Err(ToolError::new(
+                ToolErrorKind::Panic,
+                "tool panicked; outcome unknown, changes may have taken effect; do not automatically retry",
+            )))
+    }
+
+    async fn execute_inner(&self, name: &str, input: Value, ctx: &ToolContext) -> ToolResult {
         let tool = match self.tools.get(name) {
             Some(t) => t.clone(),
             None => return Err(ToolError::not_found(format!("unknown tool \"{}\"", name))),
@@ -451,7 +462,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            output.as_text().unwrap().lines().next(),
+            output.model_text().lines().next(),
             Some("     1\ttrusted builtin content")
         );
         assert!(fixture.ctx.files.fully_read(
@@ -578,6 +589,46 @@ mod tests {
                 .kind,
             ToolErrorKind::PermissionDenied
         );
+    }
+
+    struct PanicTool(bool);
+
+    #[async_trait]
+    impl Tool for PanicTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "panic_tool".into(),
+                description: String::new(),
+                input_schema: json!({"type":"object"}),
+            }
+        }
+        fn preview(&self, _: &Value, _: &ToolContext) -> Option<String> {
+            assert!(!self.0, "preview panic");
+            None
+        }
+        async fn execute(&self, _: Value, _: &ToolContext) -> ToolResult {
+            tokio::task::yield_now().await;
+            panic!("async polling panic");
+        }
+    }
+
+    #[tokio::test]
+    async fn catches_preview_and_async_poll_panics_as_distinct_failures() {
+        let fixture = FileFixture::new();
+        for preview in [true, false] {
+            let mut registry = ToolRegistry::new(Some(Arc::new(PermissionEngine::new(
+                crate::core::permissions::Decision::Allow,
+                None,
+            ))));
+            registry.add(Arc::new(PanicTool(preview)));
+            let error = registry
+                .execute("panic_tool", json!({}), &fixture.ctx)
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind, ToolErrorKind::Panic);
+            assert!(error.message.contains("outcome unknown"));
+            assert!(error.message.contains("do not automatically retry"));
+        }
     }
 
     #[test]
