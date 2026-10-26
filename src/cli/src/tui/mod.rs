@@ -817,8 +817,8 @@ pub async fn run(
                     app.queue.clear();
                     app.agent_team.stop_descendants("root");
                 }
-                if let Some(msg) = completion.error {
-                    app.view.push_notice(format!("error: {}", msg));
+                if let Some(message) = completion.error {
+                    app.bus.emit(AgentEvent::Error { agent_id: "root".into(), message });
                     app.stick_to_bottom();
                 }
                 while let Ok(event) = evt_rx.try_recv() {
