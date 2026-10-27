@@ -1112,7 +1112,7 @@ mod tests {
             let text: String = (0..32).map(|x| buffer[(x, y)].symbol()).collect();
             let expected = match y {
                 3 => format!("{}first{}", " ".repeat(9), " ".repeat(18)),
-                4 => format!("{}error: bad{}", " ".repeat(9), " ".repeat(13)),
+                5 => format!("{}error: bad{}", " ".repeat(9), " ".repeat(13)),
                 _ => " ".repeat(32),
             };
             assert_eq!(text, expected, "row {y}");
@@ -1120,13 +1120,15 @@ mod tests {
                 renderer.hit_test_offset(y),
                 match y {
                     3 => Some((0, 0)),
-                    4 => Some((2, 0)),
+                    4 => Some((0, 1)),
+                    5 => Some((2, 0)),
+                    6 => Some((2, 1)),
                     _ => None,
                 }
             );
         }
         assert_eq!(buffer[(9, 3)].fg, Palette::DIM());
-        assert_eq!(buffer[(9, 4)].fg, Palette::ERROR());
+        assert_eq!(buffer[(9, 5)].fg, Palette::ERROR());
         assert_eq!(renderer.preparations, 2);
         assert!(renderer.at_bottom());
 
