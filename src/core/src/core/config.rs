@@ -1481,7 +1481,8 @@ mod tests {
         )
         .unwrap();
         let config = load_project_config(global, &cwd).unwrap();
-        let shell = crate::core::shell::BashShell::resolve(&cwd, config.bash_executable.as_deref());
+        let shell =
+            crate::core::shell::CommandShell::resolve(&cwd, config.bash_executable.as_deref());
         assert!(shell.executable().unwrap_err().contains("must be absolute"));
     }
 

@@ -31,7 +31,7 @@ use crate::tools::todo_write::TodoWriteTool;
 use crate::tools::web::{WebFetchTool, WebSearchTool};
 use std::sync::Arc;
 
-pub fn builtin_tools(shell: Arc<crate::core::shell::BashShell>) -> Vec<Arc<dyn Tool>> {
+pub fn builtin_tools(shell: Arc<crate::core::shell::CommandShell>) -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(ReadFileTool),
         Arc::new(WriteFileTool),

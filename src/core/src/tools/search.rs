@@ -383,6 +383,8 @@ async fn collect_process(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
     let mut child = cmd.spawn().map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             ToolError::unavailable("ripgrep (rg) is required for search; install ripgrep and retry")

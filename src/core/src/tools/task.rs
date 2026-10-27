@@ -959,7 +959,7 @@ mod tests {
                 tools: tools.clone(),
             });
             for tool in crate::tools::builtin_tools(Arc::new(
-                crate::core::shell::BashShell::resolve(std::path::Path::new("."), None),
+                crate::core::shell::CommandShell::resolve(std::path::Path::new("."), None),
             )) {
                 env.subagent_tools.add(tool);
             }
@@ -1965,7 +1965,7 @@ mod tests {
             permissions.add(crate::core::policies::deny_tools(vec!["write_file".into()]));
             env.subagent_tools = ToolRegistry::new(Some(Arc::new(permissions)));
             for tool in crate::tools::builtin_tools(Arc::new(
-                crate::core::shell::BashShell::resolve(std::path::Path::new("."), None),
+                crate::core::shell::CommandShell::resolve(std::path::Path::new("."), None),
             )) {
                 env.subagent_tools.add(tool);
             }
@@ -2207,7 +2207,7 @@ mod tests {
                     team: AgentRegistry::new(),
                     cwd: dir.path().to_string_lossy().into_owned(),
                     system_prompt: String::new(),
-                    shell: Arc::new(crate::core::shell::BashShell::resolve(dir.path(), None)),
+                    shell: Arc::new(crate::core::shell::CommandShell::resolve(dir.path(), None)),
                     mcp_tools: impostors(),
                     extra_tools: impostors(),
                     lsp: None,

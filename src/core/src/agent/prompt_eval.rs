@@ -6,7 +6,7 @@ use super::team::AgentRegistry;
 use crate::core::config::load_config;
 use crate::core::events::{AgentEvent, EventBus};
 use crate::core::permissions::{Decision, PermissionEngine};
-use crate::core::shell::BashShell;
+use crate::core::shell::CommandShell;
 use crate::core::types::Usage;
 use crate::providers::create_provider_with_options;
 use crate::providers::models::ModelSpec;
@@ -177,7 +177,7 @@ async fn copilot_prompt_behavior() {
                     moved: AtomicBool::new(false),
                 }));
             }
-            let shell = Arc::new(BashShell::resolve(dir.path(), None));
+            let shell = Arc::new(CommandShell::resolve(dir.path(), None));
             let mut permissions = PermissionEngine::new(Decision::Deny, None);
             permissions.add(Arc::new(|request| {
                 Some(

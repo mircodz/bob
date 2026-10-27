@@ -1,5 +1,6 @@
+use crate::core::permissions::{parse_bash, ParsedCommand};
 use crate::core::process::{ManagedProcess, ProcessOutput};
-use crate::core::shell::BashShell;
+use crate::core::shell::{CommandShell, ShellKind};
 use crate::core::types::{ShellOutcome, ShellOutput, ShellStream, ToolSpec};
 use crate::tools::jobs::JobStatus;
 use crate::tools::registry::{Tool, ToolContext, ToolError, ToolResult};
@@ -7,11 +8,11 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 pub struct BashTool {
-    shell: std::sync::Arc<BashShell>,
+    shell: std::sync::Arc<CommandShell>,
 }
 
 impl BashTool {
-    pub fn new(shell: std::sync::Arc<BashShell>) -> Self {
+    pub fn new(shell: std::sync::Arc<CommandShell>) -> Self {
         Self { shell }
     }
 }
@@ -19,11 +20,15 @@ impl BashTool {
 #[async_trait]
 impl Tool for BashTool {
     fn spec(&self) -> ToolSpec {
+        let guidance = match self.shell.kind() {
+            ShellKind::Bash => "Uses bash -c; write Bash syntax.",
+            ShellKind::Pwsh => "Uses PowerShell 7 (pwsh -NoLogo -NoProfile -NonInteractive -Command); write PowerShell syntax, not Bash. Check $LASTEXITCODE immediately after native commands and use exit $LASTEXITCODE to preserve their exact exit status. Later successful commands can mask earlier failures; use -ErrorAction Stop when PowerShell errors must halt a script.",
+        };
         ToolSpec {
             name: "bash".to_string(),
             description:
-                "Run a shell command with bash -c for builds, tests, git, package managers, \
-                or scripts. Prefer dedicated read/search tools for inspecting files. Commands \
+                format!("Run a shell command for builds, tests, git, package managers, \
+                or scripts. {guidance} Prefer dedicated read/search tools for inspecting files. Commands \
                 start in the working directory; quote paths and keep commands non-interactive. \
                 Use a foreground timeout for bounded work. Timeout and cancellation terminate \
                 the owned process group (Unix) or job (Windows) and reap the shell. Processes \
@@ -33,8 +38,7 @@ impl Tool for BashTool {
                 Foreground output keeps the head and tail when it exceeds roughly 30k bytes. \
                 For verification, check an explicit exit status or test result rather than \
                 assuming returned text means success. Never commit, push, or run destructive \
-                actions without the user's authorization."
-                    .to_string(),
+                actions without the user's authorization."),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -47,6 +51,13 @@ impl Tool for BashTool {
         }
     }
 
+    fn command_analysis(&self, input: &Value) -> Option<ParsedCommand> {
+        match self.shell.kind() {
+            ShellKind::Bash => Some(parse_bash(input["command"].as_str().unwrap_or(""))),
+            ShellKind::Pwsh => None,
+        }
+    }
+
     async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
         let command = input["command"].as_str().unwrap_or("").to_string();
         let cwd = ctx.cwd.clone();
@@ -56,6 +67,7 @@ impl Tool for BashTool {
                 .executable()
                 .map_err(ToolError::failed)?
                 .to_path_buf();
+            let kind = self.shell.kind();
             let id = ctx.jobs.next_id();
             let bg_cmd = command.clone();
             let accepted = ctx.jobs.spawn_cancellable(
@@ -69,7 +81,7 @@ impl Tool for BashTool {
                             ..ShellOutput::default()
                         }.into());
                     }
-                    let mut process = match spawn_shell(&executable, &bg_cmd, &cwd) {
+                    let mut process = match spawn_shell(&executable, kind, &bg_cmd, &cwd) {
                         Ok(process) => process,
                         Err(error) => {
                             return (JobStatus::Failed, format!("failed to run: {error}").into())
@@ -121,7 +133,7 @@ impl Tool for BashTool {
             _ => None,
         };
         let executable = self.shell.executable().map_err(ToolError::failed)?;
-        let mut process = spawn_shell(executable, &command, &cwd)
+        let mut process = spawn_shell(executable, self.shell.kind(), &command, &cwd)
             .map_err(|error| ToolError::failed(error.to_string()))?;
         let output = if let Some(duration) = timeout {
             match tokio::time::timeout(duration, process.collect_output(14_000)).await {
@@ -159,12 +171,13 @@ impl Tool for BashTool {
 
 fn spawn_shell(
     executable: &std::path::Path,
+    kind: ShellKind,
     command: &str,
     cwd: &str,
 ) -> std::io::Result<ManagedProcess> {
     ManagedProcess::spawn(
         tokio::process::Command::new(executable)
-            .arg("-c")
+            .args(kind.command_args())
             .arg(command)
             .current_dir(cwd)
             .stdin(std::process::Stdio::null())
@@ -175,7 +188,8 @@ fn spawn_shell(
         std::io::Error::new(
             error.kind(),
             format!(
-                "could not start Bash executable '{}' in working directory '{cwd}': {error}",
+                "could not start {} executable '{}' in working directory '{cwd}': {error}",
+                kind.name(),
                 executable.display()
             ),
         )
@@ -231,7 +245,7 @@ mod tests {
     }
 
     fn bash() -> BashTool {
-        BashTool::new(Arc::new(BashShell::resolve(
+        BashTool::new(Arc::new(CommandShell::resolve_bash(
             std::path::Path::new("."),
             None,
         )))
@@ -436,6 +450,7 @@ mod tests {
             move |mut cancel| async move {
                 let mut process = spawn_shell(
                     bash().shell.executable().unwrap(),
+                    ShellKind::Bash,
                     "printf before; printf error >&2; sleep 60",
                     ".",
                 )
@@ -474,7 +489,7 @@ mod tests {
     #[tokio::test]
     async fn unavailable_shell_rejects_foreground_and_background_without_a_job() {
         let root = crate::test_support::TestDir::new();
-        let tool = BashTool::new(Arc::new(BashShell::resolve(
+        let tool = BashTool::new(Arc::new(CommandShell::resolve_bash(
             &root,
             Some(&root.join("missing Bash 終.exe")),
         )));
@@ -542,11 +557,11 @@ mod tests {
         let cwd = root.join("working directory 終");
         std::fs::create_dir(&cwd).unwrap();
         std::fs::write(cwd.join("input file 終"), "fixture").unwrap();
-        let discovered = BashShell::resolve(&cwd, None);
+        let discovered = CommandShell::resolve_bash(&cwd, None);
         let executable = discovered
             .executable()
             .expect("native Bash required for shell tests");
-        let selected = Arc::new(BashShell::resolve(&cwd, Some(executable)));
+        let selected = Arc::new(CommandShell::resolve_bash(&cwd, Some(executable)));
         let foreground = BashTool::new(selected.clone());
         let background = BashTool::new(selected.clone());
         assert!(Arc::ptr_eq(&foreground.shell, &background.shell));
@@ -575,6 +590,214 @@ mod tests {
         assert!(direct.stdout.text.ends_with("stdout 終"));
         assert!(!direct.stdout.truncated);
         assert!(ctx.jobs.shutdown().await);
+    }
+
+    #[cfg(windows)]
+    mod powershell {
+        use super::*;
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use std::time::Duration;
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+
+        fn pwsh(cwd: &std::path::Path) -> BashTool {
+            let selected = CommandShell::resolve(cwd, None);
+            selected
+                .executable()
+                .expect("PowerShell 7 required for Windows tests");
+            assert_eq!(selected.kind(), ShellKind::Pwsh);
+            BashTool::new(Arc::new(selected))
+        }
+
+        #[tokio::test]
+        async fn foreground_and_background_preserve_powershell_syntax_and_streams() {
+            let root = crate::test_support::TestDir::new();
+            let cwd = root.join("working directory 終");
+            std::fs::create_dir(&cwd).unwrap();
+            std::fs::write(cwd.join("input file 終"), "fixture").unwrap();
+            let tool = pwsh(&cwd);
+            let mut ctx = context();
+            ctx.cwd = cwd.to_string_lossy().into_owned();
+            let command = r#"
+if ($PSVersionTable.PSEdition -ne 'Core' -or $PSVersionTable.PSVersion.Major -lt 7) { exit 3 }
+if ((Get-Content -LiteralPath 'input file 終' -Raw) -ne 'fixture') { exit 4 }
+$value = 'literal $value "quotes" 終'
+[Console]::Out.Write($value)
+[Console]::Error.Write('stderr 終')
+exit 7
+"#;
+            let direct = shell(
+                tool.execute(json!({"command": command}), &ctx)
+                    .await
+                    .unwrap_err()
+                    .into_output(),
+            );
+            tool.execute(json!({"command": command, "run_in_background": true}), &ctx)
+                .await
+                .unwrap();
+            wait_for_job(&ctx).await;
+            let page = ctx.jobs.output_page("job_1", 0, 24_000).unwrap();
+            assert_eq!(page.status, JobStatus::Failed);
+            let retained = page.shell.unwrap();
+            assert_eq!(direct.exit_code, Some(7));
+            assert_eq!(retained.exit_code, direct.exit_code);
+            assert_eq!(retained.stdout, direct.stdout);
+            assert_eq!(retained.stderr, direct.stderr);
+            assert_eq!(direct.stdout.text, "literal $value \"quotes\" 終");
+            assert_eq!(direct.stderr.text, "stderr 終");
+            assert!(ctx.jobs.shutdown().await);
+        }
+
+        #[tokio::test]
+        async fn exit_status_follows_powershell_without_stale_native_exit_codes() {
+            let tool = pwsh(std::path::Path::new("."));
+            let ctx = context();
+            for (command, exit_code, stderr) in [
+                ("[Console]::Out.Write('success')", 0, ""),
+                ("throw 'terminating failure'", 1, "terminating failure"),
+                (
+                    "Write-Error 'nonterminating failure'",
+                    1,
+                    "nonterminating failure",
+                ),
+                (
+                    "Write-Error 'handled'; [Console]::Out.Write('recovered')",
+                    0,
+                    "handled",
+                ),
+                (
+                    r#"& "$PSHOME/pwsh.exe" -NoProfile -NonInteractive -Command 'exit 7'"#,
+                    1,
+                    "",
+                ),
+                (
+                    r#"& "$PSHOME/pwsh.exe" -NoProfile -NonInteractive -Command 'exit 7'; exit $LASTEXITCODE"#,
+                    7,
+                    "",
+                ),
+                (
+                    r#"& "$PSHOME/pwsh.exe" -NoProfile -NonInteractive -Command 'exit 7'; [Console]::Out.Write('recovered')"#,
+                    0,
+                    "",
+                ),
+            ] {
+                let result = tool
+                    .execute(json!({"command": command, "timeout": 15}), &ctx)
+                    .await;
+                assert_eq!(result.is_ok(), exit_code == 0, "{command}");
+                let output = shell(result.unwrap_or_else(ToolError::into_output));
+                assert_eq!(output.exit_code, Some(exit_code), "{command}");
+                assert!(
+                    output.stderr.text.contains(stderr),
+                    "{command}: {}",
+                    output.stderr.text
+                );
+            }
+        }
+
+        async fn child_handle(cwd: &std::path::Path) -> OwnedHandle {
+            let pid = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if let Some(pid) = std::fs::read_to_string(cwd.join("child.pid"))
+                        .ok()
+                        .and_then(|text| text.trim().parse::<u32>().ok())
+                    {
+                        break pid;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("PowerShell descendant should start");
+            let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+            assert!(
+                !raw.is_null(),
+                "open child process: {}",
+                std::io::Error::last_os_error()
+            );
+            unsafe { OwnedHandle::from_raw_handle(raw) }
+        }
+
+        async fn assert_exited(handle: &OwnedHandle) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let mut code = 0;
+                    assert_ne!(
+                        unsafe { GetExitCodeProcess(handle.as_raw_handle(), &mut code) },
+                        0
+                    );
+                    if code != 259 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("owned PowerShell descendant must terminate");
+        }
+
+        #[tokio::test]
+        async fn timeout_drop_and_background_cancellation_terminate_powershell_descendants() {
+            let command = r#"
+[Console]::Out.Write('before'); [Console]::Out.Flush()
+[Console]::Error.Write('error'); [Console]::Error.Flush()
+& "$PSHOME/pwsh.exe" -NoLogo -NoProfile -NonInteractive -Command '[IO.File]::WriteAllText("child.pid", [string]$PID); Start-Sleep -Seconds 60'
+"#;
+            for mode in ["timeout", "drop", "cancel", "shutdown"] {
+                let root = crate::test_support::TestDir::new();
+                let tool = pwsh(&root);
+                let mut ctx = context();
+                ctx.cwd = root.to_string_lossy().into_owned();
+                let background = matches!(mode, "cancel" | "shutdown");
+                let mut execution = Box::pin(tool.execute(
+                    json!({
+                        "command": command,
+                        "run_in_background": background,
+                        "timeout": 15,
+                    }),
+                    &ctx,
+                ));
+                let child = if background {
+                    execution.as_mut().await.unwrap();
+                    child_handle(&root).await
+                } else {
+                    tokio::select! {
+                        child = child_handle(&root) => child,
+                        result = &mut execution => panic!("shell exited before descendant startup: {result:?}"),
+                    }
+                };
+                let output = match mode {
+                    "timeout" => {
+                        let error = execution.as_mut().await.unwrap_err();
+                        assert_eq!(error.kind, crate::tools::registry::ToolErrorKind::Timeout);
+                        let output = shell(error.into_output());
+                        assert_eq!(output.outcome, ShellOutcome::TimedOut);
+                        Some(output)
+                    }
+                    "drop" => None,
+                    _ => {
+                        if mode == "cancel" {
+                            assert!(ctx.jobs.cancel_and_wait("job_1").await);
+                        } else {
+                            assert!(ctx.jobs.shutdown().await);
+                        }
+                        let page = ctx.jobs.output_page("job_1", 0, 24_000).unwrap();
+                        assert_eq!(page.status, JobStatus::Cancelled);
+                        let output = page.shell.unwrap();
+                        assert_eq!(output.outcome, ShellOutcome::Cancelled);
+                        Some(*output)
+                    }
+                };
+                drop(execution);
+                assert_exited(&child).await;
+                if let Some(output) = output {
+                    assert_eq!(output.stdout.text, "before");
+                    assert_eq!(output.stderr.text, "error");
+                }
+                assert!(ctx.jobs.shutdown().await);
+            }
+        }
     }
 
     #[tokio::test]

@@ -474,7 +474,7 @@ mod tests {
         tool.env.subagent_tools =
             ToolRegistry::new(Some(Arc::new(PermissionEngine::new(decision, None))));
         for builtin in crate::tools::builtin_tools(Arc::new(
-            crate::core::shell::BashShell::resolve(path, None),
+            crate::core::shell::CommandShell::resolve(path, None),
         )) {
             tool.env.subagent_tools.add(builtin);
         }

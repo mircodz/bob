@@ -56,6 +56,13 @@ jobs:
       - name: Install search dependency (Windows)
         if: runner.os == 'Windows'
         run: choco install ripgrep --yes --no-progress
+      - name: Verify PowerShell 7 (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $pwsh = (Get-Command pwsh -CommandType Application -ErrorAction Stop).Source
+          & $pwsh -NoLogo -NoProfile -NonInteractive -Command 'if ($PSVersionTable.PSEdition -ne "Core" -or $PSVersionTable.PSVersion.Major -lt 7) { throw "PowerShell 7 or newer is required" }; $PSVersionTable.PSVersion.ToString()'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Verify native Git Bash (Windows)
         if: runner.os == 'Windows'
         shell: pwsh

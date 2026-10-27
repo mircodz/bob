@@ -1,13 +1,35 @@
 use crossterm::event::{DisableBracketedPaste, DisableMouseCapture};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, LeaveAlternateScreen};
+use futures::Stream;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+#[cfg(windows)]
+mod windows;
 
 pub(crate) struct TerminalGuard {
     restore: fn(),
+    #[cfg(windows)]
+    original_input: Option<windows::SavedInput>,
 }
 
 impl TerminalGuard {
     pub(crate) fn activate() -> std::io::Result<Self> {
+        #[cfg(windows)]
+        {
+            let original = windows::SavedInput::capture()?;
+            let mut guard = Self::activate_with(enable_raw_mode, restore_terminal)?;
+            guard.original_input = Some(original);
+            guard
+                .original_input
+                .as_ref()
+                .unwrap()
+                .input
+                .ensure_record_mode()?;
+            Ok(guard)
+        }
+        #[cfg(not(windows))]
         Self::activate_with(enable_raw_mode, restore_terminal)
     }
 
@@ -16,7 +38,11 @@ impl TerminalGuard {
         restore: fn(),
     ) -> std::io::Result<Self> {
         activate()?;
-        Ok(Self { restore })
+        Ok(Self {
+            restore,
+            #[cfg(windows)]
+            original_input: None,
+        })
     }
 }
 
@@ -35,6 +61,52 @@ pub(super) fn restore_terminal() {
         crossterm::cursor::Show,
     );
     let _ = disable_raw_mode();
+}
+
+pub(super) struct InputEvents {
+    events: crossterm::event::EventStream,
+    #[cfg(windows)]
+    input: windows::ConsoleInput,
+}
+
+impl InputEvents {
+    pub(super) fn new() -> std::io::Result<Self> {
+        #[cfg(windows)]
+        let input = windows::ConsoleInput::open()?;
+        #[cfg(windows)]
+        input.ensure_record_mode()?;
+        Ok(Self {
+            events: crossterm::event::EventStream::new(),
+            #[cfg(windows)]
+            input,
+        })
+    }
+}
+
+impl Stream for InputEvents {
+    type Item = std::io::Result<crossterm::event::Event>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        #[cfg(windows)]
+        if let Err(error) = this.input.ensure_record_mode() {
+            return Poll::Ready(Some(Err(error)));
+        }
+        let result = Pin::new(&mut this.events).poll_next(cx);
+        #[cfg(windows)]
+        if result.is_pending() {
+            if let Err(error) = this.input.ensure_record_mode() {
+                return Poll::Ready(Some(Err(error)));
+            }
+        }
+        result
+    }
+}
+
+pub(crate) fn read_event() -> std::io::Result<crossterm::event::Event> {
+    #[cfg(windows)]
+    windows::ConsoleInput::open()?.ensure_record_mode()?;
+    crossterm::event::read()
 }
 
 #[cfg(test)]

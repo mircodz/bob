@@ -221,7 +221,7 @@ fn pick_session(cwd: &str) -> anyhow::Result<Option<Session>> {
 }
 
 fn run_picker(items: &[PickerItem]) -> anyhow::Result<Option<usize>> {
-    use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+    use crossterm::event::{Event, KeyCode, KeyModifiers};
     use crossterm::execute;
     use crossterm::terminal::EnterAlternateScreen;
     use ratatui::backend::CrosstermBackend;
@@ -246,14 +246,17 @@ fn run_picker(items: &[PickerItem]) -> anyhow::Result<Option<usize>> {
 
         terminal.draw(|f| draw_picker(f, items, &filtered, selected, &mut scroll, &query))?;
 
-        let Event::Key(key) = event::read()? else {
+        let Event::Key(key) = tui::read_event()? else {
             continue;
         };
         if key.kind != crossterm::event::KeyEventKind::Press {
             continue;
         }
         match (key.code, key.modifiers) {
-            (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => break None,
+            (KeyCode::Esc, _) => break None,
+            (KeyCode::Char('c' | 'C'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+                break None;
+            }
             (KeyCode::Enter, _) => break filtered.get(selected).copied(),
             (KeyCode::Up, _) | (KeyCode::Char('k'), KeyModifiers::NONE) if !filtered.is_empty() => {
                 selected = selected.saturating_sub(1);

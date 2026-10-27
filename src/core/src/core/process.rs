@@ -18,7 +18,10 @@ impl ManagedProcess {
         #[cfg(unix)]
         command.process_group(0);
         #[cfg(windows)]
-        command.creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED);
+        command.creation_flags(
+            windows_sys::Win32::System::Threading::CREATE_SUSPENDED
+                | windows_sys::Win32::System::Threading::CREATE_NO_WINDOW,
+        );
         command.kill_on_drop(true);
         let mut child = command.spawn()?;
         match ProcessTree::new(&child) {

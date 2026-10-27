@@ -12,7 +12,7 @@ mod scrollback;
 mod session_ui;
 mod team;
 mod terminal;
-pub(super) use terminal::TerminalGuard;
+pub(super) use terminal::{read_event, TerminalGuard};
 mod theme;
 mod view;
 mod widgets;
@@ -33,7 +33,7 @@ use bob_core::providers::provider::Provider;
 
 use async_trait::async_trait;
 use crossterm::event::{
-    EnableBracketedPaste, EnableMouseCapture, Event as CtEvent, EventStream, KeyCode, KeyEventKind,
+    EnableBracketedPaste, EnableMouseCapture, Event as CtEvent, KeyCode, KeyEventKind,
     KeyModifiers, MouseButton, MouseEventKind,
 };
 use crossterm::execute;
@@ -437,7 +437,7 @@ pub async fn run(
         Some(bob_core::lsp::LspManager::start(&config.lsp_servers, &cwd))
     };
 
-    let shell = Arc::new(bob_core::core::shell::BashShell::resolve(
+    let shell = Arc::new(bob_core::core::shell::CommandShell::resolve(
         &cwd,
         config.bash_executable.as_deref(),
     ));
@@ -574,7 +574,7 @@ pub async fn run(
         app.view.push_event(note.clone());
     }
 
-    let mut keys = EventStream::new();
+    let mut keys = terminal::InputEvents::new()?;
     let mut ticker = tokio::time::interval(Duration::from_millis(100));
     // Coalesce input bursts into one repaint per frame to avoid scroll backlog.
     const FRAME: Duration = Duration::from_millis(16);
@@ -767,7 +767,8 @@ pub async fn run(
                             KeyOutcome::None => {}
                         }
                     }
-                    Some(Err(_)) | None => break 'outer Ok(()),
+                    Some(Err(error)) => break 'outer Err(anyhow::anyhow!("terminal input failed: {error}")),
+                    None => break 'outer Ok(()),
                 }
             }
             Some(evt) = evt_rx.recv() => {
@@ -1862,7 +1863,13 @@ impl App {
 
     fn on_key(&mut self, code: KeyCode, mods: KeyModifiers) -> KeyOutcome {
         self.clear_closed_prompts();
-        if code == KeyCode::Char('c') && mods.contains(KeyModifiers::CONTROL) {
+        let shortcut = match code {
+            KeyCode::Char(ch) if mods.contains(KeyModifiers::CONTROL) => {
+                KeyCode::Char(ch.to_ascii_lowercase())
+            }
+            _ => code,
+        };
+        if shortcut == KeyCode::Char('c') && mods.contains(KeyModifiers::CONTROL) {
             return KeyOutcome::Quit;
         }
         if code == KeyCode::Esc
@@ -1874,7 +1881,7 @@ impl App {
             self.file_at = None;
             return KeyOutcome::None;
         }
-        if code == KeyCode::Char('x') && mods.contains(KeyModifiers::CONTROL) {
+        if shortcut == KeyCode::Char('x') && mods.contains(KeyModifiers::CONTROL) {
             if let Some(id) = self.stop_target() {
                 let message = match self.agent_team.stop("root", &id) {
                     Ok(count) => format!("cancellation requested ({count})"),
@@ -1891,7 +1898,7 @@ impl App {
             return KeyOutcome::None;
         }
 
-        if code == KeyCode::Char('t') && mods.contains(KeyModifiers::CONTROL) {
+        if shortcut == KeyCode::Char('t') && mods.contains(KeyModifiers::CONTROL) {
             self.sidebar_open = !self.sidebar_open;
             self.workflow_view = None;
             self.wf_view_agents = None;
@@ -1899,7 +1906,7 @@ impl App {
             self.sidebar_rows = None;
             return KeyOutcome::None;
         }
-        if code == KeyCode::Char('g') && mods.contains(KeyModifiers::CONTROL) {
+        if shortcut == KeyCode::Char('g') && mods.contains(KeyModifiers::CONTROL) {
             return KeyOutcome::None;
         }
         // Sidebar navigation must not consume composer or modal input.
@@ -1968,8 +1975,7 @@ impl App {
             return KeyOutcome::None;
         }
 
-        match (code, mods) {
-            (KeyCode::Char('c'), KeyModifiers::CONTROL) => return KeyOutcome::Quit,
+        match (shortcut, mods) {
             (KeyCode::Char('o'), KeyModifiers::CONTROL) => {
                 self.copy_last();
                 return KeyOutcome::None;
@@ -2002,7 +2008,7 @@ impl App {
             _ => {}
         }
 
-        if self.handle_emacs(code, mods) {
+        if self.handle_emacs(shortcut, mods) {
             self.refresh_menu();
             return KeyOutcome::None;
         }
@@ -3063,6 +3069,44 @@ mod tests {
         assert!(app.wf_view_agents.is_none());
         assert_eq!(app.focused_agent.as_deref(), Some("worker"));
         assert_eq!(app.input.text(), "界界");
+    }
+
+    #[test]
+    fn global_control_shortcuts_accept_uppercase_without_editing_the_draft() {
+        for modifiers in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ] {
+            for draft in ["Draft C T", "/co"] {
+                let mut app = test_app();
+                app.input.set(draft);
+                app.refresh_menu();
+                let was_open = app.sidebar_open;
+                let mut dirty = false;
+                let event = |ch| {
+                    CtEvent::Key(crossterm::event::KeyEvent::new(
+                        KeyCode::Char(ch),
+                        modifiers,
+                    ))
+                };
+                assert!(matches!(
+                    app.on_terminal_event(event('T'), &mut dirty),
+                    KeyOutcome::None
+                ));
+                assert_eq!(app.sidebar_open, !was_open);
+                assert_eq!(app.input.text(), draft);
+                assert!(matches!(
+                    app.on_terminal_event(event('C'), &mut dirty),
+                    KeyOutcome::Quit
+                ));
+                assert_eq!(app.input.text(), draft);
+            }
+        }
+        let mut app = test_app();
+        for ch in ['C', 'T', 'É'] {
+            app.on_key(KeyCode::Char(ch), KeyModifiers::SHIFT);
+        }
+        assert_eq!(app.input.text(), "CTÉ");
     }
 
     #[test]

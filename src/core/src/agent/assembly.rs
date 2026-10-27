@@ -22,7 +22,7 @@ pub struct RootAgentParams {
     pub jobs: JobRegistry,
     pub team: AgentRegistry,
     pub cwd: String,
-    pub shell: Arc<crate::core::shell::BashShell>,
+    pub shell: Arc<crate::core::shell::CommandShell>,
     pub system_prompt: String,
     /// Configured MCP tools (already connected), namespaced `<server>.<tool>`.
     pub mcp_tools: Vec<Arc<dyn Tool>>,

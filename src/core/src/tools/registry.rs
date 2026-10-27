@@ -1,6 +1,6 @@
 //! Validates tool inputs and applies configured permissions before execution.
 
-use crate::core::permissions::{parse_bash, PermissionEngine, PermissionRequest};
+use crate::core::permissions::{ParsedCommand, PermissionEngine, PermissionRequest};
 use crate::core::types::{ToolOutput, ToolSpec};
 use crate::tools::file_tracker::FileTracker;
 use crate::tools::jobs::JobRegistry;
@@ -56,6 +56,9 @@ pub trait Tool: Send + Sync {
     /// Controls concurrency and explore membership; auto-allow is a separate policy.
     fn is_read_only(&self) -> bool {
         false
+    }
+    fn command_analysis(&self, _input: &Value) -> Option<ParsedCommand> {
+        None
     }
     /// Permission-prompt preview; must not have side effects.
     fn preview(&self, _input: &Value, _ctx: &ToolContext) -> Option<String> {
@@ -295,12 +298,7 @@ impl ToolRegistry {
         };
 
         if let Some(perms) = &self.permissions {
-            let bash = if name == "bash" {
-                let cmd = input.get("command").and_then(|c| c.as_str()).unwrap_or("");
-                Some(parse_bash(cmd))
-            } else {
-                None
-            };
+            let bash = tool.command_analysis(&input);
             let preview = tool.preview(&input, ctx);
             let req = PermissionRequest {
                 tool: name.to_string(),
@@ -584,6 +582,128 @@ mod tests {
         assert_eq!(
             selected
                 .execute("mutating", json!({}), &fixture.ctx)
+                .await
+                .unwrap_err()
+                .kind,
+            ToolErrorKind::PermissionDenied
+        );
+    }
+
+    struct CommandProbe(crate::tools::bash::BashTool);
+
+    #[async_trait]
+    impl Tool for CommandProbe {
+        fn spec(&self) -> ToolSpec {
+            self.0.spec()
+        }
+
+        fn command_analysis(&self, input: &Value) -> Option<ParsedCommand> {
+            self.0.command_analysis(input)
+        }
+
+        async fn execute(&self, _: Value, _: &ToolContext) -> ToolResult {
+            Ok("executed".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn powershell_requires_fresh_approval_without_inheriting_bash_grants() {
+        use crate::core::permissions::{Asker, Decision, Grant, Mode, PermissionOption};
+        use crate::core::policies::{allow_bash_commands, deny_tools, flag_dangerous_bash};
+        use crate::core::shell::{CommandShell, ShellKind};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct Approval {
+            allow: AtomicBool,
+            calls: AtomicUsize,
+        }
+        #[async_trait]
+        impl Asker for Approval {
+            async fn ask(
+                &self,
+                req: &PermissionRequest,
+                options: &[PermissionOption],
+            ) -> Option<usize> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                assert!(req.bash.is_none());
+                assert!(options.iter().all(|option| option.grant.is_none()));
+                options
+                    .iter()
+                    .position(|option| option.allow == self.allow.load(Ordering::SeqCst))
+            }
+        }
+
+        let fixture = FileFixture::new();
+        let approval = Arc::new(Approval::default());
+        let mut engine = PermissionEngine::new(Decision::Ask, Some(approval.clone()));
+        engine.add(allow_bash_commands(vec!["git".into()]));
+        engine.add(flag_dangerous_bash());
+        engine.import_grants(vec![
+            Grant::Tool {
+                name: "bash".into(),
+            },
+            Grant::BashCommand {
+                name: "git".into(),
+                glob: "**".into(),
+            },
+        ]);
+        let engine = Arc::new(engine);
+        let probe = |kind| {
+            Arc::new(CommandProbe(crate::tools::bash::BashTool::new(Arc::new(
+                CommandShell::for_test(fixture.dir.join("not-launched.exe"), kind),
+            ))))
+        };
+        let mut bash = ToolRegistry::new(Some(engine.clone()));
+        bash.add(probe(ShellKind::Bash));
+        let mut pwsh = ToolRegistry::new(Some(engine.clone()));
+        pwsh.add(probe(ShellKind::Pwsh));
+        let input = json!({"command": "git status"});
+        assert!(bash
+            .execute("bash", input.clone(), &fixture.ctx)
+            .await
+            .is_ok());
+        assert_eq!(approval.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            pwsh.execute("bash", input.clone(), &fixture.ctx)
+                .await
+                .unwrap_err()
+                .kind,
+            ToolErrorKind::PermissionDenied
+        );
+
+        approval.allow.store(true, Ordering::SeqCst);
+        for _ in 0..2 {
+            assert!(pwsh
+                .execute("bash", input.clone(), &fixture.ctx)
+                .await
+                .is_ok());
+        }
+        assert_eq!(approval.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(engine.export_grants().len(), 2);
+        engine.toggle_bypass();
+        assert!(pwsh
+            .execute("bash", input.clone(), &fixture.ctx)
+            .await
+            .is_ok());
+        assert_eq!(approval.calls.load(Ordering::SeqCst), 3);
+        engine.set_mode(Mode::Plan);
+        assert_eq!(
+            pwsh.execute("bash", input.clone(), &fixture.ctx)
+                .await
+                .unwrap_err()
+                .kind,
+            ToolErrorKind::PermissionDenied
+        );
+
+        let mut denied = PermissionEngine::new(Decision::Allow, None);
+        denied.add(deny_tools(vec!["bash".into()]));
+        denied.toggle_bypass();
+        let mut denied_registry = ToolRegistry::new(Some(Arc::new(denied)));
+        denied_registry.add(probe(ShellKind::Pwsh));
+        assert_eq!(
+            denied_registry
+                .execute("bash", input, &fixture.ctx)
                 .await
                 .unwrap_err()
                 .kind,
