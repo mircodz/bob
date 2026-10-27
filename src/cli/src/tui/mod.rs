@@ -6,6 +6,8 @@ mod files;
 mod highlight;
 mod input;
 mod markdown;
+#[cfg(test)]
+mod perf_tests;
 mod prompts;
 mod render;
 mod scrollback;

@@ -14,3 +14,6 @@ pub mod shell;
 pub mod store;
 pub mod types;
 pub mod usage;
+
+#[cfg(test)]
+mod restore_bench;
