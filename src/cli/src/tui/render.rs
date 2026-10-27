@@ -488,10 +488,11 @@ impl PreparedCell {
         let start = out.len();
         render_cell_inner(self, cell, width, out);
         sanitize_display_lines(&mut out[start..]);
-        if self.tool.as_ref().is_some_and(|tool| tool.compact) {
-            while out.len() > start && out.last().is_some_and(|line| line.width() == 0) {
-                out.pop();
-            }
+        while out.len() > start && out.last().is_some_and(|line| line.width() == 0) {
+            out.pop();
+        }
+        if out.len() > start && !self.tool.as_ref().is_some_and(|tool| tool.compact) {
+            out.push(Line::from(""));
         }
     }
 }
@@ -1063,6 +1064,43 @@ mod tests {
             status: ToolStatus::Ok,
             output: Some(output.into()),
             expanded,
+        }
+    }
+
+    #[test]
+    fn standalone_outputs_share_spacing_without_separating_compact_tools() {
+        let cells = [
+            Cell::Notice("YOLO on — permission prompts bypassed.".into()),
+            Cell::Notice("YOLO off — permission prompts restored.".into()),
+            Cell::Notice("error: connection closed".into()),
+            Cell::Retry {
+                attempt: 1,
+                max_attempts: 10,
+                state: super::super::view::RetryState::Waiting,
+            },
+            Cell::Event("Resumed session".into()),
+            Cell::Assistant {
+                text: "Next step.\n\n".into(),
+                open: false,
+            },
+            tool("bash", "done", false),
+        ];
+        for width in [24, 80] {
+            let mut lines = vec![Line::from("previous output"), Line::from("")];
+            for cell in &cells {
+                let start = lines.len();
+                render_cell(cell, width, &mut lines);
+                let rendered = &lines[start..];
+                assert!(rendered.len() >= 2);
+                assert_eq!(rendered.last().unwrap().width(), 0);
+                assert!(rendered[rendered.len() - 2].width() > 0);
+            }
+            let compact = tool("read_file", "content", false);
+            let start = lines.len();
+            PreparedCell::compact_tool(&compact).render(&compact, width, &mut lines);
+            assert!(lines[start..].iter().all(|line| line.width() > 0));
+            assert_eq!(lines[0].to_string(), "previous output");
+            assert_eq!(lines[1].width(), 0);
         }
     }
 
