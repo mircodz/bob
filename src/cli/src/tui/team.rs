@@ -258,7 +258,25 @@ impl AgentTranscripts {
             AgentEvent::ContextReset { agent_id, .. } if agent_id == "root" => {
                 *self = Self::new();
             }
-            AgentEvent::AgentMessage { .. } => {}
+            AgentEvent::AgentMessage { to, from, text } => {
+                if from == "user" {
+                    return;
+                }
+                if to != "root" {
+                    self.push_message(to, from, text, showing);
+                }
+                if to != from {
+                    if let Some(sender) = self.threads.get_mut(from) {
+                        sender
+                            .cells
+                            .push(Cell::Notice(format!("Message received by {to}")));
+                        sender.revision += 1;
+                        if showing != Some(from.as_str()) {
+                            sender.unread += 1;
+                        }
+                    }
+                }
+            }
             _ => {
                 if let Some(id) = event_agent_id(event) {
                     if id == "root" {
@@ -506,14 +524,6 @@ mod tests {
                     usage: Usage::default(),
                 },
             ),
-            (
-                "inter-agent message",
-                AgentEvent::AgentMessage {
-                    to: "b".into(),
-                    from: "a".into(),
-                    text: "check X".into(),
-                },
-            ),
         ] {
             let mut threads = AgentTranscripts::new();
             threads.on_spawn("a", "root", "task a", "");
@@ -527,6 +537,109 @@ mod tests {
                 assert_eq!(thread.unread, 0, "{label}: {id} unread");
             }
         }
+    }
+
+    #[test]
+    fn coordination_receipts_and_nested_messages_survive_replay_and_snapshots() {
+        let mut threads = AgentTranscripts::new();
+        threads.on_spawn("parent", "root", "parent", "");
+        threads.on_spawn("child", "parent", "child", "");
+        let mut events = Vec::new();
+        for (to, from, text) in [
+            ("parent", "root", "First instruction"),
+            ("child", "parent", "Nested instruction"),
+            ("parent", "child", "Nested answer"),
+            ("root", "child", "Finished report"),
+        ] {
+            let event = AgentEvent::AgentMessage {
+                to: to.into(),
+                from: from.into(),
+                text: text.into(),
+            };
+            threads.apply(&event, Some("child"));
+            events.push(event);
+        }
+        assert!(threads.get("root").is_none());
+        let parent = threads.get("parent").unwrap();
+        assert!(
+            matches!(&parent.cells[0], Cell::AgentMsg { from, text } if from == "root" && text == "First instruction")
+        );
+        assert!(
+            matches!(&parent.cells[1], Cell::Notice(text) if text == "Message received by child")
+        );
+        assert!(
+            matches!(&parent.cells[2], Cell::AgentMsg { from, text } if from == "child" && text == "Nested answer")
+        );
+        assert_eq!(parent.unread, 3);
+        let child = threads.get("child").unwrap();
+        assert_eq!(child.unread, 0);
+        assert!(
+            matches!(&child.cells[0], Cell::AgentMsg { from, text } if from == "parent" && text == "Nested instruction")
+        );
+        assert!(
+            matches!(&child.cells[2], Cell::Notice(text) if text == "Message received by root")
+        );
+        threads.on_done("child", false);
+        let report = AgentEvent::AgentMessage {
+            to: "root".into(),
+            from: "child".into(),
+            text: "Final report".into(),
+        };
+        threads.apply(&report, None);
+        assert_eq!(threads.get("child").unwrap().status, ThreadStatus::Done);
+        events.push(report);
+        threads.on_done("parent", false);
+        let saved = threads.to_persisted();
+        let restored = AgentTranscripts::from_persisted(&saved);
+        assert_eq!(
+            serde_json::to_value(restored.to_persisted()).unwrap(),
+            serde_json::to_value(saved).unwrap()
+        );
+        let serialized = serde_json::to_string(&events).unwrap();
+        let replay = AgentTranscripts::replay(
+            &serde_json::from_str::<Vec<AgentEvent>>(&serialized).unwrap(),
+        );
+        for id in ["parent", "child"] {
+            let visible = |thread: &AgentThread| {
+                thread
+                    .cells
+                    .iter()
+                    .map(Cell::fingerprint)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                visible(threads.get(id).unwrap()),
+                visible(replay.get(id).unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn queued_human_messages_render_once_without_deduplicating_repeated_text() {
+        let mut threads = AgentTranscripts::new();
+        threads.on_spawn("child", "root", "child", "");
+        for _ in 0..2 {
+            threads.apply(
+                &AgentEvent::UserMessageQueued {
+                    to: "child".into(),
+                    text: "continue".into(),
+                },
+                None,
+            );
+            threads.apply(
+                &AgentEvent::AgentMessage {
+                    to: "child".into(),
+                    from: "user".into(),
+                    text: "continue".into(),
+                },
+                None,
+            );
+        }
+        let child = threads.get("child").unwrap();
+        assert_eq!(child.cells.len(), 2);
+        assert_eq!(child.unread, 2);
+        assert!(child.cells.iter().all(|cell| matches!(cell, Cell::AgentMsg { from, text } if from == "user" && text == "continue")));
+        assert!(threads.get("user").is_none());
     }
 
     #[test]

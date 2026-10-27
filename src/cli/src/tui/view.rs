@@ -458,7 +458,10 @@ pub fn apply_content_event(cells: &mut Vec<Cell>, event: &AgentEvent, include_me
             ..
         } => {
             if let Some(Cell::Tool {
-                status, output: o, ..
+                name,
+                status,
+                output: o,
+                ..
             }) = find_tool_in(cells, tool_use_id)
             {
                 *status = if *is_error {
@@ -466,7 +469,11 @@ pub fn apply_content_event(cells: &mut Vec<Cell>, event: &AgentEvent, include_me
                 } else {
                     ToolStatus::Ok
                 };
-                *o = Some(output.clone());
+                *o = Some(if include_messages {
+                    output.clone()
+                } else {
+                    root_tool_output(name, output, *is_error)
+                });
             }
         }
         AgentEvent::Compaction {
@@ -534,6 +541,24 @@ pub fn apply_content_event(cells: &mut Vec<Cell>, event: &AgentEvent, include_me
         }
         _ => {}
     }
+}
+
+fn root_tool_output(name: &str, output: &ToolOutput, is_error: bool) -> ToolOutput {
+    if is_error && matches!(name, "task" | "explore") {
+        if let ToolOutput::Text(text) = output {
+            let summary: String = text
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .chars()
+                .take(200)
+                .collect();
+            if summary != *text {
+                return format!("{summary}\nOpen the agent thread with Ctrl+T for details.").into();
+            }
+        }
+    }
+    output.clone()
 }
 
 #[derive(Default)]
@@ -774,15 +799,23 @@ impl ViewModel {
                             is_error,
                         } = b
                         {
-                            if let Some(Cell::Tool { status, output, .. }) =
-                                self.find_tool(tool_use_id)
+                            if let Some(Cell::Tool {
+                                name,
+                                status,
+                                output,
+                                ..
+                            }) = self.find_tool(tool_use_id)
                             {
                                 *status = if is_error.unwrap_or(false) {
                                     ToolStatus::Error
                                 } else {
                                     ToolStatus::Ok
                                 };
-                                *output = Some(content.clone());
+                                *output = Some(root_tool_output(
+                                    name,
+                                    content,
+                                    is_error.unwrap_or(false),
+                                ));
                             }
                         }
                     }
@@ -1992,7 +2025,77 @@ mod tests {
         }
 
         #[test]
-        fn agent_to_agent_message_preview_appears_in_sender_thread_and_replay() {
+        fn failed_task_reports_stay_detailed_in_agent_views_but_compact_in_root() {
+            let output: ToolOutput =
+                "failed: ### Review parser\nDetailed internal report\nUnresolved work".into();
+            let input = json!({"tasks":[{"description":"Review parser", "prompt":"review"}]});
+            let events = [
+                AgentEvent::ToolCall {
+                    agent_id: "root".into(),
+                    tool_use_id: "task-1".into(),
+                    name: "task".into(),
+                    input: input.clone(),
+                },
+                AgentEvent::ToolResult {
+                    agent_id: "root".into(),
+                    tool_use_id: "task-1".into(),
+                    output: output.clone(),
+                    is_error: true,
+                },
+            ];
+            let mut root = ViewModel::new();
+            let mut child_cells = Vec::new();
+            for event in &events {
+                root.apply(event);
+                apply_content_event(&mut child_cells, event, true);
+            }
+            let root_text = rendered(&root.cells);
+            assert!(root_text.contains("Review parser"));
+            assert!(root_text.contains("Ctrl+T"));
+            assert!(
+                matches!(&child_cells[0], Cell::Tool { output: Some(value), .. } if value == &output)
+            );
+            let messages = vec![
+                Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::ToolUse {
+                        id: "task-1".into(),
+                        name: "task".into(),
+                        input,
+                    }],
+                },
+                Message {
+                    role: Role::Tool,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: "task-1".into(),
+                        content: output.clone(),
+                        is_error: Some(true),
+                    }],
+                },
+            ];
+            let mut hydrated = ViewModel::new();
+            hydrated.hydrate(&messages, &[]);
+            let hydrated_tool = hydrated
+                .cells
+                .iter()
+                .find(|cell| {
+                    matches!(cell,
+                        Cell::Tool { id, .. } if id == "task-1"
+                    )
+                })
+                .unwrap();
+            assert_eq!(root_text, rendered(std::slice::from_ref(hydrated_tool)));
+            assert!(
+                matches!(&messages[1].content[0], ContentBlock::ToolResult { content, .. } if content == &output)
+            );
+            assert!(
+                matches!(&root.cells[0], Cell::Tool { output: Some(value), .. }
+                if value.as_text() == Some("failed: ### Review parser\nOpen the agent thread with Ctrl+T for details."))
+            );
+        }
+
+        #[test]
+        fn agent_messages_appear_in_sender_and_recipient_threads_and_replay() {
             let mut events = Vec::new();
             for id in ["implementer", "reviewer"] {
                 events.push(AgentEvent::SubagentSpawn {
@@ -2019,8 +2122,16 @@ mod tests {
             let replayed: Vec<AgentEvent> = serde_json::from_str(&serialized).unwrap();
             let replay = AgentTranscripts::replay(&replayed);
             assert_eq!(text, rendered(&replay.get("implementer").unwrap().cells));
-            assert!(live.get("reviewer").unwrap().cells.is_empty());
-            assert!(replay.get("reviewer").unwrap().cells.is_empty());
+            assert!(text.contains("Message received by reviewer"));
+            let recipient = live.get("reviewer").unwrap();
+            assert!(
+                matches!(recipient.cells.as_slice(), [Cell::AgentMsg { from, text }]
+                if from == "implementer" && text == "Review\n the parser changes.")
+            );
+            assert_eq!(
+                rendered(&recipient.cells),
+                rendered(&replay.get("reviewer").unwrap().cells)
+            );
         }
     }
 

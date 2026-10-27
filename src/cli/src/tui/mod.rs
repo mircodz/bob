@@ -900,10 +900,14 @@ pub async fn run(
                             "Background job(s) finished: {list}. Use job_output to read the \
                              result(s) and continue the task accordingly."
                         );
+                        if !app.agent_team.send("root", "runtime", &prompt) {
+                            app.notify("Background work finished, but the root inbox is unavailable");
+                            continue 'outer;
+                        }
                         app.view.push_event(format!("Resumed — {list} finished"));
                         app.running = true;
                         app.turn_started = Some(std::time::Instant::now());
-                        root_turn = Some(spawn_turn(&agent, &app.turn_done_tx, prompt));
+                        root_turn = Some(spawn_turn(&agent, &app.turn_done_tx, String::new()));
                         dirty = true;
                     } else {
                         let pending = {
