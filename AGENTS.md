@@ -1,0 +1,14 @@
+## Memories
+- Keep `job_status` and `job_output` out of rendered transcripts (including replay and subagent views); they are internal polling/collection and should not clutter the coding UI.
+- Show all agent tasks in the agents sidebar with inspectable terminal states and brief launch notices; reserve the above-input jobs panel for background shell commands only, avoiding duplicate task status displays.
+- Use color-only agent status indicators (no Idle/Done labels); keep completed agents at the bottom, muted and struck through, so status stays clear without extra text.
+- Render MCP startup/connection notices with full-contrast event styling like “Resumed…”, not gray notice text, so integration availability is clearly visible.
+- Style “Started agent” notices like normal tool headers (colored bullet and bold full-contrast title), not dim notices; keep them as static launch announcements.
+- Center scroll-position indicators within the conversation viewport, so opening the agents sidebar cannot clip them.
+- Show only running shell commands in the above-input panel and hide it when empty; retain finished results internally for collection, while completed agents stay inspectable in the sidebar.
+- Use the agents sidebar as the single agent interface; inspect and message agents in the main conversation viewport instead of a separate team drawer, avoiding duplicate UI and rendering work.
+- Use Ctrl+T as the only agents-sidebar toggle; keep Ctrl+G unbound and omit it from hints to avoid duplicate shortcuts.
+- Keep bob focused on the CLI product; defer notch, mobile-app, and remote-control surfaces to reduce feature creep and prioritize reliable coding behavior and evaluation.
+- Keep LSP diagnostics explicit/on demand: edits should synchronize documents but must not wait for analysis or append automatic diagnostics, keeping tool results focused and predictable.
+- Workflow hardening must keep normal edit/shell capabilities under existing permissions; read-only execution is opt-in, not forced, so workflows remain useful for implementation work.
+- Support SDK sessions through one SessionStore interface with in-memory storage by default and explicit SQLite persistence; shared memory supports in-process resume without surprising writes to ~/.bob.
