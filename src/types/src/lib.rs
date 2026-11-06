@@ -213,8 +213,19 @@ pub struct Completion {
     pub usage: Usage,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ReasoningKind {
+    Summary,
+    Thinking,
+}
+
 #[derive(Clone, Debug)]
 pub enum StreamEvent {
+    ReasoningDelta {
+        block_id: String,
+        kind: ReasoningKind,
+        text: String,
+    },
     TextDelta {
         text: String,
     },

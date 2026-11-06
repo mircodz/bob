@@ -38,14 +38,40 @@ where
 
 pub async fn parse_sse_control<F>(
     resp: reqwest::Response,
-    mut on_event: F,
+    on_event: F,
     idle: Duration,
 ) -> anyhow::Result<SseEnd>
 where
     F: FnMut(SseEvent) -> ControlFlow<()>,
 {
+    parse_sse_inner(resp, on_event, idle, false).await
+}
+
+pub(crate) async fn parse_provider_sse<F>(
+    resp: reqwest::Response,
+    on_event: F,
+    idle: Duration,
+) -> anyhow::Result<SseEnd>
+where
+    F: FnMut(SseEvent) -> ControlFlow<()>,
+{
+    parse_sse_inner(resp, on_event, idle, true).await
+}
+
+async fn parse_sse_inner<F>(
+    resp: reqwest::Response,
+    mut on_event: F,
+    idle: Duration,
+    bounded: bool,
+) -> anyhow::Result<SseEnd>
+where
+    F: FnMut(SseEvent) -> ControlFlow<()>,
+{
     let mut stream = resp.bytes_stream();
-    let mut decoder = Decoder::default();
+    let mut decoder = Decoder {
+        bounded,
+        ..Default::default()
+    };
     loop {
         let chunk = tokio::time::timeout(idle, stream.next())
             .await
@@ -54,11 +80,17 @@ where
             decoder.finish()?;
             return Ok(SseEnd::Eof);
         };
-        if decoder.push(&chunk?, &mut on_event)?.is_break() {
-            return Ok(SseEnd::Stopped);
+        for bytes in chunk?.chunks(4096) {
+            if decoder.push(bytes, &mut on_event)?.is_break() {
+                return Ok(SseEnd::Stopped);
+            }
+            tokio::task::yield_now().await;
         }
     }
 }
+
+const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+const MAX_STREAM_FRAMES: usize = 65_536;
 
 #[derive(Default)]
 struct Decoder {
@@ -67,6 +99,10 @@ struct Decoder {
     has_data: bool,
     after_cr: bool,
     started: bool,
+    frame_bytes: usize,
+    total_bytes: usize,
+    frames: usize,
+    bounded: bool,
 }
 
 impl Decoder {
@@ -76,6 +112,21 @@ impl Decoder {
         on_event: &mut impl FnMut(SseEvent) -> ControlFlow<()>,
     ) -> anyhow::Result<ControlFlow<()>> {
         for &byte in bytes {
+            if self.bounded {
+                self.total_bytes += 1;
+                self.frame_bytes += 1;
+                if self.total_bytes > super::provider::MAX_RESPONSE_BYTES {
+                    anyhow::bail!(
+                        "provider resource limit exceeded: SSE stream exceeds {} bytes",
+                        super::provider::MAX_RESPONSE_BYTES
+                    );
+                }
+                if self.frame_bytes > MAX_FRAME_BYTES {
+                    anyhow::bail!(
+                        "provider resource limit exceeded: SSE frame exceeds {MAX_FRAME_BYTES} bytes"
+                    );
+                }
+            }
             if self.after_cr {
                 self.after_cr = false;
                 if byte == b'\n' {
@@ -106,6 +157,13 @@ impl Decoder {
             line = line.strip_prefix('\u{feff}').unwrap_or(line);
         }
         if line.is_empty() {
+            if self.bounded {
+                self.frame_bytes = 0;
+                self.frames += 1;
+                if self.frames > MAX_STREAM_FRAMES {
+                    anyhow::bail!("provider resource limit exceeded: too many SSE frames");
+                }
+            }
             if !self.has_data {
                 return Ok(ControlFlow::Continue(()));
             }
@@ -143,6 +201,104 @@ impl Decoder {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn shared_decoder_does_not_apply_provider_resource_limits() {
+        let mut decoder = Decoder {
+            frame_bytes: MAX_FRAME_BYTES,
+            total_bytes: super::super::provider::MAX_RESPONSE_BYTES,
+            frames: MAX_STREAM_FRAMES,
+            ..Default::default()
+        };
+        let mut events = Vec::new();
+        assert!(decoder
+            .push(b"data: {}\n\n", &mut |event| {
+                events.push(event);
+                ControlFlow::Continue(())
+            })
+            .unwrap()
+            .is_continue());
+        decoder.finish().unwrap();
+        assert_eq!(events, vec![SseEvent::Json(json!({}))]);
+    }
+
+    #[test]
+    fn frame_and_stream_limits_fail_before_dispatch_or_growth() {
+        let mut decoder = Decoder {
+            frame_bytes: MAX_FRAME_BYTES,
+            bounded: true,
+            ..Default::default()
+        };
+        let error = decoder
+            .push(b"x", &mut |_| panic!("oversized frame dispatched"))
+            .unwrap_err();
+        assert!(error.to_string().contains("resource limit exceeded"));
+        assert!(decoder.line.is_empty());
+
+        let mut decoder = Decoder {
+            total_bytes: super::super::provider::MAX_RESPONSE_BYTES,
+            bounded: true,
+            ..Default::default()
+        };
+        assert!(decoder
+            .push(b"x", &mut |_| panic!("oversized stream dispatched"))
+            .is_err());
+        assert!(decoder.line.is_empty());
+
+        let mut decoder = Decoder {
+            frames: MAX_STREAM_FRAMES,
+            bounded: true,
+            ..Default::default()
+        };
+        assert!(decoder
+            .push(b"\n", &mut |_| panic!("excess frame dispatched"))
+            .is_err());
+    }
+
+    #[test]
+    fn many_small_frames_exhaust_total_accumulation_budget() {
+        let frame = format!("data: {}\n\n", json!({"text":"x".repeat(64 * 1024)}));
+        let mut decoder = Decoder {
+            bounded: true,
+            ..Default::default()
+        };
+        let mut dispatched = 0;
+        let error = loop {
+            match decoder.push(frame.as_bytes(), &mut |_| {
+                dispatched += 1;
+                ControlFlow::Continue(())
+            }) {
+                Ok(_) => {}
+                Err(error) => break error,
+            }
+        };
+        assert!(dispatched > 1);
+        assert!(error.to_string().contains("SSE stream exceeds"));
+        assert_eq!(
+            decoder.total_bytes,
+            super::super::provider::MAX_RESPONSE_BYTES + 1
+        );
+    }
+
+    #[test]
+    fn multiline_data_and_ignored_metadata_share_frame_budget() {
+        for line in ["data: \"abc\"\n", ": keepalive\n"] {
+            let mut decoder = Decoder {
+                frame_bytes: MAX_FRAME_BYTES - line.len(),
+                bounded: true,
+                ..Default::default()
+            };
+            assert!(decoder
+                .push(line.as_bytes(), &mut |_| panic!(
+                    "unfinished frame dispatched"
+                ))
+                .unwrap()
+                .is_continue());
+            assert!(decoder
+                .push(b"x", &mut |_| panic!("oversized frame dispatched"))
+                .is_err());
+        }
+    }
 
     #[test]
     fn framing_survives_every_byte_boundary() {

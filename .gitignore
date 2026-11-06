@@ -12,3 +12,12 @@ xcuserdata/
 .vscode/
 *.swp
 .DS_Store
+
+# Local exports of old sessions (large, private)
+/old-session.json
+
+# Local notes and planning (not committed)
+/AGENTS.md
+/ROADMAP.md
+/ISSUES.md
+/scripts/

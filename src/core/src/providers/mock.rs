@@ -134,17 +134,18 @@ impl Provider for MockProvider {
         Ok(self.completion_for(self.reply_for(&opts.messages)))
     }
 
-    async fn stream(
-        &self,
-        opts: GenerateOptions,
-    ) -> anyhow::Result<mpsc::UnboundedReceiver<StreamEvent>> {
+    async fn stream(&self, opts: GenerateOptions) -> anyhow::Result<mpsc::Receiver<StreamEvent>> {
         self.calls.fetch_add(1, Ordering::Relaxed);
         let completion = self.completion_for(self.reply_for(&opts.messages));
         let delay = self.delay;
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = crate::providers::provider::stream_channel();
         tokio::spawn(async move {
             if !delay.is_zero() {
-                tokio::time::sleep(delay).await;
+                tokio::select! {
+                    biased;
+                    _ = tx.closed() => return,
+                    _ = tokio::time::sleep(delay) => {}
+                }
             }
             let _ = tx.send(StreamEvent::MessageStop { completion });
         });

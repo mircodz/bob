@@ -26,16 +26,15 @@ pub async fn begin_login() -> anyhow::Result<DeviceCode> {
 
 pub async fn finish_login<F: FnMut()>(device: &DeviceCode, on_wait: F) -> anyhow::Result<()> {
     let github_token = poll_for_token(&device_flow(), device, on_wait).await?;
-    let mut store = AuthStore::load();
-    store.set(
+    AuthStore::set_credential(
         "copilot",
         Credential {
             token: github_token,
             refresh_token: None,
             extra: Default::default(),
         },
-    );
-    store.save()?;
+    )
+    .await?;
     Ok(())
 }
 

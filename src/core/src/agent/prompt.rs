@@ -328,7 +328,7 @@ mod tests {
         let dir = TestDir::new();
         std::fs::create_dir(dir.join(".git")).unwrap();
         let missing = dir.join("missing-shell");
-        let shell = CommandShell::resolve(dir.path(), Some(&missing));
+        let shell = CommandShell::resolve_bash(dir.path(), Some(&missing));
         let error = shell.executable().unwrap_err();
         let prompt = build_system_prompt(Some("Custom coding instructions."), dir.path(), &shell);
         assert!(prompt.contains(&format!("Command tool unavailable: {error}")));

@@ -32,7 +32,7 @@ impl Tool for WorkflowTool {
         let examples = json!([
             {
                 "title": "review-crates", "read_only": true,
-                "shape": "map_reduce", "items": ["src/cli", "src/core"],
+                "shape": "map_reduce", "items": ["src/bob", "src/core"],
                 "map_prompt": "Review only {item} for error-handling bugs. Report concrete evidence.",
                 "reduce_prompt": "Summarize the verified findings without overstating coverage."
             },
@@ -57,9 +57,9 @@ impl Tool for WorkflowTool {
                 "steps": [{"id": "repair", "loop": {
                     "max": 3, "until": "$check.pass",
                     "steps": [
-                        {"id": "fix", "agent": {"prompt": "Fix failing unit tests in src/cli, editing only src/cli."}},
+                        {"id": "fix", "agent": {"prompt": "Fix failing unit tests in src/bob, editing only src/bob."}},
                         {"id": "check", "agent": {
-                            "prompt": "Run cargo test -p bob-cli. Return whether the command passed, not a prediction.",
+                            "prompt": "Run cargo test -p bob. Return whether the command passed, not a prediction.",
                             "schema": {"type": "object", "required": ["pass"], "properties": {"pass": {"type": "boolean"}}}
                         }}
                     ]
@@ -213,7 +213,7 @@ mod tests {
         async fn stream(
             &self,
             opts: GenerateOptions,
-        ) -> anyhow::Result<mpsc::UnboundedReceiver<StreamEvent>> {
+        ) -> anyhow::Result<mpsc::Receiver<StreamEvent>> {
             self.tools
                 .lock()
                 .unwrap()

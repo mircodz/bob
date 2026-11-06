@@ -2,7 +2,7 @@
 //! Third-party use may be restricted by Anthropic's terms; prefer API keys.
 
 use super::{
-    authorize_url, exchange_code, now, pkce, refresh_token, store_tokens, wait_for_callback,
+    authorize_url, exchange_code, pkce, refresh_token, store_tokens, wait_for_callback,
     AuthCodeConfig, AuthStore, Pkce,
 };
 
@@ -43,7 +43,7 @@ pub async fn finish_login(handle: LoginHandle) -> anyhow::Result<()> {
     let cfg = config();
     let code = wait_for_callback(cfg.callback_port, &handle.state).await?;
     let tokens = exchange_code(&cfg, &handle.pkce, &code).await?;
-    store_tokens("anthropic", &tokens, &[])?;
+    store_tokens("anthropic", &tokens, &[]).await?;
     Ok(())
 }
 
@@ -56,27 +56,12 @@ pub fn is_logged_in() -> bool {
 
 /// Refresh expired tokens; error if not logged in.
 pub async fn access_token() -> anyhow::Result<String> {
-    let store = AuthStore::load();
-    let cred = store
-        .get("anthropic")
-        .ok_or_else(|| anyhow::anyhow!("not logged in to Anthropic — run `bob login anthropic`"))?
-        .clone();
-
-    let expires_at: u64 = cred
-        .extra
-        .get("expires_at")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    if expires_at > now() + 60 {
-        return Ok(cred.token);
-    }
-    let refresh = cred
-        .refresh_token
-        .ok_or_else(|| anyhow::anyhow!("session expired and no refresh token; log in again"))?;
-    let tokens = refresh_token(TOKEN_URL, CLIENT_ID, &refresh).await?;
-    store_tokens("anthropic", &tokens, &[])?;
-    Ok(tokens["access_token"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string())
+    super::storage::access_token_with(
+        &super::auth_path(),
+        "anthropic",
+        &[],
+        "not logged in to Anthropic — run `bob login anthropic`",
+        |refresh| async move { refresh_token(TOKEN_URL, CLIENT_ID, &refresh).await },
+    )
+    .await
 }

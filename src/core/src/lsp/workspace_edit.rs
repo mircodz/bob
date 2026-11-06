@@ -3,12 +3,12 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-pub(crate) struct DocumentEdits {
+pub struct DocumentEdits {
     pub version: Option<i64>,
     pub edits: Vec<TextEdit>,
 }
 
-pub(crate) struct TextEdit {
+pub struct TextEdit {
     start_line: usize,
     start_char: usize,
     end_line: usize,
@@ -16,9 +16,7 @@ pub(crate) struct TextEdit {
     new_text: String,
 }
 
-pub(crate) fn collect_workspace_edit(
-    result: &Value,
-) -> Result<BTreeMap<PathBuf, DocumentEdits>, String> {
+pub fn collect_workspace_edit(result: &Value) -> Result<BTreeMap<PathBuf, DocumentEdits>, String> {
     let mut out = BTreeMap::new();
     if result.get("changes").is_some() && result.get("documentChanges").is_some() {
         return Err("workspace edit contains both changes and documentChanges".into());
@@ -71,13 +69,7 @@ fn add(
     version: Option<i64>,
     edits: &Value,
 ) -> Result<(), String> {
-    let url = reqwest::Url::parse(uri).map_err(|error| error.to_string())?;
-    if url.scheme() != "file" || url.query().is_some() || url.fragment().is_some() {
-        return Err("workspace edit requires a local file URI".into());
-    }
-    let path = url
-        .to_file_path()
-        .map_err(|_| "workspace edit requires a local file URI")?;
+    let path = local_file_path(uri)?;
     let edits = edits
         .as_array()
         .ok_or("edits must be an array")?
@@ -88,6 +80,15 @@ fn add(
         return Err("repeated document edits are unsupported; no files changed".into());
     }
     Ok(())
+}
+
+pub fn local_file_path(uri: &str) -> Result<PathBuf, String> {
+    let url = reqwest::Url::parse(uri).map_err(|error| error.to_string())?;
+    if url.scheme() != "file" || url.query().is_some() || url.fragment().is_some() {
+        return Err("workspace edit requires a local file URI".into());
+    }
+    url.to_file_path()
+        .map_err(|_| "workspace edit requires a local file URI".into())
 }
 
 fn parse_text_edit(edit: &Value) -> Result<TextEdit, String> {
@@ -109,7 +110,7 @@ fn parse_text_edit(edit: &Value) -> Result<TextEdit, String> {
     })
 }
 
-pub(crate) fn apply_edits(
+pub fn apply_edits(
     content: &str,
     edits: &[TextEdit],
     encoding: PositionEncoding,

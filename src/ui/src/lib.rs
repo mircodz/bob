@@ -1,0 +1,13 @@
+pub mod activity;
+pub mod clipboard;
+pub mod commands;
+pub mod diffview;
+pub mod highlight;
+pub mod input;
+pub mod markdown;
+pub mod sanitize;
+pub mod segmented;
+pub mod sidebar;
+pub mod terminal;
+pub mod theme;
+pub mod widgets;

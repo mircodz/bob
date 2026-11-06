@@ -1,6 +1,6 @@
 //! ChatGPT subscription auth via Codex device codes, exchanged for OAuth tokens.
 
-use super::{now, store_tokens, urlencode, AuthStore};
+use super::{store_tokens, urlencode, AuthStore};
 
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const ISSUER: &str = "https://auth.openai.com";
@@ -112,7 +112,7 @@ pub async fn finish_login<F: FnMut()>(device: &DeviceCode, mut on_wait: F) -> an
         );
     }
     let tokens: serde_json::Value = res.json().await?;
-    store_tokens("openai", &tokens, &["id_token"])?;
+    store_tokens("openai", &tokens, &["id_token"]).await?;
     Ok(())
 }
 
@@ -125,45 +125,32 @@ pub fn is_logged_in() -> bool {
 
 /// Return a valid access token, refreshing via /oauth/token if expired.
 pub async fn access_token() -> anyhow::Result<String> {
-    let store = AuthStore::load();
-    let cred = store
-        .get("openai")
-        .ok_or_else(|| anyhow::anyhow!("not logged in to OpenAI — run `bob login openai`"))?
-        .clone();
-
-    let expires_at: u64 = cred
-        .extra
-        .get("expires_at")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    if expires_at > now() + 60 {
-        return Ok(cred.token);
-    }
-    let refresh = cred
-        .refresh_token
-        .ok_or_else(|| anyhow::anyhow!("session expired and no refresh token; log in again"))?;
-    let token_url = format!("{}/oauth/token", ISSUER);
-    let form = format!(
-        "grant_type=refresh_token&refresh_token={}&client_id={}",
-        urlencode(&refresh),
-        urlencode(CLIENT_ID),
-    );
-    let res = client()
-        .post(&token_url)
-        .header("content-type", "application/x-www-form-urlencoded")
-        .body(form)
-        .send()
-        .await?;
-    if !res.status().is_success() {
-        anyhow::bail!(
-            "token refresh failed ({}); run `bob login openai` again",
-            res.status()
-        );
-    }
-    let tokens: serde_json::Value = res.json().await?;
-    store_tokens("openai", &tokens, &["id_token"])?;
-    Ok(tokens["access_token"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string())
+    super::storage::access_token_with(
+        &super::auth_path(),
+        "openai",
+        &["id_token"],
+        "not logged in to OpenAI — run `bob login openai`",
+        |refresh| async move {
+            let token_url = format!("{}/oauth/token", ISSUER);
+            let form = format!(
+                "grant_type=refresh_token&refresh_token={}&client_id={}",
+                urlencode(&refresh),
+                urlencode(CLIENT_ID),
+            );
+            let res = client()
+                .post(&token_url)
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(form)
+                .send()
+                .await?;
+            if !res.status().is_success() {
+                anyhow::bail!(
+                    "token refresh failed ({}); run `bob login openai` again",
+                    res.status()
+                );
+            }
+            Ok(res.json().await?)
+        },
+    )
+    .await
 }

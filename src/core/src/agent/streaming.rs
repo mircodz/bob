@@ -208,7 +208,7 @@ mod tests {
         async fn stream(
             &self,
             _: GenerateOptions,
-        ) -> anyhow::Result<tokio::sync::mpsc::UnboundedReceiver<StreamEvent>> {
+        ) -> anyhow::Result<tokio::sync::mpsc::Receiver<StreamEvent>> {
             let fail = {
                 let mut calls = self.calls.lock().unwrap();
                 calls.push(tokio::time::Instant::now());
@@ -217,18 +217,18 @@ mod tests {
             if fail && !self.midstream {
                 return Err(anyhow::anyhow!(self.error).context("provider startup"));
             }
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let (tx, rx) = tokio::sync::mpsc::channel(4);
             if fail {
-                tx.send(StreamEvent::TextDelta {
+                tx.try_send(StreamEvent::TextDelta {
                     text: "discarded".into(),
                 })
                 .unwrap();
-                tx.send(StreamEvent::Error {
+                tx.try_send(StreamEvent::Error {
                     message: self.error.into(),
                 })
                 .unwrap();
             } else {
-                tx.send(StreamEvent::MessageStop {
+                tx.try_send(StreamEvent::MessageStop {
                     completion: completion(vec![text("recovered")]),
                 })
                 .unwrap();
@@ -478,6 +478,11 @@ mod tests {
     async fn completed_message_is_authoritative_and_deltas_remain_in_event_order() {
         let reply = completion(vec![text("authoritative answer")]);
         let provider = Arc::new(ScriptProvider::new(vec![Step::Events(vec![
+            StreamEvent::ReasoningDelta {
+                block_id: "reasoning-0".into(),
+                kind: crate::core::types::ReasoningKind::Summary,
+                text: "public summary, not the answer".into(),
+            },
             StreamEvent::TextDelta {
                 text: "preview ".into(),
             },

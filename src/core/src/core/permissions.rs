@@ -464,6 +464,114 @@ impl ParsedCommand {
     }
 }
 
+/// Candidate for an optional remembered program choice, not an execution decision.
+/// Accepts only unquoted literal words in one simple command and a bare ASCII name
+/// of at most 64 bytes. Shells, interpreters, and known execution wrappers abstain.
+/// The case-preserved name does not pin an executable; arguments are not sandboxed.
+/// `None` leaves one-shot approval and existing exact-command grants unchanged.
+pub fn simple_bash_program(raw: &str) -> Option<String> {
+    let name = crate::core::bash_parse::simple_literal_program(raw)?;
+    if name.len() > 64
+        || !name
+            .as_bytes()
+            .first()
+            .is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_')
+        || !name
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.'))
+    {
+        return None;
+    }
+    let lowercase = name.to_ascii_lowercase();
+    let executable = lowercase.strip_suffix(".exe").unwrap_or(&lowercase);
+    const EXCLUDED: &[&str] = &[
+        "sh",
+        "bash",
+        "zsh",
+        "dash",
+        "ash",
+        "ksh",
+        "mksh",
+        "pdksh",
+        "csh",
+        "tcsh",
+        "fish",
+        "yash",
+        "nu",
+        "elvish",
+        "pwsh",
+        "powershell",
+        "cmd",
+        "python",
+        "pypy",
+        "node",
+        "nodejs",
+        "ruby",
+        "perl",
+        "php",
+        "lua",
+        "luajit",
+        "tclsh",
+        "wish",
+        "deno",
+        "bun",
+        "awk",
+        "gawk",
+        "mawk",
+        "nawk",
+        "eval",
+        "exec",
+        "command",
+        "builtin",
+        "source",
+        "env",
+        "sudo",
+        "doas",
+        "xargs",
+        "su",
+        "runuser",
+        "nohup",
+        "nice",
+        "timeout",
+        "time",
+        "setsid",
+        "stdbuf",
+        "chroot",
+        "chrt",
+        "taskset",
+        "ionice",
+        "unshare",
+        "nsenter",
+        "watch",
+        "parallel",
+        "busybox",
+        "toybox",
+        "ssh",
+        "npx",
+        "npm",
+        "yarn",
+        "pnpm",
+        "uv",
+        "uvx",
+        "pipx",
+    ];
+    if EXCLUDED.contains(&executable)
+        || [
+            "python", "pypy", "node", "ruby", "perl", "php", "lua", "tclsh", "wish",
+        ]
+        .iter()
+        .any(|base| {
+            executable.strip_prefix(*base).is_some_and(|version| {
+                version.as_bytes().first().is_some_and(u8::is_ascii_digit)
+                    && version.bytes().all(|c| c.is_ascii_digit() || c == b'.')
+            })
+        })
+    {
+        return None;
+    }
+    Some(name)
+}
+
 /// Parse failures and unmodeled constructs set `analyzable` to false.
 pub fn parse_bash(raw: &str) -> ParsedCommand {
     match crate::core::bash_parse::analyze(raw) {
@@ -483,6 +591,266 @@ pub fn parse_bash(raw: &str) -> ParsedCommand {
             analyzable: false,
             raw: raw.to_string(),
         },
+    }
+}
+
+#[cfg(test)]
+mod simple_bash_program_tests {
+    use super::{parse_bash, simple_bash_program};
+
+    #[test]
+    fn literal_candidates_preserve_the_entire_case_sensitive_name() {
+        for (raw, expected) in [
+            ("git status", "git"),
+            ("git diff --stat", "git"),
+            ("cargo test", "cargo"),
+            ("git", "git"),
+            (" \tgit\t status  ", "git"),
+            ("gitty status", "gitty"),
+            ("Git status", "Git"),
+            ("git-lfs version", "git-lfs"),
+            ("tool.v2 arg", "tool.v2"),
+            ("_tool arg", "_tool"),
+            ("git diff -- src/file.rs", "git"),
+        ] {
+            assert_eq!(
+                simple_bash_program(raw).as_deref(),
+                Some(expected),
+                "{raw:?}"
+            );
+        }
+        let longest = "a".repeat(64);
+        assert_eq!(
+            simple_bash_program(&longest).as_deref(),
+            Some(longest.as_str())
+        );
+        assert_eq!(simple_bash_program(&"a".repeat(65)), None);
+    }
+
+    #[test]
+    fn rejects_every_non_simple_shell_structure() {
+        for raw in [
+            "git status; git diff",
+            "git status;",
+            "git status ; ",
+            "git status\ngit diff",
+            "git status\n",
+            "\ngit status",
+            "git status\r",
+            "git status\r\nbash script",
+            "git status &",
+            "git status & git diff",
+            "git status && git diff",
+            "git status || git diff",
+            "git status | cat",
+            "git status |& cat",
+            "! git status",
+            "time git status",
+            "time -p git status",
+            "(git status)",
+            "{ git status; }",
+            "f() { git status; }",
+            "function f { git status; }",
+            "if git status; then git diff; fi",
+            "while git status; do git diff; done",
+            "until git status; do git diff; done",
+            "for x in a; do git status; done",
+            "for ((i=0;i<1;i++)); do git status; done",
+            "case x in x) git status;; esac",
+            "coproc git status",
+            "[[ -n foo ]]",
+            "((1 + 1))",
+            "git status > out",
+            "git status >> out",
+            "git status 2>&1",
+            "git status &> out",
+            "git status < in",
+            "< in git status",
+            "git status <> in",
+            "git status <<< text",
+            "git status <<EOF\ntext\nEOF\n",
+            "git status <<'EOF'\ntext\nEOF\n",
+            "git status <<-EOF\n\ttext\nEOF\n",
+            "git status <(cat in)",
+            "git status >(cat)",
+            "FOO=bar git status",
+            "PATH=/tmp git status",
+            "FOO=bar",
+            "FOO=(bar) git status",
+            "declare FOO=bar",
+            "git status # harmless",
+            "git status # ; bash script",
+            "git status # comment\nbash script",
+            "# git status\nbash script",
+            "#!/bin/bash\ngit status",
+            "git status\0bash script",
+        ] {
+            assert_eq!(simple_bash_program(raw), None, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_quoting_expansion_paths_and_malformed_input() {
+        for raw in [
+            "",
+            " \t ",
+            "# comment",
+            "'git' status",
+            "\"git\" status",
+            "g\"i\"t status",
+            "\\git status",
+            "g\\it status",
+            "$'git' status",
+            "g\\\nit status",
+            "git 'status'",
+            "git \"status\"",
+            "git sta\\tus",
+            "git $ARG",
+            "git ${ARG:-status}",
+            "git $(printf status)",
+            "git `printf status`",
+            "$(printf git) status",
+            "git $((1 + 2))",
+            "git *.rs",
+            "git file?",
+            "git [ab]",
+            "git {status,diff}",
+            "git ~(x)",
+            "git ~user",
+            "git @(status|diff)",
+            "git +(status)",
+            "git !(diff)",
+            "git !status",
+            "git 'unterminated",
+            "git \"unterminated",
+            "git $(",
+            "git >",
+            "git |",
+            "git &&",
+            "git )",
+            "/usr/bin/git status",
+            "./git status",
+            "../git status",
+            "tools/git status",
+            "C:/tools/git status",
+            "C:\\tools\\git status",
+            ".\\git status",
+            "gít status",
+            "-git status",
+            ".git status",
+        ] {
+            assert_eq!(simple_bash_program(raw), None, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn excludes_interpreters_evaluation_and_execution_wrappers() {
+        for name in [
+            "sh",
+            "bash",
+            "zsh",
+            "dash",
+            "ksh",
+            "fish",
+            "pwsh",
+            "powershell",
+            "cmd",
+            "python",
+            "python2",
+            "python3",
+            "python3.12",
+            "pypy3",
+            "node",
+            "nodejs",
+            "ruby",
+            "perl",
+            "php",
+            "lua5.4",
+            "tclsh8.6",
+            "deno",
+            "bun",
+            "awk",
+            "eval",
+            "exec",
+            "command",
+            "builtin",
+            "source",
+            ".",
+            "env",
+            "sudo",
+            "doas",
+            "xargs",
+            "nohup",
+            "nice",
+            "timeout",
+            "time",
+            "setsid",
+            "stdbuf",
+            "chroot",
+            "unshare",
+            "nsenter",
+            "watch",
+            "parallel",
+            "busybox",
+            "ssh",
+            "npx",
+            "npm",
+            "yarn",
+            "pnpm",
+            "uv",
+            "uvx",
+            "pipx",
+            "BASH",
+            "PowerShell.exe",
+            "CMD.EXE",
+            "Python3.12.exe",
+        ] {
+            assert_eq!(
+                simple_bash_program(&format!("{name} script")),
+                None,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_altered_invocation_requires_fresh_candidate_analysis() {
+        assert_eq!(simple_bash_program("git status").as_deref(), Some("git"));
+        for (raw, expected) in [
+            ("git diff --stat", Some("git")),
+            ("git -C other status", Some("git")),
+            ("git reset --hard", Some("git")),
+            ("gitty status", Some("gitty")),
+            ("Git status", Some("Git")),
+            ("cargo run", Some("cargo")),
+            ("git status; bash script", None),
+            ("git status\nbash script", None),
+            ("git status &", None),
+            ("git status < script", None),
+            ("git $(bash script)", None),
+            ("PATH=/tmp git status", None),
+            ("env git status", None),
+            ("/tmp/git status", None),
+            ("'git' status", None),
+        ] {
+            assert_eq!(simple_bash_program(raw).as_deref(), expected, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn candidate_rejection_does_not_change_existing_analysis() {
+        for raw in [
+            "git status;",
+            "git status &",
+            "(git status)",
+            "git status < in",
+        ] {
+            let parsed = parse_bash(raw);
+            assert!(parsed.analyzable, "{raw}");
+            assert_eq!(parsed.commands, [vec!["git", "status"]], "{raw}");
+            assert_eq!(parsed.raw, raw);
+            assert_eq!(simple_bash_program(raw), None, "{raw}");
+        }
     }
 }
 

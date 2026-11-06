@@ -1,7 +1,7 @@
 //! MCP OAuth + PKCE; server credentials are isolated under `mcp:<name>`.
 
 use super::{
-    authorize_url, exchange_code, now, pkce, refresh_token, store_tokens, wait_for_callback,
+    authorize_url, exchange_code, pkce, refresh_token, store_tokens, wait_for_callback,
     AuthCodeConfig, AuthStore, Pkce,
 };
 use crate::core::config::McpOAuthConfig;
@@ -192,22 +192,21 @@ pub fn begin_login(server: &str, oauth: &McpOAuthConfig) -> LoginHandle {
 pub async fn finish_login(handle: LoginHandle) -> anyhow::Result<()> {
     let code = wait_for_callback(handle.cfg.callback_port, &handle.state).await?;
     let tokens = exchange_code(&handle.cfg, &handle.pkce, &code).await?;
-    store_tokens(&store_key(&handle.server), &tokens, &[])?;
+    store_tokens(&store_key(&handle.server), &tokens, &[]).await?;
     Ok(())
 }
 
 /// Static bearer tokens have no expiry and are never refreshed.
-pub fn store_static_token(server: &str, token: &str) -> anyhow::Result<()> {
-    let mut store = AuthStore::load();
-    store.set(
+pub async fn store_static_token(server: &str, token: &str) -> anyhow::Result<()> {
+    AuthStore::set_credential(
         &store_key(server),
         super::Credential {
             token: token.to_string(),
             refresh_token: None,
             extra: std::collections::HashMap::new(),
         },
-    );
-    store.save()
+    )
+    .await
 }
 
 /// Bearer token for servers without OAuth configuration.
@@ -221,41 +220,14 @@ pub fn stored_token(server: &str) -> Option<String> {
 /// Refresh expired tokens through the server's token endpoint.
 pub async fn access_token(server: &str, oauth: &McpOAuthConfig) -> anyhow::Result<String> {
     let key = store_key(server);
-    let store = AuthStore::load();
-    let cred = store
-        .get(&key)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "not logged in to MCP server '{}'; run `bob mcp login {}`",
-                server,
-                server
-            )
-        })?
-        .clone();
-
-    // Allow 60 seconds for clock skew.
-    let expires_at: u64 = cred
-        .extra
-        .get("expires_at")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    if !cred.token.is_empty() && now() + 60 < expires_at {
-        return Ok(cred.token);
-    }
-
-    let refresh = cred.refresh_token.ok_or_else(|| {
-        anyhow::anyhow!(
-            "session for MCP server '{}' expired and no refresh token; run `bob mcp login {}`",
-            server,
-            server
-        )
-    })?;
-    let tokens = refresh_token(&oauth.token_url, &oauth.client_id, &refresh).await?;
-    store_tokens(&key, &tokens, &[])?;
-    Ok(tokens["access_token"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("no access_token in refresh response"))?
-        .to_string())
+    super::storage::access_token_with(
+        &super::auth_path(),
+        &key,
+        &[],
+        &format!("not logged in to MCP server '{server}'; run `bob mcp login {server}`"),
+        |refresh| async move { refresh_token(&oauth.token_url, &oauth.client_id, &refresh).await },
+    )
+    .await
 }
 
 #[cfg(test)]

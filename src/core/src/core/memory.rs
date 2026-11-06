@@ -42,6 +42,19 @@ pub struct MemoryEntry {
 pub trait MemoryRepository: Send + Sync {
     fn remember(&self, scope: &MemoryScope, content: &str) -> anyhow::Result<MemoryEntry>;
     fn list(&self, scope: &MemoryScope) -> anyhow::Result<Vec<MemoryEntry>>;
+    fn list_page(
+        &self,
+        scope: &MemoryScope,
+        offset: usize,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        Ok(self
+            .list(scope)?
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .collect())
+    }
     fn forget(&self, scope: &MemoryScope, id: i64) -> anyhow::Result<bool>;
 }
 
@@ -88,6 +101,15 @@ impl MemoryRepository for InMemoryMemories {
     }
 
     fn list(&self, scope: &MemoryScope) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.list_page(scope, 0, usize::MAX)
+    }
+
+    fn list_page(
+        &self,
+        scope: &MemoryScope,
+        offset: usize,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
         Ok(self
             .entries
             .lock()
@@ -96,6 +118,8 @@ impl MemoryRepository for InMemoryMemories {
             .values()
             .rev()
             .filter(|entry| &entry.scope == scope)
+            .skip(offset)
+            .take(limit)
             .cloned()
             .collect())
     }
@@ -112,6 +136,97 @@ impl MemoryRepository for InMemoryMemories {
         } else {
             Ok(false)
         }
+    }
+}
+
+pub struct SqliteMemoryRepository {
+    connection: Mutex<rusqlite::Connection>,
+}
+
+impl SqliteMemoryRepository {
+    pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let connection = rusqlite::Connection::open(path)?;
+        connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scope TEXT NOT NULL,
+                scope_key TEXT NOT NULL,
+                content TEXT NOT NULL,
+                UNIQUE(scope, scope_key, content)
+            );",
+        )?;
+        Ok(Self {
+            connection: Mutex::new(connection),
+        })
+    }
+}
+
+impl MemoryRepository for SqliteMemoryRepository {
+    fn remember(&self, scope: &MemoryScope, value: &str) -> anyhow::Result<MemoryEntry> {
+        let value = content(value)?;
+        let (kind, key) = scope.key();
+        let mut connection = self.connection.lock().unwrap();
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT INTO memories (scope, scope_key, content) VALUES (?1, ?2, ?3)
+             ON CONFLICT(scope, scope_key, content) DO NOTHING",
+            params![kind, key, value],
+        )?;
+        let id = transaction.query_row(
+            "SELECT id FROM memories WHERE scope = ?1 AND scope_key = ?2 AND content = ?3",
+            params![kind, key, value],
+            |row| row.get(0),
+        )?;
+        transaction.commit()?;
+        Ok(MemoryEntry {
+            id,
+            scope: scope.clone(),
+            content: value.into(),
+        })
+    }
+
+    fn list(&self, scope: &MemoryScope) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.list_page(scope, 0, i64::MAX as usize)
+    }
+
+    fn list_page(
+        &self,
+        scope: &MemoryScope,
+        offset: usize,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let (kind, key) = scope.key();
+        let connection = self.connection.lock().unwrap();
+        let mut statement = connection.prepare(
+            "SELECT id, content FROM memories WHERE scope = ?1 AND scope_key = ?2 ORDER BY id DESC LIMIT ?3 OFFSET ?4",
+        )?;
+        let rows = statement.query_map(
+            params![
+                kind,
+                key,
+                i64::try_from(limit).unwrap_or(i64::MAX),
+                i64::try_from(offset).unwrap_or(i64::MAX)
+            ],
+            |row| {
+                Ok(MemoryEntry {
+                    id: row.get(0)?,
+                    scope: scope.clone(),
+                    content: row.get(1)?,
+                })
+            },
+        )?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    fn forget(&self, scope: &MemoryScope, id: i64) -> anyhow::Result<bool> {
+        let (kind, key) = scope.key();
+        let connection = self.connection.lock().unwrap();
+        Ok(connection.execute(
+            "DELETE FROM memories WHERE id = ?1 AND scope = ?2 AND scope_key = ?3",
+            params![id, kind, key],
+        )? != 0)
     }
 }
 
@@ -223,6 +338,46 @@ mod tests {
 
     mod repositories {
         use super::*;
+
+        #[test]
+        fn standalone_repository_persists_pages_without_session_tables_or_instruction_files() {
+            let dir = TestDir::new();
+            let path = dir.join("durable-memory.db");
+            let project = MemoryScope::project(&dir.0).unwrap();
+            let repository = SqliteMemoryRepository::open(&path).unwrap();
+            for index in 0..55 {
+                repository
+                    .remember(&project, &format!("preference {index}"))
+                    .unwrap();
+            }
+            let global = repository
+                .remember(&MemoryScope::Global, "global preference")
+                .unwrap();
+            assert!(!repository.forget(&project, global.id).unwrap());
+            let first = repository.list_page(&project, 0, 50).unwrap();
+            assert_eq!(first.len(), 50);
+            assert_eq!(first[0].content, "preference 54");
+            assert_eq!(repository.list_page(&project, 50, 50).unwrap().len(), 5);
+            assert!(repository
+                .list_page(&project, usize::MAX, 50)
+                .unwrap()
+                .is_empty());
+            drop(repository);
+            let reopened = SqliteMemoryRepository::open(&path).unwrap();
+            assert_eq!(reopened.list_page(&project, 0, 50).unwrap(), first);
+            assert_eq!(
+                reopened
+                    .remember(&MemoryScope::Global, " global preference ")
+                    .unwrap(),
+                global
+            );
+            assert!(reopened.forget(&MemoryScope::Global, global.id).unwrap());
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            let tables: Vec<String> = connection.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name").unwrap().query_map([], |row| row.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
+            assert_eq!(tables, ["memories"]);
+            assert!(!dir.join("AGENTS.md").exists());
+            assert!(!dir.join("CLAUDE.md").exists());
+        }
 
         #[test]
         fn deduplication_is_scope_local_and_preserves_newest_first_order() {

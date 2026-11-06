@@ -1,7 +1,7 @@
 //! Streamable HTTP uses JSON-RPC POSTs with JSON or SSE replies.
 //! Echo the server's `Mcp-Session-Id` on subsequent messages.
 
-use super::Transport;
+use super::{Transport, MAX_FRAME_BYTES};
 use crate::core::config::{McpOAuthConfig, McpServerConfig};
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -30,6 +30,7 @@ impl HttpTransport {
             // Bound the full response lifetime, including SSE streams that never close.
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()?,
             session_id: Mutex::new(None),
             next_id: AtomicI64::new(1),
@@ -40,13 +41,24 @@ impl HttpTransport {
     async fn token(&self) -> anyhow::Result<Option<String>> {
         match &self.oauth {
             Some(oauth) => Ok(Some(
-                crate::auth::mcp::access_token(&self.server, oauth).await?,
+                crate::auth::mcp::access_token(&self.server, oauth)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("MCP authorization failed; check server login"))?,
             )),
             None => Ok(crate::auth::mcp::stored_token(&self.server)),
         }
     }
 
     async fn post(&self, msg: &Value) -> anyhow::Result<reqwest::Response> {
+        let token = self.token().await?;
+        let request = self.build_request(msg, token.as_deref())?;
+        self.client
+            .execute(request)
+            .await
+            .map_err(|_| anyhow::anyhow!("MCP HTTP request failed"))
+    }
+
+    fn build_request(&self, msg: &Value, token: Option<&str>) -> anyhow::Result<reqwest::Request> {
         let mut req = self
             .client
             .post(&self.url)
@@ -55,16 +67,26 @@ impl HttpTransport {
         if let Some(sid) = self.session_id.lock().unwrap().clone() {
             req = req.header("mcp-session-id", sid);
         }
-        if let Some(tok) = self.token().await? {
-            req = req.header("authorization", format!("Bearer {}", tok));
+        if let Some(token) = token {
+            let mut authorization =
+                reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+                    .map_err(|_| anyhow::anyhow!("MCP authorization token is invalid"))?;
+            authorization.set_sensitive(true);
+            req = req.header("authorization", authorization);
         }
-        let resp = req.json(msg).send().await?;
-        Ok(resp)
+        let body = serde_json::to_vec(msg)?;
+        anyhow::ensure!(
+            body.len() <= MAX_FRAME_BYTES,
+            "MCP request exceeds byte limit"
+        );
+        req.body(body)
+            .build()
+            .map_err(|_| anyhow::anyhow!("MCP HTTP request configuration is invalid"))
     }
 }
 
 /// Match the request ID in either JSON or SSE; do not wait for SSE EOF after a reply.
-async fn read_reply(resp: reqwest::Response, id: i64) -> anyhow::Result<Value> {
+async fn read_reply(mut resp: reqwest::Response, id: i64) -> anyhow::Result<Value> {
     let is_sse = resp
         .headers()
         .get("content-type")
@@ -72,32 +94,104 @@ async fn read_reply(resp: reqwest::Response, id: i64) -> anyhow::Result<Value> {
         .map(|ct| ct.contains("text/event-stream"))
         .unwrap_or(false);
 
-    if !is_sse {
-        let v: Value = resp.json().await?;
-        anyhow::ensure!(
-            is_reply(&v, id),
-            "MCP HTTP response did not match request {}",
-            id
-        );
-        return Ok(v);
+    anyhow::ensure!(
+        resp.content_length().unwrap_or(0) <= MAX_FRAME_BYTES as u64,
+        "MCP HTTP response exceeds byte limit"
+    );
+    let mut decoder = ReplyDecoder::new(is_sse, id);
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|_| anyhow::anyhow!("MCP HTTP response interrupted"))?
+    {
+        if let Some(reply) = decoder.push(&chunk)? {
+            return Ok(reply);
+        }
+    }
+    decoder.finish()
+}
+
+struct ReplyDecoder {
+    sse: bool,
+    id: i64,
+    received: usize,
+    buffer: Vec<u8>,
+    event: Vec<u8>,
+}
+
+impl ReplyDecoder {
+    fn new(sse: bool, id: i64) -> Self {
+        Self {
+            sse,
+            id,
+            received: 0,
+            buffer: Vec::new(),
+            event: Vec::new(),
+        }
     }
 
-    let mut found: Option<Value> = None;
-    crate::providers::sse::parse_sse_control(
-        resp,
-        |event| {
-            if let crate::providers::sse::SseEvent::Json(event) = event {
-                if is_reply(&event, id) {
-                    found = Some(event);
-                    return std::ops::ControlFlow::Break(());
-                }
+    fn push(&mut self, chunk: &[u8]) -> anyhow::Result<Option<Value>> {
+        anyhow::ensure!(
+            chunk.len() <= MAX_FRAME_BYTES - self.received,
+            "MCP HTTP response exceeds byte limit"
+        );
+        self.received += chunk.len();
+        self.buffer.extend_from_slice(chunk);
+        if !self.sse {
+            return Ok(None);
+        }
+        let mut consumed = 0;
+        for line in self.buffer.split_inclusive(|byte| *byte == b'\n') {
+            if !line.ends_with(b"\n") {
+                break;
             }
-            std::ops::ControlFlow::Continue(())
-        },
-        std::time::Duration::from_secs(30),
-    )
-    .await?;
-    found.ok_or_else(|| anyhow::anyhow!("MCP HTTP stream ended without a reply"))
+            consumed += line.len();
+            if let Some(reply) = Self::line(&mut self.event, &line[..line.len() - 1], self.id)? {
+                return Ok(Some(reply));
+            }
+        }
+        self.buffer.drain(..consumed);
+        Ok(None)
+    }
+
+    fn line(event: &mut Vec<u8>, line: &[u8], id: i64) -> anyhow::Result<Option<Value>> {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            if event.is_empty() {
+                return Ok(None);
+            }
+            let parsed = serde_json::from_slice::<Value>(event)
+                .map_err(|_| anyhow::anyhow!("MCP SSE event contains invalid JSON"))?;
+            event.clear();
+            return Ok(is_reply(&parsed, id).then_some(parsed));
+        }
+        if let Some(data) = line.strip_prefix(b"data:") {
+            let data = data.strip_prefix(b" ").unwrap_or(data);
+            if !event.is_empty() {
+                event.push(b'\n');
+            }
+            event.extend_from_slice(data);
+        }
+        Ok(None)
+    }
+
+    fn finish(mut self) -> anyhow::Result<Value> {
+        if !self.sse {
+            let reply: Value = serde_json::from_slice(&self.buffer)
+                .map_err(|_| anyhow::anyhow!("MCP HTTP response contains invalid JSON"))?;
+            anyhow::ensure!(
+                is_reply(&reply, self.id),
+                "MCP HTTP response did not match request {}",
+                self.id
+            );
+            return Ok(reply);
+        }
+        if let Some(reply) = Self::line(&mut self.event, &self.buffer, self.id)? {
+            return Ok(reply);
+        }
+        Self::line(&mut self.event, b"", self.id)?
+            .ok_or_else(|| anyhow::anyhow!("MCP HTTP stream ended without a reply"))
+    }
 }
 
 fn is_reply(value: &Value, id: i64) -> bool {
@@ -128,9 +222,7 @@ impl Transport for HttpTransport {
                 );
             }
             if !resp.status().is_success() {
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                anyhow::bail!("MCP HTTP {} error: {} {}", self.server, status, body);
+                anyhow::bail!("MCP HTTP error: {}", resp.status());
             }
 
             if let Some(sid) = resp
@@ -144,7 +236,10 @@ impl Transport for HttpTransport {
 
             let reply = read_reply(resp, id).await?;
             if let Some(err) = reply.get("error") {
-                anyhow::bail!("MCP error: {}", err);
+                anyhow::bail!(
+                    "MCP JSON-RPC error (code {})",
+                    err["code"].as_i64().unwrap_or(0)
+                );
             }
             Ok(reply.get("result").cloned().unwrap_or(Value::Null))
         })
@@ -163,6 +258,90 @@ mod tests {
     use super::*;
     use crate::test_support::http::response;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn auth_and_session_headers_are_bound_without_network_or_secret_debug_output() {
+        let config =
+            serde_json::from_value(json!({"name":"fixture","url":"http://127.0.0.1:1/mcp"}))
+                .unwrap();
+        let transport = HttpTransport::connect(&config).await.unwrap();
+        *transport.session_id.lock().unwrap() = Some("fixture-session".into());
+        let request = transport
+            .build_request(&json!({"id":1}), Some("fixture-secret"))
+            .unwrap();
+        assert_eq!(request.headers()["authorization"], "Bearer fixture-secret");
+        assert!(request.headers()["authorization"].is_sensitive());
+        assert_eq!(request.headers()["mcp-session-id"], "fixture-session");
+        assert_eq!(
+            request.headers()["accept"],
+            "application/json, text/event-stream"
+        );
+        assert!(!format!("{request:?}").contains("fixture-secret"));
+        let no_auth = transport.build_request(&json!({}), None).unwrap();
+        assert!(!no_auth.headers().contains_key("authorization"));
+        assert!(transport
+            .build_request(&json!({}), Some("bad\nsecret"))
+            .is_err());
+    }
+
+    #[test]
+    fn decoder_handles_every_utf8_chunk_boundary_multiline_and_crlf() {
+        let stream = ": keepalive\r\ndata: {\"id\":2,\"result\":null}\r\n\r\ndata: {\"id\":1,\r\ndata: \"result\":\"é😀\"}\r\n\r\n".as_bytes();
+        for split in 0..stream.len() {
+            let mut decoder = ReplyDecoder::new(true, 1);
+            assert!(decoder.push(&stream[..split]).unwrap().is_none());
+            assert_eq!(
+                decoder.push(&stream[split..]).unwrap().unwrap()["result"],
+                "é😀"
+            );
+        }
+        let mut decoder = ReplyDecoder::new(false, 1);
+        for byte in br#"{"id":1,"result":null}"# {
+            assert!(decoder.push(&[*byte]).unwrap().is_none());
+        }
+        assert_eq!(decoder.finish().unwrap()["result"], Value::Null);
+    }
+
+    #[test]
+    fn decoder_rejects_oversized_json_sse_frames_and_endless_notices() {
+        for sse in [false, true] {
+            let mut decoder = ReplyDecoder::new(sse, 1);
+            decoder.push(&vec![b' '; MAX_FRAME_BYTES]).unwrap();
+            assert!(decoder
+                .push(b"x")
+                .unwrap_err()
+                .to_string()
+                .contains("byte limit"));
+        }
+        let mut decoder = ReplyDecoder::new(true, 1);
+        let comment = vec![b':'; 1023];
+        let mut line = comment;
+        line.push(b'\n');
+        for _ in 0..MAX_FRAME_BYTES / line.len() {
+            assert!(decoder.push(&line).unwrap().is_none());
+        }
+        assert!(decoder.push(&line).is_err());
+    }
+
+    #[test]
+    fn decoder_eof_and_parse_errors_do_not_echo_body() {
+        let mut decoder = ReplyDecoder::new(true, 1);
+        decoder.push(b"data: {\"id\":1,\"result\":true}").unwrap();
+        assert_eq!(decoder.finish().unwrap()["result"], true);
+        for sse in [false, true] {
+            let mut decoder = ReplyDecoder::new(sse, 1);
+            let malformed = if sse {
+                b"data: Bearer secret\n\n".as_slice()
+            } else {
+                b"Bearer secret".as_slice()
+            };
+            let error = match decoder.push(malformed) {
+                Err(error) => error,
+                Ok(_) => decoder.finish().unwrap_err(),
+            };
+            assert!(!error.to_string().contains("secret"));
+        }
+    }
 
     #[test]
     fn reply_matching_requires_exact_integer_id_and_a_response_member() {

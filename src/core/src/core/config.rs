@@ -1,7 +1,9 @@
 //! TOML config precedence: defaults, ~/.bob/config.toml, then project ancestors
 //! from the repository root to cwd (nearest wins).
 
+use super::file_update::{atomic_replace, sibling, update_path, FileLock};
 use super::project_context::ProjectContext;
+use super::shell::{ShellKind, ShellSelection};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -105,7 +107,7 @@ pub struct BobConfig {
     #[serde(default)]
     pub theme: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bash_executable: Option<std::path::PathBuf>,
+    pub shell: Option<ShellSelection>,
     pub permissions: PermissionsConfig,
     #[serde(default)]
     pub provider_timeouts: ProviderTimeoutsConfig,
@@ -124,7 +126,7 @@ impl Default for BobConfig {
             system: None,
             max_turns: Some(crate::agent::agent::DEFAULT_MAX_TURNS),
             theme: None,
-            bash_executable: None,
+            shell: None,
             permissions: PermissionsConfig {
                 default: "ask".to_string(),
                 allow_bash: [
@@ -154,11 +156,40 @@ struct PartialConfig {
     system: Option<String>,
     max_turns: Option<u32>,
     theme: Option<String>,
-    bash_executable: Option<std::path::PathBuf>,
+    #[serde(flatten)]
+    shell: ShellLayer,
     permissions: Option<PartialPermissions>,
     provider_timeouts: Option<PartialProviderTimeouts>,
     mcp_servers: Option<Vec<PartialMcpServer>>,
     lsp_servers: Option<Vec<PartialLspServer>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(try_from = "RawShellLayer")]
+struct ShellLayer(Option<ShellSelection>);
+
+#[derive(Deserialize)]
+struct RawShellLayer {
+    shell: Option<ShellSelection>,
+    bash_executable: Option<std::path::PathBuf>,
+}
+
+impl TryFrom<RawShellLayer> for ShellLayer {
+    type Error = &'static str;
+
+    fn try_from(raw: RawShellLayer) -> Result<Self, Self::Error> {
+        if raw.shell.is_some() && raw.bash_executable.is_some() {
+            return Err(
+                "shell and bash_executable conflict in the same config file; use only [shell]",
+            );
+        }
+        Ok(Self(raw.shell.or_else(|| {
+            raw.bash_executable.map(|executable| ShellSelection {
+                dialect: ShellKind::Bash,
+                executable,
+            })
+        })))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -372,7 +403,7 @@ fn merge(mut base: BobConfig, over: PartialConfig) -> BobConfig {
         system: over.system.or(base.system),
         max_turns: over.max_turns.or(base.max_turns),
         theme: over.theme.or(base.theme),
-        bash_executable: over.bash_executable.or(base.bash_executable),
+        shell: over.shell.0.or(base.shell),
         permissions: base.permissions,
         provider_timeouts: base.provider_timeouts,
         mcp_servers: base.mcp_servers,
@@ -462,6 +493,14 @@ max_turns = {max_turns}
 # Optional: replace the built-in system prompt entirely (advanced).
 # system = "You are ..."
 
+# Shell selection is atomic: nearer config replaces dialect AND executable.
+# Windows automatic selection prefers native PowerShell 7, then Git Bash.
+# Explicit selection never falls back; unresolved Store execution aliases are unsupported.
+# [shell]
+# dialect = "pwsh" # "bash" or "pwsh"
+# executable = 'C:\Program Files\PowerShell\7\pwsh.exe'
+# Legacy top-level bash_executable is accepted, but cannot coexist with [shell].
+
 # [provider_timeouts]
 # startup_secs = 120
 # idle_secs = 120
@@ -469,7 +508,7 @@ max_turns = {max_turns}
 [permissions]
 # What to do for a tool call not covered by the lists below: allow | deny | ask.
 default = "{perm_default}"
-# Shell commands auto-approved without a prompt.
+# Bash commands auto-approved without a prompt (never applies to PowerShell).
 allow_bash = [{allow_bash}]
 # Tools auto-approved without a prompt.
 allow = [{allow}]
@@ -503,32 +542,52 @@ deny = [{deny}]
 /// If the file exists, it is overwritten only when `force` is true.
 pub fn init_global_config(force: bool) -> anyhow::Result<(std::path::PathBuf, bool)> {
     let path = global_config_path()?;
-    if path.exists() && !force {
-        return Ok((path, false));
+    let target = update_path(&path)?;
+    let _lock = FileLock::acquire(&sibling(&target, ".lock"))?;
+    match std::fs::metadata(&target) {
+        Ok(_) if !force => return Ok((path, false)),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&path, default_config_toml())?;
+    atomic_replace(&target, default_config_toml().as_bytes(), false)?;
     Ok((path, true))
 }
 
-fn read_config_doc() -> anyhow::Result<toml_edit::DocumentMut> {
-    let path = global_config_path()?;
-    if !path.exists() {
-        return Ok(toml_edit::DocumentMut::new());
-    }
-    let text = std::fs::read_to_string(&path)?;
+fn read_config_doc_at(path: &Path) -> anyhow::Result<toml_edit::DocumentMut> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(toml_edit::DocumentMut::new());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let _: PartialConfig = toml::from_str(&text)?;
     Ok(text.parse::<toml_edit::DocumentMut>()?)
 }
 
-fn write_config_doc(doc: &toml_edit::DocumentMut) -> anyhow::Result<()> {
-    let path = global_config_path()?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+fn set_config_string(doc: &mut toml_edit::DocumentMut, key: &str, text: &str) {
+    let mut value = toml_edit::Value::from(text);
+    if let Some(existing) = doc.get(key).and_then(toml_edit::Item::as_value) {
+        value.decor_mut().clone_from(existing.decor());
     }
-    std::fs::write(path, doc.to_string())?;
-    Ok(())
+    doc[key] = toml_edit::Item::Value(value);
+}
+
+fn update_config_doc_at<T>(
+    path: &Path,
+    change: impl FnOnce(&mut toml_edit::DocumentMut) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let path = update_path(path)?;
+    let _lock = FileLock::acquire(&sibling(&path, ".lock"))?;
+    let mut doc = read_config_doc_at(&path)?;
+    let before = doc.to_string();
+    let result = change(&mut doc)?;
+    let after = doc.to_string();
+    if after != before {
+        atomic_replace(&path, after.as_bytes(), false)?;
+    }
+    Ok(result)
 }
 
 /// The configured MCP servers from the global config file (empty if none).
@@ -591,22 +650,22 @@ fn set_mcp_servers(
 /// Add (or replace, by name) an MCP server in the global config file.
 /// Returns true if an existing server with the same name was replaced.
 pub fn add_mcp_server(server: McpServerConfig) -> anyhow::Result<bool> {
-    let mut doc = read_config_doc()?;
-    let mut single = toml_edit::DocumentMut::new();
-    set_mcp_servers(&mut single, std::slice::from_ref(&server))?;
-    let replaced = replace_named_server(
-        &mut doc,
-        "mcp_servers",
-        &server.name,
-        single["mcp_servers"]
-            .as_array_of_tables()
-            .unwrap()
-            .get(0)
-            .unwrap()
-            .clone(),
-    )?;
-    write_config_doc(&doc)?;
-    Ok(replaced)
+    update_config_doc_at(&global_config_path()?, |doc| {
+        let mut single = toml_edit::DocumentMut::new();
+        set_mcp_servers(&mut single, std::slice::from_ref(&server))?;
+        let replaced = replace_named_server(
+            doc,
+            "mcp_servers",
+            &server.name,
+            single["mcp_servers"]
+                .as_array_of_tables()
+                .unwrap()
+                .get(0)
+                .unwrap()
+                .clone(),
+        )?;
+        Ok(replaced)
+    })
 }
 
 fn replace_named_server(
@@ -628,45 +687,76 @@ fn replace_named_server(
     Ok(replaced)
 }
 
+pub fn set_default_provider_if_unset(provider: &str) -> anyhow::Result<bool> {
+    set_default_provider_if_unset_at(&global_config_path()?, provider)
+}
+
+pub fn set_default_provider_if_unset_at(path: &Path, provider: &str) -> anyhow::Result<bool> {
+    update_config_doc_at(path, |doc| {
+        let mut value = toml_edit::Value::from(provider);
+        if let Some(existing) = doc.get("provider") {
+            let current = existing
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("configured provider must be a string"))?;
+            if !current.trim().is_empty() {
+                return Ok(false);
+            }
+            value
+                .decor_mut()
+                .clone_from(existing.as_value().unwrap().decor());
+        }
+        doc["provider"] = toml_edit::Item::Value(value);
+        Ok(true)
+    })
+}
+
 /// Preserves comments and unrelated settings; an empty model clears its override.
 pub fn set_default_model(provider: &str, model: &str) -> anyhow::Result<()> {
-    use toml_edit::value;
-    let mut doc = read_config_doc()?;
-    doc["provider"] = value(provider);
-    if model.is_empty() {
-        doc.as_table_mut().remove("model");
-    } else {
-        doc["model"] = value(model);
-    }
-    write_config_doc(&doc)
+    set_default_model_at(&global_config_path()?, provider, model)
+}
+
+pub fn set_default_model_at(path: &Path, provider: &str, model: &str) -> anyhow::Result<()> {
+    update_config_doc_at(path, |doc| {
+        set_config_string(doc, "provider", provider);
+        if model.is_empty() {
+            doc.as_table_mut().remove("model");
+        } else {
+            set_config_string(doc, "model", model);
+        }
+        Ok(())
+    })
 }
 
 /// Empty or "off" clears the override; comments and unrelated settings survive.
 pub fn set_default_reasoning(label: &str) -> anyhow::Result<()> {
-    use toml_edit::value;
-    let mut doc = read_config_doc()?;
-    if label.is_empty() || label == "off" {
-        doc.as_table_mut().remove("reasoning");
-    } else {
-        doc["reasoning"] = value(label);
-    }
-    write_config_doc(&doc)
+    set_default_reasoning_at(&global_config_path()?, label)
+}
+
+pub fn set_default_reasoning_at(path: &Path, label: &str) -> anyhow::Result<()> {
+    update_config_doc_at(path, |doc| {
+        if label.is_empty() || label == "off" {
+            doc.as_table_mut().remove("reasoning");
+        } else {
+            set_config_string(doc, "reasoning", label);
+        }
+        Ok(())
+    })
 }
 
 /// Remove an MCP server by name. Returns true if one was removed.
 pub fn remove_mcp_server(name: &str) -> anyhow::Result<bool> {
-    let mut doc = read_config_doc()?;
-    let Some(item) = doc.get_mut("mcp_servers") else {
-        return Ok(false);
-    };
-    let entries = item
-        .as_array_of_tables_mut()
-        .ok_or_else(|| anyhow::anyhow!("mcp_servers must be an array of tables"))?;
-    let before = entries.len();
-    entries.retain(|entry| entry.get("name").and_then(toml_edit::Item::as_str) != Some(name));
-    let removed = entries.len() != before;
-    write_config_doc(&doc)?;
-    Ok(removed)
+    update_config_doc_at(&global_config_path()?, |doc| {
+        let Some(item) = doc.get_mut("mcp_servers") else {
+            return Ok(false);
+        };
+        let entries = item
+            .as_array_of_tables_mut()
+            .ok_or_else(|| anyhow::anyhow!("mcp_servers must be an array of tables"))?;
+        let before = entries.len();
+        entries.retain(|entry| entry.get("name").and_then(toml_edit::Item::as_str) != Some(name));
+        let removed = entries.len() != before;
+        Ok(removed)
+    })
 }
 
 fn project_config_path(cwd: &Path) -> anyhow::Result<std::path::PathBuf> {
@@ -680,20 +770,6 @@ fn project_config_path(cwd: &Path) -> anyhow::Result<std::path::PathBuf> {
         }
     }
     Ok(context.root.join(".bob.config.toml"))
-}
-
-fn read_project_doc(cwd: &Path) -> anyhow::Result<toml_edit::DocumentMut> {
-    let path = project_config_path(cwd)?;
-    if !path.exists() {
-        return Ok(toml_edit::DocumentMut::new());
-    }
-    let text = std::fs::read_to_string(&path)?;
-    Ok(text.parse::<toml_edit::DocumentMut>()?)
-}
-
-fn write_project_doc(cwd: &Path, doc: &toml_edit::DocumentMut) -> anyhow::Result<()> {
-    std::fs::write(project_config_path(cwd)?, doc.to_string())?;
-    Ok(())
 }
 
 /// The configured LSP servers from the project config file (empty if none).
@@ -731,48 +807,56 @@ fn set_lsp_servers(
 /// Add (or replace, by name) an LSP server in the project config file.
 /// Returns true if an existing server with the same name was replaced.
 pub fn add_lsp_server(cwd: &Path, server: LspServerConfig) -> anyhow::Result<bool> {
-    let mut doc = read_project_doc(cwd)?;
-    let replaced = list_lsp_servers(cwd)?.iter().any(|s| s.name == server.name);
-    let mut single = toml_edit::DocumentMut::new();
-    set_lsp_servers(&mut single, std::slice::from_ref(&server))?;
-    replace_named_server(
-        &mut doc,
-        "lsp_servers",
-        &server.name,
-        single["lsp_servers"]
-            .as_array_of_tables()
-            .unwrap()
-            .get(0)
-            .unwrap()
-            .clone(),
-    )?;
-    write_project_doc(cwd, &doc)?;
-    Ok(replaced)
+    update_config_doc_at(&project_config_path(cwd)?, |doc| {
+        let replaced = list_lsp_servers(cwd)?.iter().any(|s| s.name == server.name);
+        let mut single = toml_edit::DocumentMut::new();
+        set_lsp_servers(&mut single, std::slice::from_ref(&server))?;
+        replace_named_server(
+            doc,
+            "lsp_servers",
+            &server.name,
+            single["lsp_servers"]
+                .as_array_of_tables()
+                .unwrap()
+                .get(0)
+                .unwrap()
+                .clone(),
+        )?;
+        Ok(replaced)
+    })
 }
 
 /// Remove an LSP server by name. Returns true if one was removed.
 pub fn remove_lsp_server(cwd: &Path, name: &str) -> anyhow::Result<bool> {
-    if !list_lsp_servers(cwd)?
-        .iter()
-        .any(|server| server.name == name)
-    {
-        return Ok(false);
-    }
-    let mut doc = read_project_doc(cwd)?;
-    let mut disabled = toml_edit::Table::new();
-    disabled["name"] = toml_edit::value(name);
-    disabled["disabled"] = toml_edit::value(true);
-    replace_named_server(&mut doc, "lsp_servers", name, disabled)?;
-    write_project_doc(cwd, &doc)?;
-    Ok(true)
+    update_config_doc_at(&project_config_path(cwd)?, |doc| {
+        if !list_lsp_servers(cwd)?
+            .iter()
+            .any(|server| server.name == name)
+        {
+            return Ok(false);
+        }
+        let mut disabled = toml_edit::Table::new();
+        disabled["name"] = toml_edit::value(name);
+        disabled["disabled"] = toml_edit::value(true);
+        replace_named_server(doc, "lsp_servers", name, disabled)?;
+        Ok(true)
+    })
 }
 
 pub fn set_theme_in_project(cwd: &Path, theme: &str) -> anyhow::Result<()> {
-    let mut doc = read_project_doc(cwd)?;
-    doc["theme"] = toml_edit::value(theme);
-    write_project_doc(cwd, &doc)?;
-    Ok(())
+    update_config_doc_at(&project_config_path(cwd)?, |doc| {
+        set_config_string(doc, "theme", theme);
+        Ok(())
+    })
 }
+
+#[cfg(test)]
+#[path = "config_login_tests.rs"]
+mod login_tests;
+
+#[cfg(test)]
+#[path = "config_shell_tests.rs"]
+mod shell_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1461,10 +1545,11 @@ mod tests {
         );
         let cwd = root.join("nested/deep");
         assert_eq!(
-            load_project_config(global.clone(), &cwd)
-                .unwrap()
-                .bash_executable,
-            Some(global_path),
+            load_project_config(global.clone(), &cwd).unwrap().shell,
+            Some(ShellSelection {
+                dialect: ShellKind::Bash,
+                executable: global_path
+            }),
         );
         std::fs::write(
             root.join(".bob.config.toml"),
@@ -1473,7 +1558,13 @@ mod tests {
         .unwrap();
         std::fs::write(root.join("nested/.bob.config.toml"), "model = 'nearest'").unwrap();
         let config = load_project_config(global.clone(), &cwd).unwrap();
-        assert_eq!(config.bash_executable, Some(project_path));
+        assert_eq!(
+            config.shell,
+            Some(ShellSelection {
+                dialect: ShellKind::Bash,
+                executable: project_path
+            })
+        );
         assert_eq!(config.model, "nearest");
         std::fs::write(
             root.join("nested/.bob.config.toml"),
@@ -1481,8 +1572,7 @@ mod tests {
         )
         .unwrap();
         let config = load_project_config(global, &cwd).unwrap();
-        let shell =
-            crate::core::shell::CommandShell::resolve(&cwd, config.bash_executable.as_deref());
+        let shell = crate::core::shell::CommandShell::resolve(&cwd, config.shell.as_ref());
         assert!(shell.executable().unwrap_err().contains("must be absolute"));
     }
 

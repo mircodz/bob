@@ -36,6 +36,67 @@ pub fn analyze(raw: &str) -> Option<Analysis> {
     Some(a)
 }
 
+pub(super) fn simple_literal_program(raw: &str) -> Option<String> {
+    if raw.chars().any(|c| c.is_control() && c != '\t') {
+        return None;
+    }
+    let opts = brush_parser::ParserOptions::default();
+    let mut parser = brush_parser::Parser::new(std::io::Cursor::new(raw.as_bytes()), &opts);
+    let program = parser.parse_program().ok()?;
+    let [list] = program.complete_commands.as_slice() else {
+        return None;
+    };
+    let [ast::CompoundListItem(and_or, ast::SeparatorOperator::Sequence)] = list.0.as_slice()
+    else {
+        return None;
+    };
+    let ast::AndOrList { first, additional } = and_or;
+    let ast::Pipeline { timed, bang, seq } = first;
+    if !additional.is_empty() || timed.is_some() || *bang {
+        return None;
+    }
+    let [ast::Command::Simple(ast::SimpleCommand {
+        prefix: None,
+        word_or_name: Some(name),
+        suffix,
+    })] = seq.as_slice()
+    else {
+        return None;
+    };
+    let mut words = vec![name.value.as_str()];
+    if let Some(suffix) = suffix {
+        for item in &suffix.0 {
+            let ast::CommandPrefixOrSuffixItem::Word(word) = item else {
+                return None;
+            };
+            words.push(word.value.as_str());
+        }
+    }
+    for word in &words {
+        // Globs and brace expansion remain Text in the word AST.
+        if word.contains(['*', '?', '[', ']', '{', '}', '(', ')', '~', '!', '#']) {
+            return None;
+        }
+        let pieces = brush_parser::word::parse(word, &opts).ok()?;
+        if !matches!(pieces.as_slice(), [piece] if matches!(
+            &piece.piece,
+            brush_parser::word::WordPiece::Text(text) if text.as_str() == *word
+        )) {
+            return None;
+        }
+    }
+    // The AST discards comments and normalizes trailing sequence separators.
+    // Require every source word to survive unchanged, with only spaces/tabs between.
+    if !raw
+        .split([' ', '\t'])
+        .filter(|word| !word.is_empty())
+        .eq(words.iter().copied())
+    {
+        return None;
+    }
+    Some(name.value.clone())
+}
+
 // Bound substitution recursion to prevent stack exhaustion.
 const MAX_DEPTH: usize = 24;
 

@@ -350,7 +350,7 @@ mod tests {
         async fn stream(
             &self,
             opts: GenerateOptions,
-        ) -> anyhow::Result<mpsc::UnboundedReceiver<StreamEvent>> {
+        ) -> anyhow::Result<mpsc::Receiver<StreamEvent>> {
             self.before(&opts)?;
             self.mock.stream(opts).await
         }

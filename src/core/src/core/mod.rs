@@ -2,6 +2,7 @@ pub mod bash_parse;
 pub mod commands;
 pub mod config;
 pub mod events;
+pub(crate) mod file_update;
 pub mod memory;
 pub mod panic;
 pub mod permissions;

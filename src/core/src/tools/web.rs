@@ -4,6 +4,187 @@ use async_trait::async_trait;
 use regex::Regex;
 use serde_json::{json, Value};
 
+pub const MAX_WEB_BODY_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_WEB_PREVIEW_CHARS: usize = 200_000;
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WebRequest {
+    Fetch { url: String, max_chars: usize },
+    Search { query: String, max_results: usize },
+}
+
+impl WebRequest {
+    pub fn prepare(name: &str, input: &Value) -> anyhow::Result<Self> {
+        let fields = input
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("web input must be an object"))?;
+        let number = |name: &str, default: usize, maximum: usize| -> anyhow::Result<usize> {
+            let value = match fields.get(name) {
+                None => default,
+                Some(value) => value
+                    .as_u64()
+                    .and_then(|n| usize::try_from(n).ok())
+                    .ok_or_else(|| anyhow::anyhow!("{name} must be a positive integer"))?,
+            };
+            anyhow::ensure!(
+                (1..=maximum).contains(&value),
+                "{name} must be in 1..={maximum}"
+            );
+            Ok(value)
+        };
+        match name {
+            "web_fetch" => {
+                anyhow::ensure!(
+                    fields
+                        .keys()
+                        .all(|key| ["url", "max_chars"].contains(&key.as_str())),
+                    "unknown web_fetch field"
+                );
+                let raw = input["url"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("url is required"))?;
+                anyhow::ensure!(raw.len() <= 16_384, "URL exceeds 16384 bytes");
+                let url =
+                    reqwest::Url::parse(raw).map_err(|_| anyhow::anyhow!("invalid HTTP(S) URL"))?;
+                anyhow::ensure!(
+                    ["http", "https"].contains(&url.scheme()) && url.host_str().is_some(),
+                    "url must start with http:// or https://"
+                );
+                anyhow::ensure!(
+                    url.username().is_empty() && url.password().is_none(),
+                    "URL credentials are not supported"
+                );
+                Ok(Self::Fetch {
+                    url: url.into(),
+                    max_chars: number("max_chars", 20_000, MAX_WEB_PREVIEW_CHARS)?,
+                })
+            }
+            "web_search" => {
+                anyhow::ensure!(
+                    fields
+                        .keys()
+                        .all(|key| ["query", "max_results"].contains(&key.as_str())),
+                    "unknown web_search field"
+                );
+                let query = input["query"].as_str().unwrap_or("").trim();
+                anyhow::ensure!(
+                    !query.is_empty() && query.len() <= 16_384,
+                    "query must contain 1..=16384 bytes"
+                );
+                Ok(Self::Search {
+                    query: query.into(),
+                    max_results: number("max_results", 8, 20)?,
+                })
+            }
+            _ => anyhow::bail!("unknown web operation"),
+        }
+    }
+}
+
+pub struct WebResponse {
+    pub text: String,
+    pub preview: String,
+}
+
+pub struct WebClient {
+    client: reqwest::Client,
+}
+
+impl WebClient {
+    pub fn new() -> anyhow::Result<Self> {
+        Ok(Self {
+            client: reqwest::Client::builder()
+                .user_agent("Mozilla/5.0 (compatible; bob/0.1)")
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(30))
+                .redirect(reqwest::redirect::Policy::limited(5))
+                .build()?,
+        })
+    }
+
+    pub async fn execute(&self, request: &WebRequest) -> anyhow::Result<WebResponse> {
+        let response = match request {
+            WebRequest::Fetch { url, .. } => self.client.get(url).send().await,
+            WebRequest::Search { query, .. } => {
+                self.client
+                    .post("https://html.duckduckgo.com/html/")
+                    .form(&[("q", query)])
+                    .send()
+                    .await
+            }
+        }
+        .map_err(|error| anyhow::anyhow!("web request failed: {}", error.without_url()))?;
+        anyhow::ensure!(
+            response.status().is_success(),
+            "web request returned HTTP {}",
+            response.status().as_u16()
+        );
+        let html = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.contains("html"));
+        let bytes = read_bounded_body(response).await?;
+        Ok(decode_web_response(request, &bytes, html))
+    }
+}
+
+fn decode_web_response(request: &WebRequest, bytes: &[u8], html: bool) -> WebResponse {
+    let body = String::from_utf8_lossy(bytes);
+    let (text, cap) = match request {
+        WebRequest::Fetch { max_chars, .. } => (
+            if html {
+                html_to_text(&body)
+            } else {
+                body.into_owned()
+            },
+            *max_chars,
+        ),
+        WebRequest::Search { query, max_results } => {
+            let results = parse_ddg_results(&body, *max_results);
+            let mut out = String::new();
+            for (i, result) in results.iter().enumerate() {
+                out.push_str(&format!("{}. {}\n   {}\n", i + 1, result.title, result.url));
+                if !result.snippet.is_empty() {
+                    out.push_str(&format!("   {}\n", result.snippet));
+                }
+            }
+            if out.is_empty() {
+                out = format!("no results for \"{query}\".");
+            }
+            (out.trim_end().to_owned(), 20_000)
+        }
+    };
+    let mut preview: String = text.chars().take(cap).collect();
+    if preview.len() < text.len() {
+        preview.push_str("\n…[preview truncated; full response retained]");
+    }
+    WebResponse { text, preview }
+}
+
+async fn read_bounded_body(mut response: reqwest::Response) -> anyhow::Result<Vec<u8>> {
+    anyhow::ensure!(
+        response
+            .content_length()
+            .is_none_or(|size| size <= MAX_WEB_BODY_BYTES as u64),
+        "web response exceeds {MAX_WEB_BODY_BYTES} bytes"
+    );
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| anyhow::anyhow!("web response failed: {}", error.without_url()))?
+    {
+        anyhow::ensure!(
+            bytes.len().saturating_add(chunk.len()) <= MAX_WEB_BODY_BYTES,
+            "web response exceeds {MAX_WEB_BODY_BYTES} bytes"
+        );
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
 pub struct WebFetchTool;
 
 #[async_trait]
@@ -269,6 +450,62 @@ fn html_to_text(html: &str) -> String {
 mod tests {
     use super::*;
     use crate::test_support::{files::tool_context, TestDir};
+
+    #[test]
+    fn durable_web_validation_and_preview_preserve_full_unicode_content() {
+        for input in [
+            json!({"url":"file:///private"}),
+            json!({"url":"https://user:secret@example.test"}),
+            json!({"url":"https://example.test","max_chars":0}),
+            json!({"url":"https://example.test","max_chars":200001}),
+        ] {
+            assert!(WebRequest::prepare("web_fetch", &input).is_err());
+        }
+        for input in [
+            json!({"query":" "}),
+            json!({"query":"test","max_results":21}),
+            json!({"query":"test","max_results":1.5}),
+        ] {
+            assert!(WebRequest::prepare("web_search", &input).is_err());
+        }
+        let request = WebRequest::prepare(
+            "web_fetch",
+            &json!({"url":"https://example.test","max_chars":2}),
+        )
+        .unwrap();
+        let response = decode_web_response(&request, "<p>界😀abc</p>".as_bytes(), true);
+        assert_eq!(response.text, "界😀abc");
+        assert_eq!(
+            response.preview,
+            "界😀\n…[preview truncated; full response retained]"
+        );
+        let search =
+            WebRequest::prepare("web_search", &json!({"query":"fixture","max_results":1})).unwrap();
+        let response = decode_web_response(&search, br#"<a class="result__a" href="https://example.test/">Fixture</a><a class="result__snippet">A snippet</a>"#, true);
+        assert_eq!(
+            response.text,
+            "1. Fixture\n   https://example.test/\n   A snippet"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_web_body_reader_rejects_oversize_and_can_be_cancelled() {
+        use crate::test_support::http::response;
+        let (body, _release) = response("text/plain", "fixture", false).await;
+        assert_eq!(read_bounded_body(body).await.unwrap(), b"fixture");
+        let bytes = "x".repeat(MAX_WEB_BODY_BYTES + 1);
+        let (body, _release) = response("text/plain", &bytes, false).await;
+        assert!(read_bounded_body(body)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds"));
+        let (body, release) = response("text/plain", "partial", true).await;
+        let mut request = Box::pin(read_bounded_body(body));
+        assert!(futures::poll!(&mut request).is_pending());
+        drop(request);
+        drop(release);
+    }
 
     #[tokio::test]
     async fn invalid_fetch_schemes_and_blank_searches_fail_before_network_io() {

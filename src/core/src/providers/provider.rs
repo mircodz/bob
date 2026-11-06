@@ -1,6 +1,7 @@
 use crate::core::types::{Completion, GenerateOptions, StreamEvent};
 use anyhow::Context;
 use async_trait::async_trait;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -19,8 +20,51 @@ impl Default for StreamTimeouts {
     }
 }
 
+// Large enough that a slow consumer buffers instead of aborting the reply.
+pub(crate) const STREAM_EVENT_CAPACITY: usize = 1 << 20;
+pub(crate) const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+
+pub(crate) struct StreamSender {
+    tx: mpsc::Sender<StreamEvent>,
+    stopped: AtomicBool,
+}
+
+pub(crate) fn stream_channel() -> (StreamSender, mpsc::Receiver<StreamEvent>) {
+    let (tx, rx) = mpsc::channel(STREAM_EVENT_CAPACITY);
+    (
+        StreamSender {
+            tx,
+            stopped: AtomicBool::new(false),
+        },
+        rx,
+    )
+}
+
+impl StreamSender {
+    pub(crate) fn send(&self, event: StreamEvent) -> Result<(), ()> {
+        if self.is_stopped() {
+            return Err(());
+        }
+        if matches!(
+            event,
+            StreamEvent::Error { .. } | StreamEvent::MessageStop { .. }
+        ) {
+            self.stopped.store(true, Ordering::Relaxed);
+        }
+        self.tx.try_send(event).map_err(|_| ())
+    }
+
+    pub(crate) fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Relaxed) || self.tx.is_closed()
+    }
+
+    pub(crate) async fn closed(&self) {
+        self.tx.closed().await;
+    }
+}
+
 pub(crate) async fn start_stream(
-    tx: &mpsc::UnboundedSender<StreamEvent>,
+    tx: &StreamSender,
     timeout: Duration,
     request: impl std::future::Future<Output = anyhow::Result<reqwest::Response>>,
 ) -> Option<reqwest::Response> {
@@ -60,15 +104,26 @@ pub(crate) async fn send_once(
     let res = req.send().await.with_context(|| label.to_owned())?;
     let status = res.status();
     if !status.is_success() {
-        let body = res.text().await.unwrap_or_default();
+        let body = String::from_utf8_lossy(&response_bytes(res).await?).into_owned();
         anyhow::bail!("{label} {status}: {body}");
     }
     Ok(res)
 }
 
 pub(crate) async fn response_json(res: reqwest::Response) -> anyhow::Result<serde_json::Value> {
-    let body = res.bytes().await?;
+    let body = response_bytes(res).await?;
     serde_json::from_slice(&body).context("invalid response JSON")
+}
+
+async fn response_bytes(mut res: reqwest::Response) -> anyhow::Result<Vec<u8>> {
+    let mut body = Vec::new();
+    while let Some(chunk) = res.chunk().await? {
+        if chunk.len() > MAX_RESPONSE_BYTES - body.len() {
+            anyhow::bail!("provider resource limit exceeded: response body exceeds {MAX_RESPONSE_BYTES} bytes");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 pub(crate) async fn generate_with_retry(
@@ -96,9 +151,28 @@ pub(crate) fn retries_exhausted(error: anyhow::Error) -> anyhow::Error {
     anyhow::anyhow!("provider request failed after {MAX_RETRIES} retries: {error:#}")
 }
 
-pub(crate) fn is_transient_error(message: &str) -> bool {
+pub fn is_context_overflow(error: &anyhow::Error) -> bool {
+    let text = format!("{error:#}").to_ascii_lowercase();
+    [
+        "context_length_exceeded",
+        "context window",
+        "context length",
+        "maximum context",
+        "prompt is too long",
+        "prompt too long",
+        "too many input tokens",
+        "input is too long",
+        "exceeds the model's maximum",
+        "request too large",
+    ]
+    .iter()
+    .any(|pattern| text.contains(pattern))
+}
+
+pub fn is_transient_error(message: &str) -> bool {
     let m = message.to_ascii_lowercase();
     if [
+        "provider resource limit exceeded",
         "invalid api key",
         "invalid_api_key",
         "authentication",
@@ -193,11 +267,10 @@ pub trait Provider: Send + Sync {
     async fn generate_once(&self, opts: GenerateOptions) -> anyhow::Result<Completion> {
         self.generate(opts).await
     }
-    /// Single streaming attempt; the consumer owns retries, including midstream failures.
-    async fn stream(
-        &self,
-        opts: GenerateOptions,
-    ) -> anyhow::Result<mpsc::UnboundedReceiver<StreamEvent>>;
+    /// Single streaming attempt; dropping the bounded receiver cancels its work.
+    /// Slow consumers receive an explicit terminal error on overflow, never a partial success.
+    /// The consumer owns retries, including midstream failures.
+    async fn stream(&self, opts: GenerateOptions) -> anyhow::Result<mpsc::Receiver<StreamEvent>>;
 
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {
         Ok(vec![])
@@ -332,7 +405,7 @@ mod tests {
 
         #[tokio::test]
         async fn startup_error_emits_one_error_without_a_completion() {
-            let (tx, mut rx) = mpsc::unbounded_channel();
+            let (tx, mut rx) = stream_channel();
             assert!(start_stream(&tx, Duration::from_secs(1), async {
                 anyhow::bail!("credential unavailable")
             })
@@ -350,7 +423,7 @@ mod tests {
 
         #[tokio::test]
         async fn already_closed_receiver_does_not_poll_request() {
-            let (tx, rx) = mpsc::unbounded_channel();
+            let (tx, rx) = stream_channel();
             drop(rx);
             let polled = std::cell::Cell::new(false);
             let result = start_stream(&tx, Duration::from_secs(1), async {
@@ -373,7 +446,7 @@ mod tests {
             }
             let entered = Arc::new(tokio::sync::Notify::new());
             let cancelled = Arc::new(AtomicBool::new(false));
-            let (tx, rx) = mpsc::unbounded_channel();
+            let (tx, rx) = stream_channel();
             let task = {
                 let entered = entered.clone();
                 let cancelled = cancelled.clone();

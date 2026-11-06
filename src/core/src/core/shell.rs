@@ -1,6 +1,19 @@
+use serde::{Deserialize, Serialize};
+use std::ffi::OsString;
+use std::io;
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShellSelection {
+    pub dialect: ShellKind,
+    pub executable: PathBuf,
+}
+
+pub const PWSH_VERSION_CHECK: &str = "if ($PSVersionTable.PSEdition -eq 'Core' -and $PSVersionTable.PSVersion.Major -ge 7) { exit 0 } else { exit 125 }";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ShellKind {
     Bash,
     Pwsh,
@@ -29,7 +42,17 @@ pub struct CommandShell {
 }
 
 impl CommandShell {
-    pub fn resolve(cwd: &Path, configured: Option<&Path>) -> Self {
+    pub fn from_resolved(executable: Result<PathBuf, String>, kind: ShellKind) -> Self {
+        Self { executable, kind }
+    }
+
+    pub fn resolve(cwd: &Path, configured: Option<&ShellSelection>) -> Self {
+        if let Some(selection) = configured {
+            return Self {
+                executable: validate_override(&selection.executable, selection.dialect),
+                kind: selection.dialect,
+            };
+        }
         #[cfg(windows)]
         {
             let pwsh_roots: Vec<_> = ["ProgramW6432", "ProgramFiles"]
@@ -38,16 +61,10 @@ impl CommandShell {
                 .map(|value| PathBuf::from(value).join("PowerShell/7"))
                 .collect();
             let _ = cwd;
-            Self::resolve_windows_with(
-                configured,
-                &search_path(),
-                &pwsh_roots,
-                &git_roots(),
-                probe_pwsh,
-            )
+            Self::resolve_windows_with(None, &search_path(), &pwsh_roots, &git_roots())
         }
         #[cfg(not(windows))]
-        Self::resolve_bash(cwd, configured)
+        Self::resolve_bash(cwd, None)
     }
 
     pub fn resolve_bash(cwd: &Path, configured: Option<&Path>) -> Self {
@@ -76,26 +93,30 @@ impl CommandShell {
 
     #[cfg(any(windows, test))]
     fn resolve_windows_with(
-        configured: Option<&Path>,
+        configured: Option<&ShellSelection>,
         path: &[PathBuf],
         pwsh_roots: &[PathBuf],
         git_roots: &[PathBuf],
-        probe: impl FnMut(&Path) -> bool,
     ) -> Self {
-        let executable = if let Some(configured) = configured {
-            validate_override(configured)
-        } else {
-            if let Some(executable) = discover_pwsh(path, pwsh_roots, probe) {
-                return Self {
-                    executable: Ok(executable),
-                    kind: ShellKind::Pwsh,
-                };
-            }
-            discover_windows_bash(path, git_roots).ok_or_else(|| {
-                "No command shell available: install PowerShell 7 (pwsh.exe) or Git for Windows, or set bash_executable to an absolute native Bash executable path in ~/.bob/config.toml or .bob.config.toml. WSL launchers are not supported."
-                    .to_string()
-            })
-        };
+        if let Some(selection) = configured {
+            return Self {
+                executable: validate_candidate(&selection.executable, selection.dialect, true)
+                    .map_err(|error| format!("{error}; no fallback was attempted")),
+                kind: selection.dialect,
+            };
+        }
+        let mut failures = Vec::new();
+        if let Some(executable) = discover_pwsh(path, pwsh_roots, &mut failures) {
+            return Self {
+                executable: Ok(executable),
+                kind: ShellKind::Pwsh,
+            };
+        }
+        let executable = discover_windows_bash_with_errors(path, git_roots, &mut failures)
+            .ok_or_else(|| format!(
+                "No command shell available: install PowerShell 7 (pwsh.exe) or Git for Windows, or configure [shell] dialect and an absolute executable. WSL launchers are not supported. Discovery failures: {}",
+                failures.join("; ")
+            ));
         Self {
             executable,
             kind: ShellKind::Bash,
@@ -109,13 +130,13 @@ impl CommandShell {
         git_roots: &[PathBuf],
     ) -> Self {
         let executable = if let Some(configured) = configured {
-            validate_override(configured)
+            validate_override(configured, ShellKind::Bash)
         } else {
             discover(cwd, path, git_roots).ok_or_else(|| {
                 if cfg!(windows) {
-                    "Bash unavailable: install Git for Windows or set bash_executable to the absolute path of its bin/bash.exe in ~/.bob/config.toml or .bob.config.toml. WSL launchers are not supported."
+                    "Bash unavailable: install Git for Windows or configure [shell] with dialect = 'bash' and an absolute executable path in ~/.bob/config.toml or .bob.config.toml. WSL launchers are not supported."
                 } else {
-                    "Bash unavailable: install bash on PATH or set bash_executable to its absolute path in ~/.bob/config.toml or .bob.config.toml."
+                    "Bash unavailable: install bash on PATH or configure [shell] with dialect = 'bash' and its absolute executable path in ~/.bob/config.toml or .bob.config.toml."
                 }
                 .to_string()
             })
@@ -146,35 +167,72 @@ fn git_roots() -> Vec<PathBuf> {
     roots
 }
 
-fn validate_override(path: &Path) -> Result<PathBuf, String> {
-    let invalid = |reason: &str| {
+fn validate_override(path: &Path, kind: ShellKind) -> Result<PathBuf, String> {
+    validate_candidate(path, kind, cfg!(windows))
+        .map_err(|error| format!("{error}; no fallback was attempted"))
+}
+
+fn validate_candidate(path: &Path, kind: ShellKind, windows: bool) -> Result<PathBuf, String> {
+    let invalid = |phase: &str, reason: &dyn std::fmt::Display| {
         format!(
-            "Invalid bash_executable '{}': {reason}. Set bash_executable to an absolute native Bash executable path in ~/.bob/config.toml or .bob.config.toml; no fallback was attempted.",
+            "{} executable '{}' failed {phase}: {reason}",
+            kind.name(),
             path.display()
         )
     };
     if !path.is_absolute() {
-        return Err(invalid("the path must be absolute"));
+        return Err(invalid("selection", &"the path must be absolute"));
     }
-    #[cfg(windows)]
-    if !native_windows_path(path) {
+    if windows {
+        validate_windows_path(path, kind).map_err(|reason| invalid("selection", &reason))?;
+    }
+    let resolved =
+        std::fs::canonicalize(path).map_err(|error| invalid("canonicalization", &error))?;
+    if windows {
+        validate_windows_path(&resolved, kind)
+            .map_err(|reason| invalid("resolved target", &reason))?;
+    }
+    let metadata = std::fs::metadata(&resolved).map_err(|error| invalid("metadata", &error))?;
+    if !metadata.is_file() {
         return Err(invalid(
-            "use a native .exe, not a Windows/WSL launcher or command wrapper",
+            "verification",
+            &"the path is not a regular executable file",
         ));
     }
-    let resolved = std::fs::canonicalize(path).map_err(|error| invalid(&error.to_string()))?;
-    #[cfg(windows)]
-    if !native_windows_path(&resolved) {
-        return Err(invalid(
-            "the path resolves to a Windows/WSL launcher or command wrapper",
-        ));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return Err(invalid(
+                "verification",
+                &"the file has no execute permission",
+            ));
+        }
     }
-    if !is_executable(&resolved) {
-        return Err(invalid("the path is not an executable file"));
-    }
+    std::fs::File::open(&resolved).map_err(|error| invalid("open for verification", &error))?;
     Ok(resolved)
 }
 
+fn validate_windows_path(path: &Path, kind: ShellKind) -> Result<(), &'static str> {
+    if path
+        .parent()
+        .and_then(Path::file_name)
+        .is_some_and(|name| name.eq_ignore_ascii_case("WindowsApps"))
+    {
+        return Err("the Store execution-alias directory is unsupported; set [shell].executable to the real PowerShell 7 executable (for example under Program Files/PowerShell/7), not the WindowsApps alias");
+    }
+    let valid = match kind {
+        ShellKind::Bash => native_windows_path(path),
+        ShellKind::Pwsh => native_pwsh_path(path),
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err("use a native executable for the selected dialect, not a Windows/WSL launcher or command wrapper")
+    }
+}
+
+#[cfg(not(windows))]
 fn is_executable(path: &Path) -> bool {
     let Ok(metadata) = std::fs::metadata(path) else {
         return false;
@@ -210,106 +268,136 @@ fn discover(_: &Path, path: &[PathBuf], git_roots: &[PathBuf]) -> Option<PathBuf
 
 #[cfg(any(windows, test))]
 fn discover_windows_bash(path: &[PathBuf], git_roots: &[PathBuf]) -> Option<PathBuf> {
+    discover_windows_bash_with_errors(path, git_roots, &mut Vec::new())
+}
+
+#[cfg(any(windows, test))]
+fn discover_windows_bash_with_errors(
+    path: &[PathBuf],
+    git_roots: &[PathBuf],
+    failures: &mut Vec<String>,
+) -> Option<PathBuf> {
     windows_candidates(path, git_roots)
         .into_iter()
-        .find_map(|candidate| {
-            let resolved = std::fs::canonicalize(&candidate).ok()?;
-            (native_windows_path(&candidate)
-                && native_windows_path(&resolved)
-                && is_executable(&resolved))
-            .then_some(resolved)
-        })
+        .find_map(
+            |candidate| match validate_candidate(&candidate, ShellKind::Bash, true) {
+                Ok(path) => Some(path),
+                Err(error) => {
+                    failures.push(error);
+                    None
+                }
+            },
+        )
 }
 
 #[cfg(any(windows, test))]
 fn discover_pwsh(
     path: &[PathBuf],
     roots: &[PathBuf],
-    mut probe: impl FnMut(&Path) -> bool,
+    failures: &mut Vec<String>,
 ) -> Option<PathBuf> {
-    let mut seen: Vec<PathBuf> = Vec::new();
+    let mut seen = Vec::new();
     path.iter()
         .chain(roots)
         .filter(|directory| directory.is_absolute())
         .find_map(|directory| {
             let candidate = directory.join("pwsh.exe");
-            if !native_pwsh_path(&candidate) {
+            if seen.contains(&candidate) {
                 return None;
             }
-            let windows_app = candidate
-                .components()
-                .any(|part| part.as_os_str().eq_ignore_ascii_case("WindowsApps"));
-            let resolved = match std::fs::canonicalize(&candidate) {
-                Ok(resolved) => resolved,
-                Err(_) if windows_app => candidate,
-                Err(_) => return None,
-            };
-            if !native_pwsh_path(&resolved)
-                || (!windows_app && !is_executable(&resolved))
-                || seen
-                    .iter()
-                    .any(|path| path.as_os_str().eq_ignore_ascii_case(resolved.as_os_str()))
-            {
-                return None;
+            seen.push(candidate.clone());
+            match validate_candidate(&candidate, ShellKind::Pwsh, true) {
+                Ok(path) => Some(path),
+                Err(error) => {
+                    failures.push(error);
+                    None
+                }
             }
-            seen.push(resolved.clone());
-            probe(&resolved).then_some(resolved)
         })
 }
 
-#[cfg(windows)]
-fn probe_pwsh(path: &Path) -> bool {
-    use std::os::windows::process::CommandExt;
-    use std::process::{Command, Stdio};
-
-    const CREATE_NO_WINDOW: u32 = 0x08000000;
-    let child = Command::new(path)
-        .args(ShellKind::Pwsh.command_args())
-        .arg("if ($PSVersionTable.PSEdition -eq 'Core' -and $PSVersionTable.PSVersion.Major -ge 7) { exit 0 }; exit 1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn();
-    match child {
-        Ok(mut child) => wait_for_probe(&mut child, std::time::Duration::from_secs(5)),
-        Err(_) => false,
+pub fn invocation_args(
+    executable: &Path,
+    kind: ShellKind,
+    script: &str,
+) -> io::Result<Vec<OsString>> {
+    if script.contains('\0') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "shell command contains a NUL byte",
+        ));
     }
-}
-
-#[cfg(any(windows, all(test, unix)))]
-fn wait_for_probe(child: &mut std::process::Child, timeout: std::time::Duration) -> bool {
-    use std::time::{Duration, Instant};
-
-    let started = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return status.success(),
-            Ok(None) if started.elapsed() < timeout => {
-                std::thread::sleep(
-                    Duration::from_millis(10).min(timeout.saturating_sub(started.elapsed())),
-                );
-            }
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return false;
-            }
-        }
+    let args: Vec<OsString> = kind
+        .command_args()
+        .iter()
+        .map(|arg| OsString::from(*arg))
+        .chain(std::iter::once(OsString::from(script)))
+        .collect();
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let executable: Vec<u16> = executable.as_os_str().encode_wide().collect();
+        let args: Vec<Vec<u16>> = args.iter().map(|arg| arg.encode_wide().collect()).collect();
+        check_windows_command_line(&executable, &args)?;
     }
+    #[cfg(not(windows))]
+    let _ = executable;
+    Ok(args)
 }
 
 #[cfg(any(windows, test))]
+fn check_windows_command_line(executable: &[u16], args: &[Vec<u16>]) -> io::Result<()> {
+    if executable.contains(&0) || executable.contains(&(b'"' as u16)) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid Windows shell executable path",
+        ));
+    }
+    let length = executable.len()
+        + 2
+        + 1
+        + args
+            .iter()
+            .map(|arg| 1 + windows_argument_len(arg))
+            .sum::<usize>();
+    if length > 32767 {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("shell command line requires {length} UTF-16 code units including quoting and terminator; Windows permits at most 32767; shorten the command or use a script file")));
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn windows_argument_len(arg: &[u16]) -> usize {
+    // Mirror std::process::Command escaping without changing the transported argument.
+    let quoted = arg.is_empty()
+        || arg
+            .iter()
+            .any(|unit| *unit == b' ' as u16 || *unit == b'\t' as u16);
+    let mut length = usize::from(quoted) * 2;
+    let mut slashes = 0;
+    for unit in arg {
+        if *unit == b'\\' as u16 {
+            slashes += 1;
+        } else {
+            length += slashes + 1;
+            if *unit == b'"' as u16 {
+                length += slashes + 1;
+            }
+            slashes = 0;
+        }
+    }
+    length + slashes * if quoted { 2 } else { 1 }
+}
+
 fn blocked_windows_directory(path: &Path) -> bool {
     path.components().any(|part| {
-        let part = part.as_os_str().to_string_lossy();
+        let part = part.as_os_str();
         ["System32", "SysWOW64", "Sysnative", "WindowsApps"]
             .iter()
             .any(|blocked| part.eq_ignore_ascii_case(blocked))
     })
 }
 
-#[cfg(any(windows, test))]
 fn native_pwsh_path(path: &Path) -> bool {
     path.is_absolute()
         && !path.components().any(|part| {
@@ -322,10 +410,8 @@ fn native_pwsh_path(path: &Path) -> bool {
             .is_some_and(|name| name.eq_ignore_ascii_case("pwsh.exe"))
 }
 
-#[cfg(any(windows, test))]
 fn native_windows_path(path: &Path) -> bool {
     let launcher = path.file_name().is_some_and(|name| {
-        let name = name.to_string_lossy();
         [
             "wsl.exe",
             "wslhost.exe",
@@ -375,6 +461,10 @@ fn windows_candidates(path: &[PathBuf], git_roots: &[PathBuf]) -> Vec<PathBuf> {
 }
 
 #[cfg(test)]
+#[path = "shell_selection_tests.rs"]
+mod selection_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::TestDir;
@@ -414,7 +504,7 @@ mod tests {
         ] {
             let shell = CommandShell::resolve_bash_with(&root, Some(&path_override), &path, &[]);
             let error = shell.executable().unwrap_err();
-            assert!(error.contains("bash_executable"));
+            assert!(error.contains("Bash executable"));
             assert!(error.contains("no fallback was attempted"));
             assert!(error.contains(&path_override.display().to_string()));
         }
@@ -442,115 +532,12 @@ mod tests {
                 &path,
                 std::slice::from_ref(&conventional),
                 std::slice::from_ref(&git),
-                |_| true,
             );
             assert_eq!(shell.kind(), ShellKind::Pwsh);
             assert_eq!(
                 shell.executable().unwrap(),
                 expected.join("pwsh.exe").canonicalize().unwrap()
             );
-        }
-    }
-
-    #[test]
-    fn windows_rejects_old_pwsh_once_then_selects_valid_pwsh_or_git() {
-        let root = TestDir::new();
-        let old = root.join("PowerShell/6");
-        let current = root.join("PowerShell/7");
-        let git = root.join("Git");
-        fixture_file(&old.join("pwsh.exe"));
-        fixture_file(&current.join("pwsh.exe"));
-        fixture_file(&git.join("bin/bash.exe"));
-        let old_exe = old.join("pwsh.exe").canonicalize().unwrap();
-        let current_exe = current.join("pwsh.exe").canonicalize().unwrap();
-        for accept_current in [true, false] {
-            let mut probed = Vec::new();
-            let shell = CommandShell::resolve_windows_with(
-                None,
-                &[old.clone(), old.clone()],
-                &[old.clone(), current.clone(), current.clone()],
-                std::slice::from_ref(&git),
-                |candidate| {
-                    probed.push(candidate.to_path_buf());
-                    accept_current && candidate == current_exe
-                },
-            );
-            assert_eq!(probed, [old_exe.clone(), current_exe.clone()]);
-            if accept_current {
-                assert_eq!(shell.kind(), ShellKind::Pwsh);
-                assert_eq!(shell.executable().unwrap(), current_exe);
-            } else {
-                assert_eq!(shell.kind(), ShellKind::Bash);
-                assert_eq!(
-                    shell.executable().unwrap(),
-                    git.join("bin/bash.exe").canonicalize().unwrap()
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn windows_store_pwsh_and_unresolved_alias_require_successful_probe() {
-        let root = TestDir::new();
-        let store =
-            root.join("Program Files/WindowsApps/Microsoft.PowerShell_7.6.0.0_x64__8wekyb3d8bbwe");
-        let alias = root.join("LocalAppData/Microsoft/WindowsApps");
-        fixture_file(&store.join("pwsh.exe"));
-        assert!(alias.join("pwsh.exe").canonicalize().is_err());
-        for directory in [&store, &alias] {
-            let candidate = directory.join("pwsh.exe");
-            let expected = candidate.canonicalize().unwrap_or(candidate);
-            for valid in [false, true] {
-                let mut probed = Vec::new();
-                let selected =
-                    discover_pwsh(&[directory.clone(), directory.clone()], &[], |path| {
-                        probed.push(path.to_path_buf());
-                        valid
-                    });
-                assert_eq!(probed, std::slice::from_ref(&expected));
-                assert_eq!(selected, valid.then(|| expected.clone()));
-            }
-            assert!(!native_windows_path(&expected));
-            assert!(!native_windows_path(&directory.join("bash.exe")));
-        }
-        fixture_file(&store.join("cmd/git.exe"));
-        fixture_file(&store.join("bin/bash.exe"));
-        assert!(discover_windows_bash(&[], &[store]).is_none());
-        assert!(!native_windows_path(&root.join("Git/bin/wsl.exe")));
-        assert!(!native_pwsh_path(&root.join("PowerShell/7/powershell.exe")));
-        assert!(!native_pwsh_path(Path::new("relative/pwsh.exe")));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn probe_wait_checks_exit_status_and_reaps_timed_out_child() {
-        use std::os::unix::process::ExitStatusExt;
-        use std::process::{Command, Stdio};
-        use std::time::{Duration, Instant};
-
-        let root = TestDir::new();
-        let fixture = root.join("probe.sh");
-        std::fs::write(&fixture, "exec sleep 30\n").unwrap();
-        let mut child = Command::new("/bin/sh")
-            .arg(&fixture)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let started = Instant::now();
-        assert!(!wait_for_probe(&mut child, Duration::from_millis(50)));
-        assert!(started.elapsed() < Duration::from_secs(5));
-        assert_eq!(child.try_wait().unwrap().unwrap().signal(), Some(9));
-        for (script, expected) in [("exit 0", true), ("exit 1", false)] {
-            let mut child = Command::new("/bin/sh")
-                .args(["-c", script])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .unwrap();
-            assert_eq!(wait_for_probe(&mut child, Duration::from_secs(5)), expected);
         }
     }
 
@@ -579,16 +566,13 @@ mod tests {
             &path,
             &["relative/PowerShell/7".into()],
             std::slice::from_ref(&git),
-            |_| panic!("unsafe candidates must not be probed"),
         );
         assert_eq!(shell.kind(), ShellKind::Bash);
         assert_eq!(
             shell.executable().unwrap(),
             git.join("bin/bash.exe").canonicalize().unwrap()
         );
-        let shell = CommandShell::resolve_windows_with(None, &path, &[], &[], |_| {
-            panic!("unsafe candidates must not be probed")
-        });
+        let shell = CommandShell::resolve_windows_with(None, &path, &[], &[]);
         let error = shell.executable().unwrap_err();
         assert!(error.contains("PowerShell 7"));
         assert!(error.contains("Git for Windows"));
@@ -602,9 +586,11 @@ mod tests {
         fixture_file(&bash);
         fixture_file(&pwsh.join("pwsh.exe"));
         let path = [pwsh];
-        let shell = CommandShell::resolve_windows_with(Some(&bash), &path, &[], &[], |_| {
-            panic!("Bash overrides must not probe PowerShell")
-        });
+        let selection = ShellSelection {
+            dialect: ShellKind::Bash,
+            executable: bash.clone(),
+        };
+        let shell = CommandShell::resolve_windows_with(Some(&selection), &path, &[], &[]);
         assert_eq!(shell.kind(), ShellKind::Bash);
         assert_eq!(shell.executable().unwrap(), bash.canonicalize().unwrap());
         for invalid in [
@@ -612,9 +598,11 @@ mod tests {
             root.join("missing.exe"),
             root.to_path_buf(),
         ] {
-            let shell = CommandShell::resolve_windows_with(Some(&invalid), &path, &[], &[], |_| {
-                panic!("invalid overrides must not fall back")
-            });
+            let selection = ShellSelection {
+                dialect: ShellKind::Bash,
+                executable: invalid,
+            };
+            let shell = CommandShell::resolve_windows_with(Some(&selection), &path, &[], &[]);
             assert_eq!(shell.kind(), ShellKind::Bash);
             assert!(shell
                 .executable()
@@ -623,13 +611,11 @@ mod tests {
         }
         #[cfg(windows)]
         {
-            let shell = CommandShell::resolve_windows_with(
-                Some(&path[0].join("pwsh.exe")),
-                &path,
-                &[],
-                &[],
-                |_| panic!("invalid overrides must not fall back"),
-            );
+            let selection = ShellSelection {
+                dialect: ShellKind::Bash,
+                executable: path[0].join("pwsh.exe"),
+            };
+            let shell = CommandShell::resolve_windows_with(Some(&selection), &path, &[], &[]);
             assert!(shell
                 .executable()
                 .unwrap_err()
@@ -661,7 +647,7 @@ mod tests {
         )
         .unwrap();
         path.push(nonexecutable);
-        assert!(discover_pwsh(&path, &[], |_| panic!("invalid target was probed")).is_none());
+        assert!(discover_pwsh(&path, &[], &mut Vec::new()).is_none());
         let native = root.join("PowerShell/7/pwsh.exe");
         fixture_file(&native);
         let link = root.join("native-link");
@@ -669,7 +655,7 @@ mod tests {
         symlink(&native, link.join("pwsh.exe")).unwrap();
         path.push(link);
         assert_eq!(
-            discover_pwsh(&path, &[], |_| true).unwrap(),
+            discover_pwsh(&path, &[], &mut Vec::new()).unwrap(),
             native.canonicalize().unwrap()
         );
     }
@@ -744,7 +730,13 @@ mod tests {
             root.join("second/bash").canonicalize().unwrap()
         );
         let selected = root.join("second/bash");
-        let automatic = CommandShell::resolve(&root, Some(&selected));
+        let automatic = CommandShell::resolve(
+            &root,
+            Some(&ShellSelection {
+                dialect: ShellKind::Bash,
+                executable: selected.clone(),
+            }),
+        );
         let explicit = CommandShell::resolve_bash(&root, Some(&selected));
         assert_eq!(automatic.kind(), ShellKind::Bash);
         assert_eq!(automatic.executable(), explicit.executable());

@@ -29,11 +29,11 @@ jobs:
       - name: Format check
         run: cargo fmt --all --check
       - name: Build
-        run: cargo build --workspace --all-targets
+        run: cargo build --locked --workspace --all-targets
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
   platform-tests:
     name: Test ${{ matrix.os }}
@@ -56,23 +56,28 @@ jobs:
       - name: Install search dependency (Windows)
         if: runner.os == 'Windows'
         run: choco install ripgrep --yes --no-progress
-      - name: Verify PowerShell 7 (Windows)
+      - name: Native Windows acceptance (PowerShell and Git Bash)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: |
-          $pwsh = (Get-Command pwsh -CommandType Application -ErrorAction Stop).Source
-          & $pwsh -NoLogo -NoProfile -NonInteractive -Command 'if ($PSVersionTable.PSEdition -ne "Core" -or $PSVersionTable.PSVersion.Major -lt 7) { throw "PowerShell 7 or newer is required" }; $PSVersionTable.PSVersion.ToString()'
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Verify native Git Bash (Windows)
+        run: ./scripts/windows-acceptance.ps1
+      - name: Native Windows locked build
         if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $bash = Join-Path $env:ProgramFiles 'Git\bin\bash.exe'
-          if (-not (Test-Path $bash)) { throw "Git for Windows Bash is required: $bash" }
-          & $bash --version
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        run: cargo build --locked --workspace --all-targets
+      - name: Native Windows Clippy
+        if: runner.os == 'Windows'
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Build native effect helper
+        run: cargo build --locked -p bob --bin bob-exec
       - name: Test workspace
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
+      - name: Retain native acceptance evidence
+        if: always() && runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-windows-acceptance
+          path: native-windows-artifacts/
+          if-no-files-found: warn
+          retention-days: 7
 
   build:
     name: Build ${{ matrix.target }}
@@ -85,13 +90,10 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            ext: ""
           - os: macos-latest
             target: aarch64-apple-darwin
-            ext: ""
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            ext: ".exe"
     steps:
       - uses: actions/checkout@v4
       - name: Install declared Rust toolchain and target
@@ -100,11 +102,42 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-      - name: Build release binary
-        run: cargo build --release --bin bob --target ${{ matrix.target }}
-      - name: Upload bob binary
+      - name: Build durable release binaries
+        run: cargo build --locked --release -p bob --bins --target ${{ matrix.target }}
+      - name: Package Unix archives
+        if: runner.os != 'Windows'
+        run: |
+          directory="target/${{ matrix.target }}/release"
+          archive="bob-${{ matrix.target }}.tar.gz"
+          tar -czf "$archive" -C "$directory" bob bob-exec
+          echo "ASSET=$archive" >> "$GITHUB_ENV"
+          test "$(tar -tzf "$archive" | LC_ALL=C sort)" = "$(printf '%s\n' bob bob-exec | LC_ALL=C sort)"
+          mkdir package-smoke
+          tar -xzf "$archive" -C package-smoke
+      - name: Relocated Unix real-helper acceptance
+        if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'aarch64-apple-darwin'
+        run: |
+          BOB_REPLACEMENT_PACKAGE_DIR="$PWD/package-smoke" cargo test --locked --release -p bob --target ${{ matrix.target }} --test packaged_unix_acceptance packaged_unix_frontend_and_helper_acceptance -- --exact --nocapture --test-threads=1
+      - name: Package and execute Windows durable smoke
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $directory = 'target/${{ matrix.target }}/release'
+          $archive = 'bob-${{ matrix.target }}.zip'
+          Compress-Archive -Path "$directory/bob.exe", "$directory/bob-exec.exe" -DestinationPath $archive
+          "ASSET=$archive" | Out-File -FilePath $env:GITHUB_ENV -Append
+          ./scripts/windows-acceptance.ps1 -Package $archive -Artifacts native-package-artifacts
+      - name: Retain package acceptance evidence
+        if: always() && runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-windows-package-acceptance
+          path: native-package-artifacts/
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Upload durable archive
         uses: actions/upload-artifact@v4
         with:
           name: bob-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/bob${{ matrix.ext }}
+          path: ${{ env.ASSET }}
           if-no-files-found: error

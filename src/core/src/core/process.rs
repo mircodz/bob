@@ -2,14 +2,103 @@
 
 use std::io;
 use std::process::ExitStatus;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
+use tokio::sync::mpsc;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputStream {
+    Stdout,
+    Stderr,
+}
+
+pub struct OutputChunk {
+    pub stream: OutputStream,
+    pub bytes: Vec<u8>,
+}
+
+struct ObservedStream {
+    admitted: AtomicU64,
+    omitted: AtomicU64,
+}
+
+#[derive(Clone)]
+pub struct OutputObserver {
+    sender: mpsc::Sender<OutputChunk>,
+    streams: Arc<[ObservedStream; 2]>,
+    byte_limit: u64,
+}
+
+pub fn bounded_output_observer(
+    capacity: usize,
+    byte_limit_per_stream: usize,
+) -> (OutputObserver, mpsc::Receiver<OutputChunk>) {
+    let (sender, receiver) = mpsc::channel(capacity);
+    (
+        OutputObserver {
+            sender,
+            streams: Arc::new(std::array::from_fn(|_| ObservedStream {
+                admitted: AtomicU64::new(0),
+                omitted: AtomicU64::new(0),
+            })),
+            byte_limit: byte_limit_per_stream as u64,
+        },
+        receiver,
+    )
+}
+
+impl OutputObserver {
+    pub fn omitted_bytes(&self) -> [u64; 2] {
+        std::array::from_fn(|i| self.streams[i].omitted.load(Ordering::Relaxed))
+    }
+
+    fn observe(&self, stream: OutputStream, bytes: &[u8]) {
+        let state = &self.streams[match stream {
+            OutputStream::Stdout => 0,
+            OutputStream::Stderr => 1,
+        }];
+        // Once a gap occurs, retain only the contiguous prefix for this stream.
+        if state.omitted.load(Ordering::Relaxed) != 0 {
+            state
+                .omitted
+                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            return;
+        }
+        let remaining = self
+            .byte_limit
+            .saturating_sub(state.admitted.load(Ordering::Relaxed));
+        let keep = bytes.len().min(remaining as usize);
+        if keep == 0
+            || self
+                .sender
+                .try_send(OutputChunk {
+                    stream,
+                    bytes: bytes[..keep].to_vec(),
+                })
+                .is_err()
+        {
+            state
+                .omitted
+                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        } else {
+            state.admitted.fetch_add(keep as u64, Ordering::Relaxed);
+            state
+                .omitted
+                .fetch_add((bytes.len() - keep) as u64, Ordering::Relaxed);
+        }
+    }
+}
 
 pub struct ManagedProcess {
     child: Option<Child>,
     tree: ProcessTree,
     stdout_capture: Option<Capture<ChildStdout>>,
     stderr_capture: Option<Capture<ChildStderr>>,
+    output_observer: Option<OutputObserver>,
 }
 
 impl ManagedProcess {
@@ -30,6 +119,7 @@ impl ManagedProcess {
                 tree,
                 stdout_capture: None,
                 stderr_capture: None,
+                output_observer: None,
             }),
             Err(error) => {
                 let _ = child.start_kill();
@@ -37,6 +127,11 @@ impl ManagedProcess {
                 Err(error)
             }
         }
+    }
+
+    /// Attach before the first collection; the observer survives cancelled collection futures.
+    pub fn observe_output(&mut self, observer: OutputObserver) {
+        self.output_observer = Some(observer);
     }
 
     pub fn id(&self) -> Option<u32> {
@@ -94,6 +189,12 @@ impl ManagedProcess {
         if self.stdout_capture.is_none() {
             self.stdout_capture = Some(Capture::new(self.take_stdout(), limit));
             self.stderr_capture = Some(Capture::new(self.take_stderr(), limit));
+            if let Some(observer) = &self.output_observer {
+                self.stdout_capture.as_mut().unwrap().observer =
+                    Some((observer.clone(), OutputStream::Stdout));
+                self.stderr_capture.as_mut().unwrap().observer =
+                    Some((observer.clone(), OutputStream::Stderr));
+            }
         }
         let child = self.child.as_mut().expect("owned child");
         let tree = &mut self.tree;
@@ -179,6 +280,7 @@ struct Capture<R> {
     tail: std::collections::VecDeque<u8>,
     limit: usize,
     total_bytes: u64,
+    observer: Option<(OutputObserver, OutputStream)>,
 }
 
 impl<R: AsyncRead + Unpin> Capture<R> {
@@ -189,6 +291,7 @@ impl<R: AsyncRead + Unpin> Capture<R> {
             tail: std::collections::VecDeque::new(),
             limit,
             total_bytes: 0,
+            observer: None,
         }
     }
 
@@ -206,6 +309,9 @@ impl<R: AsyncRead + Unpin> Capture<R> {
                 return Ok(());
             }
             self.total_bytes = self.total_bytes.saturating_add(n as u64);
+            if let Some((observer, stream)) = &self.observer {
+                observer.observe(*stream, &chunk[..n]);
+            }
             let head_count = (head_limit - self.head.len()).min(n);
             self.head.extend_from_slice(&chunk[..head_count]);
             for byte in &chunk[head_count..n] {
@@ -384,6 +490,75 @@ impl ProcessTree {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn observed_capture_drains_when_sink_is_full_or_disconnected() {
+        for disconnected in [false, true] {
+            let input = vec![b'x'; 1_000_000];
+            let (observer, receiver) = bounded_output_observer(1, 16384);
+            let mut receiver = Some(receiver);
+            if disconnected {
+                receiver.take();
+            }
+            let mut captured = Capture::new(Some(input.as_slice()), 17);
+            captured.observer = Some((observer.clone(), OutputStream::Stdout));
+            tokio::time::timeout(std::time::Duration::from_secs(1), captured.read())
+                .await
+                .unwrap()
+                .unwrap();
+            let output = captured.finish();
+            assert_eq!(output.total_bytes, input.len() as u64);
+            assert_eq!(output.bytes, vec![b'x'; 17]);
+            assert!(!output.incomplete);
+            let retained = if let Some(receiver) = &mut receiver {
+                let chunk = receiver.try_recv().unwrap();
+                assert_eq!(chunk.stream, OutputStream::Stdout);
+                assert!(receiver.try_recv().is_err());
+                chunk.bytes.len() as u64
+            } else {
+                0
+            };
+            assert_eq!(observer.omitted_bytes(), [input.len() as u64 - retained, 0]);
+        }
+    }
+
+    #[tokio::test]
+    async fn observer_preserves_stream_prefix_and_exact_byte_budget() {
+        let input = "a界🦀z".repeat(100);
+        for chunk_size in [1, 3, 8192] {
+            let (observer, mut receiver) = bounded_output_observer(2048, 103);
+            for stream in [OutputStream::Stdout, OutputStream::Stderr] {
+                let mut captured = Capture::new(
+                    Some(ChunkedReader {
+                        remaining: input.as_bytes(),
+                        chunk_size,
+                        fail_at_end: false,
+                    }),
+                    input.len(),
+                );
+                captured.observer = Some((observer.clone(), stream));
+                captured.read().await.unwrap();
+                assert_eq!(captured.finish().bytes, input.as_bytes());
+            }
+            let mut streams = [Vec::new(), Vec::new()];
+            while let Ok(chunk) = receiver.try_recv() {
+                let index = if chunk.stream == OutputStream::Stdout {
+                    0
+                } else {
+                    1
+                };
+                streams[index].extend(chunk.bytes);
+            }
+            assert_eq!(
+                streams,
+                [
+                    input.as_bytes()[..103].to_vec(),
+                    input.as_bytes()[..103].to_vec()
+                ]
+            );
+            assert_eq!(observer.omitted_bytes(), [(input.len() - 103) as u64; 2]);
+        }
+    }
 
     #[tokio::test]
     async fn bounded_capture_keeps_head_tail_and_byte_count() {
@@ -624,6 +799,8 @@ mod tests {
             )
             .unwrap();
             let pid = process.id().unwrap() as i32;
+            let (observer, mut progress) = bounded_output_observer(16, 100);
+            process.observe_output(observer.clone());
             tokio::time::timeout(Duration::from_secs(3), async {
                 loop {
                     let mut collection = Box::pin(process.collect_output(100));
@@ -639,6 +816,17 @@ mod tests {
             })
             .await
             .unwrap();
+            let mut streams = [Vec::new(), Vec::new()];
+            while let Ok(chunk) = progress.try_recv() {
+                let index = if chunk.stream == OutputStream::Stdout {
+                    0
+                } else {
+                    1
+                };
+                streams[index].extend(chunk.bytes);
+            }
+            assert_eq!(streams, [b"before".to_vec(), b"error".to_vec()]);
+            assert_eq!(observer.omitted_bytes(), [0, 0]);
             assert!(
                 tokio::time::timeout(Duration::from_millis(20), process.collect_output(100))
                     .await
@@ -649,6 +837,10 @@ mod tests {
             assert_eq!(output.stdout.total_bytes, 6);
             assert_eq!(output.stderr.bytes, b"error");
             assert_eq!(output.stderr.total_bytes, 5);
+            assert!(
+                progress.try_recv().is_err(),
+                "collection must not replay progress"
+            );
             assert!(!output.status.success());
             assert_reaped(pid);
         }

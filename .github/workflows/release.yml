@@ -52,36 +52,105 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Build
-        run: cargo build --release --bin bob --target ${{ matrix.target }}
+      - name: Build durable binaries
+        run: cargo build --locked --release -p bob --bins --target ${{ matrix.target }}
 
       - name: Package (unix)
         if: matrix.os != 'windows-latest'
         run: |
-          bin="target/${{ matrix.target }}/release/bob"
+          directory="target/${{ matrix.target }}/release"
           archive="bob-${{ matrix.target }}.tar.gz"
-          tar -czf "$archive" -C "$(dirname "$bin")" bob
+          tar -czf "$archive" -C "$directory" bob bob-exec
           echo "ASSET=$archive" >> "$GITHUB_ENV"
 
       - name: Package (windows)
         if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
-          $bin = "target/${{ matrix.target }}/release/bob.exe"
+          $directory = "target/${{ matrix.target }}/release"
           $archive = "bob-${{ matrix.target }}.zip"
-          Compress-Archive -Path $bin -DestinationPath $archive
+          Compress-Archive -Path "$directory/bob.exe", "$directory/bob-exec.exe" -DestinationPath $archive
           "ASSET=$archive" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Upload workflow artifact
+      - name: Validate archive layout (unix)
+        if: matrix.os != 'windows-latest'
+        run: |
+          test "$(tar -tzf "$ASSET" | LC_ALL=C sort)" = "$(printf '%s\n' bob bob-exec | LC_ALL=C sort)"
+          mkdir package-smoke
+          tar -xzf "$ASSET" -C package-smoke
+          test -x package-smoke/bob
+          test -x package-smoke/bob-exec
+
+      - name: Relocated Unix real-helper acceptance
+        if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'aarch64-apple-darwin'
+        run: |
+          BOB_REPLACEMENT_PACKAGE_DIR="$PWD/package-smoke" cargo test --locked --release -p bob --target ${{ matrix.target }} --test packaged_unix_acceptance packaged_unix_frontend_and_helper_acceptance -- --exact --nocapture --test-threads=1
+
+      - name: Smoke test durable archive (windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: ./scripts/windows-acceptance.ps1 -Package $env:ASSET -Artifacts native-release-artifacts
+
+      - name: Record outstanding native qualification
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          @'
+          ## Native Windows release qualification
+          Automated helper execution is not full packaged application acceptance.
+          NOT RUN here: actual packaged TUI in Windows Terminal, multiline paste safety,
+          Unicode/IME/layout input, real clipboard contention/readback, mouse/resize,
+          terminal restoration, large-session memory/handle measurements, and an
+          explicitly authorized GitHub Copilot-only live coding scenario.
+          The release owner must record these results for this source/archive identity
+          before approving the native-windows-release environment. Locked Crossterm's
+          native paste/Unicode-key behavior remains a qualification limitation.
+          ReplaceFileW also retains a final pathname-substitution window; passing
+          recovery characterization does not establish prevention of raced publication.
+          '@ | Add-Content $env:GITHUB_STEP_SUMMARY
+
+      - name: Retain Windows package acceptance evidence
+        if: always() && matrix.os == 'windows-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-windows-release-evidence
+          path: native-release-artifacts/
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Upload durable workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: bob-${{ matrix.target }}
           path: ${{ env.ASSET }}
           if-no-files-found: error
 
+  publish:
+    name: Publish after native qualification
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    environment: native-windows-release
+    steps:
+      - name: Require source-specific native acceptance
+        env:
+          ACCEPTED_SHA: ${{ vars.NATIVE_WINDOWS_ACCEPTED_SHA }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          if [ -z "$ACCEPTED_SHA" ] || [ "$ACCEPTED_SHA" != "$SOURCE_SHA" ]; then
+            echo '::error::Publication blocked: complete the README native Windows Terminal/Copilot checklist for this exact source and archive, then have the release owner set NATIVE_WINDOWS_ACCEPTED_SHA to the full tested commit SHA in the protected native-windows-release environment.'
+            exit 1
+          fi
+      - name: Download validated archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bob-*
+          path: release-assets
+          merge-multiple: true
       - name: Attach to release
-        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ env.ASSET }}
+          files: |
+            release-assets/*.zip
+            release-assets/*.tar.gz
           fail_on_unmatched_files: true

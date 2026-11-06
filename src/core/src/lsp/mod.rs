@@ -3,7 +3,7 @@
 mod command;
 mod positions;
 pub(crate) mod transport;
-pub(crate) mod workspace_edit;
+pub mod workspace_edit;
 pub use positions::PositionEncoding;
 
 use crate::core::config::LspServerConfig;
@@ -216,7 +216,7 @@ impl LspClient {
             .map_err(|_| anyhow::anyhow!("document synchronization stopped"))?
     }
 
-    pub(crate) fn defer_sync_file(&self, path: &Path) {
+    pub fn defer_sync_file(&self, path: &Path) {
         self.enqueue_sync(SyncWork::Deferred(path.to_path_buf()));
     }
 
@@ -339,6 +339,27 @@ impl LspClient {
 
     pub fn document_snapshots(&self) -> HashMap<String, DocumentSnapshot> {
         self.inner.documents.lock().unwrap().clone()
+    }
+
+    pub fn document_snapshots_bounded(
+        &self,
+        max_files: usize,
+        max_bytes: usize,
+    ) -> anyhow::Result<HashMap<String, DocumentSnapshot>> {
+        let documents = self.inner.documents.lock().unwrap();
+        anyhow::ensure!(
+            documents.len() <= max_files,
+            "LSP snapshot cache exceeds {max_files} files"
+        );
+        let mut bytes = 0usize;
+        for document in documents.values() {
+            bytes = bytes.saturating_add(document.text.len());
+            anyhow::ensure!(
+                bytes <= max_bytes,
+                "LSP snapshot cache exceeds {max_bytes} bytes"
+            );
+        }
+        Ok(documents.clone())
     }
 
     pub fn position_encoding(&self) -> PositionEncoding {
@@ -538,6 +559,15 @@ fn language_id_for(path: &Path) -> String {
 pub struct LspManager {
     servers: Vec<ServerSlot>,
     repo_root: std::path::PathBuf,
+    startup: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+}
+
+impl Drop for LspManager {
+    fn drop(&mut self) {
+        for task in self.startup.get_mut().unwrap().drain(..) {
+            task.abort();
+        }
+    }
 }
 
 struct ServerSlot {
@@ -561,13 +591,18 @@ impl LspManager {
         let mgr = Arc::new(LspManager {
             servers,
             repo_root: repo_root.to_path_buf(),
+            startup: Mutex::new(Vec::new()),
         });
 
         for i in 0..mgr.servers.len() {
-            let mgr2 = mgr.clone();
-            tokio::spawn(async move {
-                let slot = &mgr2.servers[i];
-                match LspClient::start(&slot.cfg, &mgr2.repo_root).await {
+            let weak = Arc::downgrade(&mgr);
+            let cfg = mgr.servers[i].cfg.clone();
+            let repo_root = mgr.repo_root.clone();
+            let task = tokio::spawn(async move {
+                let result = LspClient::start(&cfg, &repo_root).await;
+                let Some(mgr) = weak.upgrade() else { return };
+                let slot = &mgr.servers[i];
+                match result {
                     Ok(client) => {
                         *slot.client.lock().unwrap() = Some(client);
                     }
@@ -576,6 +611,7 @@ impl LspManager {
                     }
                 }
             });
+            mgr.startup.lock().unwrap().push(task);
         }
         mgr
     }
@@ -629,6 +665,9 @@ impl LspManager {
 }
 
 #[cfg(test)]
+mod startup_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::TestDir;
@@ -671,6 +710,44 @@ mod tests {
             .await
             .expect("expected a document notification")
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn bounded_document_snapshots_reject_limits_before_cloning() {
+        let (client, _server) = fixture_client();
+        assert!(client.document_snapshots_bounded(0, 0).unwrap().is_empty());
+        client.inner.documents.lock().unwrap().extend([
+            (
+                "file:///a.rs".into(),
+                DocumentSnapshot {
+                    version: 2,
+                    text: "abc".into(),
+                },
+            ),
+            (
+                "file:///b.rs".into(),
+                DocumentSnapshot {
+                    version: 3,
+                    text: "defg".into(),
+                },
+            ),
+        ]);
+        assert!(client
+            .document_snapshots_bounded(1, 7)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("files"));
+        assert!(client
+            .document_snapshots_bounded(2, 6)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("bytes"));
+        let snapshots = client.document_snapshots_bounded(2, 7).unwrap();
+        assert_eq!(snapshots["file:///a.rs"].text, "abc");
+        assert_eq!(snapshots["file:///b.rs"].version, 3);
+        assert_eq!(client.inner.documents.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -1112,6 +1189,7 @@ mod tests {
                 health: Mutex::new(Health::Ready),
             }],
             repo_root: dir.path().to_path_buf(),
+            startup: Mutex::new(Vec::new()),
         });
         let ctx = ToolContext {
             cwd: dir.to_string_lossy().into_owned(),

@@ -3,7 +3,7 @@
 use crate::core::types::*;
 use crate::providers::codec::BlockWire;
 use crate::providers::provider::{Provider, StreamTimeouts};
-use crate::providers::sse::{parse_sse_control, SseEvent};
+use crate::providers::sse::{parse_provider_sse, SseEvent};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
@@ -227,13 +227,10 @@ impl Provider for AnthropicProvider {
         })
     }
 
-    async fn stream(
-        &self,
-        opts: GenerateOptions,
-    ) -> anyhow::Result<mpsc::UnboundedReceiver<StreamEvent>> {
+    async fn stream(&self, opts: GenerateOptions) -> anyhow::Result<mpsc::Receiver<StreamEvent>> {
         let body = self.build_body(&opts, true);
         let provider = self.clone();
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = crate::providers::provider::stream_channel();
         tokio::spawn(async move {
             let Some(res) =
                 crate::providers::provider::start_stream(&tx, provider.timeouts.startup, async {
@@ -254,12 +251,21 @@ impl Provider for AnthropicProvider {
             let mut usage = Usage::default();
             let mut stopped = false;
 
-            let consume = parse_sse_control(
+            let consume = parse_provider_sse(
                 res,
                 |event| {
+                    if tx.is_stopped() {
+                        return ControlFlow::Break(());
+                    }
                     let SseEvent::Json(data) = event else {
                         return ControlFlow::Break(());
                     };
+                    if data["index"].as_u64().is_some_and(|index| index >= 4096) {
+                        let _ = tx.send(StreamEvent::Error {
+                            message: "provider resource limit exceeded: Anthropic block index exceeds 4095".into(),
+                        });
+                        return ControlFlow::Break(());
+                    }
                     let typ = data["type"].as_str().unwrap_or("");
                     match typ {
                         "message_start" => {
@@ -277,9 +283,12 @@ impl Provider for AnthropicProvider {
                             let b = &data["content_block"];
                             match b["type"].as_str() {
                                 Some("text") => {
-                                    blocks[idx] = Some(ContentBlock::Text {
-                                        text: b["text"].as_str().unwrap_or("").to_string(),
-                                    });
+                                    let text = b["text"].as_str().unwrap_or("").to_string();
+                                    if !text.is_empty() {
+                                        let _ =
+                                            tx.send(StreamEvent::TextDelta { text: text.clone() });
+                                    }
+                                    blocks[idx] = Some(ContentBlock::Text { text });
                                 }
                                 Some("tool_use") => {
                                     let id = b["id"].as_str().unwrap_or("").to_string();
@@ -292,6 +301,15 @@ impl Provider for AnthropicProvider {
                                     let _ = tx.send(StreamEvent::ToolUseStart { id, name });
                                 }
                                 Some("thinking") => {
+                                    if let Some(text) =
+                                        b["thinking"].as_str().filter(|text| !text.is_empty())
+                                    {
+                                        let _ = tx.send(StreamEvent::ReasoningDelta {
+                                            block_id: idx.to_string(),
+                                            kind: ReasoningKind::Thinking,
+                                            text: text.to_owned(),
+                                        });
+                                    }
                                     blocks[idx] = Some(ContentBlock::Thinking {
                                         thinking: b["thinking"].as_str().unwrap_or("").to_string(),
                                         signature: b["signature"]
@@ -324,11 +342,14 @@ impl Provider for AnthropicProvider {
                                 }
                                 Some("input_json_delta") => {
                                     let pj = d["partial_json"].as_str().unwrap_or("").to_string();
-                                    tool_json[idx].push_str(&pj);
                                     let id = match blocks.get(idx) {
                                         Some(Some(ContentBlock::ToolUse { id, .. })) => id.clone(),
-                                        _ => String::new(),
+                                        _ => {
+                                            let _ = tx.send(StreamEvent::Error { message: "anthropic protocol error: tool arguments without a tool block".into() });
+                                            return ControlFlow::Break(());
+                                        }
                                     };
+                                    tool_json[idx].push_str(&pj);
                                     let _ = tx.send(StreamEvent::ToolUseInputDelta {
                                         id,
                                         partial_json: pj,
@@ -340,6 +361,13 @@ impl Provider for AnthropicProvider {
                                         blocks.get_mut(idx)
                                     {
                                         thinking.push_str(t);
+                                        if !t.is_empty() {
+                                            let _ = tx.send(StreamEvent::ReasoningDelta {
+                                                block_id: idx.to_string(),
+                                                kind: ReasoningKind::Thinking,
+                                                text: t.to_owned(),
+                                            });
+                                        }
                                     }
                                 }
                                 Some("signature_delta") => {
@@ -406,7 +434,7 @@ impl Provider for AnthropicProvider {
                         }
                         _ => {}
                     }
-                    if stopped {
+                    if stopped || tx.is_stopped() {
                         ControlFlow::Break(())
                     } else {
                         ControlFlow::Continue(())
@@ -929,6 +957,58 @@ mod tests {
                 client: reqwest::Client::new(),
                 timeouts,
             })
+        }
+
+        #[tokio::test]
+        async fn thinking_observations_exclude_signature_and_redacted_continuity() {
+            let frames = [
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"Check ","signature":"sig-start"}}),
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"files"}}),
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"-end"}}),
+                json!({"type":"content_block_stop","index":0}),
+                json!({"type":"content_block_start","index":1,"content_block":{"type":"redacted_thinking","data":"SECRET"}}),
+                json!({"type":"content_block_stop","index":1}),
+                json!({"type":"content_block_start","index":2,"content_block":{"type":"text","text":"Answer"}}),
+                json!({"type":"content_block_stop","index":2}),
+                json!({"type":"message_delta","delta":{"stop_reason":"end_turn"}}),
+                json!({"type":"message_stop"}),
+            ];
+            let body = frames
+                .iter()
+                .map(|frame| format!("data: {frame}\n\n"))
+                .collect::<String>();
+            let (base, server) = serve(&body, true).await;
+            let events = collect(provider(base, deadlines())).await;
+            server.await.unwrap();
+            assert!(matches!(events.as_slice(), [
+                StreamEvent::ReasoningDelta { block_id: first, kind: ReasoningKind::Thinking, text: start },
+                StreamEvent::ReasoningDelta { block_id: second, kind: ReasoningKind::Thinking, text: delta },
+                StreamEvent::TextDelta { text: answer },
+                StreamEvent::MessageStop { .. },
+            ] if first == "0" && second == "0" && start == "Check " && delta == "files" && answer == "Answer"));
+            let Some(StreamEvent::MessageStop { completion }) = events.last() else {
+                panic!("missing completion")
+            };
+            assert_eq!(completion.message.text(), "Answer");
+            assert!(
+                matches!(&completion.message.content[0], ContentBlock::Thinking { thinking, signature } if thinking == "Check files" && signature == "sig-start-end")
+            );
+            assert!(
+                matches!(&completion.message.content[1], ContentBlock::RedactedThinking { data } if data == "SECRET")
+            );
+        }
+
+        #[tokio::test]
+        async fn sparse_untrusted_block_index_fails_without_allocating() {
+            let frame = json!({"type":"content_block_start","index":u64::MAX,
+                "content_block":{"type":"tool_use","id":"t1","name":"read_file","input":{}}});
+            let (base, server) = serve(&format!("data: {frame}\n\n"), true).await;
+            let events = collect(provider(base, deadlines())).await;
+            assert_error(&events);
+            assert!(
+                matches!(&events[0], StreamEvent::Error { message } if message.contains("resource limit exceeded"))
+            );
+            server.await.unwrap();
         }
 
         #[tokio::test]

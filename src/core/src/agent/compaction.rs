@@ -4,7 +4,7 @@
 use crate::agent::team::COORD_MESSAGE_PREFIX;
 use crate::core::types::{ContentBlock, GenerateOptions, Message, Role, StopReason};
 use crate::providers::provider::{
-    is_transient_error, retries_exhausted, Provider, MAX_RETRIES, RETRY_DELAY,
+    is_context_overflow, is_transient_error, retries_exhausted, Provider, MAX_RETRIES, RETRY_DELAY,
 };
 use anyhow::{bail, Context};
 use std::collections::HashMap;
@@ -442,24 +442,6 @@ fn next_chunk(text: &str, max_bytes: usize) -> &str {
     &text[..end]
 }
 
-fn is_context_overflow(error: &anyhow::Error) -> bool {
-    let text = format!("{error:#}").to_ascii_lowercase();
-    [
-        "context_length_exceeded",
-        "context window",
-        "context length",
-        "maximum context",
-        "prompt is too long",
-        "prompt too long",
-        "too many input tokens",
-        "input is too long",
-        "exceeds the model's maximum",
-        "request too large",
-    ]
-    .iter()
-    .any(|pattern| text.contains(pattern))
-}
-
 fn render_for_summary(message: &Message) -> String {
     let parts: Vec<String> = message
         .content
@@ -585,10 +567,7 @@ mod tests {
             })
         }
 
-        async fn stream(
-            &self,
-            _: GenerateOptions,
-        ) -> anyhow::Result<mpsc::UnboundedReceiver<StreamEvent>> {
+        async fn stream(&self, _: GenerateOptions) -> anyhow::Result<mpsc::Receiver<StreamEvent>> {
             unreachable!("compaction uses non-streaming requests")
         }
     }
@@ -1508,7 +1487,7 @@ mod tests {
             async fn stream(
                 &self,
                 options: GenerateOptions,
-            ) -> anyhow::Result<mpsc::UnboundedReceiver<StreamEvent>> {
+            ) -> anyhow::Result<mpsc::Receiver<StreamEvent>> {
                 crate::providers::mock::MockProvider::new(Vec::new())
                     .with_default(crate::providers::mock::MockReply::Text("resumed".into()))
                     .stream(options)

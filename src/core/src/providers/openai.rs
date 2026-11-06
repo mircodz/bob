@@ -2,7 +2,7 @@
 
 use crate::core::types::*;
 use crate::providers::provider::{Provider, StreamTimeouts};
-use crate::providers::sse::{parse_sse_control, SseEvent};
+use crate::providers::sse::{parse_provider_sse, SseEvent};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -53,6 +53,7 @@ pub(crate) async fn create_with_options(
                 "https://chatgpt.com/backend-api/codex".to_string(),
                 source,
             )
+            .with_reasoning_summary(true)
             .with_stream_timeouts(timeouts),
         ))
     } else {
@@ -238,13 +239,10 @@ impl Provider for OpenAiProvider {
         })
     }
 
-    async fn stream(
-        &self,
-        opts: GenerateOptions,
-    ) -> anyhow::Result<mpsc::UnboundedReceiver<StreamEvent>> {
+    async fn stream(&self, opts: GenerateOptions) -> anyhow::Result<mpsc::Receiver<StreamEvent>> {
         let body = self.build_body(&opts, true);
         let provider = self.clone();
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = crate::providers::provider::stream_channel();
         tokio::spawn(async move {
             let Some(res) = crate::providers::provider::start_stream(
                 &tx, provider.timeouts.startup, async {
@@ -263,9 +261,12 @@ impl Provider for OpenAiProvider {
             // Tool calls arrive incrementally, keyed by index (ordered).
             let mut tool_acc: BTreeMap<i64, (String, String, String)> = BTreeMap::new();
 
-            let consume = parse_sse_control(
+            let consume = parse_provider_sse(
                 res,
                 |event| {
+                    if tx.is_stopped() {
+                        return ControlFlow::Break(());
+                    }
                     let SseEvent::Json(evt) = event else {
                         return ControlFlow::Break(());
                     };
@@ -349,7 +350,11 @@ impl Provider for OpenAiProvider {
                     if let Some(fr) = choice["finish_reason"].as_str() {
                         finish = Some(fr.to_string());
                     }
-                    ControlFlow::Continue(())
+                    if tx.is_stopped() {
+                        ControlFlow::Break(())
+                    } else {
+                        ControlFlow::Continue(())
+                    }
                 },
                 provider.timeouts.idle,
             );
@@ -359,6 +364,9 @@ impl Provider for OpenAiProvider {
                 result = consume => result,
             };
 
+            if tx.is_stopped() {
+                return;
+            }
             if let Err(e) = sse {
                 let _ = tx.send(StreamEvent::Error {
                     message: format!("openai stream ended: {e}"),

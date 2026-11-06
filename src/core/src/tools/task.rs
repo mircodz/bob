@@ -542,7 +542,7 @@ mod tests {
             async fn stream(
                 &self,
                 opts: crate::core::types::GenerateOptions,
-            ) -> anyhow::Result<tokio::sync::mpsc::UnboundedReceiver<crate::core::types::StreamEvent>>
+            ) -> anyhow::Result<tokio::sync::mpsc::Receiver<crate::core::types::StreamEvent>>
             {
                 let reply = self.reply(&opts, false);
                 MockProvider::new(vec![])
@@ -798,7 +798,7 @@ mod tests {
             async fn stream(
                 &self,
                 opts: crate::core::types::GenerateOptions,
-            ) -> anyhow::Result<tokio::sync::mpsc::UnboundedReceiver<crate::core::types::StreamEvent>>
+            ) -> anyhow::Result<tokio::sync::mpsc::Receiver<crate::core::types::StreamEvent>>
             {
                 use crate::core::types::{ContentBlock, Role};
                 use crate::providers::mock::MockReply;
@@ -937,7 +937,7 @@ mod tests {
             async fn stream(
                 &self,
                 opts: crate::core::types::GenerateOptions,
-            ) -> anyhow::Result<tokio::sync::mpsc::UnboundedReceiver<crate::core::types::StreamEvent>>
+            ) -> anyhow::Result<tokio::sync::mpsc::Receiver<crate::core::types::StreamEvent>>
             {
                 {
                     let mut tools = self.tools.lock().unwrap();
@@ -1233,7 +1233,7 @@ mod tests {
             async fn stream(
                 &self,
                 opts: crate::core::types::GenerateOptions,
-            ) -> anyhow::Result<tokio::sync::mpsc::UnboundedReceiver<crate::core::types::StreamEvent>>
+            ) -> anyhow::Result<tokio::sync::mpsc::Receiver<crate::core::types::StreamEvent>>
             {
                 self.tools
                     .lock()
@@ -1746,8 +1746,7 @@ mod tests {
         struct PendingStreamProvider {
             started: Arc<tokio::sync::Notify>,
             calls: AtomicUsize,
-            senders:
-                Mutex<Vec<tokio::sync::mpsc::UnboundedSender<crate::core::types::StreamEvent>>>,
+            senders: Mutex<Vec<tokio::sync::mpsc::Sender<crate::core::types::StreamEvent>>>,
         }
 
         #[async_trait]
@@ -1769,11 +1768,11 @@ mod tests {
             async fn stream(
                 &self,
                 opts: crate::core::types::GenerateOptions,
-            ) -> anyhow::Result<tokio::sync::mpsc::UnboundedReceiver<crate::core::types::StreamEvent>>
+            ) -> anyhow::Result<tokio::sync::mpsc::Receiver<crate::core::types::StreamEvent>>
             {
                 assert_eq!(self.calls.fetch_add(1, Ordering::Relaxed), 0);
                 assert_eq!(opts.messages.last().unwrap().text(), "review code");
-                let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+                let (sender, receiver) = tokio::sync::mpsc::channel(1);
                 self.senders.lock().unwrap().push(sender);
                 self.started.notify_one();
                 Ok(receiver)
@@ -1855,7 +1854,7 @@ mod tests {
             async fn stream(
                 &self,
                 _: crate::core::types::GenerateOptions,
-            ) -> anyhow::Result<tokio::sync::mpsc::UnboundedReceiver<crate::core::types::StreamEvent>>
+            ) -> anyhow::Result<tokio::sync::mpsc::Receiver<crate::core::types::StreamEvent>>
             {
                 anyhow::bail!("fixture failure")
             }
@@ -2123,7 +2122,7 @@ mod tests {
             async fn stream(
                 &self,
                 opts: GenerateOptions,
-            ) -> anyhow::Result<tokio::sync::mpsc::UnboundedReceiver<StreamEvent>> {
+            ) -> anyhow::Result<tokio::sync::mpsc::Receiver<StreamEvent>> {
                 let step = {
                     let mut observed = self.observed.lock().unwrap();
                     let step = observed.len();

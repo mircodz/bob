@@ -543,7 +543,7 @@ mod tests {
         async fn stream(
             &self,
             opts: GenerateOptions,
-        ) -> anyhow::Result<mpsc::UnboundedReceiver<StreamEvent>> {
+        ) -> anyhow::Result<mpsc::Receiver<StreamEvent>> {
             self.check(&opts)?;
             self.0.mock.stream(opts).await
         }
@@ -918,7 +918,7 @@ mod tests {
     struct StalledProvider {
         calls: AtomicUsize,
         started: Notify,
-        streams: Mutex<Vec<mpsc::UnboundedSender<StreamEvent>>>,
+        streams: Mutex<Vec<mpsc::Sender<StreamEvent>>>,
     }
 
     #[async_trait]
@@ -939,9 +939,9 @@ mod tests {
         async fn stream(
             &self,
             _opts: GenerateOptions,
-        ) -> anyhow::Result<mpsc::UnboundedReceiver<StreamEvent>> {
+        ) -> anyhow::Result<mpsc::Receiver<StreamEvent>> {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            let (tx, rx) = mpsc::unbounded_channel();
+            let (tx, rx) = mpsc::channel(1);
             self.streams.lock().unwrap().push(tx);
             self.started.notify_one();
             Ok(rx)
@@ -1071,7 +1071,7 @@ mod tests {
         async fn stream(
             &self,
             _opts: GenerateOptions,
-        ) -> anyhow::Result<mpsc::UnboundedReceiver<StreamEvent>> {
+        ) -> anyhow::Result<mpsc::Receiver<StreamEvent>> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             panic!("runtime provider panic");
         }

@@ -1,6 +1,8 @@
 pub(crate) mod agent;
 pub(crate) mod files;
 pub(crate) mod http;
+#[cfg(windows)]
+pub(crate) mod windows_rpc;
 pub(crate) mod workspace;
 
 pub(crate) use workspace::TestDir;

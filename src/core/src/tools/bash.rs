@@ -1,6 +1,6 @@
 use crate::core::permissions::{parse_bash, ParsedCommand};
 use crate::core::process::{ManagedProcess, ProcessOutput};
-use crate::core::shell::{CommandShell, ShellKind};
+use crate::core::shell::{invocation_args, CommandShell, ShellKind, PWSH_VERSION_CHECK};
 use crate::core::types::{ShellOutcome, ShellOutput, ShellStream, ToolSpec};
 use crate::tools::jobs::JobStatus;
 use crate::tools::registry::{Tool, ToolContext, ToolError, ToolResult};
@@ -22,7 +22,7 @@ impl Tool for BashTool {
     fn spec(&self) -> ToolSpec {
         let guidance = match self.shell.kind() {
             ShellKind::Bash => "Uses bash -c; write Bash syntax.",
-            ShellKind::Pwsh => "Uses PowerShell 7 (pwsh -NoLogo -NoProfile -NonInteractive -Command); write PowerShell syntax, not Bash. Check $LASTEXITCODE immediately after native commands and use exit $LASTEXITCODE to preserve their exact exit status. Later successful commands can mask earlier failures; use -ErrorAction Stop when PowerShell errors must halt a script.",
+            ShellKind::Pwsh => "Uses PowerShell 7 (pwsh -NoLogo -NoProfile -NonInteractive -Command); write PowerShell syntax, not Bash. Each approved execution first runs a managed PowerShell Core 7+ version check; failure does not run the user command or fall back to another shell. Check $LASTEXITCODE immediately after native commands and use exit $LASTEXITCODE to preserve their exact exit status. Later successful commands can mask earlier failures; use -ErrorAction Stop when PowerShell errors must halt a script.",
         };
         ToolSpec {
             name: "bash".to_string(),
@@ -61,12 +61,11 @@ impl Tool for BashTool {
     async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
         let command = input["command"].as_str().unwrap_or("").to_string();
         let cwd = ctx.cwd.clone();
+        let executable = self.shell.executable().map_err(ToolError::failed)?;
+        invocation_args(executable, self.shell.kind(), &command)
+            .map_err(|error| ToolError::invalid_input(error.to_string()))?;
         if input["run_in_background"].as_bool().unwrap_or(false) {
-            let executable = self
-                .shell
-                .executable()
-                .map_err(ToolError::failed)?
-                .to_path_buf();
+            let executable = executable.to_path_buf();
             let kind = self.shell.kind();
             let id = ctx.jobs.next_id();
             let bg_cmd = command.clone();
@@ -80,6 +79,17 @@ impl Tool for BashTool {
                             outcome: ShellOutcome::Cancelled,
                             ..ShellOutput::default()
                         }.into());
+                    }
+                    let validation = tokio::select! {
+                        biased;
+                        _ = cancel.changed() => return (JobStatus::Cancelled, "cancelled during approved shell validation; user command was not started".into()),
+                        result = validate_shell(&executable, kind, &cwd, None) => result,
+                    };
+                    if let Err(error) = validation {
+                        return (JobStatus::Failed, error.to_string().into());
+                    }
+                    if *cancel.borrow() {
+                        return (JobStatus::Cancelled, "cancelled before user command startup".into());
                     }
                     let mut process = match spawn_shell(&executable, kind, &bg_cmd, &cwd) {
                         Ok(process) => process,
@@ -132,7 +142,20 @@ impl Tool for BashTool {
             ),
             _ => None,
         };
-        let executable = self.shell.executable().map_err(ToolError::failed)?;
+        let started = std::time::Instant::now();
+        validate_shell(executable, self.shell.kind(), &cwd, timeout)
+            .await
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::TimedOut {
+                    ToolError::timeout(error.to_string())
+                } else {
+                    ToolError::failed(error.to_string())
+                }
+            })?;
+        let timeout = timeout.map(|duration| duration.saturating_sub(started.elapsed()));
+        if timeout.is_some_and(|duration| duration.is_zero()) {
+            return Err(ToolError::timeout("command deadline expired during approved shell validation; user command was not started"));
+        }
         let mut process = spawn_shell(executable, self.shell.kind(), &command, &cwd)
             .map_err(|error| ToolError::failed(error.to_string()))?;
         let output = if let Some(duration) = timeout {
@@ -169,6 +192,56 @@ impl Tool for BashTool {
     }
 }
 
+async fn validate_shell(
+    executable: &std::path::Path,
+    kind: ShellKind,
+    cwd: &str,
+    timeout: Option<std::time::Duration>,
+) -> std::io::Result<()> {
+    if kind != ShellKind::Pwsh {
+        return Ok(());
+    }
+    let failed = |reason: String| {
+        std::io::Error::other(format!(
+        "{} executable '{}' failed approved version validation: {reason}; user command was not started; no fallback was attempted",
+        kind.name(), executable.display()
+    ))
+    };
+    let mut probe = spawn_shell(executable, kind, PWSH_VERSION_CHECK, cwd)
+        .map_err(|error| failed(error.to_string()))?;
+    let limit = timeout
+        .unwrap_or(std::time::Duration::from_secs(10))
+        .min(std::time::Duration::from_secs(10));
+    let output = match tokio::time::timeout(limit, probe.collect_output(4096)).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => {
+            probe
+                .terminate_and_wait()
+                .await
+                .map_err(|cleanup| failed(format!("{error}; cleanup failed: {cleanup}")))?;
+            return Err(failed(error.to_string()));
+        }
+        Err(_) => {
+            probe
+                .terminate_and_collect(4096)
+                .await
+                .map_err(|cleanup| failed(format!("timed out; cleanup failed: {cleanup}")))?;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                failed("timed out".into()),
+            ));
+        }
+    };
+    if !output.status.success() {
+        return Err(failed(format!(
+            "PowerShell Core 7 or later is required; status {}; stderr: {}",
+            output.status,
+            output.stderr.text()
+        )));
+    }
+    Ok(())
+}
+
 fn spawn_shell(
     executable: &std::path::Path,
     kind: ShellKind,
@@ -177,8 +250,7 @@ fn spawn_shell(
 ) -> std::io::Result<ManagedProcess> {
     ManagedProcess::spawn(
         tokio::process::Command::new(executable)
-            .args(kind.command_args())
-            .arg(command)
+            .args(invocation_args(executable, kind, command)?)
             .current_dir(cwd)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
@@ -229,6 +301,10 @@ fn truncate_desc(cmd: &str) -> String {
         line
     }
 }
+
+#[cfg(test)]
+#[path = "bash_shell_tests.rs"]
+mod shell_tests;
 
 #[cfg(test)]
 mod tests {
@@ -505,7 +581,7 @@ mod tests {
                 )
                 .await
                 .unwrap_err();
-            assert!(error.message.contains("bash_executable"));
+            assert!(error.message.contains("Bash executable"));
             assert!(error.message.contains("missing Bash 終.exe"));
             assert!(ctx.jobs.list().is_empty());
         }

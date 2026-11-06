@@ -38,7 +38,7 @@ pub(crate) struct ScriptProvider {
     pub(crate) caps: Mutex<Vec<Option<u32>>>,
     pub(crate) calls: AtomicUsize,
     pub(crate) started: Notify,
-    parked: Mutex<Vec<mpsc::UnboundedSender<StreamEvent>>>,
+    parked: Mutex<Vec<mpsc::Sender<StreamEvent>>>,
 }
 
 impl ScriptProvider {
@@ -128,10 +128,7 @@ impl Provider for ScriptProvider {
         }
     }
 
-    async fn stream(
-        &self,
-        opts: GenerateOptions,
-    ) -> anyhow::Result<mpsc::UnboundedReceiver<StreamEvent>> {
+    async fn stream(&self, opts: GenerateOptions) -> anyhow::Result<mpsc::Receiver<StreamEvent>> {
         self.calls.fetch_add(1, Ordering::Relaxed);
         self.caps.lock().unwrap().push(opts.max_tokens);
         self.requests.lock().unwrap().push(opts.messages);
@@ -142,10 +139,10 @@ impl Provider for ScriptProvider {
             .unwrap()
             .pop_front()
             .expect("unexpected provider call");
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(256);
         match step {
             Step::Complete(content) => {
-                tx.send(StreamEvent::MessageStop {
+                tx.try_send(StreamEvent::MessageStop {
                     completion: completion(content),
                 })
                 .unwrap();
@@ -161,14 +158,14 @@ impl Provider for ScriptProvider {
             Step::Transient => anyhow::bail!("HTTP 503"),
             Step::Overflow => anyhow::bail!("Your input exceeds the context window of this model."),
             Step::Partial => {
-                tx.send(StreamEvent::TextDelta {
+                tx.try_send(StreamEvent::TextDelta {
                     text: "partial answer".into(),
                 })
                 .unwrap();
             }
             Step::Events(events) => {
                 for event in events {
-                    tx.send(event).unwrap();
+                    tx.try_send(event).unwrap();
                 }
             }
         }

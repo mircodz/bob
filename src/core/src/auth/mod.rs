@@ -4,6 +4,7 @@ pub mod anthropic;
 pub mod copilot;
 pub mod mcp;
 pub mod openai;
+mod storage;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -81,49 +82,25 @@ fn auth_path() -> PathBuf {
 impl AuthStore {
     pub fn load() -> AuthStore {
         let path = auth_path();
-        let raw = match std::fs::read_to_string(&path) {
-            Ok(s) => s,
-            Err(_) => return AuthStore::default(),
-        };
-        match serde_json::from_str(&raw) {
+        match storage::load_at(&path) {
             Ok(store) => store,
-            Err(e) => {
-                // Preserve corrupt credentials before a later save overwrites them.
-                let backup = path.with_extension("json.corrupt");
-                let _ = std::fs::rename(&path, &backup);
+            Err(error) => {
                 eprintln!(
-                    "bob: warning: {} was unreadable ({e}); backed it up to {} and \
-                     started with an empty credential store. Re-run login if needed.",
-                    path.display(),
-                    backup.display()
+                    "bob: warning: could not read {}: {error}; original file preserved",
+                    path.display()
                 );
                 AuthStore::default()
             }
         }
     }
 
-    pub fn save(&self) -> anyhow::Result<()> {
-        let path = auth_path();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let body = serde_json::to_string_pretty(self)?;
-        // Same-directory rename avoids exposing a partial write; no fsync.
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, &body)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
-        }
-        std::fs::rename(&tmp, &path)?;
-        // Best-effort: restrict permissions (contains tokens).
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-        }
+    pub async fn set_credential(provider: &str, credential: Credential) -> anyhow::Result<()> {
+        storage::update_at(&auth_path(), provider, |_| Ok(Some(credential))).await?;
         Ok(())
+    }
+
+    pub async fn remove_credential(provider: &str) -> anyhow::Result<bool> {
+        storage::update_at(&auth_path(), provider, |_| Ok(None)).await
     }
 
     pub fn get(&self, provider: &str) -> Option<&Credential> {
@@ -452,19 +429,12 @@ pub(crate) fn now() -> u64 {
 }
 
 /// Persist tokens and expiry; copy `extra_keys` from top-level response fields.
-pub(crate) fn store_tokens(
+pub(crate) async fn store_tokens(
     provider: &str,
     tokens: &serde_json::Value,
     extra_keys: &[&str],
 ) -> anyhow::Result<()> {
-    let access = tokens["access_token"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("no access_token"))?
-        .to_string();
-    let mut store = AuthStore::load();
-    let cred = credential_from_tokens(tokens, store.get(provider), extra_keys, now(), access);
-    store.set(provider, cred);
-    store.save()
+    storage::store_tokens_at(&auth_path(), provider, tokens, extra_keys).await
 }
 
 fn credential_from_tokens(

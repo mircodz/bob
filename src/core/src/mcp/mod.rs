@@ -12,11 +12,50 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 
 #[async_trait]
-pub(crate) trait Transport: Send + Sync {
+pub trait Transport: Send + Sync {
     /// JSON-RPC errors become `Err`, not successful results.
     async fn request(&self, method: &str, params: Value) -> anyhow::Result<Value>;
     /// Notifications expect no reply; delivery errors are ignored.
     async fn notify(&self, method: &str, params: Value);
+
+    fn is_closed(&self) -> bool {
+        false
+    }
+}
+
+pub(crate) const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+const MAX_DISCOVERY_PAGES: usize = 128;
+const MAX_DISCOVERED_TOOLS: usize = 4096;
+
+#[derive(Clone, Debug)]
+pub struct McpToolMetadata {
+    pub name: String,
+    pub description: String,
+    pub input_schema: Value,
+}
+
+pub fn tool_result_text(result: &Value) -> String {
+    let text = result
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|parts| {
+            parts
+                .iter()
+                .map(|part| match part["type"].as_str() {
+                    Some("text") => part["text"].as_str().unwrap_or("").to_string(),
+                    _ => part.to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    match result.get("structuredContent") {
+        Some(structured) if !text.is_empty() => {
+            format!("{text}\n\nStructured content:\n{structured}")
+        }
+        Some(structured) => structured.to_string(),
+        None => text,
+    }
 }
 
 #[derive(Clone)]
@@ -27,15 +66,33 @@ pub struct McpClient {
 
 impl McpClient {
     pub async fn connect(cfg: &McpServerConfig) -> anyhow::Result<McpClient> {
+        Self::connect_with_workspace(cfg, None).await
+    }
+
+    pub async fn connect_in(
+        cfg: &McpServerConfig,
+        workspace: &std::path::Path,
+    ) -> anyhow::Result<McpClient> {
+        Self::connect_with_workspace(cfg, Some(workspace)).await
+    }
+
+    async fn connect_with_workspace(
+        cfg: &McpServerConfig,
+        workspace: Option<&std::path::Path>,
+    ) -> anyhow::Result<McpClient> {
         let transport: Arc<dyn Transport> = if cfg.is_http() {
             Arc::new(http::HttpTransport::connect(cfg).await?)
         } else {
-            Arc::new(stdio::StdioTransport::connect(cfg).await?)
+            Arc::new(stdio::StdioTransport::connect(cfg, workspace).await?)
         };
-        let client = McpClient {
-            name: cfg.name.clone(),
-            transport,
-        };
+        Self::from_transport(cfg.name.clone(), transport).await
+    }
+
+    pub async fn from_transport(
+        name: String,
+        transport: Arc<dyn Transport>,
+    ) -> anyhow::Result<Self> {
+        let client = McpClient { name, transport };
 
         client
             .transport
@@ -56,56 +113,99 @@ impl McpClient {
         Ok(client)
     }
 
-    pub async fn list_tools(&self) -> anyhow::Result<Vec<Arc<dyn Tool>>> {
-        let result = self.transport.request("tools/list", json!({})).await?;
-        let tools = result
-            .get("tools")
-            .and_then(|t| t.as_array())
-            .cloned()
-            .unwrap_or_default();
+    pub fn is_closed(&self) -> bool {
+        self.transport.is_closed()
+    }
 
-        let mut out: Vec<Arc<dyn Tool>> = Vec::new();
-        for t in tools {
-            let raw_name = t["name"].as_str().unwrap_or("").to_string();
-            if raw_name.is_empty() {
-                continue;
+    pub async fn list_tools_raw(&self) -> anyhow::Result<Vec<McpToolMetadata>> {
+        let mut out = Vec::new();
+        let mut cursor = None;
+        let mut cursors = std::collections::HashSet::new();
+        let mut names = std::collections::HashSet::new();
+        let mut bytes = 0;
+        for _ in 0..MAX_DISCOVERY_PAGES {
+            let params = cursor
+                .as_ref()
+                .map(|cursor| json!({"cursor":cursor}))
+                .unwrap_or_else(|| json!({}));
+            let result = self.transport.request("tools/list", params).await?;
+            bytes += serde_json::to_vec(&result)?.len();
+            anyhow::ensure!(bytes <= MAX_FRAME_BYTES, "MCP discovery exceeds byte limit");
+            let tools = result
+                .get("tools")
+                .and_then(Value::as_array)
+                .ok_or_else(|| anyhow::anyhow!("MCP discovery response has no tools array"))?;
+            for tool in tools {
+                let Some(name) = tool["name"].as_str().filter(|name| !name.is_empty()) else {
+                    continue;
+                };
+                anyhow::ensure!(
+                    names.insert(name.to_string()),
+                    "MCP discovery contains duplicate tool names"
+                );
+                anyhow::ensure!(
+                    out.len() < MAX_DISCOVERED_TOOLS,
+                    "MCP discovery exceeds tool limit"
+                );
+                out.push(McpToolMetadata {
+                    name: name.to_string(),
+                    description: tool["description"].as_str().unwrap_or("").to_string(),
+                    input_schema: tool
+                        .get("inputSchema")
+                        .cloned()
+                        .unwrap_or_else(|| json!({"type":"object","properties":{}})),
+                });
             }
-            let spec = ToolSpec {
-                name: format!("{}_{}", self.name, raw_name),
-                description: t["description"].as_str().unwrap_or("").to_string(),
-                input_schema: t
-                    .get("inputSchema")
-                    .cloned()
-                    .unwrap_or_else(|| json!({ "type": "object", "properties": {} })),
-            };
-            out.push(Arc::new(McpTool {
-                client: self.clone(),
-                raw_name,
-                spec,
-            }));
+            match result.get("nextCursor") {
+                None | Some(Value::Null) => return Ok(out),
+                Some(Value::String(next)) if !next.is_empty() => {
+                    anyhow::ensure!(
+                        cursors.insert(next.clone()),
+                        "MCP discovery cursor repeated"
+                    );
+                    cursor = Some(next.clone());
+                }
+                _ => anyhow::bail!("MCP discovery cursor is invalid"),
+            }
         }
-        Ok(out)
+        anyhow::bail!("MCP discovery exceeds page limit")
+    }
+
+    pub async fn call_tool_raw(&self, name: &str, args: Value) -> anyhow::Result<Value> {
+        let result = self
+            .transport
+            .request("tools/call", json!({"name":name,"arguments":args}))
+            .await?;
+        anyhow::ensure!(result.is_object(), "MCP tool response is not an object");
+        Ok(result)
+    }
+
+    pub async fn list_tools(&self) -> anyhow::Result<Vec<Arc<dyn Tool>>> {
+        Ok(self
+            .list_tools_raw()
+            .await?
+            .into_iter()
+            .map(|tool| {
+                let spec = ToolSpec {
+                    name: format!("{}_{}", self.name, tool.name),
+                    description: tool.description,
+                    input_schema: tool.input_schema,
+                };
+                Arc::new(McpTool {
+                    client: self.clone(),
+                    raw_name: tool.name,
+                    spec,
+                }) as Arc<dyn Tool>
+            })
+            .collect())
     }
 
     async fn call_tool(&self, name: &str, args: Value) -> ToolResult {
         let result = self
-            .transport
-            .request("tools/call", json!({ "name": name, "arguments": args }))
+            .call_tool_raw(name, args)
             .await
             .map_err(|error| ToolError::failed(error.to_string()))?;
-        let parts = result
-            .get("content")
-            .and_then(|c| c.as_array())
-            .cloned()
-            .unwrap_or_default();
-        let text = parts
-            .iter()
-            .map(|p| match p["type"].as_str() {
-                Some("text") => p["text"].as_str().unwrap_or("").to_string(),
-                _ => p.to_string(),
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        let text = tool_result_text(&result);
         if result
             .get("isError")
             .and_then(|v| v.as_bool())
@@ -204,6 +304,91 @@ mod tests {
             },
             transport,
         )
+    }
+
+    #[tokio::test]
+    async fn raw_discovery_follows_cursors_and_raw_call_preserves_all_metadata() {
+        let response = json!({"content":[],"structuredContent":{"value":1},"isError":true,"_meta":{"trace":"fixture"}});
+        let (client, transport) = scripted_client(vec![
+            ExpectedRequest {
+                method: "tools/list",
+                params: json!({}),
+                reply: Ok(json!({"tools":[{"name":"first"}],"nextCursor":"page-two"})),
+            },
+            ExpectedRequest {
+                method: "tools/list",
+                params: json!({"cursor":"page-two"}),
+                reply: Ok(json!({"tools":[{"name":"second","inputSchema":{"type":"object"}}]})),
+            },
+            ExpectedRequest {
+                method: "tools/call",
+                params: json!({"name":"second","arguments":{"x":1}}),
+                reply: Ok(response.clone()),
+            },
+        ]);
+        let tools = client.list_tools_raw().await.unwrap();
+        assert_eq!(
+            tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+        assert_eq!(
+            client
+                .call_tool_raw("second", json!({"x":1}))
+                .await
+                .unwrap(),
+            response
+        );
+        assert!(transport.0.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn discovery_rejects_duplicate_names_cursors_and_invalid_pages() {
+        for second in [
+            json!({"tools":[],"nextCursor":"again"}),
+            json!({"tools":[{"name":"first"}]}),
+            json!({"tools":[],"nextCursor":true}),
+            json!({"unexpected":[]}),
+        ] {
+            let (client, _) = scripted_client(vec![
+                ExpectedRequest {
+                    method: "tools/list",
+                    params: json!({}),
+                    reply: Ok(json!({"tools":[{"name":"first"}],"nextCursor":"again"})),
+                },
+                ExpectedRequest {
+                    method: "tools/list",
+                    params: json!({"cursor":"again"}),
+                    reply: Ok(second),
+                },
+            ]);
+            assert!(client.list_tools_raw().await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn discovery_is_bounded_even_when_every_page_has_a_new_cursor() {
+        let requests = (0..MAX_DISCOVERY_PAGES)
+            .map(|page| ExpectedRequest {
+                method: "tools/list",
+                params: if page == 0 {
+                    json!({})
+                } else {
+                    json!({"cursor":page.to_string()})
+                },
+                reply: Ok(json!({"tools":[],"nextCursor":(page+1).to_string()})),
+            })
+            .collect();
+        let (client, transport) = scripted_client(requests);
+        assert!(client
+            .list_tools_raw()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("page limit"));
+        assert!(transport.0.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -3,7 +3,7 @@
 use crate::core::types::*;
 use crate::providers::openai::TokenSource;
 use crate::providers::provider::{ModelEntry, Provider, StreamTimeouts};
-use crate::providers::sse::{parse_sse_control, SseEvent};
+use crate::providers::sse::{parse_provider_sse, SseEvent};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -20,6 +20,7 @@ pub struct ResponsesProvider {
     context_window: Option<usize>,
     model_catalog: Vec<ModelEntry>,
     timeouts: StreamTimeouts,
+    reasoning_summary: bool,
 }
 
 impl ResponsesProvider {
@@ -32,6 +33,7 @@ impl ResponsesProvider {
             context_window: None,
             model_catalog: Vec::new(),
             timeouts: StreamTimeouts::default(),
+            reasoning_summary: false,
         }
     }
 
@@ -48,6 +50,12 @@ impl ResponsesProvider {
 
     pub fn with_stream_timeouts(mut self, timeouts: StreamTimeouts) -> Self {
         self.timeouts = timeouts;
+        self
+    }
+
+    /// Enable only for a backend that accepts `reasoning.summary`.
+    pub fn with_reasoning_summary(mut self, enabled: bool) -> Self {
+        self.reasoning_summary = enabled;
         self
     }
 
@@ -74,6 +82,12 @@ impl ResponsesProvider {
             body["reasoning"] = json!({ "effort": effort });
             // store:false requires encrypted reasoning to be echoed across tool calls.
             body["include"] = json!(["reasoning.encrypted_content"]);
+        }
+        if self.reasoning_summary {
+            if body.get("reasoning").is_none() {
+                body["reasoning"] = json!({});
+            }
+            body["reasoning"]["summary"] = json!("auto");
         }
         if !opts.tools.is_empty() {
             body["tools"] = json!(opts
@@ -150,13 +164,10 @@ impl Provider for ResponsesProvider {
         completion.ok_or_else(|| anyhow::anyhow!("responses stream ended without completion"))
     }
 
-    async fn stream(
-        &self,
-        opts: GenerateOptions,
-    ) -> anyhow::Result<mpsc::UnboundedReceiver<StreamEvent>> {
+    async fn stream(&self, opts: GenerateOptions) -> anyhow::Result<mpsc::Receiver<StreamEvent>> {
         let body = self.build_body(&opts);
         let provider = self.clone();
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = crate::providers::provider::stream_channel();
         tokio::spawn(async move {
             let Some(res) =
                 crate::providers::provider::start_stream(&tx, provider.timeouts.startup, async {
@@ -180,14 +191,27 @@ impl Provider for ResponsesProvider {
             let mut text_index: Option<i64> = None;
             let mut usage = Usage::default();
             let mut terminal_seen = false;
+            let mut summaries = BTreeMap::new();
 
-            let consume = parse_sse_control(
+            let consume = parse_provider_sse(
                 res,
                 |event| {
+                    if tx.is_stopped() {
+                        return ControlFlow::Break(());
+                    }
                     let SseEvent::Json(evt) = event else {
                         return ControlFlow::Break(());
                     };
                     let kind = evt["type"].as_str().unwrap_or("");
+                    if let Err(error) = observe_summaries(&evt, &mut summaries, &tx) {
+                        let _ = tx.send(StreamEvent::Error {
+                            message: error.to_string(),
+                        });
+                        return ControlFlow::Break(());
+                    }
+                    if tx.is_stopped() {
+                        return ControlFlow::Break(());
+                    }
                     let invalid_arguments = match kind {
                         "response.function_call_arguments.delta" => {
                             evt.get("delta").is_some_and(|value| !value.is_string())
@@ -278,21 +302,25 @@ impl Provider for ResponsesProvider {
                         "response.function_call_arguments.delta" => {
                             let idx = evt["output_index"].as_i64().unwrap_or(0);
                             if let Some(d) = evt["delta"].as_str() {
-                                if let Some(entry) = tools.get_mut(&idx) {
-                                    entry.2.push_str(d);
-                                    let _ = tx.send(StreamEvent::ToolUseInputDelta {
-                                        id: entry.0.clone(),
-                                        partial_json: d.to_string(),
-                                    });
-                                }
+                                let Some(entry) = tools.get_mut(&idx) else {
+                                    let _ = tx.send(StreamEvent::Error { message: "responses protocol error: tool arguments without an output item".into() });
+                                    return ControlFlow::Break(());
+                                };
+                                entry.2.push_str(d);
+                                let _ = tx.send(StreamEvent::ToolUseInputDelta {
+                                    id: entry.0.clone(),
+                                    partial_json: d.to_string(),
+                                });
                             }
                         }
                         "response.function_call_arguments.done" => {
                             let idx = evt["output_index"].as_i64().unwrap_or(0);
-                            if let Some(entry) = tools.get_mut(&idx) {
-                                if let Some(args) = evt["arguments"].as_str() {
-                                    entry.2 = args.to_string();
-                                }
+                            let Some(entry) = tools.get_mut(&idx) else {
+                                let _ = tx.send(StreamEvent::Error { message: "responses protocol error: final tool arguments without an output item".into() });
+                                return ControlFlow::Break(());
+                            };
+                            if let Some(args) = evt["arguments"].as_str() {
+                                entry.2 = args.to_string();
                             }
                         }
                         "response.completed" | "response.incomplete" => {
@@ -455,7 +483,7 @@ impl Provider for ResponsesProvider {
                         }
                         _ => {}
                     }
-                    if terminal_seen {
+                    if terminal_seen || tx.is_stopped() {
                         ControlFlow::Break(())
                     } else {
                         ControlFlow::Continue(())
@@ -478,6 +506,128 @@ impl Provider for ResponsesProvider {
         });
 
         Ok(rx)
+    }
+}
+
+fn observe_summaries(
+    event: &Value,
+    summaries: &mut BTreeMap<String, Option<String>>,
+    tx: &crate::providers::provider::StreamSender,
+) -> anyhow::Result<()> {
+    let kind = event["type"].as_str().unwrap_or("");
+    match kind {
+        "response.reasoning_summary_text.delta" | "response.reasoning_summary_text.done" => {
+            let id = event["item_id"]
+                .as_str()
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("responses protocol error: summary without item_id")
+                })?;
+            let index = event["summary_index"].as_u64().ok_or_else(|| {
+                anyhow::anyhow!("responses protocol error: summary without summary_index")
+            })?;
+            let delta = kind.ends_with(".delta");
+            let text = event[if delta { "delta" } else { "text" }]
+                .as_str()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("responses protocol error: summary text must be a string")
+                })?;
+            emit_summary(format!("{id}:{index}"), text, delta, summaries, tx);
+        }
+        "response.reasoning_summary_part.done" => {
+            if event["part"]["type"] == "summary_text" {
+                let id = event["item_id"]
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("responses protocol error: summary without item_id")
+                    })?;
+                let index = event["summary_index"].as_u64().ok_or_else(|| {
+                    anyhow::anyhow!("responses protocol error: summary without summary_index")
+                })?;
+                let text = event["part"]["text"].as_str().ok_or_else(|| {
+                    anyhow::anyhow!("responses protocol error: summary text must be a string")
+                })?;
+                emit_summary(format!("{id}:{index}"), text, false, summaries, tx);
+            }
+        }
+        "response.output_item.done" => {
+            observe_summary_item(&event["item"], summaries, tx)?;
+        }
+        "response.completed" | "response.incomplete" => {
+            if let Some(output) = event["response"]["output"].as_array() {
+                for item in output {
+                    observe_summary_item(item, summaries, tx)?;
+                    if tx.is_stopped() {
+                        break;
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn observe_summary_item(
+    item: &Value,
+    summaries: &mut BTreeMap<String, Option<String>>,
+    tx: &crate::providers::provider::StreamSender,
+) -> anyhow::Result<()> {
+    if item["type"] != "reasoning" {
+        return Ok(());
+    }
+    if let Some(parts) = item["summary"].as_array() {
+        for (index, part) in parts.iter().enumerate() {
+            if part["type"] != "summary_text" {
+                continue;
+            }
+            if let Some(text) = part["text"].as_str().filter(|text| !text.is_empty()) {
+                let id = item["id"]
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("responses protocol error: summary without item id")
+                    })?;
+                emit_summary(format!("{id}:{index}"), text, false, summaries, tx);
+                if tx.is_stopped() {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn emit_summary(
+    block_id: String,
+    text: &str,
+    delta: bool,
+    summaries: &mut BTreeMap<String, Option<String>>,
+    tx: &crate::providers::provider::StreamSender,
+) {
+    let state = summaries
+        .entry(block_id.clone())
+        .or_insert_with(|| Some(String::new()));
+    let Some(previous) = state.as_mut() else {
+        return;
+    };
+    let suffix = if delta {
+        text
+    } else if let Some(suffix) = text.strip_prefix(previous.as_str()) {
+        suffix
+    } else {
+        // A corrected final summary cannot safely append to the preview.
+        *state = None;
+        return;
+    };
+    if !suffix.is_empty() {
+        previous.push_str(suffix);
+        let _ = tx.send(StreamEvent::ReasoningDelta {
+            block_id,
+            kind: ReasoningKind::Summary,
+            text: suffix.to_owned(),
+        });
     }
 }
 
@@ -931,6 +1081,207 @@ mod tests {
                 vec![added.clone(), done, completed.clone()],
                 vec![added, delta, completed],
             ]
+        }
+
+        #[test]
+        fn summary_request_requires_explicit_backend_opt_in() {
+            let provider = ResponsesProvider::with_auth(
+                "test".into(),
+                "http://localhost".into(),
+                Arc::new(StaticKey("test".into())),
+            );
+            let options = GenerateOptions {
+                reasoning: ReasoningEffort::High,
+                ..Default::default()
+            };
+            assert_eq!(
+                provider.build_body(&options)["reasoning"],
+                json!({"effort":"high"})
+            );
+            let provider = provider.with_reasoning_summary(true);
+            let body = provider.build_body(&options);
+            assert_eq!(body["reasoning"], json!({"effort":"high","summary":"auto"}));
+            assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+            assert_eq!(
+                provider.build_body(&GenerateOptions::default())["reasoning"],
+                json!({"summary":"auto"})
+            );
+        }
+
+        #[tokio::test]
+        async fn public_summary_is_separate_deduplicated_and_final_answer_is_authoritative() {
+            let item = json!({"type":"reasoning","id":"r1","encrypted_content":"SECRET",
+                "summary":[{"type":"summary_text","text":"Checking files"}]});
+            let events = collect_tool_frames(&[
+                json!({"type":"response.reasoning_summary_text.delta","item_id":"r1","summary_index":0,"delta":"Checking"}),
+                json!({"type":"response.reasoning_summary_text.done","item_id":"r1","summary_index":0,"text":"Checking files"}),
+                json!({"type":"response.reasoning_summary_part.done","item_id":"r1","summary_index":0,"part":{"type":"summary_text","text":"Checking files"}}),
+                json!({"type":"response.output_item.done","output_index":0,"item":item}),
+                json!({"type":"response.output_text.delta","output_index":1,"delta":"draft"}),
+                json!({"type":"response.completed","response":{"output":[item,
+                    {"type":"message","content":[{"type":"output_text","text":"final answer"}]}]}}),
+            ]).await;
+            let summaries: Vec<_> = events
+                .iter()
+                .filter_map(|event| match event {
+                    StreamEvent::ReasoningDelta {
+                        block_id,
+                        kind,
+                        text,
+                    } => Some((block_id.as_str(), kind.clone(), text.as_str())),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                summaries,
+                vec![
+                    ("r1:0", ReasoningKind::Summary, "Checking"),
+                    ("r1:0", ReasoningKind::Summary, " files")
+                ]
+            );
+            let answers: Vec<_> = events
+                .iter()
+                .filter_map(|event| match event {
+                    StreamEvent::TextDelta { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(answers, ["draft"]);
+            let completion = events
+                .iter()
+                .find_map(|event| match event {
+                    StreamEvent::MessageStop { completion } => Some(completion),
+                    _ => None,
+                })
+                .expect("valid final completion");
+            assert_eq!(completion.message.text(), "final answer");
+            assert!(
+                matches!(&completion.message.content[0], ContentBlock::ReasoningItem { item: value } if value == &item)
+            );
+            assert!(!events
+                .iter()
+                .any(|event| matches!(event, StreamEvent::Error { .. })));
+        }
+
+        #[tokio::test]
+        async fn corrected_final_summary_preserves_authoritative_tool_and_answer() {
+            let item = json!({"type":"reasoning","id":"r1","encrypted_content":"opaque",
+                "summary":[{"type":"summary_text","text":"Corrected summary"}]});
+            let events = collect_tool_frames(&[
+                json!({"type":"response.reasoning_summary_text.delta","item_id":"r1","summary_index":0,"delta":"Draft summary"}),
+                json!({"type":"response.output_item.done","output_index":0,"item":item}),
+                json!({"type":"response.completed","response":{"output":[item,
+                    {"type":"message","content":[{"type":"output_text","text":"Final answer"}]},
+                    {"type":"function_call","call_id":"call-1","name":"list_agents","arguments":"{}"}
+                ]}}),
+            ]).await;
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, StreamEvent::ReasoningDelta { .. }))
+                    .count(),
+                1
+            );
+            assert!(
+                matches!(&events[0], StreamEvent::ReasoningDelta { text, .. } if text == "Draft summary")
+            );
+            assert!(!events
+                .iter()
+                .any(|event| matches!(event, StreamEvent::Error { .. })));
+            let Some(StreamEvent::MessageStop { completion }) = events.last() else {
+                panic!("missing completion")
+            };
+            assert_eq!(completion.stop_reason, StopReason::ToolUse);
+            assert_eq!(completion.message.text(), "Final answer");
+            assert!(
+                matches!(&completion.message.content[0], ContentBlock::ReasoningItem { item: actual } if actual == &item)
+            );
+            assert!(
+                matches!(&completion.message.content[2], ContentBlock::ToolUse { id, name, input } if id == "call-1" && name == "list_agents" && input == &json!({}))
+            );
+        }
+
+        #[tokio::test]
+        async fn final_only_summaries_emit_once_and_opaque_payloads_never_emit() {
+            let events = collect_tool_frames(&[
+                json!({"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"opaque","encrypted_content":"SECRET"}}),
+                json!({"type":"response.completed","response":{"output":[
+                    {"type":"reasoning","id":"opaque","encrypted_content":"SECRET"},
+                    {"type":"reasoning","id":"visible","summary":[{"type":"summary_text","text":"Public summary"}]}
+                ]}}),
+            ]).await;
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, StreamEvent::ReasoningDelta { .. }))
+                    .count(),
+                1
+            );
+            assert!(
+                matches!(&events[0], StreamEvent::ReasoningDelta { block_id, text, .. } if block_id == "visible:0" && text == "Public summary")
+            );
+            assert!(matches!(
+                events.last(),
+                Some(StreamEvent::MessageStop { .. })
+            ));
+        }
+
+        #[tokio::test]
+        async fn reasoning_before_eof_error_or_incomplete_never_admits_tools() {
+            for terminal in [
+                None,
+                Some(json!({"type":"response.failed","response":{"error":{"message":"failed"}}})),
+                Some(
+                    json!({"type":"response.incomplete","response":{"incomplete_details":{"reason":"content_filter"}}}),
+                ),
+            ] {
+                let mut frames = vec![
+                    json!({"type":"response.reasoning_summary_text.delta","item_id":"r1","summary_index":0,"delta":"Checking"}),
+                    json!({"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"t1","name":"list_agents","arguments":"{"}}),
+                ];
+                if let Some(terminal) = terminal {
+                    frames.push(terminal);
+                }
+                let events = collect_tool_frames(&frames).await;
+                assert!(matches!(
+                    events.first(),
+                    Some(StreamEvent::ReasoningDelta { .. })
+                ));
+                assert_error(&events);
+            }
+        }
+
+        #[tokio::test]
+        async fn dropping_receiver_during_reasoning_cancels_the_http_producer() {
+            let frame = json!({"type":"response.reasoning_summary_text.delta","item_id":"r1","summary_index":0,"delta":"Checking"});
+            let (base, server) = serve(&format!("data: {frame}\n\n"), true).await;
+            let mut rx = responses(base, StreamTimeouts::default())
+                .stream(GenerateOptions::default())
+                .await
+                .unwrap();
+            assert!(matches!(
+                tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                    .await
+                    .unwrap(),
+                Some(StreamEvent::ReasoningDelta { .. })
+            ));
+            drop(rx);
+            server.await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn orphan_tool_fragments_fail_instead_of_disappearing() {
+            for kind in [
+                "response.function_call_arguments.delta",
+                "response.function_call_arguments.done",
+            ] {
+                let events = collect_tool_frames(&[
+                    json!({"type":kind,"output_index":1,"delta":"{}","arguments":"{}"}),
+                    json!({"type":"response.completed","response":{}}),
+                ])
+                .await;
+                assert_error(&events);
+            }
         }
 
         #[tokio::test]
