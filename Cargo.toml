@@ -1,5 +1,5 @@
 [workspace]
-members = ["src/types", "src/core", "src/kernel", "src/bob", "src/ui"]
+members = ["src/types", "src/core", "src/kernel", "src/bob", "src/ui", "src/voice"]
 default-members = ["src/bob"]
 resolver = "2"
 
