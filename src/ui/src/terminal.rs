@@ -5,7 +5,7 @@ pub mod windows;
 pub fn restore_terminal() -> std::io::Result<()> {
     use crossterm::{
         cursor::Show,
-        event::{DisableBracketedPaste, DisableMouseCapture},
+        event::{DisableBracketedPaste, DisableFocusChange, DisableMouseCapture},
         execute,
         terminal::LeaveAlternateScreen,
     };
@@ -13,7 +13,7 @@ pub fn restore_terminal() -> std::io::Result<()> {
     restore_stages(|stage| match stage {
         RestoreStage::Screen => execute!(output, LeaveAlternateScreen),
         RestoreStage::Paste => execute!(output, DisableBracketedPaste),
-        RestoreStage::Mouse => execute!(output, DisableMouseCapture),
+        RestoreStage::Mouse => execute!(output, DisableMouseCapture, DisableFocusChange),
         RestoreStage::Cursor => execute!(output, Show),
         RestoreStage::Raw => disable_raw_mode(),
     })

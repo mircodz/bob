@@ -54,6 +54,7 @@ mod live;
 #[cfg(test)]
 mod live_tests;
 mod markdown;
+mod notify;
 #[cfg(test)]
 mod output_parity_tests;
 #[cfg(test)]
@@ -156,6 +157,10 @@ pub(crate) async fn run(options: Options, terminal_titles: bool) -> Result<()> {
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let now = tokio::time::Instant::now();
     let mut scheduler = visual::Scheduler::new(now, app.animation_deadline(now));
+    let kitty = notify::is_kitty();
+    let mut focused = true;
+    let mut notified = 0u64;
+    let mut root_phase = None;
     let result: Result<()> = async {
         loop {
             guard.record_mode()?;
@@ -185,6 +190,8 @@ pub(crate) async fn run(options: Options, terminal_titles: bool) -> Result<()> {
                             app.hits.clear();
                             urgency = Some(visual::Urgency::Immediate);
                         }
+                        Event::FocusGained => focused = true,
+                        Event::FocusLost => focused = false,
                         _ => {}
                     }
                 }
@@ -231,6 +238,17 @@ pub(crate) async fn run(options: Options, terminal_titles: bool) -> Result<()> {
                 None => {}
             }
             guard.record_mode()?;
+            if let Some(root) = app.threads.iter().find(|thread| thread.parent_thread.is_none()) {
+                let phase = notify::phase(root);
+                if let Some(message) = root_phase.and_then(|previous| notify::message(previous, phase)) {
+                    if kitty || !focused {
+                        notified += 1;
+                        let title = app.terminal_title();
+                        notify::send(terminal.backend_mut(), kitty, notified, &title, message);
+                    }
+                }
+                root_phase = Some(phase);
+            }
             let now = tokio::time::Instant::now();
             if let Some(urgency) = urgency {
                 scheduler.invalidate(now, urgency);
@@ -395,7 +413,8 @@ impl TerminalGuard {
             io::stdout(),
             EnterAlternateScreen,
             EnableBracketedPaste,
-            EnableMouseCapture
+            EnableMouseCapture,
+            crossterm::event::EnableFocusChange
         )?;
         Ok(guard)
     }
