@@ -215,6 +215,33 @@ fn production_model_flags_are_not_restricted_to_copilot() {
     }
 }
 
+#[test]
+fn reasoning_flag_parses_levels_and_leaves_the_lsp_root_short_flag_alone() {
+    for (args, expected) in [
+        (vec!["bob"], None),
+        (vec!["bob", "-r", "off"], Some(ReasoningEffort::Off)),
+        (
+            vec!["bob", "--resume", "--reasoning", "MAX"],
+            Some(ReasoningEffort::Max),
+        ),
+    ] {
+        let cli = Args::try_parse_from(&args).unwrap();
+        assert_eq!(cli.reasoning, expected, "{args:?}");
+    }
+    let error = Args::try_parse_from(["bob", "-r", "loud"]).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::ValueValidation);
+    assert!(error
+        .to_string()
+        .contains("expected off, low, medium, high or max"));
+    let cli = Args::try_parse_from([
+        "bob", "lsp", "add", "ts", "--ext", "ts", "-r", "web", "--", "tsls",
+    ])
+    .unwrap();
+    assert!(
+        matches!(cli.command, Some(Command::Lsp { action: LspAction::Add { root, .. } }) if root == "web")
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn isolated_admin_config_and_server_roundtrip() -> anyhow::Result<()> {

@@ -104,10 +104,11 @@ pub(crate) async fn create_with_options(
 
     // Backend input-token limits take precedence over model-name heuristics.
     let model_limits = auth::fetch_model_limits(&tok, &api_base).await;
-    let window = model_limits
-        .iter()
-        .find(|m| m.id == model)
-        .and_then(|m| m.max_prompt_tokens.or(m.max_context_window_tokens));
+    let advertised = model_limits.iter().find(|m| m.id == model);
+    let window = advertised.and_then(|m| m.max_prompt_tokens.or(m.max_context_window_tokens));
+    let reasoning_efforts = advertised
+        .map(|m| m.reasoning_efforts.clone())
+        .unwrap_or_default();
 
     let source: Arc<dyn TokenSource> = Arc::new(source);
 
@@ -129,7 +130,8 @@ pub(crate) async fn create_with_options(
         Ok(Arc::new(
             OpenAiProvider::with_auth(model, api_base, source)
                 .with_stream_timeouts(timeouts)
-                .with_context_window(window),
+                .with_context_window(window)
+                .with_reasoning_efforts(reasoning_efforts),
         ))
     }
 }

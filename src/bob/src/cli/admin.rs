@@ -176,6 +176,10 @@ async fn run_login(which: &str) -> anyhow::Result<()> {
             bob_core::auth::openai::finish_login(&device, dot).await?;
             done("OpenAI", "openai")
         }
+        "deepseek" => anyhow::bail!(
+            "DeepSeek uses an API key instead of a login: set DEEPSEEK_API_KEY \
+             (create one at https://platform.deepseek.com/api_keys)"
+        ),
         other => anyhow::bail!(
             "unknown provider '{}'. known: copilot, anthropic, openai",
             other
@@ -213,6 +217,7 @@ fn show_auth() -> anyhow::Result<()> {
     for (env, prov) in [
         ("ANTHROPIC_API_KEY", "anthropic"),
         ("OPENAI_API_KEY", "openai"),
+        ("DEEPSEEK_API_KEY", "deepseek"),
     ] {
         if std::env::var(env).is_ok() {
             println!("  \x1b[90m{} is set (api key for {})\x1b[0m", env, prov);

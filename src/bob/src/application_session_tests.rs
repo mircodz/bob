@@ -118,6 +118,7 @@ fn invalid_initial_reasoning_can_be_corrected_without_orphaning_storage() -> Res
             provider: Some("fixture-no-provider:fixture".into()),
             model: None,
             worker_model: None,
+            reasoning: None,
             selection: SessionSelection::New,
             page_size: 80,
         };
@@ -216,6 +217,7 @@ fn owned_resume_fails_before_provider_startup_and_failed_startup_releases_claim(
                 provider: Some("fixture-no-provider:fixture".into()),
                 model: None,
                 worker_model: None,
+                reasoning: None,
                 selection: SessionSelection::Id(created.session.clone()),
                 page_size: 80,
             };

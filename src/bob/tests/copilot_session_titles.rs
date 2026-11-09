@@ -52,6 +52,7 @@ impl Fixture {
             provider: Some("copilot".into()),
             model: Some(model.into()),
             worker_model: None,
+            reasoning: None,
             selection,
             page_size: 80,
         }

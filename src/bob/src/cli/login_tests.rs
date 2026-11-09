@@ -47,6 +47,7 @@ fn first_successful_login_selects_global_default_without_changing_other_choices(
             provider: args.provider,
             model: args.model,
             worker_model: args.worker_model,
+            reasoning: args.reasoning,
             selection: SessionSelection::New,
             page_size: args.limit,
         };

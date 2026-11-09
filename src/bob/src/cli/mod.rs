@@ -4,8 +4,13 @@ mod sessions;
 #[cfg(test)]
 mod tests;
 
+use bob_types::ReasoningEffort;
 use clap::Parser;
 use std::path::PathBuf;
+
+fn parse_reasoning(value: &str) -> Result<ReasoningEffort, String> {
+    ReasoningEffort::parse(value).ok_or_else(|| "expected off, low, medium, high or max".to_owned())
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -29,7 +34,7 @@ pub struct Args {
         short = 'p',
         long,
         global = true,
-        help = "Provider id: copilot | anthropic | openai"
+        help = "Provider id: copilot | anthropic | openai | deepseek"
     )]
     pub provider: Option<String>,
     #[arg(
@@ -39,6 +44,14 @@ pub struct Args {
         help = "Model id within the provider, or a provider-qualified model id"
     )]
     pub model: Option<String>,
+    #[arg(
+        short = 'r',
+        long,
+        value_name = "EFFORT",
+        value_parser = parse_reasoning,
+        help = "Reasoning effort: off | low | medium | high | max. Overrides the configured default and a resumed session's level"
+    )]
+    pub reasoning: Option<ReasoningEffort>,
     #[arg(long, help = "Model id for delegated work")]
     pub worker_model: Option<String>,
     #[arg(

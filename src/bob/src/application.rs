@@ -27,6 +27,7 @@ pub struct LaunchOptions {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub worker_model: Option<String>,
+    pub reasoning: Option<ReasoningEffort>,
     pub selection: SessionSelection,
     pub page_size: usize,
 }
@@ -83,17 +84,7 @@ fn launch_model_spec(
     restored: Option<&Profile>,
 ) -> String {
     if let Some(model) = &options.model {
-        if [
-            "copilot:",
-            "openai:",
-            "anthropic:",
-            "copilot/",
-            "openai/",
-            "anthropic/",
-        ]
-        .iter()
-        .any(|prefix| model.starts_with(prefix))
-        {
+        if crate::provider::is_provider_qualified(model) {
             return model.clone();
         }
     }
@@ -139,9 +130,13 @@ fn launch_model_spec(
     )
 }
 
-fn launch_reasoning(config: &BobConfig, restored: Option<&Profile>) -> Result<ReasoningEffort> {
-    if let Some(profile) = restored {
-        return Ok(profile.reasoning);
+fn launch_reasoning(
+    explicit: Option<ReasoningEffort>,
+    config: &BobConfig,
+    restored: Option<&Profile>,
+) -> Result<ReasoningEffort> {
+    if let Some(effort) = explicit.or(restored.map(|profile| profile.reasoning)) {
+        return Ok(effort);
     }
     if config.reasoning.is_empty() {
         Ok(ReasoningEffort::Off)
@@ -218,7 +213,11 @@ fn prepare_launch(mut options: LaunchOptions) -> Result<PreparedLaunch> {
     ensure!(workspace.is_dir(), "stored workspace must be a directory");
     let config = load_config(&workspace)?;
     let permission_policy = permissions(&config)?;
-    launch_reasoning(&config, selected.as_ref().map(|session| &session.profile))?;
+    launch_reasoning(
+        options.reasoning,
+        &config,
+        selected.as_ref().map(|session| &session.profile),
+    )?;
     let claim = selected
         .as_ref()
         .map(|session| SessionClaim::acquire(&options.database, session.id.clone()))
@@ -231,7 +230,11 @@ fn prepare_launch(mut options: LaunchOptions) -> Result<PreparedLaunch> {
         );
         selected = Some(fresh);
     }
-    let reasoning = launch_reasoning(&config, selected.as_ref().map(|session| &session.profile))?;
+    let reasoning = launch_reasoning(
+        options.reasoning,
+        &config,
+        selected.as_ref().map(|session| &session.profile),
+    )?;
     Ok(PreparedLaunch {
         options,
         workspace,
@@ -446,6 +449,7 @@ mod tests {
             provider: None,
             model: None,
             worker_model: None,
+            reasoning: None,
             selection: SessionSelection::New,
             page_size: 80,
         }

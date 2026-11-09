@@ -63,6 +63,7 @@ fn limits(id: &str) -> ModelLimits {
         max_context_window_tokens: Some(128_000),
         max_prompt_tokens: Some(120_000),
         max_output_tokens: Some(8000),
+        ..Default::default()
     }
 }
 
@@ -141,10 +142,12 @@ fn normalization_never_infers_a_paid_provider_from_a_model_name() {
     for (input, expected) in [
         ("gpt-5", "copilot:gpt-5"),
         ("claude-sonnet-5", "copilot:claude-sonnet-5"),
+        ("deepseek-flash", "copilot:deepseek-flash"),
         ("copilot:m", "copilot:m"),
         ("copilot/m", "copilot:m"),
         ("openai:m", "openai:m"),
         ("anthropic/m", "anthropic:m"),
+        ("deepseek/m", "deepseek:m"),
         (
             "copilot:vendor/model:preview",
             "copilot:vendor/model:preview",
@@ -152,6 +155,7 @@ fn normalization_never_infers_a_paid_provider_from_a_model_name() {
         ("copilot", "copilot"),
         ("openai", "openai"),
         ("anthropic", "anthropic"),
+        ("deepseek", "deepseek"),
     ] {
         assert_eq!(normalize_model_id(input).unwrap(), expected);
     }
@@ -263,7 +267,7 @@ async fn explicit_worker_provider_gets_its_own_catalog_and_identity() {
 
 #[tokio::test]
 async fn provider_only_defaults_come_from_factory_and_catalog() {
-    for kind in ["copilot", "openai", "anthropic"] {
+    for kind in ["copilot", "openai", "anthropic", "deepseek"] {
         let factory = Arc::new(Factory::default());
         let service = create(factory.clone(), &[kind]).await;
         let expected = format!("{kind}:factory-default");
@@ -364,7 +368,7 @@ async fn lazy_factory_failure_is_not_cached_or_retried_by_adapter() {
 
 #[tokio::test]
 async fn enumeration_outage_keeps_explicit_normal_model_usable() {
-    for kind in ["openai", "anthropic"] {
+    for kind in ["openai", "anthropic", "deepseek"] {
         let factory = Arc::new(Factory {
             fail_list: true,
             ..Default::default()

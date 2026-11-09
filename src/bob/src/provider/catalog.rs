@@ -13,16 +13,18 @@ pub(super) enum ProviderKind {
     Copilot,
     OpenAi,
     Anthropic,
+    DeepSeek,
 }
 
 impl ProviderKind {
-    fn parse(value: &str) -> Result<Self> {
+    pub(super) fn parse(value: &str) -> Result<Self> {
         match value {
             "copilot" => Ok(Self::Copilot),
             "openai" => Ok(Self::OpenAi),
             "anthropic" => Ok(Self::Anthropic),
+            "deepseek" => Ok(Self::DeepSeek),
             _ => anyhow::bail!(
-                "unknown provider {value:?}; known providers: copilot, openai, anthropic"
+                "unknown provider {value:?}; known providers: copilot, openai, anthropic, deepseek"
             ),
         }
     }
@@ -32,6 +34,7 @@ impl ProviderKind {
             Self::Copilot => "copilot",
             Self::OpenAi => "openai",
             Self::Anthropic => "anthropic",
+            Self::DeepSeek => "deepseek",
         }
     }
 }

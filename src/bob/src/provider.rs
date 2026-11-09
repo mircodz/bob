@@ -19,13 +19,16 @@ pub fn normalize_model_id(value: &str) -> Result<String> {
     Ok(Selection::parse(value)?.id())
 }
 
+/// Whether `value` starts with a known provider, as in `deepseek:model` or `openai/model`.
+pub fn is_provider_qualified(value: &str) -> bool {
+    value
+        .split_once([':', '/'])
+        .is_some_and(|(provider, _)| ProviderKind::parse(provider).is_ok())
+}
+
 pub fn qualify_model_id(value: &str, current: &str) -> Result<String> {
-    if value.contains(':')
-        || ["copilot/", "openai/", "anthropic/"]
-            .iter()
-            .any(|prefix| value.starts_with(prefix))
-        || matches!(value, "copilot" | "openai" | "anthropic")
-    {
+    let prefix = value.split('/').next().unwrap_or(value);
+    if value.contains(':') || ProviderKind::parse(prefix).is_ok() {
         return normalize_model_id(value);
     }
     let current = Selection::parse(current)?;
@@ -309,6 +312,7 @@ mod tests {
             max_context_window_tokens: Some(12345),
             max_prompt_tokens: Some(12000),
             max_output_tokens: Some(1000),
+            ..Default::default()
         })
         .unwrap();
         assert_eq!(binding.info.id, "copilot:m");
@@ -415,6 +419,7 @@ mod tests {
             max_context_window_tokens: Some(32000),
             max_prompt_tokens: Some(8000),
             max_output_tokens: Some(2000),
+            ..Default::default()
         };
         let mut binding = catalog::copilot_binding(&limits).unwrap();
         binding.provider = OnceCell::new_with(Some(leaf.clone() as Arc<dyn Provider>));

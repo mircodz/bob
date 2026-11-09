@@ -7,6 +7,7 @@ fn options(provider: Option<&str>, model: Option<&str>) -> LaunchOptions {
         provider: provider.map(str::to_owned),
         model: model.map(str::to_owned),
         worker_model: None,
+        reasoning: None,
         selection: SessionSelection::Latest,
         page_size: 80,
     }
@@ -36,6 +37,7 @@ fn resume_resolves_model_and_reasoning_precedence_independently() {
             (None, None, format!("{provider}:restored")),
             (None, Some("override"), format!("{provider}:override")),
             (None, Some("openai/explicit"), "openai/explicit".into()),
+            (None, Some("deepseek/explicit"), "deepseek/explicit".into()),
             (
                 None,
                 Some("anthropic:explicit"),
@@ -53,7 +55,7 @@ fn resume_resolves_model_and_reasoning_precedence_independently() {
                 expected
             );
             assert_eq!(
-                launch_reasoning(&config, Some(&restored)).unwrap(),
+                launch_reasoning(None, &config, Some(&restored)).unwrap(),
                 ReasoningEffort::Off
             );
         }
@@ -63,7 +65,7 @@ fn resume_resolves_model_and_reasoning_precedence_independently() {
         "copilot:configured"
     );
     assert_eq!(
-        launch_reasoning(&config, None).unwrap(),
+        launch_reasoning(None, &config, None).unwrap(),
         ReasoningEffort::High
     );
 }
@@ -124,21 +126,40 @@ fn restored_reasoning_including_off_wins_even_over_invalid_config() {
         ReasoningEffort::Max,
     ] {
         assert_eq!(
-            launch_reasoning(&config, Some(&profile("openai:restored", effort))).unwrap(),
+            launch_reasoning(None, &config, Some(&profile("openai:restored", effort))).unwrap(),
             effort
         );
     }
-    assert!(launch_reasoning(&config, None).is_err());
+    assert!(launch_reasoning(None, &config, None).is_err());
     config.reasoning.clear();
     assert_eq!(
-        launch_reasoning(&config, None).unwrap(),
+        launch_reasoning(None, &config, None).unwrap(),
         ReasoningEffort::Off
     );
 }
 
 #[test]
+fn explicit_reasoning_wins_over_restored_and_invalid_configured_levels() {
+    let config = BobConfig {
+        reasoning: "invalid".into(),
+        ..Default::default()
+    };
+    let restored = profile("deepseek:restored", ReasoningEffort::High);
+    for effort in [ReasoningEffort::Off, ReasoningEffort::Max] {
+        assert_eq!(
+            launch_reasoning(Some(effort), &config, Some(&restored)).unwrap(),
+            effort
+        );
+        assert_eq!(
+            launch_reasoning(Some(effort), &config, None).unwrap(),
+            effort
+        );
+    }
+}
+
+#[test]
 fn interactive_model_qualification_uses_current_provider_but_preserves_explicit_choices() {
-    for current in ["copilot:old", "anthropic:old", "openai:old"] {
+    for current in ["copilot:old", "anthropic:old", "openai:old", "deepseek:old"] {
         let provider = current.split_once(':').unwrap().0;
         assert_eq!(
             crate::provider::qualify_model_id("next", current).unwrap(),
@@ -159,6 +180,10 @@ fn interactive_model_qualification_uses_current_provider_but_preserves_explicit_
         assert_eq!(
             crate::provider::qualify_model_id("copilot", current).unwrap(),
             "copilot"
+        );
+        assert_eq!(
+            crate::provider::qualify_model_id("deepseek/deepseek-v4-pro", current).unwrap(),
+            "deepseek:deepseek-v4-pro"
         );
         assert!(crate::provider::qualify_model_id("unknown:explicit", current).is_err());
         assert!(crate::provider::qualify_model_id("bad model", current).is_err());

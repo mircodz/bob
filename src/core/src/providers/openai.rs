@@ -80,6 +80,10 @@ pub struct OpenAiProvider {
     /// Authoritative input-token budget; `None` uses model-name heuristics.
     context_window: Option<usize>,
     timeouts: StreamTimeouts,
+    /// Backend-advertised `reasoning_effort` levels; empty uses name heuristics.
+    reasoning_efforts: Vec<String>,
+    /// DeepSeek wire rules: replay reasoning as `reasoning_content`, disable thinking for Off.
+    deepseek: bool,
 }
 
 impl OpenAiProvider {
@@ -98,6 +102,8 @@ impl OpenAiProvider {
             client: http_client(),
             context_window: None,
             timeouts: StreamTimeouts::default(),
+            reasoning_efforts: Vec::new(),
+            deepseek: false,
         }
     }
 
@@ -109,7 +115,46 @@ impl OpenAiProvider {
             client: http_client(),
             context_window: None,
             timeouts: StreamTimeouts::default(),
+            reasoning_efforts: Vec::new(),
+            deepseek: false,
         }
+    }
+
+    pub fn with_reasoning_efforts(mut self, efforts: Vec<String>) -> Self {
+        self.reasoning_efforts = efforts;
+        self
+    }
+
+    /// DeepSeek rejects tool requests (400) unless earlier reasoning comes back as
+    /// `reasoning_content`, and it thinks unless thinking is explicitly disabled.
+    pub fn with_deepseek_dialect(mut self) -> Self {
+        self.deepseek = true;
+        self
+    }
+
+    fn label(&self) -> &'static str {
+        if self.deepseek {
+            "deepseek"
+        } else {
+            "openai"
+        }
+    }
+
+    fn reasoning_effort(&self, effort: ReasoningEffort) -> Option<String> {
+        let requested = effort.as_str()?;
+        if self.reasoning_efforts.is_empty() {
+            return chat_supports_reasoning(&self.model).then(|| requested.to_owned());
+        }
+        if effort != ReasoningEffort::Max {
+            if let Some(level) = self
+                .reasoning_efforts
+                .iter()
+                .find(|l| l.as_str() == requested)
+            {
+                return Some(level.clone());
+            }
+        }
+        self.reasoning_efforts.last().cloned()
     }
 
     pub fn with_context_window(mut self, window: Option<usize>) -> Self {
@@ -128,7 +173,7 @@ impl OpenAiProvider {
             messages.push(json!({ "role": "system", "content": sys }));
         }
         for m in &opts.messages {
-            messages.extend(to_api_messages(m));
+            messages.extend(to_api_messages(m, self.deepseek));
         }
         let mut body = json!({
             "model": self.model,
@@ -146,12 +191,12 @@ impl OpenAiProvider {
             body["temperature"] = json!(t);
         }
         // Non-reasoning models reject reasoning_effort; Off omits it.
-        if chat_supports_reasoning(&self.model) {
-            if let Some(effort) = opts.reasoning.as_str() {
-                body["reasoning_effort"] = json!(effort);
-                // Reasoning models reject an explicit temperature.
-                body.as_object_mut().map(|o| o.remove("temperature"));
-            }
+        if let Some(effort) = self.reasoning_effort(opts.reasoning) {
+            body["reasoning_effort"] = json!(effort);
+            // Reasoning models reject an explicit temperature.
+            body.as_object_mut().map(|o| o.remove("temperature"));
+        } else if self.deepseek && opts.reasoning == ReasoningEffort::Off {
+            body["thinking"] = json!({ "type": "disabled" });
         }
         if !opts.tools.is_empty() {
             body["tools"] = json!(opts
@@ -195,7 +240,7 @@ impl OpenAiProvider {
 #[async_trait]
 impl Provider for OpenAiProvider {
     fn name(&self) -> &str {
-        "openai"
+        self.label()
     }
     fn model(&self) -> &str {
         &self.model
@@ -210,17 +255,18 @@ impl Provider for OpenAiProvider {
 
     async fn generate_once(&self, opts: GenerateOptions) -> anyhow::Result<Completion> {
         let body = self.build_body(&opts, false);
+        let label = self.label();
         let res = tokio::time::timeout(self.timeouts.startup, async {
-            crate::providers::provider::send_once(self.request(body).await?, "openai").await
+            crate::providers::provider::send_once(self.request(body).await?, label).await
         })
         .await
-        .map_err(|_| anyhow::anyhow!("openai startup deadline exceeded"))??;
+        .map_err(|_| anyhow::anyhow!("{label} startup deadline exceeded"))??;
         let data: Value = tokio::time::timeout(
             self.timeouts.idle,
             crate::providers::provider::response_json(res),
         )
         .await
-        .map_err(|_| anyhow::anyhow!("openai response body deadline exceeded"))??;
+        .map_err(|_| anyhow::anyhow!("{label} response body deadline exceeded"))??;
         let choice = &data["choices"][0];
         let cached = data["usage"]["prompt_tokens_details"]["cached_tokens"]
             .as_u64()
@@ -242,11 +288,12 @@ impl Provider for OpenAiProvider {
     async fn stream(&self, opts: GenerateOptions) -> anyhow::Result<mpsc::Receiver<StreamEvent>> {
         let body = self.build_body(&opts, true);
         let provider = self.clone();
+        let label = self.label();
         let (tx, rx) = crate::providers::provider::stream_channel();
         tokio::spawn(async move {
             let Some(res) = crate::providers::provider::start_stream(
                 &tx, provider.timeouts.startup, async {
-                    crate::providers::provider::send_once(provider.request(body).await?, "openai")
+                    crate::providers::provider::send_once(provider.request(body).await?, label)
                         .await.map_err(|error| {
                             if error.to_string().contains("unsupported_api_for_model") {
                                 anyhow::anyhow!("model '{}' needs the Responses API — log in with `bob login openai` or pick a chat model", provider.model)
@@ -255,6 +302,7 @@ impl Provider for OpenAiProvider {
                 },
             ).await else { return; };
             let mut text = String::new();
+            let mut thinking = String::new();
             let mut finish = None;
             let mut protocol_error = None;
             let mut usage = Usage::default();
@@ -271,7 +319,7 @@ impl Provider for OpenAiProvider {
                         return ControlFlow::Break(());
                     };
                     if let Some(error) = evt.get("error") {
-                        protocol_error = Some(format!("openai: {error}"));
+                        protocol_error = Some(format!("{label}: {error}"));
                         return ControlFlow::Break(());
                     }
                     // The final chunk carries usage with an empty choices array.
@@ -299,6 +347,20 @@ impl Provider for OpenAiProvider {
                     }
                     let delta = &choice["delta"];
 
+                    // Copilot streams Claude thinking as `reasoning_text`; DeepSeek uses `reasoning_content`.
+                    let reasoning = delta["reasoning_text"]
+                        .as_str()
+                        .or_else(|| delta["reasoning_content"].as_str());
+                    if let Some(r) = reasoning {
+                        if !r.is_empty() {
+                            thinking.push_str(r);
+                            let _ = tx.send(StreamEvent::ReasoningDelta {
+                                block_id: evt["id"].as_str().unwrap_or("reasoning").to_string(),
+                                kind: ReasoningKind::Thinking,
+                                text: r.to_string(),
+                            });
+                        }
+                    }
                     if let Some(c) = delta["content"].as_str() {
                         if !c.is_empty() {
                             text.push_str(c);
@@ -369,7 +431,7 @@ impl Provider for OpenAiProvider {
             }
             if let Err(e) = sse {
                 let _ = tx.send(StreamEvent::Error {
-                    message: format!("openai stream ended: {e}"),
+                    message: format!("{label} stream ended: {e}"),
                 });
                 return;
             }
@@ -380,17 +442,24 @@ impl Provider for OpenAiProvider {
             }
             let Some(finish) = finish else {
                 let _ = tx.send(StreamEvent::Error {
-                    message: "openai stream ended without finish_reason".into(),
+                    message: format!("{label} stream ended without finish_reason"),
                 });
                 return;
             };
             if finish == "content_filter" {
                 let _ = tx.send(StreamEvent::Error {
-                    message: "openai completion blocked by content_filter".into(),
+                    message: format!("{label} completion blocked by content_filter"),
                 });
                 return;
             }
             let mut content: Vec<ContentBlock> = Vec::new();
+            // Unsigned, so Anthropic never replays it; only DeepSeek gets it back as input.
+            if !thinking.is_empty() {
+                content.push(ContentBlock::Thinking {
+                    thinking,
+                    signature: String::new(),
+                });
+            }
             if !text.is_empty() {
                 content.push(ContentBlock::Text { text });
             }
@@ -405,7 +474,7 @@ impl Provider for OpenAiProvider {
                         Ok(input) => input,
                         Err(error) => {
                             let _ = tx.send(StreamEvent::Error {
-                                message: format!("openai: {error}"),
+                                message: format!("{label}: {error}"),
                             });
                             return;
                         }
@@ -512,8 +581,9 @@ fn map_finish(reason: &str) -> StopReason {
     crate::providers::codec::map_stop_reason(reason)
 }
 
-/// Tool results split into separate Chat Completions messages.
-fn to_api_messages(m: &Message) -> Vec<Value> {
+/// Tool results split into separate Chat Completions messages. With `reasoning_content`,
+/// every assistant message carries it, empty when there was no thinking, as DeepSeek requires.
+fn to_api_messages(m: &Message, reasoning_content: bool) -> Vec<Value> {
     if m.role == Role::Tool {
         return m
             .content
@@ -533,12 +603,14 @@ fn to_api_messages(m: &Message) -> Vec<Value> {
     }
 
     let mut text = String::new();
+    let mut reasoning = String::new();
     let mut tool_calls: Vec<Value> = Vec::new();
     for b in &m.content {
         match classify_block(b) {
             OpenAiBlock::Text(t) => text.push_str(&t),
+            OpenAiBlock::Reasoning(t) => reasoning.push_str(&t),
             OpenAiBlock::ToolCall(v) => tool_calls.push(v),
-            // Tool results require Role::Tool; reasoning blocks have no chat representation.
+            // Tool results require Role::Tool; opaque reasoning has no chat representation.
             OpenAiBlock::ToolResult { .. } | OpenAiBlock::SkipUnsupported => {}
         }
     }
@@ -556,11 +628,15 @@ fn to_api_messages(m: &Message) -> Vec<Value> {
     if !tool_calls.is_empty() {
         msg["tool_calls"] = json!(tool_calls);
     }
+    if reasoning_content && m.role == Role::Assistant {
+        msg["reasoning_content"] = json!(reasoning);
+    }
     vec![msg]
 }
 
 enum OpenAiBlock {
     Text(String),
+    Reasoning(String),
     ToolCall(Value),
     ToolResult {
         tool_use_id: String,
@@ -585,15 +661,21 @@ fn classify_block(b: &ContentBlock) -> OpenAiBlock {
             tool_use_id: tool_use_id.clone(),
             content: content.model_text().into_owned(),
         },
-        // Anthropic thinking and Responses reasoning have no chat representation.
-        ContentBlock::Thinking { .. }
-        | ContentBlock::RedactedThinking { .. }
-        | ContentBlock::ReasoningItem { .. } => OpenAiBlock::SkipUnsupported,
+        ContentBlock::Thinking { thinking, .. } => OpenAiBlock::Reasoning(thinking.clone()),
+        ContentBlock::RedactedThinking { .. } | ContentBlock::ReasoningItem { .. } => {
+            OpenAiBlock::SkipUnsupported
+        }
     }
 }
 
 fn from_api_message(msg: &Value) -> Message {
     let mut content: Vec<ContentBlock> = Vec::new();
+    if let Some(r) = msg["reasoning_content"].as_str().filter(|r| !r.is_empty()) {
+        content.push(ContentBlock::Thinking {
+            thinking: r.to_string(),
+            signature: String::new(),
+        });
+    }
     if let Some(c) = msg["content"].as_str() {
         if !c.is_empty() {
             content.push(ContentBlock::Text {
@@ -708,8 +790,129 @@ mod tests {
                     role,
                     content: vec![block],
                 };
-                assert_eq!(to_api_messages(&message), vec![expected], "{message:?}");
+                assert_eq!(
+                    to_api_messages(&message, false),
+                    vec![expected],
+                    "{message:?}"
+                );
             }
+        }
+        #[test]
+        fn advertised_reasoning_levels_enable_claude_and_map_max_to_the_top_level() {
+            let provider = OpenAiProvider::with_auth(
+                "claude-opus-5.5".into(),
+                "https://example.invalid/".into(),
+                Arc::new(crate::auth::StaticKey("test".into())),
+            );
+            let options = |reasoning| GenerateOptions {
+                reasoning,
+                ..Default::default()
+            };
+            assert!(provider
+                .build_body(&options(ReasoningEffort::Max), true)
+                .get("reasoning_effort")
+                .is_none());
+            let provider = provider.with_reasoning_efforts(
+                ["low", "medium", "high", "xhigh", "max"]
+                    .map(String::from)
+                    .to_vec(),
+            );
+            for (effort, expected) in [
+                (ReasoningEffort::Off, None),
+                (ReasoningEffort::Low, Some("low")),
+                (ReasoningEffort::High, Some("high")),
+                (ReasoningEffort::Max, Some("max")),
+            ] {
+                assert_eq!(
+                    provider
+                        .build_body(&options(effort), true)
+                        .get("reasoning_effort"),
+                    expected.map(|v| json!(v)).as_ref()
+                );
+            }
+        }
+        #[test]
+        fn deepseek_dialect_replays_reasoning_on_every_assistant_message_and_toggles_thinking() {
+            let key = || Arc::new(crate::auth::StaticKey("test".into()));
+            let deepseek = OpenAiProvider::with_auth(
+                "deepseek-flash".into(),
+                "https://example.invalid".into(),
+                key(),
+            )
+            .with_deepseek_dialect()
+            .with_reasoning_efforts(["low", "medium", "high", "max"].map(String::from).to_vec());
+            let thinking = |text: &str| ContentBlock::Thinking {
+                thinking: text.into(),
+                signature: String::new(),
+            };
+            let messages = vec![
+                Message::user_text("list agents"),
+                Message {
+                    role: Role::Assistant,
+                    content: vec![
+                        thinking("Use "),
+                        thinking("the tool"),
+                        ContentBlock::ToolUse {
+                            id: "call-1".into(),
+                            name: "list_agents".into(),
+                            input: json!({}),
+                        },
+                    ],
+                },
+                Message {
+                    role: Role::Tool,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: "call-1".into(),
+                        content: "[]".into(),
+                        is_error: Some(false),
+                    }],
+                },
+                Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: "None".into(),
+                    }],
+                },
+            ];
+            let options = |reasoning| GenerateOptions {
+                messages: messages.clone(),
+                reasoning,
+                ..Default::default()
+            };
+            let body = deepseek.build_body(&options(ReasoningEffort::Off), true);
+            assert_eq!(
+                body["messages"],
+                json!([
+                    {"role":"user","content":"list agents"},
+                    {"role":"assistant","content":null,"reasoning_content":"Use the tool","tool_calls":[
+                        {"id":"call-1","type":"function","function":{"name":"list_agents","arguments":"{}"}}
+                    ]},
+                    {"role":"tool","tool_call_id":"call-1","content":"[]"},
+                    {"role":"assistant","content":"None","reasoning_content":""}
+                ])
+            );
+            assert_eq!(body["thinking"], json!({"type":"disabled"}));
+            assert!(body.get("reasoning_effort").is_none());
+            for (effort, expected) in [
+                (ReasoningEffort::Low, "low"),
+                (ReasoningEffort::Medium, "medium"),
+                (ReasoningEffort::High, "high"),
+                (ReasoningEffort::Max, "max"),
+            ] {
+                let body = deepseek.build_body(&options(effort), true);
+                assert_eq!(body["reasoning_effort"], expected);
+                assert!(body.get("thinking").is_none());
+            }
+
+            let openai =
+                OpenAiProvider::with_auth("gpt-4o".into(), "https://example.invalid".into(), key());
+            let body = openai.build_body(&options(ReasoningEffort::Off), true);
+            assert!(body.get("thinking").is_none());
+            assert!(body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|message| message.get("reasoning_content").is_none()));
         }
         #[test]
         fn request_options_gate_reasoning_temperature_and_stream_usage() {
@@ -823,7 +1026,7 @@ mod tests {
                 ],
             };
             assert_eq!(
-                to_api_messages(&message),
+                to_api_messages(&message, false),
                 vec![json!({
                     "role":"assistant","content":"日本語 😀","tool_calls":[
                         {"id":"call-b","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a\\nb.rs\"}"}},
@@ -847,7 +1050,7 @@ mod tests {
                 ],
             };
             assert_eq!(
-                to_api_messages(&results),
+                to_api_messages(&results, false),
                 vec![
                     json!({"role":"tool","tool_call_id":"call-b","content":"not found"}),
                     json!({"role":"tool","tool_call_id":"call-a","content":"[]"}),
@@ -880,6 +1083,21 @@ mod tests {
                 "{\"path\":"
             );
             assert!(crate::providers::codec::tool_input_parse_error(input).is_some());
+        }
+
+        #[test]
+        fn response_decoding_keeps_deepseek_reasoning_ahead_of_the_answer() {
+            let message =
+                from_api_message(&json!({"reasoning_content":"Think","content":"Answer"}));
+            assert_eq!(
+                serde_json::to_value(&message).unwrap(),
+                json!({"role":"assistant","content":[
+                    {"type":"thinking","thinking":"Think","signature":""},
+                    {"type":"text","text":"Answer"}
+                ]})
+            );
+            let message = from_api_message(&json!({"reasoning_content":"","content":"Answer"}));
+            assert!(matches!(&message.content[..], [ContentBlock::Text { .. }]));
         }
     }
 
@@ -1050,6 +1268,53 @@ mod tests {
                 })
             );
             server.await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn chat_streams_copilot_and_deepseek_reasoning_as_thinking() {
+            // Copilot sends `reasoning_text`; DeepSeek sends `reasoning_content`.
+            for field in ["reasoning_text", "reasoning_content"] {
+                let frames = [
+                    json!({"id":"msg_1","choices":[{"delta":{"content":null,"role":"assistant",field:"Checking "}}]}),
+                    json!({"id":"msg_1","choices":[{"delta":{"content":null,field:"divisors"}}]}),
+                    json!({"id":"msg_1","choices":[{"delta":{"content":"Prime"},"finish_reason":"stop"}]}),
+                ];
+                let body = frames
+                    .iter()
+                    .map(|f| format!("data: {f}\n\n"))
+                    .collect::<String>()
+                    + "data: [DONE]\n\n";
+                let (base, server) = serve(&body, false).await;
+                let events = collect(chat(base, deadlines())).await;
+                let thinking: String = events
+                    .iter()
+                    .filter_map(|event| match event {
+                        StreamEvent::ReasoningDelta {
+                            block_id,
+                            kind: ReasoningKind::Thinking,
+                            text,
+                        } if block_id == "msg_1" => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(thinking, "Checking divisors", "{field}");
+                let completion = events
+                    .iter()
+                    .find_map(|event| match event {
+                        StreamEvent::MessageStop { completion } => Some(completion),
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(
+                    serde_json::to_value(&completion.message).unwrap(),
+                    json!({"role":"assistant","content":[
+                        {"type":"thinking","thinking":"Checking divisors","signature":""},
+                        {"type":"text","text":"Prime"}
+                    ]}),
+                    "{field}"
+                );
+                server.await.unwrap();
+            }
         }
 
         #[tokio::test]

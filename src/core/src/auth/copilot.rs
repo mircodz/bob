@@ -88,6 +88,8 @@ pub struct ModelLimits {
     /// Input budget for compaction, excluding reserved output tokens.
     pub max_prompt_tokens: Option<usize>,
     pub max_output_tokens: Option<usize>,
+    /// `reasoning_effort` values the backend accepts, lowest to highest.
+    pub reasoning_efforts: Vec<String>,
 }
 
 /// Returns no limits on failure so callers can use static heuristics.
@@ -124,6 +126,15 @@ pub async fn fetch_model_limits(copilot_token: &str, api_base: &str) -> Vec<Mode
                             .map(|n| n as usize),
                         max_prompt_tokens: limits["max_prompt_tokens"].as_u64().map(|n| n as usize),
                         max_output_tokens: limits["max_output_tokens"].as_u64().map(|n| n as usize),
+                        reasoning_efforts: m["capabilities"]["supports"]["reasoning_effort"]
+                            .as_array()
+                            .map(|levels| {
+                                levels
+                                    .iter()
+                                    .filter_map(|level| level.as_str().map(str::to_owned))
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
                     })
                 })
                 .collect()

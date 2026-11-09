@@ -88,7 +88,7 @@ impl Default for ProviderTimeoutsConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BobConfig {
-    /// Provider id: copilot | anthropic | openai. May also carry the model in
+    /// Provider id: copilot | anthropic | openai | deepseek. May also carry the model in
     /// colon form ("anthropic:claude-sonnet-4-5"); a separate `model` field wins.
     pub provider: String,
     /// Model id within the provider (e.g. "claude-sonnet-4-5", "gpt-5"). Empty =
@@ -497,12 +497,13 @@ pub fn default_config_toml() -> String {
         r#"# bob global configuration (~/.bob/config.toml).
 # A project may override any of these in ./.bob.config.toml.
 
-# Provider: copilot | anthropic | openai. Log in first with `bob login <provider>`.
+# Provider: copilot | anthropic | openai | deepseek. Log in first with
+# `bob login <provider>`; deepseek reads its API key from DEEPSEEK_API_KEY.
 provider = "{provider}"
 # Model within the provider (e.g. "claude-sonnet-4-5", "gpt-5"). Empty = default.
 model = "{model}"
 # Reasoning effort: off | low | medium | high | max. Updated when you change it
-# in-session (/reasoning). Empty = off.
+# in-session (/reasoning); `bob -r <effort>` overrides it for one launch. Empty = off.
 reasoning = "{reasoning}"
 
 # Color theme: dark | light | catppuccin | catppuccin-macchiato | catppuccin-frappe

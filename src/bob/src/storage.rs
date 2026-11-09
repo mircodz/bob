@@ -364,6 +364,7 @@ mod tests {
                 provider: None,
                 model: None,
                 worker_model: None,
+                reasoning: None,
                 selection,
                 page_size: 80,
             }

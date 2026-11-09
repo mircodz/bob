@@ -124,6 +124,14 @@ mod tests {
                 WireApi::Chat,
             ),
             ("anthropic", "anthropic", "", 128_000, 16_000, WireApi::Chat),
+            (
+                "deepseek/deepseek-v4-pro",
+                "deepseek",
+                "deepseek-v4-pro",
+                1_000_000,
+                384_000,
+                WireApi::Chat,
+            ),
             ("openai:", "openai", "", 128_000, 16_000, WireApi::Chat),
         ] {
             let spec = ModelSpec::parse(input);

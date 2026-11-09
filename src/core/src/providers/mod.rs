@@ -1,6 +1,7 @@
 pub mod anthropic;
 pub mod codec;
 pub mod copilot;
+pub mod deepseek;
 #[cfg(any(test, feature = "testing"))]
 pub mod mock;
 pub mod models;
@@ -42,8 +43,9 @@ pub async fn create_provider_with_options(
             "anthropic" => anthropic::create_with_options(model, auth, timeouts).await,
             "openai" => openai::create_with_options(model, auth, timeouts).await,
             "copilot" => copilot::create_with_options(model, auth, timeouts).await,
+            "deepseek" => deepseek::create_with_options(model, auth, timeouts).await,
             other => anyhow::bail!(
-                "unknown provider \"{}\". known: anthropic, openai, copilot",
+                "unknown provider \"{}\". known: anthropic, openai, copilot, deepseek",
                 other
             ),
         }

@@ -246,6 +246,7 @@ pub(crate) fn has_status_code(hay: &str, code: &str) -> bool {
                 "error",
                 "openai",
                 "anthropic",
+                "deepseek",
                 "responses",
             ]
             .iter()
@@ -312,6 +313,9 @@ pub fn context_window_for(model: &str) -> usize {
     if m.contains("gemini") {
         return 1_000_000;
     }
+    if is_deepseek_v4(&m) {
+        return 1_000_000;
+    }
     if m.contains("gpt-5") || m.contains("o3") || m.contains("o4") {
         return 400_000;
     }
@@ -334,7 +338,15 @@ pub fn max_output_tokens_for(model: &str) -> u32 {
     if m.contains("sonnet") || m.contains("claude") {
         return 64_000;
     }
+    if is_deepseek_v4(&m) {
+        return 384_000;
+    }
     16_000
+}
+
+/// DeepSeek's V4 API models (`deepseek-flash`, `deepseek-v4-pro`), excluding older 128k ones.
+fn is_deepseek_v4(model: &str) -> bool {
+    model.contains("deepseek-flash") || model.contains("deepseek-v4")
 }
 
 #[cfg(test)]
@@ -353,6 +365,9 @@ mod tests {
             assert_eq!(context_window_for("gpt-5.3-codex"), 400_000);
             assert_eq!(context_window_for("gpt-4o"), 128_000);
             assert_eq!(context_window_for("gpt-4.1"), 1_000_000);
+            assert_eq!(context_window_for("deepseek-flash"), 1_000_000);
+            assert_eq!(context_window_for("deepseek-v4-pro"), 1_000_000);
+            assert_eq!(context_window_for("deepseek-chat"), 128_000);
             assert_eq!(context_window_for("some-new-llm"), 128_000);
         }
 
@@ -367,7 +382,20 @@ mod tests {
             assert_eq!(max_output_tokens_for("claude-opus-4.8"), 32_000);
             assert_eq!(max_output_tokens_for("claude-sonnet-5"), 64_000);
             assert_eq!(max_output_tokens_for("claude-future"), 64_000);
+            assert_eq!(max_output_tokens_for("DeepSeek-V4-Pro"), 384_000);
             assert_eq!(max_output_tokens_for("something-else"), 16_000);
+        }
+
+        #[test]
+        fn provider_labelled_http_statuses_classify_alike() {
+            for label in ["openai", "anthropic", "deepseek"] {
+                for status in ["429 Too Many Requests", "502 Bad Gateway"] {
+                    let message = format!("{label} {status}: try again");
+                    assert!(is_transient_error(&message), "{message}");
+                }
+                let message = format!("{label} 402 Payment Required: Insufficient Balance");
+                assert!(!is_transient_error(&message), "{message}");
+            }
         }
 
         #[test]

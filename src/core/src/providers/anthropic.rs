@@ -573,6 +573,8 @@ fn block_to_wire(b: &ContentBlock) -> BlockWire {
             "content": content.model_text(),
             "is_error": is_error,
         })),
+        // Unsigned thinking was captured from another provider for display; Anthropic rejects it.
+        ContentBlock::Thinking { signature, .. } if signature.is_empty() => BlockWire::Skip,
         ContentBlock::Thinking {
             thinking,
             signature,

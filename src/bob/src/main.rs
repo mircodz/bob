@@ -68,6 +68,7 @@ async fn main() -> Result<()> {
             provider: args.provider,
             model: args.model,
             worker_model: args.worker_model,
+            reasoning: args.reasoning,
             selection,
             page_size: args.limit,
         },
