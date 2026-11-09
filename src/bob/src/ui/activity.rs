@@ -1,5 +1,5 @@
 use bob_kernel::{LiveAttempt, RunId, ThreadActivity, ThreadId, ThreadState, ThreadSummary};
-use bob_ui::activity::{shimmer_spans, working_line};
+use bob_ui::activity::{labeled_working_line, shimmer_spans, working_line};
 use bob_ui::theme::Palette;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
@@ -90,6 +90,13 @@ fn line_at(
             ("Stopping", "waiting for interruption", true)
         } else if thread.needs_approval || thread.activity == Some(ThreadActivity::Approval) {
             ("Approval needed", "Tab to review · Esc denies", false)
+        } else if thread.state == ThreadState::Active && attempt.is_some_and(|a| a.compacting) {
+            return Some(labeled_working_line(
+                "Compacting context",
+                elapsed_secs,
+                tick,
+                hint,
+            ));
         } else if thread.state == ThreadState::Active {
             return Some(working_line(elapsed_secs, tick, hint));
         } else {

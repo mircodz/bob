@@ -1858,58 +1858,71 @@ impl Actor {
             Err(error) => {
                 let text = format!("{error:#}");
                 let uncertain = kind == "tool" && state == "started";
-                if kind == "tool" {
-                    finish_tool_entry(
-                        &tx,
-                        opid,
-                        &format!(
-                            "{}: {text}",
-                            if uncertain {
-                                "Unknown operation outcome"
-                            } else {
-                                "Preparation failed; nothing executed"
-                            }
-                        ),
-                        true,
-                    )?;
+                let cancelled = self
+                    .workers
+                    .get(opid)
+                    .is_some_and(|worker| worker.cancelled_at.is_some());
+                if kind == "model" && active && cancelled {
+                    tx.execute("UPDATE operations SET state='failed' WHERE id=?1", [opid])?;
                 } else {
-                    entry(
-                        &tx,
-                        &thread,
-                        "recovery",
-                        &format!("Model request failed: {text}"),
-                        EntryData {
-                            operation: Some(opid),
-                            ..Default::default()
-                        },
-                    )?;
-                }
-                tx.execute(
-                    "UPDATE operations SET state=?1 WHERE id=?2",
-                    params![if uncertain { "unknown" } else { "failed" }, opid],
-                )?;
-                let retry = active
-                    && kind == "model"
-                    && model_runtime::retry_model(
-                        &tx,
-                        opid,
-                        retry_kind.unwrap_or(ModelFailureKind::Fatal),
-                        max_output,
-                        false,
-                    )?;
-                if active && kind == "model" && !retry && name == "compact" {
-                    tx.execute("UPDATE runs SET state='interrupted' WHERE id=?1", [&run])?;
-                    tx.execute("UPDATE threads SET held=1 WHERE id=?1", [&thread])?;
-                    crate::lifecycle::stop_owned(&tx, &run)?;
-                    entry(&tx,&thread,"recovery","Compaction failed; original context retained. Select a larger model or explicitly request compaction again. Ordinary resume does not reset exhausted attempts.",EntryData::default())?;
-                } else if active && kind == "model" && !retry {
-                    fail_model_run(&tx, &run, &thread, &format!("Model request failed: {text}"))?;
-                } else if uncertain {
-                    if active {
-                        tx.execute("UPDATE runs SET state='interrupted' WHERE id=?1", [&run])?;
+                    if kind == "tool" {
+                        finish_tool_entry(
+                            &tx,
+                            opid,
+                            &format!(
+                                "{}: {text}",
+                                if uncertain {
+                                    "Unknown operation outcome"
+                                } else {
+                                    "Preparation failed; nothing executed"
+                                }
+                            ),
+                            true,
+                        )?;
+                    } else {
+                        entry(
+                            &tx,
+                            &thread,
+                            "recovery",
+                            &format!("Model request failed: {text}"),
+                            EntryData {
+                                operation: Some(opid),
+                                ..Default::default()
+                            },
+                        )?;
                     }
-                    tx.execute("UPDATE threads SET held=1 WHERE id=?1", [&thread])?;
-                    crate::lifecycle::stop_owned(&tx, &run)?;
+                    tx.execute(
+                        "UPDATE operations SET state=?1 WHERE id=?2",
+                        params![if uncertain { "unknown" } else { "failed" }, opid],
+                    )?;
+                    let retry = active
+                        && kind == "model"
+                        && model_runtime::retry_model(
+                            &tx,
+                            opid,
+                            retry_kind.unwrap_or(ModelFailureKind::Fatal),
+                            max_output,
+                            false,
+                        )?;
+                    if active && kind == "model" && !retry && name == "compact" {
+                        tx.execute("UPDATE runs SET state='interrupted' WHERE id=?1", [&run])?;
+                        tx.execute("UPDATE threads SET held=1 WHERE id=?1", [&thread])?;
+                        crate::lifecycle::stop_owned(&tx, &run)?;
+                        entry(&tx,&thread,"recovery","Compaction failed; original context retained. Select a larger model or explicitly request compaction again. Ordinary resume does not reset exhausted attempts.",EntryData::default())?;
+                    } else if active && kind == "model" && !retry {
+                        fail_model_run(
+                            &tx,
+                            &run,
+                            &thread,
+                            &format!("Model request failed: {text}"),
+                        )?;
+                    } else if uncertain {
+                        if active {
+                            tx.execute("UPDATE runs SET state='interrupted' WHERE id=?1", [&run])?;
+                        }
+                        tx.execute("UPDATE threads SET held=1 WHERE id=?1", [&thread])?;
+                        crate::lifecycle::stop_owned(&tx, &run)?;
+                    }
                 }
             }
         }

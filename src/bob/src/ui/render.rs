@@ -1,7 +1,7 @@
 use super::style::*;
 use super::*;
 use bob_kernel::Entry;
-use ratatui::{layout::Rect, text::Span};
+use ratatui::{layout::Rect, style::Modifier, text::Span};
 use std::{
     collections::{hash_map::DefaultHasher, HashSet},
     hash::{Hash, Hasher},
@@ -28,6 +28,9 @@ fn cache_key(pane: &Pane, root: bool, width: u16) -> u64 {
     pane.content_key.hash(&mut hash);
     pane.inline.revision().hash(&mut hash);
     pane.submission_revision.hash(&mut hash);
+    let mut thinking: Vec<_> = pane.expanded_thinking.iter().collect();
+    thinking.sort();
+    thinking.hash(&mut hash);
     let mut expanded: Vec<_> = pane.expanded.iter().collect();
     expanded.sort_by_key(|id| &id.0);
     expanded.hash(&mut hash);
@@ -60,6 +63,7 @@ pub(super) fn content_key(view: &View) -> u64 {
                 .hash(&mut hash);
             entry.is_preview.hash(&mut hash);
             entry.visible_text_bytes.hash(&mut hash);
+            entry.thinking.hash(&mut hash);
             if let Some(tool) = &entry.tool {
                 tool.id.hash(&mut hash);
                 tool.name.hash(&mut hash);
@@ -79,6 +83,44 @@ pub(super) struct Row {
     pub band: bool,
     pub hit: HitAction,
 }
+/// Collapsible reasoning shown above an assistant reply; click toggles it.
+/// Collapsed it is one line: the header followed by the start of the reasoning.
+fn thinking_rows(rows: &mut Vec<Row>, sequence: i64, thinking: &str, expanded: bool, width: u16) {
+    let identity = AnchorId::Thinking(sequence);
+    let hit = HitAction::Thinking(sequence);
+    let dim = text().fg(Palette::DIM());
+    let italic = dim.add_modifier(Modifier::ITALIC);
+    let row = |line: usize, offset: usize, content: Line<'static>| Row {
+        anchor: Anchor {
+            identity: identity.clone(),
+            line,
+            offset,
+        },
+        line: content,
+        band: false,
+        hit: hit.clone(),
+    };
+    rows.push(row(
+        0,
+        0,
+        Line::from(Span::styled("Thinking", dim.add_modifier(Modifier::BOLD))),
+    ));
+    if !expanded {
+        rows.push(row(usize::MAX, 0, Line::default()));
+        return;
+    }
+    let body_width = width.saturating_sub(BAND_INSET * 2 + 4).max(1) as usize;
+    for (line, source) in safe(thinking).lines().enumerate() {
+        for (offset, mut content) in
+            prose_wrap(&Line::styled(source.to_owned(), italic), body_width)
+        {
+            content.spans.insert(0, Span::raw("  "));
+            rows.push(row(line + 1, offset, content));
+        }
+    }
+    rows.push(row(usize::MAX, 0, Line::default()));
+}
+
 pub(super) fn append(
     rows: &mut Vec<Row>,
     identity: impl Into<AnchorId>,
@@ -228,21 +270,7 @@ fn append_notice(rows: &mut Vec<Row>, notice: &state::Notice, width: u16) {
     );
 }
 
-#[cfg(test)]
 pub(super) fn transcript(pane: &Pane, root: bool, width: u16) -> Vec<Row> {
-    transcript_range(pane, root, width, None)
-}
-
-fn transcript_window(pane: &Pane, root: bool, width: u16) -> Vec<Row> {
-    transcript_range(pane, root, width, super::inline::entry_window(pane))
-}
-
-fn transcript_range(
-    pane: &Pane,
-    root: bool,
-    width: u16,
-    range: Option<std::ops::Range<usize>>,
-) -> Vec<Row> {
     let mut rows = Vec::new();
     let Some(view) = &pane.view else {
         append(
@@ -268,25 +296,12 @@ fn transcript_range(
     groups.extend(exploration::groups(&view.entries[start..]));
     let mut notices = notices.into_iter().peekable();
     let mut seen = HashSet::new();
-    let range = range.unwrap_or(0..view.entries.len());
-    if range.start > 0 {
-        rows.push(super::inline::entry_gap(
-            &view.entries[range.start - 1],
-            true,
-        ));
-    }
-    for (index, entry) in view.entries.iter().enumerate() {
-        if !range.contains(&index) {
-            continue;
-        }
+    for entry in &view.entries {
         while notices
             .peek()
             .is_some_and(|notice| notice.sequence < entry.sequence)
         {
-            let notice = notices.next().unwrap();
-            if range.start == 0 || notice.sequence >= view.entries[range.start].sequence {
-                append_notice(&mut rows, notice, width);
-            }
+            append_notice(&mut rows, notices.next().unwrap(), width);
         }
         let agent_failure = agent_failure(entry);
         if root && !entry.visible_in_root() {
@@ -381,8 +396,27 @@ fn transcript_range(
             }
             continue;
         }
-        if super::inline::long(entry) {
-            rows.extend(super::inline::rows(pane, entry, width));
+        let long_body = if super::inline::long(entry) {
+            match super::inline::rows(pane, entry, width) {
+                Some(body) => Some(body),
+                None => continue,
+            }
+        } else {
+            None
+        };
+        if entry.kind == EntryKind::Assistant {
+            if let Some(thinking) = &entry.thinking {
+                thinking_rows(
+                    &mut rows,
+                    entry.sequence,
+                    thinking,
+                    pane.expanded_thinking.contains(&entry.sequence),
+                    width,
+                );
+            }
+        }
+        if let Some(body) = long_body {
+            rows.extend(body);
             rows.push(Row {
                 anchor: Anchor {
                     identity: AnchorId::Entry(entry.sequence),
@@ -397,7 +431,7 @@ fn transcript_range(
         }
         if entry.kind == EntryKind::Assistant {
             if !entry.text.trim().is_empty() {
-                rows.extend(super::live::complete_rows(pane, entry, width));
+                rows.extend(super::live::complete_rows(entry, width));
                 rows.push(Row {
                     anchor: Anchor {
                         identity: AnchorId::Entry(entry.sequence),
@@ -575,16 +609,8 @@ fn transcript_range(
             width,
         );
     }
-    if range.end < view.entries.len() {
-        rows.push(super::inline::entry_gap(&view.entries[range.end], false));
-    }
     for notice in notices {
-        if (range.start == 0 || notice.sequence >= view.entries[range.start].sequence)
-            && (range.end == view.entries.len()
-                || notice.sequence < view.entries[range.end].sequence)
-        {
-            append_notice(&mut rows, notice, width);
-        }
+        append_notice(&mut rows, notice, width);
     }
     if let Some(error) = &view.error {
         append(
@@ -920,24 +946,7 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
     } else if app.workflows.inspecting() {
         workflow::draw(frame, app, transcript_area, &mut hits);
     } else if let Some(pane) = app.pane_mut() {
-        super::inline::resize(pane, transcript_area.width);
         super::inline::handoff(pane);
-        if pane.content_key.is_none() {
-            pane.content_key = pane.view.as_ref().map(content_key);
-        }
-        let key = cache_key(pane, root, transcript_area.width);
-        let cache = match pane.rendered.take().filter(|cache| cache.key == key) {
-            Some(cache) => cache,
-            None => {
-                let rows = transcript_window(pane, root, transcript_area.width);
-                pane.viewport.rows = rows.iter().map(|row| row.anchor.clone()).collect();
-                #[cfg(test)]
-                {
-                    pane.render_builds += 1;
-                }
-                RenderCache { key, rows }
-            }
-        };
         if let Some(thread) = &selected_id {
             live::rows(
                 pane,
@@ -946,6 +955,22 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
                 transcript_area.width,
             );
         }
+        if pane.content_key.is_none() {
+            pane.content_key = pane.view.as_ref().map(content_key);
+        }
+        let key = cache_key(pane, root, transcript_area.width);
+        let cache = match pane.rendered.take().filter(|cache| cache.key == key) {
+            Some(cache) => cache,
+            None => {
+                let rows = transcript(pane, root, transcript_area.width);
+                pane.viewport.rows = rows.iter().map(|row| row.anchor.clone()).collect();
+                #[cfg(test)]
+                {
+                    pane.render_builds += 1;
+                }
+                RenderCache { key, rows }
+            }
+        };
         let live_rows = pane
             .live_rendered
             .as_ref()
@@ -995,10 +1020,7 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
                 action: row.hit.clone(),
             });
         }
-        let needs_layout = super::inline::visible(pane, top, transcript_area.height as usize);
-        if !needs_layout {
-            pane.rendered = Some(cache);
-        }
+        pane.rendered = Some(cache);
         if pane.viewport.anchor.is_some() && transcript_area.height > 0 {
             let label = " Reading · Shift+↓ to follow ";
             let width = (label.len() as u16).min(transcript_area.width);

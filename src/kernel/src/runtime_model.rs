@@ -325,7 +325,9 @@ impl Actor {
         }
         change(&tx, Some(thread), "model_started", &op.0)?;
         tx.commit()?;
-        let progress = self.live.start(thread.clone(), run.clone(), op.clone());
+        let progress = self
+            .live
+            .start(thread.clone(), run.clone(), op.clone(), name == "compact");
         let executor = self.executor.clone();
         self.spawn(op, done.clone(), move |cancel| async move {
             Ok(Output::Model(

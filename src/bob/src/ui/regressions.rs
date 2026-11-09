@@ -422,6 +422,7 @@ fn entry(sequence: i64, kind: EntryKind, text: &str) -> Entry {
         tool: None,
         is_preview: false,
         visible_text_bytes: None,
+        thinking: None,
     }
 }
 fn view(sequence: i64, entries: Vec<Entry>) -> View {
@@ -1741,17 +1742,13 @@ fn retained_tool_output_target_survives_page_separation() {
 }
 
 #[test]
-fn shortened_whitespace_response_retains_inline_loading_affordance() {
+fn shortened_whitespace_response_shows_no_loading_row() {
     let mut response = entry(8, EntryKind::Assistant, &" ".repeat(2048));
     response.is_preview = true;
     let mut app = app(vec![response]);
     let shown = screen(&render(&mut app, 100, 20));
-    assert!(shown.contains("Loading reply"), "{shown}");
+    assert!(!shown.contains("Loading"), "{shown}");
     assert!(!shown.contains("click to inspect"));
-    assert!(app
-        .hits
-        .iter()
-        .any(|hit| matches!(hit.action, HitAction::Inline(8, _, _))));
 }
 
 #[test]

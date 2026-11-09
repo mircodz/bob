@@ -241,6 +241,7 @@ fn tool_entry() -> Entry {
         }),
         is_preview: false,
         visible_text_bytes: None,
+        thinking: None,
     }
 }
 

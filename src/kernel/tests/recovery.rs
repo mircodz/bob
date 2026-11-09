@@ -1494,8 +1494,8 @@ async fn queued_followup_preserves_tool_result_order_live_and_after_reopen() {
         .find(|e| e.kind == EntryKind::ToolResult && e.text == "ordered tool output")
         .unwrap();
     assert!(
-        admitted.sequence < result.sequence,
-        "fixture must admit the follow-up before the tool result exists"
+        admitted.sequence > result.sequence,
+        "the follow-up must be shown where it was delivered, after the tool result"
     );
     bounded(handle.shutdown()).await.unwrap();
 

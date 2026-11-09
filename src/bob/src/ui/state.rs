@@ -224,7 +224,7 @@ impl Draft {
                 self.cursor = self.text.len()
             }
             KeyCode::Char('u') if control => {
-                self.text.replace_range(..self.cursor, "");
+                self.text.clear();
                 self.cursor = 0;
             }
             KeyCode::Char('k') if control => self.text.truncate(self.cursor),
@@ -289,11 +289,8 @@ pub(super) enum Focus {
 pub(super) enum AnchorId {
     Activity,
     Entry(i64),
+    Thinking(i64),
     Body(i64),
-    BodyGap {
-        sequence: i64,
-        ordinal: usize,
-    },
     Notice {
         id: u64,
         sequence: i64,
@@ -316,8 +313,8 @@ impl AnchorId {
     pub fn sequence(&self) -> Option<i64> {
         match self {
             Self::Entry(sequence)
+            | Self::Thinking(sequence)
             | Self::Body(sequence)
-            | Self::BodyGap { sequence, .. }
             | Self::Notice { sequence, .. } => Some(*sequence),
             _ => None,
         }
@@ -360,15 +357,9 @@ impl Viewport {
                     .filter(|(_, key)| {
                         if matches!(
                             anchor.identity,
-                            AnchorId::Body(_)
-                                | AnchorId::BodyGap { .. }
-                                | AnchorId::Live { .. }
-                                | AnchorId::Reasoning { .. }
+                            AnchorId::Body(_) | AnchorId::Live { .. } | AnchorId::Reasoning { .. }
                         ) {
-                            (if matches!(
-                                anchor.identity,
-                                AnchorId::Body(_) | AnchorId::BodyGap { .. }
-                            ) {
+                            (if matches!(anchor.identity, AnchorId::Body(_)) {
                                 matches!(key.identity, AnchorId::Body(_))
                                     && key.identity.sequence() == anchor.identity.sequence()
                             } else {
@@ -545,6 +536,10 @@ pub(super) struct Pane {
     pub pending: Option<u64>,
     pub action_epoch: u64,
     pub expanded: HashSet<OperationId>,
+    /// Assistant entries whose thinking block is expanded, keyed by entry sequence.
+    pub expanded_thinking: HashSet<i64>,
+    /// Streaming model calls whose live thinking is expanded.
+    pub expanded_live_thinking: HashSet<OperationId>,
     pub full_inputs: HashMap<OperationId, serde_json::Value>,
     pub input_errors: HashMap<OperationId, String>,
     pub pending_inputs: HashSet<OperationId>,
@@ -626,14 +621,7 @@ impl Pane {
             self.viewport.pending_follow = false;
         }
         self.history.direction = Some(delta < 0);
-        if live::scroll(self, delta) || super::inline::scroll(self, delta) {
-            return;
-        }
         self.viewport.scroll(delta);
-        if self.viewport.anchor.is_none() && self.inline.focus.is_some() {
-            self.inline.reset();
-            self.rendered = None;
-        }
         let travelled = self.viewport.top as isize - old_top as isize;
         if (delta < 0 && !self.history.older_exhausted) || (delta > 0 && self.before.is_some()) {
             self.history.debt = self
@@ -673,8 +661,9 @@ impl Pane {
 #[derive(Clone)]
 pub(super) enum HitAction {
     Entry(i64),
-    Inline(i64, usize, usize),
     Tool(OperationId),
+    Thinking(i64),
+    LiveThinking(OperationId),
     WorkflowRow(usize, workflow::Action),
     WorkflowSidebar(workflow::Action),
     Output(OperationId),
@@ -1028,6 +1017,7 @@ impl App {
             }
             pane.view = None;
             pane.rendered = None;
+            self.inline_cache.borrow_mut().forget(&id);
             pane.inline.epoch = pane.inline.epoch.wrapping_add(1);
             pane.inline.invalidate();
             pane.content_key = None;
@@ -2499,19 +2489,23 @@ impl App {
                         self.toggle_tool(id, jobs);
                     }
                 }
-                Some(HitAction::Output(id)) => {
-                    self.open_inspector(InspectionTarget::ToolOutput(id), 0, VecDeque::new(), jobs)
-                }
-                Some(HitAction::Inline(sequence, offset, ordinal)) => {
+                Some(HitAction::Thinking(sequence)) if self.focus != Focus::Inspector => {
                     if let Some(pane) = self.pane_mut() {
-                        pane.inline.seek(sequence, offset, ordinal, false);
-                        pane.viewport.anchor = Some(Anchor {
-                            identity: AnchorId::BodyGap { sequence, ordinal },
-                            line: ordinal,
-                            offset,
-                        });
+                        if !pane.expanded_thinking.remove(&sequence) {
+                            pane.expanded_thinking.insert(sequence);
+                        }
                         pane.rendered = None;
                     }
+                }
+                Some(HitAction::LiveThinking(operation)) if self.focus != Focus::Inspector => {
+                    if let Some(pane) = self.pane_mut() {
+                        if !pane.expanded_live_thinking.remove(&operation) {
+                            pane.expanded_live_thinking.insert(operation);
+                        }
+                    }
+                }
+                Some(HitAction::Output(id)) => {
+                    self.open_inspector(InspectionTarget::ToolOutput(id), 0, VecDeque::new(), jobs)
                 }
                 Some(HitAction::Entry(sequence)) => self.inspect(sequence, 0, jobs),
                 _ => {}
@@ -3005,6 +2999,15 @@ impl App {
                         pane.output_errors
                             .retain(|id, _| pane.expanded.contains(id));
                         pane.content_key = Some(render::content_key(&view));
+                        for entry in &view.entries {
+                            if entry.kind == EntryKind::Assistant
+                                && entry.operation.as_ref().is_some_and(|operation| {
+                                    pane.expanded_live_thinking.remove(operation)
+                                })
+                            {
+                                pane.expanded_thinking.insert(entry.sequence);
+                            }
+                        }
                         pane.committed_operations = view
                             .entries
                             .iter()

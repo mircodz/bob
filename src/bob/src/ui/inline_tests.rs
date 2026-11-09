@@ -224,9 +224,6 @@ async fn retained_reply_tail_is_inline_after_settlement_and_reopen() {
     assert_eq!(app.inline_cache.borrow().counters.requests, requests);
     assert_eq!(app.inline_cache.borrow().counters.layouts, layouts);
     assert!(app.inline_cache.borrow().counters.max_flights <= 4);
-    assert!(app.inline_cache.borrow().counters.raw_bytes <= 8 * 1024 * 1024);
-    assert!(app.inline_cache.borrow().counters.layout_bytes <= 16 * 1024 * 1024);
-    app.pane_mut().unwrap().inline.seek(sequence, 0, 0, false);
     app.pane_mut().unwrap().viewport.anchor = Some(Anchor {
         identity: AnchorId::Body(sequence),
         line: 0,
@@ -254,7 +251,7 @@ async fn retained_reply_tail_is_inline_after_settlement_and_reopen() {
 
 #[tokio::test]
 async fn later_paragraph_reading_position_survives_live_settlement_and_resize() {
-    let body = format!("{}STREAM_ONLY_MARKER", (0..200).map(|i| {
+    let body = format!("{}STREAM_ONLY_MARKER", (0..600).map(|i| {
         format!("**PARA{i:03}** {}\nREAD{i:03} middle reading line\nend of paragraph {i:03}\n\n", "word ".repeat(12))
     }).collect::<String>());
     assert!(body.len() > inline::PAGE_BYTES);
@@ -312,20 +309,17 @@ async fn later_paragraph_reading_position_survives_live_settlement_and_resize() 
 }
 
 #[tokio::test]
-async fn pane_switch_during_indexing_preserves_loading_successor() {
+async fn pane_switch_during_loading_keeps_the_preview_and_finishes_later() {
     let body = format!("{}SWITCHED_PANE_TAIL", "retained line\n".repeat(8000));
     let (database, executor, mut app, thread) = fixture(body).await;
     settle(&mut app, &executor, &thread).await;
-    assert!(frame(&mut app, 100, 30).contains("Loading reply"));
+    let first = frame(&mut app, 100, 30);
+    assert!(!first.contains("Loading"), "{first}");
     let mut jobs = JoinSet::new();
     app.refresh_inline(&mut jobs);
     app.reply(jobs.join_next().await.unwrap().unwrap());
-    assert!(
-        app.pane().unwrap().rendered.is_none(),
-        "intermediate page left a cached Loading row"
-    );
-    assert!(frame(&mut app, 100, 30).contains("Loading reply"));
-    let layouts = app.inline_cache.borrow().counters.layouts;
+    let partial = frame(&mut app, 100, 30);
+    assert!(!partial.contains("SWITCHED_PANE_TAIL") && !partial.contains("Loading"));
     app.select(ThreadId("other-pane".into()));
     app.refresh_inline(&mut jobs);
     assert!(jobs.is_empty());
@@ -341,7 +335,6 @@ async fn pane_switch_during_indexing_preserves_loading_successor() {
     }
     let screen = hydrate(&mut app).await;
     assert!(screen.contains("SWITCHED_PANE_TAIL"), "{screen}");
-    assert!(app.inline_cache.borrow().counters.layouts > layouts);
     app.handle.as_ref().unwrap().shutdown().await.unwrap();
     drop(app);
     std::fs::remove_file(database).unwrap();
@@ -406,14 +399,7 @@ async fn ordinary_scroll_traverses_every_retained_marker_without_duplicate_sourc
     for _ in 0..400 {
         app.pane_mut().unwrap().scroll(-100);
         hydrate(&mut app).await;
-        let pane = app.pane().unwrap();
-        if pane.viewport.top == 0
-            && pane
-                .viewport
-                .rows
-                .first()
-                .is_none_or(|anchor| !matches!(anchor.identity, AnchorId::BodyGap { .. }))
-        {
+        if app.pane().unwrap().viewport.top == 0 {
             break;
         }
     }

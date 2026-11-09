@@ -29,6 +29,7 @@ fn entry(sequence: i64, name: &str, state: OperationState, kind: EntryKind) -> E
         }),
         is_preview: false,
         visible_text_bytes: None,
+        thinking: None,
     }
 }
 
@@ -301,4 +302,56 @@ fn hidden_instruction_loading_neither_counts_nor_splits_exploration_groups() {
     for root in [true, false] {
         assert!(screen(&pane(entries.clone()), root).contains("project_instructions"));
     }
+}
+
+#[test]
+fn thinking_is_one_collapsed_line_above_the_reply_until_expanded() {
+    let mut reply = entry(1, "", OperationState::Done, EntryKind::Assistant);
+    reply.operation = None;
+    reply.tool = None;
+    reply.text = "Final answer".into();
+    reply.thinking = Some(
+        [
+            "step one",
+            "step two",
+            "step three",
+            "step four",
+            "step five",
+        ]
+        .join("\n"),
+    );
+    let mut pane = pane(vec![reply]);
+
+    let collapsed = screen(&pane, true);
+    let header = collapsed
+        .lines()
+        .find(|line| line.contains("Thinking"))
+        .expect("thinking header");
+    assert_eq!(header.trim_end(), "Thinking", "{collapsed}");
+    assert!(
+        collapsed.find("Thinking").unwrap() < collapsed.find("Final answer").unwrap(),
+        "{collapsed}"
+    );
+    assert!(!collapsed.contains("step"), "{collapsed}");
+    assert!(
+        !collapsed.contains('▸') && !collapsed.contains('▾'),
+        "{collapsed}"
+    );
+
+    pane.expanded_thinking.insert(1);
+    let expanded = screen(&pane, true);
+    assert!(expanded.contains("Thinking\n"), "{expanded}");
+    assert!(expanded.contains("  step five"), "{expanded}");
+}
+
+#[test]
+fn collapsed_thinking_never_previews_long_reasoning() {
+    let mut reply = entry(1, "", OperationState::Done, EntryKind::Assistant);
+    reply.operation = None;
+    reply.tool = None;
+    reply.text = String::new();
+    reply.thinking = Some("word ".repeat(100));
+    let shown = screen(&pane(vec![reply]), true);
+    assert!(shown.contains("Thinking"), "{shown}");
+    assert!(!shown.contains("word"), "{shown}");
 }

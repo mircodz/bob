@@ -561,13 +561,19 @@ pub(crate) fn finish_shell(
         |r| r.get(0),
     )?;
     if current == epoch {
+        let notice = CommandId::new();
         submit(
             tx,
-            &CommandId::new(),
+            &notice,
             &ThreadId(thread.clone()),
             "coordination",
             None,
             &format!("Shell job {id} {state}. Use job_output to inspect its retained result."),
+        )?;
+        // An idle agent would otherwise never see this until the next human message.
+        tx.execute(
+            "UPDATE submissions SET state='queued' WHERE id=?1 AND state='retained'",
+            [&notice],
         )?;
     }
     crate::effect_claims::release_settled(tx, operation)?;

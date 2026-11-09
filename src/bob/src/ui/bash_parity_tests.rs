@@ -38,6 +38,7 @@ fn shell(input: Value) -> Entry {
         }),
         is_preview: false,
         visible_text_bytes: None,
+        thinking: None,
     }
 }
 

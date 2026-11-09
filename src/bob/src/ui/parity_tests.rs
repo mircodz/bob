@@ -35,6 +35,7 @@ fn entry(sequence: i64, kind: EntryKind, text: &str) -> Entry {
         tool: None,
         is_preview: false,
         visible_text_bytes: None,
+        thinking: None,
     }
 }
 

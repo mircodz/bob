@@ -27,6 +27,7 @@ fn attempt(thread: &ThreadSummary, started_at: Instant) -> LiveAttempt {
         reasoning: vec![],
         truncated: false,
         started_at,
+        compacting: false,
         stopping: false,
         settled_sequence: None,
         error: None,

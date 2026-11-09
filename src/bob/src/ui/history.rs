@@ -168,6 +168,17 @@ impl Pane {
             Query::Refresh(_) => {}
         }
         for incoming in std::mem::take(&mut view.entries) {
+            // A queued submission moves to its delivery position when consumed;
+            // drop the stale copy so the transcript holds it exactly once.
+            if let Some(submission) = &incoming.submission {
+                entries.retain(|entry| {
+                    entry.sequence == incoming.sequence
+                        || entry
+                            .submission
+                            .as_ref()
+                            .is_none_or(|old| old.id != submission.id)
+                });
+            }
             match entries.binary_search_by_key(&incoming.sequence, |entry| entry.sequence) {
                 Ok(index) => entries[index] = incoming,
                 Err(index) => entries.insert(index, incoming),
@@ -252,6 +263,7 @@ mod tests {
                     tool: None,
                     is_preview: false,
                     visible_text_bytes: None,
+                    thinking: None,
                 })
                 .collect(),
             decisions: Vec::new(),
@@ -533,6 +545,37 @@ mod tests {
             .entries
             .iter()
             .any(|entry| entry.sequence == 2000));
+    }
+
+    #[test]
+    fn a_consumed_queued_submission_appears_once_at_its_new_position() {
+        let submission = |state| {
+            Some(bob_kernel::EntrySubmission {
+                id: bob_kernel::CommandId("queued".into()),
+                state,
+                ordinal: 1,
+                sequence: 1,
+            })
+        };
+        let mut pane = Pane::default();
+        let mut first = view(0, 5);
+        first.entries[2].kind = EntryKind::Submission;
+        first.entries[2].submission = submission(bob_kernel::SubmissionState::Pending);
+        accept(&mut pane, first, Query::Replace(None), 100);
+        let mut moved = view(5, 7);
+        moved.entries[0].kind = EntryKind::Submission;
+        moved.entries[0].submission = submission(bob_kernel::SubmissionState::Consumed);
+        accept(&mut pane, moved, Query::Newer(4), 100);
+        let sequences: Vec<_> = pane
+            .view
+            .as_ref()
+            .unwrap()
+            .entries
+            .iter()
+            .filter(|entry| entry.submission.is_some())
+            .map(|entry| entry.sequence)
+            .collect();
+        assert_eq!(sequences, [5]);
     }
 
     #[test]

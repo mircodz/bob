@@ -30,8 +30,17 @@ pub fn shimmer_spans(text: &str, tick: usize) -> Vec<Span<'static>> {
 }
 
 pub fn working_line(elapsed_secs: u64, tick: usize, hint: &str) -> Line<'static> {
+    labeled_working_line("Working", elapsed_secs, tick, hint)
+}
+
+pub fn labeled_working_line(
+    label: &str,
+    elapsed_secs: u64,
+    tick: usize,
+    hint: &str,
+) -> Line<'static> {
     let mut spans = vec![Span::styled("• ", Style::default().fg(Palette::RUNNING()))];
-    spans.extend(shimmer_spans("Working", tick));
+    spans.extend(shimmer_spans(label, tick));
     spans.push(Span::styled(
         format!(" ({elapsed_secs}s · {hint})"),
         Style::default().fg(Palette::FAINT()),

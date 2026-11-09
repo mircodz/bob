@@ -5,13 +5,17 @@ use super::{
     style::*,
 };
 use bob_kernel::{LiveAttempt, LiveSnapshot, ThreadId};
-use ratatui::text::Line;
+use bob_ui::segmented::SourceRow;
+use ratatui::{
+    style::Modifier,
+    text::{Line, Span},
+};
 use std::sync::Arc;
 use tokio::sync::watch;
 
 #[path = "live_segments.rs"]
 mod live_segments;
-use live_segments::{Document, Source, Target};
+use live_segments::{Document, Source};
 
 pub(super) async fn changed(
     receiver: &mut Option<watch::Receiver<Arc<LiveSnapshot>>>,
@@ -149,7 +153,7 @@ struct Key {
     attempts: Vec<(bob_kernel::OperationId, u64)>,
     width: u16,
     theme: u64,
-    focus: Option<Focus>,
+    thinking: Vec<bob_kernel::OperationId>,
 }
 
 pub(super) struct RenderCache {
@@ -157,37 +161,18 @@ pub(super) struct RenderCache {
     pub rows: Vec<Row>,
 }
 
-#[derive(Clone, PartialEq, Eq)]
-struct SourceKey {
-    operation: bob_kernel::OperationId,
-    reasoning: Option<usize>,
-}
-impl SourceKey {
-    fn of(source: &Source) -> Self {
-        Self {
-            operation: source.attempt.operation.clone(),
-            reasoning: source.reasoning,
-        }
-    }
-}
-#[derive(Clone, PartialEq, Eq)]
-struct Focus {
-    source: SourceKey,
-    target: Target,
-}
-struct Gap {
-    anchor: Anchor,
-    focus: Focus,
-    backward: bool,
-}
 #[derive(Default)]
 pub(super) struct Segments {
     documents: Vec<Document>,
     retained: Vec<Arc<LiveAttempt>>,
-    focus: Option<Focus>,
-    gaps: Vec<Gap>,
 }
 impl Segments {
+    /// Whether the live area draws this operation, standing in for its saved reply.
+    pub(super) fn shows(&self, operation: &bob_kernel::OperationId) -> bool {
+        self.retained
+            .iter()
+            .any(|attempt| &attempt.operation == operation)
+    }
     pub(super) fn pending(&self) -> bool {
         self.documents.iter().any(|document| {
             document.pending()
@@ -220,6 +205,31 @@ fn attempt_visible(pane: &Pane, thread: &ThreadId, attempt: &LiveAttempt) -> boo
             .is_none_or(|settled| sequence < settled)
 }
 
+/// Whether this operation's live text stands in for a saved reply whose full
+/// text is still loading, so the transcript leaves that reply out.
+fn stands_in(pane: &Pane, operation: &bob_kernel::OperationId) -> bool {
+    pane.view.as_ref().is_some_and(|view| {
+        view.entries.iter().any(|entry| {
+            entry.kind == bob_kernel::EntryKind::Assistant
+                && entry.operation.as_ref() == Some(operation)
+                && !super::inline::ready(pane, entry)
+        })
+    })
+}
+
+/// The transcript leaves out saved replies whose live text stands in for them,
+/// so it must be rebuilt when that set changes.
+fn stand_ins_changed(pane: &Pane, attempts: &[Arc<LiveAttempt>]) -> bool {
+    let retained = &pane.live_segments.retained;
+    let dropped = |from: &[Arc<LiveAttempt>], to: &[Arc<LiveAttempt>]| {
+        from.iter().any(|attempt| {
+            !to.iter().any(|other| other.operation == attempt.operation)
+                && stands_in(pane, &attempt.operation)
+        })
+    };
+    dropped(retained, attempts) || dropped(attempts, retained)
+}
+
 pub(super) fn rows(
     pane: &mut Pane,
     snapshot: Option<&LiveSnapshot>,
@@ -227,6 +237,9 @@ pub(super) fn rows(
     width: u16,
 ) {
     let Some(snapshot) = snapshot else {
+        if stand_ins_changed(pane, &[]) {
+            pane.inline.invalidate();
+        }
         pane.live_rendered = None;
         pane.live_segments = Segments::default();
         return;
@@ -257,38 +270,6 @@ pub(super) fn rows(
             attempts.push(attempt.clone());
         }
     }
-    if pane.viewport.anchor.is_none() {
-        pane.live_segments.focus = None;
-    } else if pane.live_segments.focus.is_none()
-        || pane
-            .live_rendered
-            .as_ref()
-            .is_some_and(|cache| cache.key.width != width)
-    {
-        if let Some(anchor) = pane
-            .viewport
-            .anchor
-            .as_ref()
-            .filter(|anchor| anchor.line < usize::MAX - 5)
-        {
-            if let Some(source) = pane
-                .live_segments
-                .documents
-                .iter()
-                .filter_map(Document::live_source)
-                .find(|source| {
-                    identity(source, &snapshot.instance) == anchor.identity
-                        && anchor.offset >= source_base(source)
-                        && anchor.offset <= source_base(source) + source.text().len()
-                })
-            {
-                pane.live_segments.focus = Some(Focus {
-                    source: SourceKey::of(source),
-                    target: Target::Forward(anchor.offset - source_base(source), anchor.line),
-                });
-            }
-        }
-    }
     let key = Key {
         instance: snapshot.instance.clone(),
         attempts: attempts
@@ -297,7 +278,11 @@ pub(super) fn rows(
             .collect(),
         width,
         theme: bob_ui::theme::generation(),
-        focus: pane.live_segments.focus.clone(),
+        thinking: attempts
+            .iter()
+            .filter(|attempt| pane.expanded_live_thinking.contains(&attempt.operation))
+            .map(|attempt| attempt.operation.clone())
+            .collect(),
     };
     if pane
         .live_rendered
@@ -314,16 +299,21 @@ pub(super) fn rows(
     {
         pane.live_segments.documents.clear();
     }
+    if stand_ins_changed(pane, &attempts) {
+        pane.inline.invalidate();
+    }
     pane.live_segments.retained = attempts.clone();
     let mut sources = Vec::new();
     for attempt in attempts {
-        for (index, reasoning) in attempt.reasoning.iter().enumerate() {
-            if !reasoning.text.is_empty() {
-                sources.push(Source {
-                    attempt: attempt.clone(),
-                    reasoning: Some(index),
-                });
-            }
+        if attempt
+            .reasoning
+            .iter()
+            .any(|block| !block.text.trim().is_empty())
+        {
+            sources.push(Source {
+                attempt: attempt.clone(),
+                reasoning: Some(0),
+            });
         }
         if !attempt.text.is_empty() || attempt.truncated || attempt.error.is_some() {
             sources.push(Source {
@@ -332,50 +322,24 @@ pub(super) fn rows(
             });
         }
     }
-    let focus = pane.live_segments.focus.clone();
-    let center = focus.as_ref().and_then(|focus| {
-        sources
-            .iter()
-            .position(|source| SourceKey::of(source) == focus.source)
-    });
-    let start = center.map_or(sources.len().saturating_sub(2), |center| {
-        if matches!(focus.as_ref().unwrap().target, Target::Backward(..)) {
-            center.saturating_sub(1)
-        } else {
-            center
-        }
-    });
-    let end = (start + 2).min(sources.len());
-    let selected = &sources[start..end];
     pane.live_segments.documents.retain(|document| {
         document.live_source().is_some_and(|cached| {
-            selected
+            sources
                 .iter()
-                .any(|source| SourceKey::of(source) == SourceKey::of(cached))
+                .any(|source| source.attempt.operation == cached.attempt.operation)
         })
     });
-    pane.live_segments.gaps.clear();
     let body_width = width.saturating_sub(BAND_INSET * 2).max(1) as usize;
     let mut budget = live_segments::STEP_BYTES;
     let mut rows = Vec::new();
-    if start > 0 {
-        let source = &sources[start - 1];
-        add_gap(
-            &mut rows,
-            &mut pane.live_segments,
-            source,
-            &snapshot.instance,
-            Target::Tail,
-            true,
-            "Earlier live text…",
-        );
-    }
-    for source in selected {
-        let source_key = SourceKey::of(source);
-        let target = focus
-            .as_ref()
-            .filter(|focus| focus.source == source_key)
-            .map_or(Target::Tail, |focus| focus.target);
+    for source in &sources {
+        if source.reasoning.is_some() {
+            let expanded = pane
+                .expanded_live_thinking
+                .contains(&source.attempt.operation);
+            thinking_rows(&mut rows, source, &snapshot.instance, expanded, width);
+            continue;
+        }
         let index = pane
             .live_segments
             .documents
@@ -383,77 +347,28 @@ pub(super) fn rows(
             .position(|document| {
                 document
                     .live_source()
-                    .is_some_and(|cached| SourceKey::of(cached) == source_key)
+                    .is_some_and(|cached| cached.attempt.operation == source.attempt.operation)
             })
             .unwrap_or_else(|| {
-                pane.live_segments.documents.push(Document::new(
-                    source.clone(),
-                    body_width,
-                    target,
-                ));
+                pane.live_segments
+                    .documents
+                    .push(Document::new(source.clone(), body_width));
                 pane.live_segments.documents.len() - 1
             });
         let document = &mut pane.live_segments.documents[index];
-        document.update(source.clone(), body_width, target);
+        document.update(source.clone(), body_width);
         document.step(&mut budget);
         let pending = document.pending();
-        if source.reasoning.is_some() && !document.meaningful() && !pending {
-            continue;
-        }
-        let next_anchor = document.next_anchor();
         let prepared = document.rows();
         let identity = identity(source, &snapshot.instance);
-        let base = source_base(source);
-        if let Some(first) = prepared.first() {
-            if (first.source.start, first.ordinal) != (0, 0) {
-                let (offset, ordinal) = if first.ordinal > 0 {
-                    (first.source.start, first.ordinal - 1)
-                } else {
-                    (first.source.start.saturating_sub(1), usize::MAX)
-                };
-                add_gap(
-                    &mut rows,
-                    &mut pane.live_segments,
-                    source,
-                    &snapshot.instance,
-                    Target::Backward(offset, ordinal),
-                    true,
-                    "Earlier live text…",
-                );
-            }
-        }
-        if let Some(index) = source.reasoning {
-            rows.push(Row {
-                anchor: Anchor {
-                    identity: identity.clone(),
-                    line: usize::MAX - 1,
-                    offset: base,
-                },
-                line: Line::styled(
-                    match source.attempt.reasoning[index].kind {
-                        bob_types::ReasoningKind::Summary => "Thinking summary",
-                        bob_types::ReasoningKind::Thinking => "Thinking",
-                    },
-                    text().fg(Palette::DIM()),
-                ),
-                band: false,
-                hit: HitAction::Live,
-            });
-        }
         for row in &prepared {
-            let mut line = row.line.clone();
-            if source.reasoning.is_some() {
-                for span in &mut line.spans {
-                    span.style = span.style.fg(Palette::DIM());
-                }
-            }
             rows.push(Row {
                 anchor: Anchor {
                     identity: identity.clone(),
                     line: row.ordinal,
-                    offset: base + row.source.start,
+                    offset: row.source.start,
                 },
-                line,
+                line: row.line.clone(),
                 band: false,
                 hit: HitAction::Live,
             });
@@ -463,169 +378,142 @@ pub(super) fn rows(
                 anchor: Anchor {
                     identity: identity.clone(),
                     line: usize::MAX - 2,
-                    offset: base + source.text().len(),
+                    offset: source.text().len(),
                 },
                 line: Line::styled("Preparing live text…", text().fg(Palette::DIM())),
                 band: false,
                 hit: HitAction::Live,
             });
-        } else if !matches!(target, Target::Tail) {
-            if let Some((offset, ordinal)) = next_anchor {
-                if offset < source.text().len() {
-                    add_gap(
-                        &mut rows,
-                        &mut pane.live_segments,
-                        source,
-                        &snapshot.instance,
-                        Target::Forward(offset, ordinal),
-                        false,
-                        "Later live text…",
-                    );
-                }
-            }
         }
-        if source.reasoning.is_none() {
-            if source.attempt.truncated {
-                rows.push(Row {
-                    anchor: Anchor {
-                        identity: identity.clone(),
-                        line: usize::MAX - 3,
-                        offset: source.text().len(),
-                    },
-                    line: Line::styled(
-                        "… live preview limited; final response will replace it",
-                        text().fg(Palette::DIM()),
-                    ),
-                    band: false,
-                    hit: HitAction::Live,
-                });
-            }
-            if let Some(error) = &source.attempt.error {
-                rows.push(Row {
-                    anchor: Anchor {
-                        identity: identity.clone(),
-                        line: usize::MAX - 4,
-                        offset: source.text().len(),
-                    },
-                    line: Line::styled(
-                        format!("Stream interrupted: {}", safe(&clipped(error, 1024))),
-                        text().fg(Palette::WARN()),
-                    ),
-                    band: false,
-                    hit: HitAction::Live,
-                });
-            }
+        if source.attempt.truncated {
+            rows.push(Row {
+                anchor: Anchor {
+                    identity: identity.clone(),
+                    line: usize::MAX - 3,
+                    offset: source.text().len(),
+                },
+                line: Line::styled(
+                    "… live preview limited; final response will replace it",
+                    text().fg(Palette::DIM()),
+                ),
+                band: false,
+                hit: HitAction::Live,
+            });
+        }
+        if let Some(error) = &source.attempt.error {
+            rows.push(Row {
+                anchor: Anchor {
+                    identity: identity.clone(),
+                    line: usize::MAX - 4,
+                    offset: source.text().len(),
+                },
+                line: Line::styled(
+                    format!("Stream interrupted: {}", safe(&clipped(error, 1024))),
+                    text().fg(Palette::WARN()),
+                ),
+                band: false,
+                hit: HitAction::Live,
+            });
         }
         rows.push(Row {
             anchor: Anchor {
                 identity,
                 line: usize::MAX - 5,
-                offset: base + source.text().len(),
+                offset: source.text().len(),
             },
             line: Line::default(),
             band: false,
             hit: HitAction::Live,
         });
     }
-    if end < sources.len() {
-        add_gap(
-            &mut rows,
-            &mut pane.live_segments,
-            &sources[end],
-            &snapshot.instance,
-            Target::Forward(0, 0),
-            false,
-            "Later live text…",
-        );
-    }
-    if pane.live_segments.pending() {
-        pane.inline.invalidate();
-    }
     pane.live_rendered = Some(RenderCache { key, rows });
 }
 
-pub(super) fn complete_rows(pane: &Pane, entry: &bob_kernel::Entry, width: u16) -> Vec<Row> {
-    let target = pane
-        .inline
-        .focus
-        .filter(|(sequence, _)| *sequence == entry.sequence)
-        .map(|(_, offset)| {
-            if pane.inline.backward {
-                Target::Backward(offset, pane.inline.ordinal)
-            } else {
-                Target::Forward(offset, pane.inline.ordinal)
-            }
-        })
-        .or_else(|| {
-            pane.viewport
-                .anchor
-                .as_ref()
-                .filter(|anchor| anchor.identity == AnchorId::Body(entry.sequence))
-                .map(|anchor| Target::Forward(anchor.offset, anchor.line))
-        })
-        .unwrap_or(Target::Tail);
-    let mut document = Document::complete(
-        &entry.text,
-        width.saturating_sub(BAND_INSET * 2).max(1) as usize,
-        target,
-    );
+/// A saved reply laid out in full.
+pub(super) fn complete_rows(entry: &bob_kernel::Entry, width: u16) -> Vec<Row> {
+    body_rows(entry.sequence, complete_layout(&entry.text, width))
+}
+
+pub(super) fn complete_layout(text: &str, width: u16) -> Vec<SourceRow> {
+    let mut document =
+        Document::complete(text, width.saturating_sub(BAND_INSET * 2).max(1) as usize);
     while document.pending() {
         let mut budget = live_segments::STEP_BYTES;
         document.step(&mut budget);
     }
-    let mut prepared = document.rows();
-    if prepared.is_empty() && document.meaningful() && target != Target::Tail {
-        document = Document::complete(
-            &entry.text,
-            width.saturating_sub(BAND_INSET * 2).max(1) as usize,
-            Target::Tail,
-        );
-        while document.pending() {
-            let mut budget = live_segments::STEP_BYTES;
-            document.step(&mut budget);
-        }
-        prepared = document.rows();
-    }
-    let mut rows = Vec::new();
-    let gap = |offset, ordinal, label| Row {
-        anchor: Anchor {
-            identity: AnchorId::BodyGap {
-                sequence: entry.sequence,
-                ordinal,
+    document.rows()
+}
+
+pub(super) fn body_rows(sequence: i64, rows: impl IntoIterator<Item = SourceRow>) -> Vec<Row> {
+    rows.into_iter()
+        .map(|row| Row {
+            anchor: Anchor {
+                identity: AnchorId::Body(sequence),
+                line: row.ordinal,
+                offset: row.source.start,
             },
-            line: ordinal,
-            offset,
-        },
-        line: Line::styled(label, text().fg(Palette::DIM())),
-        band: false,
-        hit: HitAction::Inline(entry.sequence, offset, ordinal),
-    };
-    if let Some(first) = prepared.first() {
-        if (first.source.start, first.ordinal) != (0, 0) {
-            let (offset, ordinal) = if first.ordinal > 0 {
-                (first.source.start, first.ordinal - 1)
-            } else {
-                (first.source.start.saturating_sub(1), usize::MAX)
-            };
-            rows.push(gap(offset, ordinal, "Earlier reply text…"));
-        }
-    }
-    rows.extend(prepared.into_iter().map(|row| Row {
+            line: row.line,
+            band: false,
+            hit: HitAction::Entry(sequence),
+        })
+        .collect()
+}
+
+fn thinking_rows(rows: &mut Vec<Row>, source: &Source, instance: &str, expanded: bool, width: u16) {
+    let identity = identity(source, instance);
+    let hit = HitAction::LiveThinking(source.attempt.operation.clone());
+    let dim = text().fg(Palette::DIM());
+    rows.push(Row {
         anchor: Anchor {
-            identity: AnchorId::Body(entry.sequence),
-            line: row.ordinal,
-            offset: row.source.start,
+            identity: identity.clone(),
+            line: usize::MAX - 1,
+            offset: 0,
         },
-        line: row.line,
+        line: Line::from(Span::styled("Thinking", dim.add_modifier(Modifier::BOLD))),
         band: false,
-        hit: HitAction::Entry(entry.sequence),
-    }));
-    if let Some((offset, ordinal)) = document.next_anchor() {
-        if offset < entry.text.len() {
-            rows.push(gap(offset, ordinal, "Later reply text…"));
+        hit: hit.clone(),
+    });
+    let mut end = 0;
+    if expanded {
+        let reasoning = source
+            .attempt
+            .reasoning
+            .iter()
+            .map(|block| block.text.trim())
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let italic = dim.add_modifier(Modifier::ITALIC);
+        let body_width = width.saturating_sub(BAND_INSET * 2 + 4).max(1) as usize;
+        for line in safe(&reasoning).lines() {
+            for (offset, mut content) in
+                prose_wrap(&Line::styled(line.to_owned(), italic), body_width)
+            {
+                content.spans.insert(0, Span::raw("  "));
+                rows.push(Row {
+                    anchor: Anchor {
+                        identity: identity.clone(),
+                        line: 0,
+                        offset: end + offset,
+                    },
+                    line: content,
+                    band: false,
+                    hit: hit.clone(),
+                });
+            }
+            end += line.len() + 1;
         }
     }
-    rows
+    rows.push(Row {
+        anchor: Anchor {
+            identity,
+            line: usize::MAX - 5,
+            offset: end,
+        },
+        line: Line::default(),
+        band: false,
+        hit,
+    });
 }
 
 fn identity(source: &Source, instance: &str) -> AnchorId {
@@ -640,90 +528,6 @@ fn identity(source: &Source, instance: &str) -> AnchorId {
             operation: source.attempt.operation.clone(),
         }
     }
-}
-
-fn source_base(source: &Source) -> usize {
-    source.reasoning.map_or(0, |index| {
-        source.attempt.reasoning[..index]
-            .iter()
-            .map(|reasoning| reasoning.text.len() + 1)
-            .sum()
-    })
-}
-
-fn add_gap(
-    rows: &mut Vec<Row>,
-    segments: &mut Segments,
-    source: &Source,
-    instance: &str,
-    target: Target,
-    backward: bool,
-    label: &'static str,
-) {
-    let offset = match target {
-        Target::Tail => source.text().len(),
-        Target::Forward(offset, _) | Target::Backward(offset, _) => offset,
-    };
-    let anchor = Anchor {
-        identity: identity(source, instance),
-        line: usize::MAX,
-        offset: source_base(source) + offset,
-    };
-    segments.gaps.push(Gap {
-        anchor: anchor.clone(),
-        focus: Focus {
-            source: SourceKey::of(source),
-            target,
-        },
-        backward,
-    });
-    rows.push(Row {
-        anchor,
-        line: Line::styled(label, text().fg(Palette::DIM())),
-        band: false,
-        hit: HitAction::Live,
-    });
-}
-
-pub(super) fn scroll(pane: &mut Pane, delta: isize) -> bool {
-    if delta == 0 {
-        return false;
-    }
-    let top = pane.viewport.top;
-    let next = top.saturating_add_signed(delta);
-    let begin = if delta < 0 { next } else { top };
-    let end = if delta < 0 {
-        top + 1
-    } else {
-        next.saturating_add(pane.viewport.height.max(1))
-    };
-    let mut candidate = pane
-        .viewport
-        .rows
-        .iter()
-        .enumerate()
-        .skip(begin)
-        .take(end.saturating_sub(begin))
-        .filter_map(|(index, anchor)| {
-            pane.live_segments
-                .gaps
-                .iter()
-                .find(|gap| gap.anchor == *anchor && gap.backward == (delta < 0))
-                .map(|gap| (index, gap.anchor.clone(), gap.focus.clone()))
-        });
-    let candidate = if delta < 0 {
-        candidate.next_back()
-    } else {
-        candidate.next()
-    };
-    let Some((index, anchor, focus)) = candidate else {
-        return false;
-    };
-    pane.live_segments.focus = Some(focus);
-    pane.viewport.anchor = Some(anchor);
-    pane.viewport.top = next.min(index);
-    pane.inline.invalidate();
-    true
 }
 
 #[cfg(test)]
@@ -750,6 +554,7 @@ mod tests {
                 }],
                 truncated: false,
                 started_at: std::time::Instant::now(),
+                compacting: false,
                 stopping: false,
                 settled_sequence: None,
                 error: None,
@@ -760,39 +565,21 @@ mod tests {
     fn finish(pane: &mut Pane, snapshot: &LiveSnapshot, width: u16) {
         for _ in 0..20000 {
             rows(pane, Some(snapshot), &ThreadId("root".into()), width);
-            let cache = pane.live_rendered.as_ref().unwrap();
-            assert!(cache.rows.len() <= live_segments::ROWS * 2 + 16);
-            let row_bytes = cache.rows.capacity() * std::mem::size_of::<Row>()
-                + cache
-                    .rows
-                    .iter()
-                    .map(|row| {
-                        row.line.spans.capacity()
-                            * std::mem::size_of::<ratatui::text::Span<'static>>()
-                            + row
-                                .line
-                                .spans
-                                .iter()
-                                .map(|span| match &span.content {
-                                    std::borrow::Cow::Owned(text) => text.capacity(),
-                                    _ => 0,
-                                })
-                                .sum::<usize>()
-                    })
-                    .sum::<usize>();
-            let bytes = row_bytes
-                + pane
-                    .live_segments
-                    .documents
-                    .iter()
-                    .map(Document::allocated_bytes)
-                    .sum::<usize>();
-            assert!(bytes <= 512 * 1024, "live prepared cache: {bytes}");
             if !pane.live_segments.pending() {
                 return;
             }
         }
         panic!("live pane did not settle");
+    }
+
+    fn rendered(pane: &Pane) -> Vec<String> {
+        pane.live_rendered
+            .as_ref()
+            .unwrap()
+            .rows
+            .iter()
+            .map(|row| row.line.to_string())
+            .collect()
     }
 
     fn entry(text: String) -> bob_kernel::Entry {
@@ -809,6 +596,7 @@ mod tests {
             tool: None,
             is_preview: false,
             visible_text_bytes: None,
+            thinking: None,
         }
     }
 
@@ -882,35 +670,14 @@ mod tests {
     }
 
     #[test]
-    fn short_body_gaps_reach_every_byte_without_hydration() {
+    fn short_saved_replies_render_every_line_without_paging() {
         let entry = entry("x".repeat(3500));
-        let mut pane = Pane::default();
-        pane.inline.seek(entry.sequence, 0, 0, false);
-        let mut collected = String::new();
-        for _ in 0..1000 {
-            let rows = complete_rows(&pane, &entry, BAND_INSET * 2 + 1);
-            assert!(rows.len() <= live_segments::ROWS + 2);
-            for row in &rows {
-                if matches!(row.anchor.identity, AnchorId::Body(_)) {
-                    collected.push_str(&row.line.to_string());
-                }
-            }
-            if let Some(row) = rows
-                .last()
-                .filter(|row| row.line.to_string() == "Later reply text…")
-            {
-                let AnchorId::BodyGap { ordinal, .. } = row.anchor.identity else {
-                    panic!("missing continuation anchor")
-                };
-                pane.inline
-                    .seek(entry.sequence, row.anchor.offset, ordinal, false);
-            } else {
-                assert_eq!(collected, entry.text);
-                assert_eq!(pane.inline.cache.borrow().counters.requests, 0);
-                return;
-            }
-        }
-        panic!("short reply traversal did not finish");
+        let rows = complete_rows(&entry, BAND_INSET * 2 + 1);
+        let text: String = rows.iter().map(|row| row.line.to_string()).collect();
+        assert_eq!(text, entry.text);
+        assert!(rows
+            .iter()
+            .all(|row| matches!(row.anchor.identity, AnchorId::Body(_))));
     }
 
     #[test]
@@ -940,41 +707,50 @@ mod tests {
     }
 
     #[test]
-    fn bounded_live_cache_keeps_large_answer_navigable() {
-        let snapshot = snapshot("Long visible paragraph with **styled** text.\n\n".repeat(8000));
+    fn long_live_answer_renders_in_full_without_paging_labels() {
+        let body: String = (0..2000)
+            .map(|index| format!("Line {index:04} with **styled** text.\n\n"))
+            .collect();
+        let snapshot = snapshot(body);
         let mut pane = Pane::default();
         finish(&mut pane, &snapshot, 60);
-        let first = pane
-            .live_rendered
-            .as_ref()
-            .unwrap()
-            .rows
+        let text = rendered(&pane);
+        assert!(text.iter().any(|line| line.contains("Line 0000")));
+        assert!(text.iter().any(|line| line.contains("Line 1999")));
+        assert!(!text
             .iter()
-            .find(|row| {
-                matches!(row.anchor.identity, AnchorId::Live { .. })
-                    && row.anchor.line < usize::MAX - 5
+            .any(|line| line.contains("Earlier") || line.contains("Later")));
+    }
+
+    #[test]
+    fn streaming_long_thinking_after_many_steps_shows_no_earlier_label() {
+        let mut pane = Pane::default();
+        let attempts = (0..5)
+            .map(|step| {
+                let mut attempt = (*snapshot(format!("Answer {step}")).attempts[0]).clone();
+                attempt.operation = bob_kernel::OperationId(format!("step-{step}"));
+                attempt.reasoning[0].text = "Reasoning ".repeat(4000);
+                if step == 4 {
+                    attempt.text.clear();
+                }
+                Arc::new(attempt)
             })
-            .unwrap()
-            .anchor
-            .clone();
-        assert!(first.offset > 0);
-        pane.viewport.rows = pane
-            .live_rendered
-            .as_ref()
-            .unwrap()
-            .rows
-            .iter()
-            .map(|row| row.anchor.clone())
             .collect();
-        pane.viewport.top = pane.viewport.rows.len().saturating_sub(12);
-        pane.viewport.height = 12;
-        assert!(scroll(&mut pane, -10000));
-        finish(&mut pane, &snapshot, 60);
-        assert!(pane.live_rendered.as_ref().unwrap().rows.iter().any(|row| {
-            matches!(row.anchor.identity, AnchorId::Live { .. })
-                && row.anchor.line < usize::MAX - 5
-                && row.anchor.offset < first.offset
-        }));
+        let snapshot = LiveSnapshot {
+            attempts,
+            ..snapshot(String::new())
+        };
+        finish(&mut pane, &snapshot, 80);
+        let text = rendered(&pane);
+        assert_eq!(
+            text.iter().filter(|line| line.trim() == "Thinking").count(),
+            5
+        );
+        assert!(text.iter().any(|line| line.contains("Answer 0")));
+        assert_eq!(text.last().map(String::as_str), Some(""));
+        assert!(!text
+            .iter()
+            .any(|line| line.contains("Earlier") || line.contains("Later")));
     }
 
     #[test]

@@ -443,6 +443,9 @@ pub struct Entry {
     pub is_preview: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visible_text_bytes: Option<usize>,
+    /// Model reasoning shown above an assistant reply; display-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
 }
 
 impl Entry {

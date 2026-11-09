@@ -59,6 +59,7 @@ fn snapshot(revision: u64) -> Arc<LiveSnapshot> {
             reasoning: vec![],
             truncated: false,
             started_at: std::time::Instant::now(),
+            compacting: false,
             stopping: false,
             settled_sequence: None,
             error: None,

@@ -29,6 +29,7 @@ fn view(sequence: i64, state: SubmissionState) -> View {
             tool: None,
             is_preview: false,
             visible_text_bytes: None,
+            thinking: None,
         }],
         decisions: Vec::new(),
         operations: Vec::new(),

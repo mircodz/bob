@@ -244,6 +244,25 @@ pub(crate) fn load_message(db: &Connection, id: &ArtifactId) -> anyhow::Result<M
     }
 }
 
+/// Reasoning text kept with an assistant reply, for display only.
+fn thinking(db: &Connection, source: &ArtifactId) -> anyhow::Result<Option<String>> {
+    let Ok(ModelRecord::Message(message)) = decode::<ModelRecord>(full_artifact(db, source)?)
+    else {
+        return Ok(None);
+    };
+    let text = message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Thinking { thinking, .. } => Some(thinking.trim()),
+            _ => None,
+        })
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    Ok((!text.is_empty()).then_some(text))
+}
+
 #[derive(Default)]
 pub(crate) struct EntryData<'a> {
     pub message: Option<&'a Message>,
@@ -996,6 +1015,7 @@ impl Store {
                         |length| length > text.len(),
                     ),
                     visible_text_bytes: r.get(17)?,
+                    thinking: None,
                     text,
                     artifact: r.get::<_, Option<String>>(3)?.map(ArtifactId),
                     operation: r.get::<_, Option<String>>(4)?.map(OperationId),
@@ -1003,6 +1023,13 @@ impl Store {
                 })
             })?;
             entries = rows.collect::<Result<_, _>>()?;
+            for entry in entries.iter_mut() {
+                if entry.kind == EntryKind::Assistant {
+                    if let Some(source) = &entry.artifact {
+                        entry.thinking = thinking(&self.db, source)?;
+                    }
+                }
+            }
             if !ascending {
                 entries.reverse();
             }
@@ -1289,6 +1316,14 @@ pub(crate) fn consume(db: &Connection, id: &CommandId, run: &RunId) -> anyhow::R
         "UPDATE entries SET model=?1,model_order=(SELECT COALESCE(MAX(model_order),0)+1 FROM entries e WHERE e.thread=entries.thread) WHERE submission=?2 AND thread=(SELECT thread FROM submissions WHERE id=?2)",
         params![model, id],
     )?;
+    if source == "human" {
+        // Input queued during a turn shows where it was delivered, not where it
+        // was typed, so it sits directly above the reply it caused.
+        db.execute(
+            "UPDATE entries SET seq=(SELECT MAX(seq)+1 FROM entries) WHERE submission=?1 AND kind='submission' AND EXISTS(SELECT 1 FROM entries e WHERE e.thread=entries.thread AND e.seq>entries.seq AND e.kind!='submission')",
+            [id],
+        )?;
+    }
     Ok(())
 }
 pub(crate) fn finish_tool_entry(
@@ -1421,6 +1456,120 @@ pub(crate) mod tests {
             )
             .unwrap();
         (dir, store, receipt, models)
+    }
+
+    #[test]
+    fn assistant_thinking_survives_reopen_and_is_not_model_text() {
+        let (dir, store, receipt, _) = fixture();
+        let message = Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: "  Checking divisors up to 31.  ".into(),
+                    signature: String::new(),
+                },
+                ContentBlock::Text {
+                    text: "Prime".into(),
+                },
+            ],
+        };
+        let result = artifact(
+            &store.db,
+            &encode(&ModelRecord::Message(message.clone())).unwrap(),
+        )
+        .unwrap();
+        entry(
+            &store.db,
+            &receipt.thread,
+            "assistant",
+            &message.text(),
+            EntryData {
+                message: Some(&message),
+                result: Some(&result),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        drop(store);
+        let reopened = Store::open(&dir.0.join("lab.db")).unwrap();
+        let view = reopened
+            .transcript(Some(receipt.thread.clone()), None, 10, None)
+            .unwrap();
+        let reply = view
+            .entries
+            .iter()
+            .find(|entry| entry.kind == EntryKind::Assistant)
+            .unwrap();
+        assert_eq!(reply.text, "Prime");
+        assert_eq!(
+            reply.thinking.as_deref(),
+            Some("Checking divisors up to 31.")
+        );
+    }
+
+    #[test]
+    fn queued_input_moves_to_where_it_was_delivered() {
+        let (_dir, store, receipt, _models) = fixture();
+        let thread = &receipt.thread;
+        entry(
+            &store.db,
+            thread,
+            "assistant",
+            "first answer",
+            EntryData::default(),
+        )
+        .unwrap();
+        let queued = CommandId::new();
+        submit(
+            &store.db,
+            &queued,
+            thread,
+            "human",
+            None,
+            "queued while busy",
+        )
+        .unwrap();
+        entry(
+            &store.db,
+            thread,
+            "assistant",
+            "rest of the turn",
+            EntryData::default(),
+        )
+        .unwrap();
+        let run = RunId::new();
+        store
+            .db
+            .execute(
+                "INSERT INTO runs(id,thread,state) VALUES(?1,?2,'active')",
+                params![run, thread],
+            )
+            .unwrap();
+        consume(&store.db, &queued, &run).unwrap();
+        entry(
+            &store.db,
+            thread,
+            "assistant",
+            "reply to it",
+            EntryData::default(),
+        )
+        .unwrap();
+        let texts: Vec<_> = store
+            .view(Some(thread.clone()), None, 100, None)
+            .unwrap()
+            .entries
+            .into_iter()
+            .map(|entry| entry.text)
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "first answer",
+                "rest of the turn",
+                "queued while busy",
+                "reply to it"
+            ]
+        );
     }
 
     #[test]

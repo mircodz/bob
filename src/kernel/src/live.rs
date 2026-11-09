@@ -49,6 +49,7 @@ pub struct LiveAttempt {
     pub reasoning: Vec<ReasoningPreview>,
     pub truncated: bool,
     pub started_at: Instant,
+    pub compacting: bool,
     pub stopping: bool,
     pub settled_sequence: Option<i64>,
     pub error: Option<String>,
@@ -69,6 +70,7 @@ pub struct ModelProgress {
     accepting: watch::Receiver<bool>,
     truncated: Arc<AtomicBool>,
     sink: Option<Arc<BoundedSink>>,
+    quiet: bool,
 }
 
 struct BoundedSink {
@@ -90,6 +92,7 @@ impl ModelProgress {
                     bytes: AtomicUsize::new(0),
                     limit,
                 })),
+                quiet: false,
             },
             invalid,
         )
@@ -124,6 +127,9 @@ impl ModelProgress {
             }
         }
         if !*self.accepting.borrow() {
+            return Ok(());
+        }
+        if self.quiet && !matches!(update, ModelUpdate::Activity(_)) {
             return Ok(());
         }
         let (text, block) = match update {
@@ -310,6 +316,7 @@ impl LiveProjection {
         thread: ThreadId,
         run: RunId,
         operation: OperationId,
+        compacting: bool,
     ) -> ModelProgress {
         assert!(self.active.len() < 16 && !self.active.contains_key(&operation));
         let (tx, rx) = mpsc::channel(QUEUE_SIZE);
@@ -328,6 +335,7 @@ impl LiveProjection {
                     reasoning: Vec::new(),
                     truncated: false,
                     started_at: Instant::now(),
+                    compacting,
                     stopping: false,
                     settled_sequence: None,
                     error: None,
@@ -344,6 +352,7 @@ impl LiveProjection {
             accepting: signal,
             truncated,
             sink: None,
+            quiet: compacting,
         }
     }
 
@@ -459,6 +468,33 @@ mod tests {
             21
         );
         assert!(invalid.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn compaction_attempts_never_stream_summary_text() {
+        let mut live = LiveProjection::new(0);
+        let watch = live.subscribe();
+        let progress = live.start(
+            ThreadId("t".into()),
+            RunId("r".into()),
+            OperationId("compact".into()),
+            true,
+        );
+        progress
+            .emit(ModelUpdate::Text("## Context\nsummary".into()))
+            .await
+            .unwrap();
+        progress
+            .emit(ModelUpdate::Activity(ModelActivity::Answering))
+            .await
+            .unwrap();
+        live.collect();
+        live.publish(1);
+        let snapshot = watch.borrow().clone();
+        assert_eq!(snapshot.attempts.len(), 1);
+        assert!(snapshot.attempts[0].compacting);
+        assert!(snapshot.attempts[0].text.is_empty());
+        assert_eq!(snapshot.attempts[0].activity, ModelActivity::Answering);
     }
 
     #[test]

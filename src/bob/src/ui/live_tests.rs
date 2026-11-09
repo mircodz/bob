@@ -1,5 +1,6 @@
 use super::*;
 use bob_kernel::{Entry, LiveAttempt, LiveSnapshot, ModelActivity, RunId, SessionId};
+use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use futures::FutureExt;
 use ratatui::backend::TestBackend;
 use std::{sync::Arc, time::Instant};
@@ -35,6 +36,7 @@ fn entry(sequence: i64, text: &str, operation: Option<&str>) -> Entry {
         tool: None,
         is_preview: false,
         visible_text_bytes: None,
+        thinking: None,
     }
 }
 fn view(sequence: i64, entries: Vec<Entry>) -> View {
@@ -71,6 +73,7 @@ fn attempt(thread: &str, operation: &str, text: &str, revision: u64) -> Arc<Live
         reasoning: vec![],
         truncated: false,
         started_at: Instant::now(),
+        compacting: false,
         stopping: false,
         settled_sequence: None,
         error: None,
@@ -274,8 +277,50 @@ fn working_indicator_preserves_reasoning_approval_and_stopping_state() {
     });
     app.accept_live(snapshot(1, vec![Arc::new(draft)]));
     let screen = render(&mut app, 90, 24);
-    assert!(screen.contains("Actual provider summary"));
+    assert!(screen.contains("Thinking"));
+    assert!(!screen.contains("Actual provider summary"));
     assert!(screen.contains("Visible answer"));
+}
+
+#[test]
+fn clicking_live_thinking_expands_it_and_keeps_it_open_after_the_reply_is_saved() {
+    let mut app = app(vec![]);
+    let mut draft = (*attempt("root", "model-op", "Visible answer", 1)).clone();
+    draft.reasoning.push(bob_kernel::ReasoningPreview {
+        block_id: "thinking".into(),
+        kind: bob_types::ReasoningKind::Thinking,
+        text: "Weighing the first option".into(),
+    });
+    app.accept_live(snapshot(1, vec![Arc::new(draft)]));
+    let screen = render(&mut app, 90, 24);
+    assert!(!screen.contains("Weighing the first option"), "{screen}");
+    let row = screen
+        .lines()
+        .position(|line| line.trim() == "Thinking")
+        .expect("live thinking line") as u16;
+    let mut jobs = JoinSet::new();
+    app.mouse(
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 4,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+        &mut jobs,
+    );
+    let screen = render(&mut app, 90, 24);
+    assert!(screen.contains("Weighing the first option"), "{screen}");
+    assert!(screen.contains("Visible answer"), "{screen}");
+
+    let mut reply = entry(2, "Visible answer", Some("model-op"));
+    reply.thinking = Some("Weighing the first option".into());
+    app.reply(Reply::View {
+        thread: ThreadId("root".into()),
+        generation: 0,
+        result: Ok(view(2, vec![reply])),
+    });
+    let screen = render(&mut app, 90, 24);
+    assert!(screen.contains("Weighing the first option"), "{screen}");
 }
 
 #[test]
@@ -322,6 +367,45 @@ fn live_continuation_frames_reach_tail_without_another_snapshot() {
     assert!(complete.contains("CONTINUATION_TAIL"), "{complete}");
     assert!(!complete.contains("Preparing live text"));
     assert_eq!(app.live_snapshot.as_ref().unwrap().revision, 1);
+}
+
+#[test]
+fn long_thinking_as_the_last_live_step_never_shows_paging_labels() {
+    let mut app = app(vec![entry(1, "History", None)]);
+    let attempts = (0..4)
+        .map(|step| {
+            let mut draft = (*attempt(
+                "root",
+                &format!("step-{step}"),
+                &format!("Step {step} answer\n\n").repeat(40),
+                1,
+            ))
+            .clone();
+            draft.reasoning.push(bob_kernel::ReasoningPreview {
+                block_id: "thinking".into(),
+                kind: bob_types::ReasoningKind::Thinking,
+                text: "Considering the next step. ".repeat(2000),
+            });
+            if step == 3 {
+                draft.text.clear();
+            }
+            Arc::new(draft)
+        })
+        .collect();
+    app.accept_live(snapshot(1, attempts));
+    let bottom = render_prepared(&mut app, 90, 24);
+    assert!(bottom.contains("Thinking"), "{bottom}");
+    let mut reached_first_step = false;
+    for _ in 0..60 {
+        let screen = render(&mut app, 90, 24);
+        assert!(
+            !screen.contains("Earlier") && !screen.contains("Later"),
+            "{screen}"
+        );
+        reached_first_step |= screen.contains("Step 0 answer");
+        app.pane_mut().unwrap().scroll(-10);
+    }
+    assert!(reached_first_step);
 }
 
 #[test]

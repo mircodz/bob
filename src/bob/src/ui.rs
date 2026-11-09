@@ -240,7 +240,9 @@ pub(crate) async fn run(options: Options, terminal_titles: bool) -> Result<()> {
                 app.refresh_inline(&mut jobs);
                 let now = tokio::time::Instant::now();
                 scheduler.drawn(now, app.animation_deadline(frame_started));
-                if inline_revision != app.pane().map(|pane| pane.inline.revision()) {
+                if inline_revision != app.pane().map(|pane| pane.inline.revision())
+                    || app.pane().is_some_and(|pane| pane.live_segments.pending())
+                {
                     scheduler.invalidate(now, visual::Urgency::Stream);
                 }
             }
@@ -543,6 +545,7 @@ mod tests {
                     tool: None,
                     is_preview: false,
                     visible_text_bytes: None,
+                    thinking: None,
                 }],
                 decisions: vec![],
                 operations: vec![],

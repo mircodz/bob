@@ -37,6 +37,7 @@ fn entries(name: &str, input: Value, outcome: &ToolOutcome) -> (Entry, Entry) {
         }),
         is_preview: false,
         visible_text_bytes: None,
+        thinking: None,
     };
     let result = Entry {
         sequence: 2,
@@ -55,6 +56,7 @@ fn entries(name: &str, input: Value, outcome: &ToolOutcome) -> (Entry, Entry) {
         tool: call.tool.clone(),
         is_preview: false,
         visible_text_bytes: None,
+        thinking: None,
     };
     (call, result)
 }
