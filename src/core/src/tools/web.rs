@@ -95,7 +95,11 @@ impl WebClient {
     pub fn new() -> anyhow::Result<Self> {
         Ok(Self {
             client: reqwest::Client::builder()
-                .user_agent("Mozilla/5.0 (compatible; bob/0.1)")
+                .user_agent(concat!(
+                    "Mozilla/5.0 (compatible; mircodz/bob/",
+                    env!("CARGO_PKG_VERSION"),
+                    ")"
+                ))
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .timeout(std::time::Duration::from_secs(30))
                 .redirect(reqwest::redirect::Policy::limited(5))
@@ -293,7 +297,11 @@ impl Tool for WebSearchTool {
 
         // The keyless HTML endpoint requires a browser-like User-Agent.
         let client = reqwest::Client::builder()
-            .user_agent("Mozilla/5.0 (compatible; bob/0.1; +https://example.invalid/bob)")
+            .user_agent(concat!(
+                "Mozilla/5.0 (compatible; mircodz/bob/",
+                env!("CARGO_PKG_VERSION"),
+                "; +https://github.com/mircodz/bob)"
+            ))
             .build()
             .map_err(|e| ToolError::failed(e.to_string()))?;
         let res = client

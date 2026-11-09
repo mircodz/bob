@@ -34,7 +34,7 @@ pub(crate) async fn create_with_options(
             auth: AuthMode::ApiKey(key),
             model,
             base_url: API_URL.to_string(),
-            client: reqwest::Client::new(),
+            client: super::openai::http_client(),
             timeouts,
         }));
     }
@@ -66,7 +66,7 @@ impl AnthropicProvider {
                 auth: AuthMode::Oauth(std::sync::Arc::new(crate::auth::AnthropicOAuth)),
                 model: model.unwrap_or_else(|| "claude-sonnet-4-5-20250929".to_string()),
                 base_url: API_URL.to_string(),
-                client: reqwest::Client::new(),
+                client: super::openai::http_client(),
                 timeouts: StreamTimeouts::default(),
             });
         }
@@ -78,7 +78,7 @@ impl AnthropicProvider {
             auth: AuthMode::ApiKey(api_key),
             model: model.unwrap_or_else(|| "claude-sonnet-4-5-20250929".to_string()),
             base_url: API_URL.to_string(),
-            client: reqwest::Client::new(),
+            client: super::openai::http_client(),
             timeouts: StreamTimeouts::default(),
         })
     }

@@ -15,7 +15,9 @@ const MCP_CALLBACK_PORT: u16 = 54546;
 
 /// Discover resource/server metadata (RFC 9728/8414) and register a client (RFC 7591).
 pub async fn discover(server: &str, url: &str) -> anyhow::Result<McpOAuthConfig> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .user_agent(crate::USER_AGENT)
+        .build()?;
 
     let probe = client
         .post(url)

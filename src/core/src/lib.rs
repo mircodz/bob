@@ -9,5 +9,8 @@ pub mod providers;
 pub mod tools;
 pub mod workflow;
 
+/// Identifies bob to every provider, auth and MCP endpoint.
+pub const USER_AGENT: &str = concat!("mircodz/bob/", env!("CARGO_PKG_VERSION"));
+
 #[cfg(test)]
 pub(crate) mod test_support;

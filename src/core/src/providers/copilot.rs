@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 const CLIENT_ID: &str = "mircodz/bob";
-const CLIENT_VERSION: &str = concat!("mircodz/bob/", env!("CARGO_PKG_VERSION"));
+const CLIENT_VERSION: &str = crate::USER_AGENT;
 
 struct CopilotAuth {
     github_token: String,

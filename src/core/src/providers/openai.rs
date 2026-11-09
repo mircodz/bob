@@ -66,6 +66,7 @@ pub(crate) async fn create_with_options(
 /// Bound connection setup, not total read time: streamed generations can take minutes.
 pub(crate) fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
+        .user_agent(crate::USER_AGENT)
         .connect_timeout(std::time::Duration::from_secs(20))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())

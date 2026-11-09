@@ -52,7 +52,7 @@ pub async fn fetch_copilot_token(github_token: &str) -> anyhow::Result<(String, 
     let res = client
         .get(COPILOT_TOKEN_URL)
         .header("authorization", format!("token {}", github_token))
-        .header("user-agent", "bob")
+        .header("user-agent", crate::USER_AGENT)
         .header("accept", "application/json")
         .send()
         .await?;
@@ -98,8 +98,8 @@ pub async fn fetch_model_limits(copilot_token: &str, api_base: &str) -> Vec<Mode
     let res = client
         .get(format!("{}/models", api_base.trim_end_matches('/')))
         .header("authorization", format!("Bearer {}", copilot_token))
-        .header("user-agent", "bob")
-        .header("editor-version", "bob/1.0")
+        .header("user-agent", crate::USER_AGENT)
+        .header("editor-version", crate::USER_AGENT)
         .header("copilot-integration-id", "vscode-chat")
         .send()
         .await;

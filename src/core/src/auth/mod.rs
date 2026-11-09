@@ -152,7 +152,7 @@ pub async fn request_device_code(cfg: &DeviceFlowConfig) -> anyhow::Result<Devic
     let res = client
         .post(&cfg.device_code_url)
         .header("accept", "application/json")
-        .header("user-agent", "bob")
+        .header("user-agent", crate::USER_AGENT)
         .form(&[
             ("client_id", cfg.client_id.as_str()),
             ("scope", cfg.scope.as_str()),
@@ -195,7 +195,7 @@ pub async fn poll_for_token<F: FnMut()>(
         let res = client
             .post(&cfg.token_url)
             .header("accept", "application/json")
-            .header("user-agent", "bob")
+            .header("user-agent", crate::USER_AGENT)
             .form(&[
                 ("client_id", cfg.client_id.as_str()),
                 ("device_code", device.device_code.as_str()),
@@ -366,6 +366,7 @@ pub async fn exchange_code(
     let res = client
         .post(&cfg.token_url)
         .header("accept", "application/json")
+        .header("user-agent", crate::USER_AGENT)
         .form(&[
             ("grant_type", "authorization_code"),
             ("code", code),
@@ -394,6 +395,7 @@ pub async fn refresh_token(
     let res = client
         .post(token_url)
         .header("accept", "application/json")
+        .header("user-agent", crate::USER_AGENT)
         .form(&[
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh),

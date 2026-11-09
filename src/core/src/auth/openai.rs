@@ -15,7 +15,7 @@ pub struct DeviceCode {
 
 fn client() -> reqwest::Client {
     reqwest::Client::builder()
-        .user_agent("bob")
+        .user_agent(crate::USER_AGENT)
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
 }

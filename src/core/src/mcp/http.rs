@@ -29,6 +29,7 @@ impl HttpTransport {
             oauth: cfg.oauth.clone(),
             // Bound the full response lifetime, including SSE streams that never close.
             client: reqwest::Client::builder()
+                .user_agent(crate::USER_AGENT)
                 .timeout(std::time::Duration::from_secs(30))
                 .redirect(reqwest::redirect::Policy::none())
                 .build()?,
