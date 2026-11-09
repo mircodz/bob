@@ -8,8 +8,7 @@
 # ///
 """Kusto (Azure Data Explorer) MCP server for bob.
 
-Run with `uv run mcp/kusto/server.py`. Clusters are configured by name in
-~/.bob/kusto.toml (override with KUSTO_MCP_CONFIG):
+Run with `uv run mcp/kusto/server.py`. Clusters are configured by name in ~/.bob/kusto.toml:
 
     [clusters.prod]
     url = "https://mycluster.westeurope.kusto.windows.net"

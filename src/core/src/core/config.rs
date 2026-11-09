@@ -139,12 +139,10 @@ impl Default for BobConfig {
             shell: None,
             permissions: PermissionsConfig {
                 default: "ask".to_string(),
-                allow_bash: [
-                    "ls", "cat", "pwd", "echo", "grep", "find", "git", "bun", "node", "tsc",
-                ]
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
+                allow_bash: ["ls", "cat", "pwd", "echo", "grep", "git"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
                 allow: ["read_file", "list_dir", "glob", "grep", "todo_write"]
                     .iter()
                     .map(|s| s.to_string())
@@ -511,9 +509,6 @@ reasoning = "{reasoning}"
 #            | solarized-light | base16-dark
 theme = "dark"
 
-# Max agent turns per prompt before it stops on its own.
-max_turns = {max_turns}
-
 # Optional: replace the built-in system prompt entirely (advanced).
 # system = "You are ..."
 
@@ -533,6 +528,8 @@ max_turns = {max_turns}
 # What to do for a tool call not covered by the lists below: allow | deny | ask.
 default = "{perm_default}"
 # Bash commands auto-approved without a prompt (never applies to PowerShell).
+# git is limited to read-only subcommands; redirections, shells and interpreters
+# always ask, whatever is listed here.
 allow_bash = [{allow_bash}]
 # Tools auto-approved without a prompt.
 allow = [{allow}]
@@ -559,7 +556,6 @@ deny = [{deny}]
         provider = "",
         model = "",
         reasoning = "",
-        max_turns = d.max_turns.unwrap_or(20),
         perm_default = d.permissions.default,
         allow_bash = quote(&d.permissions.allow_bash),
         allow = quote(&d.permissions.allow),
@@ -1229,7 +1225,7 @@ mod tests {
         let p: PartialConfig = toml::from_str(&toml_str).expect("default template is valid TOML");
         assert_eq!(p.reasoning.as_deref(), Some(""));
         assert_eq!(p.model.as_deref(), Some(""));
-        assert_eq!(p.max_turns, Some(200));
+        assert_eq!(p.max_turns, None);
         assert_eq!(p.theme.as_deref(), Some("dark"));
         assert!(p.system.is_none());
         let permissions = p.permissions.as_ref().unwrap();
@@ -1240,7 +1236,7 @@ mod tests {
         );
         assert_eq!(
             permissions.allow_bash.as_ref().unwrap(),
-            &["ls", "cat", "pwd", "echo", "grep", "find", "git", "bun", "node", "tsc"]
+            &["ls", "cat", "pwd", "echo", "grep", "git"]
         );
         assert!(permissions.deny.as_ref().unwrap().is_empty());
         let cfg = merge(BobConfig::default(), p);
@@ -1374,7 +1370,7 @@ mod tests {
                 "theme": null,
                 "permissions": {
                     "default": "ask",
-                    "allow_bash": ["ls", "cat", "pwd", "echo", "grep", "find", "git", "bun", "node", "tsc"],
+                    "allow_bash": ["ls", "cat", "pwd", "echo", "grep", "git"],
                     "allow": ["read_file", "list_dir", "glob", "grep", "todo_write"],
                     "deny": []
                 },

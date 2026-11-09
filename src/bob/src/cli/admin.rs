@@ -266,7 +266,6 @@ fn show_config() -> anyhow::Result<()> {
             "(default bob prompt)"
         }
     );
-    println!("  max_turns:   {}", config.max_turns.unwrap_or(20));
     println!(
         "  theme:       {}",
         config.theme.as_deref().unwrap_or("dark")
