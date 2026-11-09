@@ -154,10 +154,7 @@ impl Group<'_> {
                     }
                 }
             } else {
-                let (title, mut detail) = tool_render::display(&tool.name, &tool.input_preview);
-                if let Some(summary) = tool_render::read_summary(tool) {
-                    detail.push_str(&format!(" · {summary}"));
-                }
+                let (title, detail) = tool_render::display(&tool.name, &tool.input_preview);
                 let line = Line::from(vec![
                     Span::raw("  "),
                     Span::styled("• ", text().fg(state_color(&tool.state))),

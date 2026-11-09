@@ -299,10 +299,8 @@ async fn real_reads_survive_kernel_preview_projection_and_reopen_without_false_w
             assert!(presentation.body_preview.as_ref().unwrap().len() < 2048);
             let rows = render(call, result, false);
             let shown = text(&rows);
-            assert!(
-                shown.contains(&format!("Read source.rs · {expected_summary}")),
-                "{shown}"
-            );
+            assert!(shown.contains("Read source.rs"), "{shown}");
+            assert!(!shown.contains(" · lines"), "{shown}");
             assert!(!shown.contains("click to expand"));
             assert!(!shown.contains("Result preview incomplete"));
             assert_eq!(rows.len(), 2, "{shown}");
@@ -312,7 +310,7 @@ async fn real_reads_survive_kernel_preview_projection_and_reopen_without_false_w
             assert_group(view, result, expected_warning);
             let mut standalone = Vec::new();
             tool_render::tool(&mut standalone, call, None, false, 512);
-            assert!(text(&standalone).contains(expected_summary));
+            assert!(!text(&standalone).contains(" · lines"));
             if !expected_warning.is_empty() {
                 assert!(!text(&standalone).contains(expected_warning));
             }

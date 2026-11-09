@@ -15,10 +15,6 @@ const EXPANDED_MAX: usize = 500;
 #[path = "archive_recall.rs"]
 mod archive_recall;
 
-#[path = "read_presentation.rs"]
-mod read_presentation;
-pub(super) use read_presentation::summary as read_summary;
-
 fn arg<'a>(input: &'a Value, key: &str) -> &'a str {
     input.get(key).and_then(Value::as_str).unwrap_or("")
 }
@@ -706,14 +702,6 @@ pub(super) fn tool_with_input_state(
                 format!(" {}", preview(&detail, 72)),
                 Style::default().fg(Palette::DIM()),
             ));
-        }
-        if !failed {
-            if let Some(summary) = read_summary(tool) {
-                header.push(Span::styled(
-                    format!(" · {summary}"),
-                    Style::default().fg(Palette::DIM()),
-                ));
-            }
         }
         append(
             rows,
