@@ -136,6 +136,9 @@ impl WhisperTranscriber {
     /// `language` = `None` for auto-detect, or e.g. `Some("en")`.
     pub fn new(model_path: &std::path::Path, language: Option<String>) -> Result<Self> {
         use whisper_rs::{WhisperContext, WhisperContextParameters};
+        // Route whisper.cpp/ggml logs through whisper-rs's hooks, which drop
+        // them without a log backend, so they never write to the terminal.
+        whisper_rs::install_logging_hooks();
         let ctx = WhisperContext::new_with_params(
             &model_path.to_string_lossy(),
             WhisperContextParameters::default(),

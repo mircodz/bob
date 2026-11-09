@@ -183,9 +183,12 @@ fn build_cleanup(choice: CleanupChoice) -> Result<Box<dyn Cleanup>> {
         CleanupChoice::Rule => Ok(Box::new(RuleBasedCleanup::default())),
         CleanupChoice::None => Ok(Box::new(crate::cleanup::NoCleanup)),
         CleanupChoice::Custom(c) => Ok(c),
+        #[cfg(feature = "llm")]
         CleanupChoice::Llm(path) => {
             let c = crate::cleanup::LlmCleanup::new(&path)?;
             Ok(Box::new(c))
         }
+        #[cfg(not(feature = "llm"))]
+        CleanupChoice::Llm(_) => anyhow::bail!("bob-voice built without the `llm` feature"),
     }
 }

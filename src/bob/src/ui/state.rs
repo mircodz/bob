@@ -730,8 +730,118 @@ pub(super) struct App {
     pub size: Rect,
     clock: u64,
     output_epoch: u64,
+    #[cfg(target_os = "macos")]
+    pub voice: Option<crate::voice::Recorder>,
+    pub voice_state: VoiceState,
 }
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VoiceState {
+    #[default]
+    Off,
+    Loading,
+    Ready,
+    Listening,
+    Transcribing,
+}
+
 impl App {
+    #[cfg(target_os = "macos")]
+    fn toggle_voice(&mut self) {
+        if self.voice.is_none() {
+            let workspace = self
+                .workspace
+                .clone()
+                .or_else(|| std::env::current_dir().ok())
+                .unwrap_or_default();
+            match crate::voice::Recorder::spawn(&workspace) {
+                Ok(recorder) => self.voice = Some(recorder),
+                Err(error) => {
+                    self.notify_voice(format!("{error:#}"));
+                    return;
+                }
+            }
+        }
+        let recorder = self.voice.as_ref().unwrap();
+        match self.voice_state {
+            VoiceState::Listening => recorder.stop(),
+            VoiceState::Transcribing => {}
+            _ => {
+                recorder.start();
+                self.voice_state = VoiceState::Listening;
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn toggle_voice(&mut self) {
+        self.notify_voice("Voice dictation is only available on macOS.".into());
+    }
+
+    fn cancel_voice(&mut self) {
+        #[cfg(target_os = "macos")]
+        if let Some(recorder) = &self.voice {
+            recorder.cancel();
+            self.voice_state = VoiceState::Ready;
+            self.notify_voice("Recording cancelled.".into());
+        }
+    }
+
+    fn notify_voice(&mut self, text: String) {
+        if let Some(pane) = self.pane_mut() {
+            pane.notify_current(text);
+        } else {
+            self.status = text;
+        }
+    }
+
+    /// Applies finished transcriptions and recorder state; true when the UI changed.
+    #[cfg(target_os = "macos")]
+    pub fn poll_voice(&mut self) -> bool {
+        let Some(recorder) = &self.voice else {
+            return false;
+        };
+        let updates = recorder.poll();
+        let changed = !updates.is_empty();
+        for update in updates {
+            use crate::voice::Update;
+            match update {
+                Update::Loading => self.voice_state = VoiceState::Loading,
+                Update::Listening => self.voice_state = VoiceState::Listening,
+                Update::Transcribing => self.voice_state = VoiceState::Transcribing,
+                Update::Idle => {
+                    if self.voice_state != VoiceState::Listening {
+                        self.voice_state = VoiceState::Ready;
+                    }
+                }
+                Update::Text(text) => {
+                    let draft = self.draft_mut();
+                    let needs_space = draft.text[..draft.cursor]
+                        .chars()
+                        .next_back()
+                        .is_some_and(|ch| !ch.is_whitespace());
+                    if needs_space {
+                        draft.insert(" ");
+                    }
+                    draft.insert(&text);
+                    self.refresh_completion();
+                }
+                Update::Error(message) => {
+                    self.voice = None;
+                    self.voice_state = VoiceState::Off;
+                    self.notify_voice(message);
+                    break;
+                }
+            }
+        }
+        changed
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn poll_voice(&mut self) -> bool {
+        false
+    }
+
     pub fn new(page_size: usize) -> Self {
         Self {
             titles: title::SessionTitles::default(),
@@ -782,6 +892,9 @@ impl App {
             size: Rect::default(),
             clock: 0,
             output_epoch: 0,
+            #[cfg(target_os = "macos")]
+            voice: None,
+            voice_state: VoiceState::Off,
         }
     }
     pub fn set_services(&mut self, services: std::sync::Arc<bob::services::Services>) {
@@ -2045,6 +2158,18 @@ impl App {
                 return false;
             }
         }
+        if control && matches!(key.code, KeyCode::Char('r' | 'R')) && self.focus == Focus::Composer
+        {
+            self.toggle_voice();
+            return false;
+        }
+        if key.code == KeyCode::Esc
+            && self.focus == Focus::Composer
+            && matches!(self.voice_state, VoiceState::Listening)
+        {
+            self.cancel_voice();
+            return false;
+        }
         if control && matches!(key.code, KeyCode::Char('x' | 'X')) {
             self.stop(jobs);
             return false;
@@ -2671,7 +2796,10 @@ impl App {
                 self.files_loaded = true;
                 self.refresh_completion();
             }
-            Reply::ApplicationReady(Ok((application, view))) => {
+            Reply::ApplicationReady(ready) if ready.is_ok() => {
+                let Ok((application, view)) = *ready else {
+                    unreachable!()
+                };
                 let session = application.session;
                 self.configure(
                     PathBuf::from(&session.workspace),
@@ -2688,7 +2816,8 @@ impl App {
                 self.titles.select(session.id.clone());
                 self.panes.entry(thread).or_default().session = Some(session);
             }
-            Reply::ApplicationReady(Err(error)) => {
+            Reply::ApplicationReady(ready) => {
+                let Err(error) = *ready else { unreachable!() };
                 self.startup_error = Some(error.clone());
                 self.reply(Reply::Ready(Err(error)))
             }
@@ -3374,6 +3503,7 @@ pub(super) struct Metadata {
     queue: bob_kernel::QueueSnapshot,
 }
 
+#[allow(clippy::large_enum_variant)]
 pub(super) enum Reply {
     Inline(super::inline::PageReply),
     Workflow(workflow::QueryReply),
@@ -3397,7 +3527,7 @@ pub(super) enum Reply {
         epoch: u64,
         files: Vec<String>,
     },
-    ApplicationReady(std::result::Result<(bob::application::Application, View), String>),
+    ApplicationReady(Box<std::result::Result<(bob::application::Application, View), String>>),
     Metadata {
         thread: ThreadId,
         key: (u64, i64),

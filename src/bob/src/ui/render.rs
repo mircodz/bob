@@ -1419,6 +1419,14 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
         }
         let bar = inset(Rect::new(main.x, main.bottom() - 1, main.width, 1), 3);
         let mut hint = String::new();
+        match app.voice_state {
+            super::state::VoiceState::Loading => hint.push_str("◌ loading voice  "),
+            super::state::VoiceState::Listening => {
+                hint.push_str("● recording · ^R stop · esc cancel  ")
+            }
+            super::state::VoiceState::Transcribing => hint.push_str("◌ transcribing  "),
+            _ => {}
+        }
         if app
             .visible_threads()
             .iter()
@@ -1437,8 +1445,9 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
                 "^L show todos"
             });
         }
-        let reserve = if hint.len() + 24 <= bar.width as usize {
-            hint.len() as u16 + 2
+        let hint_width = hint.chars().count();
+        let reserve = if hint_width + 24 <= bar.width as usize {
+            hint_width as u16 + 2
         } else {
             0
         };
@@ -1451,8 +1460,14 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
         );
         if reserve > 0 {
             frame.render_widget(
-                Paragraph::new(hint.as_str()).style(text().fg(Palette::FAINT())),
-                Rect::new(bar.right() - hint.len() as u16, bar.y, hint.len() as u16, 1),
+                Paragraph::new(hint.as_str()).style(text().fg(
+                    if app.voice_state == super::state::VoiceState::Listening {
+                        Palette::ERROR()
+                    } else {
+                        Palette::FAINT()
+                    },
+                )),
+                Rect::new(bar.right() - hint_width as u16, bar.y, hint_width as u16, 1),
             );
         }
     }

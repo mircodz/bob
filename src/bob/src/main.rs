@@ -2,6 +2,8 @@
 use bob::adapters;
 mod cli;
 mod ui;
+#[cfg(target_os = "macos")]
+mod voice;
 
 use cli::Args;
 

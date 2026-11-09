@@ -32,6 +32,30 @@ pub enum Command {
         #[command(subcommand)]
         action: LspAction,
     },
+    /// Manage local voice dictation (Ctrl+R in the input box).
+    #[cfg(target_os = "macos")]
+    Voice {
+        #[command(subcommand)]
+        action: VoiceAction,
+    },
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Subcommand)]
+pub enum VoiceAction {
+    /// Download a Whisper model to ~/.bob/models (base English, 148 MB, by default).
+    Install {
+        /// Install the larger, more accurate large-v3-turbo model (1.6 GB).
+        #[arg(long)]
+        turbo: bool,
+        /// Copy an existing model file (or a directory containing it) instead of downloading.
+        #[arg(long, value_name = "PATH")]
+        from: Option<std::path::PathBuf>,
+    },
+    /// Show installed models and whether the microphone is available.
+    Status,
+    /// Delete downloaded voice models.
+    Remove,
 }
 
 #[derive(Debug, Subcommand)]
@@ -112,6 +136,12 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
         Command::Config { action } => run_config(action),
         Command::Mcp { action } => run_mcp(action).await,
         Command::Lsp { action } => run_lsp(action),
+        #[cfg(target_os = "macos")]
+        Command::Voice { action } => match action {
+            VoiceAction::Install { turbo, from } => crate::voice::install(turbo, from).await,
+            VoiceAction::Status => crate::voice::status(),
+            VoiceAction::Remove => crate::voice::remove(),
+        },
     }
 }
 
@@ -239,6 +269,10 @@ fn show_config() -> anyhow::Result<()> {
     println!("  permissions: default={}", config.permissions.default);
     println!("  mcp_servers: {}", config.mcp_servers.len());
     println!("  lsp_servers: {}", config.lsp_servers.len());
+    println!(
+        "  voice model: {}",
+        config.voice.model.as_deref().unwrap_or("auto")
+    );
     match &config.shell {
         Some(shell) => println!("  shell:       {} ({})", shell.dialect.name(), shell.executable.display()),
         None => println!("  shell:       automatic (native PowerShell 7, then Git Bash on Windows; Bash elsewhere)"),

@@ -23,6 +23,8 @@ enum Command {
     Start,
     /// End the current utterance, transcribe it, and emit a `Final` event.
     Stop,
+    /// End the current utterance and discard its audio.
+    Cancel,
     /// Shut the session down.
     Quit,
 }
@@ -66,6 +68,11 @@ impl Session {
         let _ = self.cmd_tx.send(Command::Stop);
     }
 
+    /// End the current utterance without transcribing it.
+    pub fn cancel(&self) {
+        let _ = self.cmd_tx.send(Command::Cancel);
+    }
+
     /// The event stream. Iterating blocks until the session is dropped.
     pub fn events(&self) -> impl Iterator<Item = Event> + '_ {
         self.events_rx.iter()
@@ -86,66 +93,71 @@ impl Drop for Session {
     }
 }
 
-/// The capture loop: buffers audio while an utterance is active, transcribes on
-/// `Stop`, and emits state/`Final` events.
+/// The capture loop: the microphone is open only while an utterance is active,
+/// so the OS recording indicator turns off as soon as capture stops.
 fn run_loop(voice: &Voice, events: &Sender<Event>, cmd: &mpsc::Receiver<Command>) -> Result<()> {
     use std::time::Duration;
 
-    let audio = AudioCapture::start()?;
+    let mut audio: Option<AudioCapture> = None;
     let mut buffer: Vec<f32> = Vec::new();
-    let mut active = false;
-    events
-        .send(Event::State {
-            state: DictationState::Idle,
-        })
-        .ok();
+    let state = |state| {
+        events.send(Event::State { state }).ok();
+    };
+    state(DictationState::Idle);
 
     loop {
-        // Handle any pending commands (non-blocking).
-        match cmd.try_recv() {
+        let command = if audio.is_some() {
+            cmd.try_recv()
+        } else {
+            cmd.recv().map_err(|_| mpsc::TryRecvError::Disconnected)
+        };
+        match command {
             Ok(Command::Start) => {
-                active = true;
-                buffer.clear();
-                // Drop buffered pre-roll so we don't capture stale audio.
-                while audio.samples.try_recv().is_ok() {}
-                events
-                    .send(Event::State {
-                        state: DictationState::Listening,
-                    })
-                    .ok();
+                if audio.is_none() {
+                    buffer.clear();
+                    match AudioCapture::start() {
+                        Ok(capture) => {
+                            audio = Some(capture);
+                            state(DictationState::Listening);
+                        }
+                        Err(error) => {
+                            events
+                                .send(Event::Error {
+                                    message: format!("microphone unavailable: {error}"),
+                                })
+                                .ok();
+                            state(DictationState::Idle);
+                        }
+                    }
+                }
             }
             Ok(Command::Stop) => {
-                if active {
-                    active = false;
-                    events
-                        .send(Event::State {
-                            state: DictationState::Transcribing,
-                        })
-                        .ok();
+                if let Some(capture) = audio.take() {
+                    buffer.extend(capture.samples.try_iter().flatten());
+                    drop(capture);
+                    state(DictationState::Transcribing);
                     let text = voice.transcribe_locked(&buffer)?;
                     buffer.clear();
                     if !text.is_empty() {
                         events.send(Event::Final { text }).ok();
                     }
-                    events
-                        .send(Event::State {
-                            state: DictationState::Idle,
-                        })
-                        .ok();
+                    state(DictationState::Idle);
                 }
             }
-            Ok(Command::Quit) => return Ok(()),
-            Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
+            Ok(Command::Cancel) => {
+                if audio.take().is_some() {
+                    buffer.clear();
+                    state(DictationState::Idle);
+                }
+            }
+            Ok(Command::Quit) | Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
             Err(mpsc::TryRecvError::Empty) => {}
         }
 
-        // Drain available audio while active.
-        if active {
-            if let Ok(chunk) = audio.samples.recv_timeout(Duration::from_millis(50)) {
+        if let Some(capture) = &audio {
+            if let Ok(chunk) = capture.samples.recv_timeout(Duration::from_millis(50)) {
                 buffer.extend_from_slice(&chunk);
             }
-        } else {
-            std::thread::sleep(Duration::from_millis(20));
         }
     }
 }

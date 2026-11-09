@@ -115,6 +115,16 @@ pub struct BobConfig {
     pub mcp_servers: Vec<McpServerConfig>,
     #[serde(default)]
     pub lsp_servers: Vec<LspServerConfig>,
+    #[serde(default)]
+    pub voice: VoiceConfig,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct VoiceConfig {
+    /// Dictation model: "base.en" | "large-v3-turbo". Unset or "auto" uses the
+    /// most accurate installed model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 impl Default for BobConfig {
@@ -144,6 +154,7 @@ impl Default for BobConfig {
             provider_timeouts: ProviderTimeoutsConfig::default(),
             mcp_servers: vec![],
             lsp_servers: vec![],
+            voice: VoiceConfig::default(),
         }
     }
 }
@@ -162,6 +173,12 @@ struct PartialConfig {
     provider_timeouts: Option<PartialProviderTimeouts>,
     mcp_servers: Option<Vec<PartialMcpServer>>,
     lsp_servers: Option<Vec<PartialLspServer>>,
+    voice: Option<PartialVoice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PartialVoice {
+    model: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -408,6 +425,12 @@ fn merge(mut base: BobConfig, over: PartialConfig) -> BobConfig {
         provider_timeouts: base.provider_timeouts,
         mcp_servers: base.mcp_servers,
         lsp_servers: base.lsp_servers,
+        voice: VoiceConfig {
+            model: over
+                .voice
+                .and_then(|voice| voice.model)
+                .or(base.voice.model),
+        },
     }
 }
 
@@ -526,6 +549,11 @@ deny = [{deny}]
 
 # Language servers live in the PROJECT config (./.bob.config.toml), added with
 # `bob lsp add rust --ext rs -- rust-analyzer`.
+
+# Voice dictation (macOS, Ctrl+R in the input box). Install models with
+# `bob voice install` (base.en) or `bob voice install --turbo` (large-v3-turbo).
+# [voice]
+# model = "large-v3-turbo" # "base.en" | "large-v3-turbo"; unset = best installed
 "#,
         provider = "",
         model = "",
@@ -1184,7 +1212,8 @@ mod tests {
                 },
                 "provider_timeouts": {"startup_secs": 120, "idle_secs": 120},
                 "mcp_servers": [],
-                "lsp_servers": []
+                "lsp_servers": [],
+                "voice": {}
             })
         );
         let cleared = merge(config, toml::from_str("reasoning = ''").unwrap());
@@ -1350,7 +1379,8 @@ mod tests {
                 },
                 "provider_timeouts": {"startup_secs": 120, "idle_secs": 120},
                 "mcp_servers": [],
-                "lsp_servers": []
+                "lsp_servers": [],
+                "voice": {}
             })
         );
     }
@@ -1574,6 +1604,22 @@ mod tests {
         let config = load_project_config(global, &cwd).unwrap();
         let shell = crate::core::shell::CommandShell::resolve(&cwd, config.shell.as_ref());
         assert!(shell.executable().unwrap_err().contains("must be absolute"));
+    }
+
+    #[test]
+    fn voice_model_overlays_and_survives_unrelated_project_config() {
+        let user: PartialConfig = toml::from_str("[voice]\nmodel = \"base.en\"\n").unwrap();
+        let config = merge(BobConfig::default(), user);
+        assert_eq!(config.voice.model.as_deref(), Some("base.en"));
+        let project: PartialConfig = toml::from_str("theme = \"light\"\n").unwrap();
+        let config = merge(config, project);
+        assert_eq!(config.voice.model.as_deref(), Some("base.en"));
+        let project: PartialConfig =
+            toml::from_str("[voice]\nmodel = \"large-v3-turbo\"\n").unwrap();
+        assert_eq!(
+            merge(config, project).voice.model.as_deref(),
+            Some("large-v3-turbo")
+        );
     }
 
     #[test]

@@ -67,6 +67,7 @@ impl Cleanup for RuleBasedCleanup {
     }
 }
 
+#[cfg(feature = "llm")]
 /// In-process LLM cleanup: a tiny instruct model (Qwen2.5-0.5B via llama.cpp)
 /// reformats the transcript — punctuation, casing, filler removal — WITHOUT
 /// changing the words. Metal-accelerated; loads once and stays resident.
@@ -81,6 +82,7 @@ pub struct LlmCleanup {
     lock: std::sync::Mutex<()>,
 }
 
+#[cfg(feature = "llm")]
 impl LlmCleanup {
     /// Load a GGUF instruct model (e.g. Qwen2.5-0.5B-Instruct Q4_K_M).
     pub fn new(model_path: &std::path::Path) -> anyhow::Result<Self> {
@@ -159,6 +161,7 @@ impl LlmCleanup {
     }
 }
 
+#[cfg(feature = "llm")]
 impl Cleanup for LlmCleanup {
     fn clean(&self, raw: &str) -> String {
         let raw = raw.trim();
@@ -169,10 +172,7 @@ impl Cleanup for LlmCleanup {
         match self.run(raw) {
             Ok(s) if !s.is_empty() => s,
             Ok(_) => raw.to_string(),
-            Err(e) => {
-                eprintln!("llm cleanup failed, using raw text: {e}");
-                raw.to_string()
-            }
+            Err(_) => raw.to_string(),
         }
     }
 }

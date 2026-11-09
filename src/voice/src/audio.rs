@@ -32,7 +32,8 @@ impl AudioCapture {
         let decim = (src_sr / TARGET_SR).max(1) as usize;
 
         let (tx, rx) = crossbeam_channel::bounded::<Vec<f32>>(32);
-        let err_fn = |e| eprintln!("audio stream error: {e}");
+        // Stream errors must not print: the host may own the terminal (e.g. a TUI).
+        let err_fn = |_e| {};
 
         let stream = match config.sample_format() {
             SampleFormat::F32 => device.build_input_stream(

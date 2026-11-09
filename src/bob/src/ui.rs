@@ -142,11 +142,11 @@ pub(crate) async fn run(options: Options, terminal_titles: bool) -> Result<()> {
     terminal.draw(|frame| draw(frame, &mut app))?;
     app.refresh_inline(&mut jobs);
     jobs.spawn(async move {
-        Reply::ApplicationReady(
+        Reply::ApplicationReady(Box::new(
             initialize(options, terminal_titles)
                 .await
                 .map_err(|error| format!("{error:#}")),
-        )
+        ))
     });
     let mut events = InputEvents {
         events: EventStream::new(),
@@ -208,6 +208,9 @@ pub(crate) async fn run(options: Options, terminal_titles: bool) -> Result<()> {
                     }
                 }
                 Some(NextEvent::Tick) => {
+                    if app.poll_voice() {
+                        urgency = Some(visual::Urgency::Immediate);
+                    }
                     if app.refresh_visual(&mut jobs) {
                         urgency = Some(visual::Urgency::Immediate);
                     }
