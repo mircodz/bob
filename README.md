@@ -16,17 +16,6 @@ bob
 bob config
 ```
 
-### DeepSeek
-
-DeepSeek uses an API key instead of a login ([create one](https://platform.deepseek.com/api_keys)):
-
-```sh
-export DEEPSEEK_API_KEY=sk-...
-bob -p deepseek                     # deepseek-flash
-bob -p deepseek -m deepseek-v4-pro
-bob -p deepseek -r high             # thinking on; -r off turns it off
-```
-
 ### MCP servers
 
 ```sh
