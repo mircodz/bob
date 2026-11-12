@@ -236,7 +236,7 @@ impl ProviderService {
         };
         tokio::select! {
             biased;
-            _ = bob_kernel::cancelled(&mut cancel) => bail!("generation cancelled"),
+            _ = bob_kernel::cancelled(&mut cancel) => bail!(failure::CANCELLED),
             result = attempt => result,
         }
     }

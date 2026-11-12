@@ -226,10 +226,18 @@ async fn actual_inflight_clear_cancel_profile_and_revision_fence_late_summary() 
             );
         } else {
             let after = state(&actor, &receipt.thread);
-            assert_eq!(
-                (after.cursor, after.offset, after.summary),
-                (before.cursor, before.offset, before.summary)
-            );
+            if invalidation == "cancel" {
+                // A stopped turn never accepts a late summary.
+                assert_eq!(
+                    (after.cursor, after.offset, after.summary),
+                    (before.cursor, before.offset, before.summary)
+                );
+            } else {
+                // Profile changes and appended messages leave the summarized prefix intact, so
+                // the in-flight summary is still valid progress.
+                assert_eq!(after.summary, "must not publish");
+                assert!(after.cursor > before.cursor || after.offset > before.offset);
+            }
             assert!(
                 crate::context::working_ids(&actor.store.db, &receipt.thread)
                     .unwrap()
@@ -247,6 +255,60 @@ async fn actual_inflight_clear_cancel_profile_and_revision_fence_late_summary() 
             .unwrap();
         assert_eq!(tools, 0);
     }
+}
+
+#[tokio::test]
+async fn cancelled_summary_is_silent_and_retries_without_blocking() {
+    let (_dir, store, receipt, _) = fixture();
+    let (requests, mut dispatched) = mpsc::unbounded_channel();
+    let mut actor = Actor::new_owned(store, Arc::new(BarrierExecutor { requests })).unwrap();
+    let (run, pending) = seeded(&mut actor, &receipt.thread, false);
+    let (done, mut completed) = mpsc::channel(16);
+    actor
+        .compact_step(&run, &receipt.thread, pending, &done)
+        .unwrap();
+    let (first, response) = dispatch(&mut dispatched).await;
+    let recoveries = |actor: &Actor| -> i64 {
+        actor
+            .store
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM entries WHERE thread=?1 AND kind='recovery'",
+                [&receipt.thread],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    let before = recoveries(&actor);
+    // The kernel cancels the request itself (stop, shutdown, stale fence).
+    for worker in actor.workers.values_mut() {
+        worker.cancelled_at = Some(std::time::Instant::now());
+    }
+    drop(response);
+    let result = tokio::time::timeout(Duration::from_secs(5), completed.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let id = result.id.clone();
+    actor.finish(result).unwrap();
+    actor.workers.remove(&id).unwrap().task.await.unwrap();
+    assert_eq!(recoveries(&actor), before);
+    let pending = state(&actor, &receipt.thread);
+    assert!(pending.phase != Phase::Blocked);
+    assert_eq!(pending.retries, 0);
+    let (status, held): (String, bool) = actor
+        .store
+        .db
+        .query_row(
+            "SELECT r.state,t.held FROM runs r JOIN threads t ON t.id=r.thread WHERE r.id=?1",
+            [&run],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((status.as_str(), held), ("active", false));
+    actor.request(&run, &receipt.thread, &done).unwrap();
+    let (second, _response) = dispatch(&mut dispatched).await;
+    assert_eq!(first.messages[0].text(), second.messages[0].text());
 }
 
 #[tokio::test]
@@ -348,20 +410,18 @@ async fn invalid_summaries_exhaust_durably_and_explicit_compact_resets() {
             .unwrap();
     store.adopt_claim(claim, true).unwrap();
     let mut actor = Actor::new_owned(store, Arc::new(CompactExecutor)).unwrap();
-    for _ in 0..3 {
-        assert!(actor
-            .store
-            .command(
-                &Command::Resume {
-                    id: CommandId::new(),
-                    thread: receipt.thread.clone()
-                },
-                &models
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("Compaction blocked"));
-    }
+    // A blocked compaction never prevents resuming; the next attempt gets fresh budgets.
+    actor
+        .store
+        .command(
+            &Command::Resume {
+                id: CommandId::new(),
+                thread: receipt.thread.clone(),
+            },
+            &models,
+        )
+        .unwrap();
+    assert!(state(&actor, &receipt.thread).run.is_empty());
     let revision = actor.context_snapshot(&receipt.thread).unwrap().revision;
     actor
         .store
@@ -379,7 +439,10 @@ async fn invalid_summaries_exhaust_durably_and_explicit_compact_resets() {
         .db
         .query_row("SELECT COUNT(*) FROM compactions", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(count, 0);
+    // Retrying keeps the accepted progress and only re-arms the exhausted budgets.
+    assert_eq!(count, 1);
+    assert!(state(&actor, &receipt.thread).run.is_empty());
+    assert_eq!(state(&actor, &receipt.thread).attempts, 5);
     assert_eq!(
         crate::context::working_ids(&actor.store.db, &receipt.thread).unwrap(),
         original

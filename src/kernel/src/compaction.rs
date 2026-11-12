@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 pub(super) const MAX_ATTEMPTS: u32 = 256;
 const MAX_RETRIES: u32 = 4;
 pub(super) const MAX_REDUCTIONS: u32 = 8;
-pub(super) const RECOVERY: &str = "Original working context retained. Select a larger model, change the context, or explicitly request compaction again; ordinary resume will not reset this budget.";
+pub(super) const RECOVERY: &str = "Original working context retained; send a message or use /compact to retry, or select a larger model.";
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -31,6 +31,8 @@ pub(super) struct CompactionState {
     pub epoch: i64,
     pub revision: i64,
     pub profile_revision: i64,
+    pub checkpoint: Option<String>,
+    pub run: String,
     pub tail_start: i64,
     pub cursor: i64,
     pub offset: usize,
@@ -41,6 +43,7 @@ pub(super) struct CompactionState {
     pub output_tokens: Option<u32>,
     pub phase: Phase,
     pub attempts: u32,
+    pub attempt_base: u32,
     pub retries: u32,
     pub reductions: u32,
     pub attempt: Attempt,
@@ -59,13 +62,40 @@ impl CompactionState {
         )?;
         Ok(())
     }
+    /// Progress stays valid while the summarized prefix is unchanged: appended messages and
+    /// profile changes keep it, a cleared context or a newer checkpoint does not. Legacy
+    /// states predate pinning, but a surviving row always belongs to the current checkpoint
+    /// because publishing a checkpoint deletes it in the same transaction.
     pub fn matches(&self, db: &Connection, thread: &ThreadId) -> anyhow::Result<bool> {
-        let current: (i64,i64,i64) = db.query_row("SELECT c.epoch,c.revision,t.profile_revision FROM contexts c JOIN threads t ON t.id=c.thread WHERE c.thread=?1",[thread],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
-        Ok(current == (self.epoch, self.revision, self.profile_revision))
+        let (epoch, checkpoint): (i64, Option<String>) = db.query_row(
+            "SELECT epoch,checkpoint FROM contexts WHERE thread=?1",
+            [thread],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok(epoch == self.epoch && (self.projection_version < 2 || checkpoint == self.checkpoint))
     }
     pub fn block(&mut self, reason: &str) {
         self.phase = Phase::Blocked;
-        self.blocked = format!("Compaction blocked: {reason}. {RECOVERY}");
+        self.blocked = format!("Compaction failed: {reason}. {RECOVERY}");
+    }
+    /// Resets per-turn budgets after a failed turn while keeping accepted summary progress.
+    pub fn rearm(&mut self) {
+        self.blocked.clear();
+        self.attempt_base = self.attempts;
+        self.retries = 0;
+        self.reductions = 0;
+        self.output_tokens = None;
+        self.input_ceiling = None;
+        self.chunk_limit = self.chunk_limit.max(24_000);
+        if !self.reduction_source.is_empty() {
+            self.summary.clear();
+            self.reduction_offset = 0;
+            self.phase = Phase::Reduce;
+        } else if self.complete {
+            self.phase = Phase::Validate;
+        } else {
+            self.phase = Phase::Summarize;
+        }
     }
     pub fn reduce(&mut self) {
         if self.reductions >= MAX_REDUCTIONS || self.summary.trim().is_empty() {
@@ -76,7 +106,7 @@ impl CompactionState {
         self.phase = Phase::Reduce;
         self.reduction_source = std::mem::take(&mut self.summary);
         self.reduction_offset = 0;
-        self.chunk_limit = 24_000;
+        self.chunk_limit = self.chunk_limit.max(24_000);
     }
     pub fn retry(
         &mut self,
@@ -86,7 +116,9 @@ impl CompactionState {
         window: usize,
     ) -> bool {
         self.retries += 1;
-        if self.retries > MAX_RETRIES || self.attempts >= MAX_ATTEMPTS {
+        if self.retries > MAX_RETRIES
+            || self.attempts.saturating_sub(self.attempt_base) >= MAX_ATTEMPTS
+        {
             self.block("attempt/retry budget exhausted");
             return false;
         }

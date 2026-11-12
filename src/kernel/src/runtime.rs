@@ -876,7 +876,7 @@ impl Actor {
         let mut expired = Vec::new();
         for (id, worker) in &mut self.workers {
             let active: bool = self.store.db.query_row(
-                "SELECT r.state='active' AND o.epoch=c.epoch AND o.profile_revision=t.profile_revision FROM operations o JOIN runs r ON r.id=o.run JOIN contexts c ON c.thread=o.thread JOIN threads t ON t.id=o.thread WHERE o.id=?1",
+                "SELECT r.state='active' AND o.epoch=c.epoch AND (o.profile_revision=t.profile_revision OR o.name='compact') FROM operations o JOIN runs r ON r.id=o.run JOIN contexts c ON c.thread=o.thread JOIN threads t ON t.id=o.thread WHERE o.id=?1",
                 [id],
                 |r| r.get(0),
             )?;
@@ -1089,8 +1089,7 @@ impl Actor {
                         .store
                         .db
                         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-                    entry(&tx, &thread, "recovery", &text, EntryData::default())?;
-                    crate::lifecycle::fail(&tx, &run, &text)?;
+                    model_runtime::fail_turn(&tx, &run, &thread, &text)?;
                     tx.commit()?;
                 }
             }
@@ -1528,7 +1527,7 @@ impl Actor {
         let run = RunId(run);
         let thread = ThreadId(thread);
         let active: bool = self.store.db.query_row(
-            "SELECT r.state='active' AND o.epoch=c.epoch AND o.profile_revision=t.profile_revision FROM operations o JOIN runs r ON r.id=o.run JOIN contexts c ON c.thread=o.thread JOIN threads t ON t.id=o.thread WHERE o.id=?1",
+            "SELECT r.state='active' AND o.epoch=c.epoch AND (o.profile_revision=t.profile_revision OR o.name='compact') FROM operations o JOIN runs r ON r.id=o.run JOIN contexts c ON c.thread=o.thread JOIN threads t ON t.id=o.thread WHERE o.id=?1",
             [opid],
             |r| r.get(0),
         )?;
@@ -1584,7 +1583,19 @@ impl Actor {
             }
             Ok(output)
         });
+        // Cancelling a turn that continues (stale fence, shutdown) is internal, not a failure;
+        // a user stop still reports the interrupted request.
+        let cancelled = self
+            .workers
+            .get(opid)
+            .is_some_and(|worker| worker.cancelled_at.is_some())
+            && self.store.db.query_row(
+                "SELECT state='active' FROM runs WHERE id=?1",
+                [&run],
+                |r| r.get::<_, bool>(0),
+            )?;
         let live_error = self.error.clone().or_else(|| match &result {
+            Err(_) if cancelled => None,
             Err(error) => Some(format!("{error:#}")),
             Ok(Output::Model(completion))
                 if matches!(completion.stop_reason, StopReason::MaxTokens)
@@ -1858,11 +1869,7 @@ impl Actor {
             Err(error) => {
                 let text = format!("{error:#}");
                 let uncertain = kind == "tool" && state == "started";
-                let cancelled = self
-                    .workers
-                    .get(opid)
-                    .is_some_and(|worker| worker.cancelled_at.is_some());
-                if kind == "model" && active && cancelled {
+                if kind == "model" && cancelled {
                     tx.execute("UPDATE operations SET state='failed' WHERE id=?1", [opid])?;
                 } else {
                     if kind == "tool" {
@@ -1879,7 +1886,7 @@ impl Actor {
                             ),
                             true,
                         )?;
-                    } else {
+                    } else if name != "compact" || !active {
                         entry(
                             &tx,
                             &thread,
@@ -1905,10 +1912,7 @@ impl Actor {
                             false,
                         )?;
                     if active && kind == "model" && !retry && name == "compact" {
-                        tx.execute("UPDATE runs SET state='interrupted' WHERE id=?1", [&run])?;
-                        tx.execute("UPDATE threads SET held=1 WHERE id=?1", [&thread])?;
-                        crate::lifecycle::stop_owned(&tx, &run)?;
-                        entry(&tx,&thread,"recovery","Compaction failed; original context retained. Select a larger model or explicitly request compaction again. Ordinary resume does not reset exhausted attempts.",EntryData::default())?;
+                        model_runtime::fail_compaction(&tx, &run, &thread, &text)?;
                     } else if active && kind == "model" && !retry {
                         fail_model_run(
                             &tx,
@@ -2470,7 +2474,9 @@ mod tests {
             .view(Some(receipt.thread), None, 100, actor.error.clone())
             .unwrap();
         assert!(view.error.is_none());
-        assert_eq!(view.threads[0].state, ThreadState::Interrupted);
+        // The turn ends with a visible error; the thread is not held, so the next message runs.
+        assert_ne!(view.threads[0].state, ThreadState::Interrupted);
+        assert_ne!(view.threads[0].state, ThreadState::Held);
         assert!(view.entries.iter().any(|e| e
             .text
             .contains("System instructions and tool schemas exceed")));

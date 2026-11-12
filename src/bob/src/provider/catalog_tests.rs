@@ -602,7 +602,7 @@ fn typed_adapter_failures_and_existing_core_predicates_drive_classification() {
         ("malformed SSE JSON", ModelFailureKind::Fatal),
         ("JSON column 429", ModelFailureKind::Fatal),
         ("provider resource limit exceeded", ModelFailureKind::Fatal),
-        ("generation cancelled", ModelFailureKind::Fatal),
+        ("generation cancelled", ModelFailureKind::Transient),
     ] {
         assert_eq!(
             failure::classify(&anyhow::anyhow!(message)),

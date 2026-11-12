@@ -35,7 +35,7 @@ pub(crate) fn input_limit(model: &ModelInfo, caps: &ModelCapabilities, output: u
 
 fn last_measurement(db: &Connection, thread: &ThreadId) -> anyhow::Result<Option<(u64, usize)>> {
     Ok(db.query_row(
-        "SELECT json_extract(o.input,'$.measured_input_tokens'),json_extract(o.input,'$.estimated_input_tokens') FROM operations o JOIN contexts c ON c.thread=o.thread JOIN threads t ON t.id=o.thread WHERE o.thread=?1 AND o.name='model' AND o.state='done' AND o.epoch=c.epoch AND o.profile_revision=t.profile_revision AND json_extract(o.input,'$.checkpoint') IS c.checkpoint AND json_extract(o.input,'$.measured_input_tokens') IS NOT NULL AND json_extract(o.input,'$.estimated_input_tokens') IS NOT NULL ORDER BY o.rowid DESC LIMIT 1",
+        "SELECT json_extract(o.input,'$.measured_input_tokens'),json_extract(o.input,'$.estimated_input_tokens') FROM operations o JOIN contexts c ON c.thread=o.thread JOIN threads t ON t.id=o.thread WHERE o.thread=?1 AND o.name='model' AND o.state='done' AND o.epoch=c.epoch AND json_extract(o.input,'$.model') IS json_extract(t.profile,'$.model') AND json_extract(o.input,'$.checkpoint') IS c.checkpoint AND json_extract(o.input,'$.measured_input_tokens') IS NOT NULL AND json_extract(o.input,'$.estimated_input_tokens') IS NOT NULL ORDER BY o.rowid DESC LIMIT 1",
         [thread],|r|Ok((r.get(0)?,r.get(1)?))).optional()?)
 }
 

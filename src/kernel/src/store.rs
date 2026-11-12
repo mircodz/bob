@@ -662,8 +662,8 @@ impl Store {
                     unresolved == 0,
                     "inspect and resolve unknown operations before resuming"
                 );
-                let blocked: Option<String> = tx.query_row("SELECT json_extract(p.state,'$.blocked') FROM compactions p JOIN contexts c ON c.thread=p.thread JOIN threads t ON t.id=p.thread WHERE p.thread=?1 AND json_extract(p.state,'$.phase')='blocked' AND json_extract(p.state,'$.epoch')=c.epoch AND json_extract(p.state,'$.revision')=c.revision AND json_extract(p.state,'$.profile_revision')=t.profile_revision",[thread],|r|r.get(0)).optional()?;
-                ensure!(blocked.is_none(), "{}", blocked.unwrap_or_default());
+                // A blocked compaction never prevents resuming; the next step re-arms it.
+                tx.execute("UPDATE compactions SET state=json_set(state,'$.run','') WHERE thread=?1 AND json_extract(state,'$.phase')='blocked'",[thread])?;
                 tx.execute(
                     "UPDATE runs SET state='active' WHERE thread=?1 AND state='interrupted'",
                     [thread],

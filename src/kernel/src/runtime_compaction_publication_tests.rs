@@ -241,7 +241,7 @@ async fn serialization_case(mode: &str) {
         assert_eq!(history(&actor, &receipt.thread), transcript);
         let snapshot = actor.context_snapshot(&receipt.thread).unwrap();
         if snapshot.checkpoint.is_some() {
-            assert_eq!(mode, "reduce");
+            assert_ne!(mode, "manifest");
             assert!(saw_reduction);
             assert_eq!(snapshot.revision, before.revision + 1);
             let mut spec = actor.model_spec(&receipt.thread).unwrap();
@@ -254,6 +254,10 @@ async fn serialization_case(mode: &str) {
             assert!(spec.messages[0]
                 .text()
                 .contains(&protected_context(&actor.store.db, &receipt.thread).unwrap()));
+            if mode == "truncate" {
+                // A model that never shortens its summary is cut instead of blocking.
+                assert!(spec.messages[0].text().contains("[summary truncated]"));
+            }
             settled = true;
             break;
         }
@@ -264,7 +268,7 @@ async fn serialization_case(mode: &str) {
         assert_eq!(snapshot.revision, before.revision);
         let blocked: bool = actor.store.db.query_row("SELECT EXISTS(SELECT 1 FROM compactions WHERE thread=?1 AND json_extract(state,'$.phase')='blocked')", [&receipt.thread], |r| r.get(0)).unwrap();
         if blocked {
-            assert_ne!(mode, "reduce");
+            assert_eq!(mode, "manifest");
             assert!(scheduled_model(&mut actor, &done, &mut completed)
                 .await
                 .is_none());
@@ -272,14 +276,11 @@ async fn serialization_case(mode: &str) {
             assert!(pending
                 .blocked
                 .contains("Original working context retained"));
-            if mode == "manifest" {
-                assert!(pending.blocked.contains("serialized request manifest"));
-                assert_eq!(pending.reductions, 0);
-            } else {
-                assert!(saw_reduction);
-            }
+            assert!(pending.blocked.contains("serialized request manifest"));
+            assert_eq!(pending.reductions, 0);
+            // The failure ends the turn visibly but never holds the thread.
             let status: (String, bool) = actor.store.db.query_row("SELECT r.state,t.held FROM runs r JOIN threads t ON t.id=r.thread WHERE r.id=?1", [&run], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
-            assert_eq!(status, ("interrupted".into(), true));
+            assert_eq!(status, ("failed".into(), false));
             assert!(actor.workers.is_empty());
             assert!(actor
                 .store
@@ -290,7 +291,7 @@ async fn serialization_case(mode: &str) {
                     },
                     &models
                 )
-                .is_err());
+                .is_ok());
             drop(actor);
             let store = Store::open(&dir.0.join("lab.db")).unwrap();
             assert_eq!(
@@ -324,13 +325,63 @@ async fn scheduler_reduces_token_fitting_serialization_oversized_checkpoint() {
 }
 
 #[tokio::test]
-async fn scheduler_blocks_unreducible_serialization_oversized_checkpoint_durably() {
-    serialization_case("block").await;
+async fn scheduler_truncates_unreducible_serialization_oversized_checkpoint() {
+    serialization_case("truncate").await;
 }
 
 #[tokio::test]
 async fn scheduler_blocks_full_manifest_overflow_before_checkpoint_publication() {
     serialization_case("manifest").await;
+}
+
+#[tokio::test]
+async fn compaction_fragments_scale_with_the_model_window() {
+    let (_dir, store, receipt, _) = fixture();
+    let (requests, mut dispatched) = mpsc::unbounded_channel();
+    let executor = Arc::new(SchedulerExecutor {
+        window: 2_000_000,
+        requests,
+    });
+    let models = executor.models();
+    let mut actor = Actor::new_owned(store, executor).unwrap();
+    for _ in 0..12 {
+        let message = answer("earlier result").message;
+        entry(
+            &actor.store.db,
+            &receipt.thread,
+            "assistant",
+            "earlier result",
+            EntryData {
+                message: Some(&message),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+    let revision = actor.context_snapshot(&receipt.thread).unwrap().revision;
+    actor
+        .store
+        .command(
+            &Command::Compact {
+                id: CommandId::new(),
+                thread: receipt.thread.clone(),
+                expected_revision: revision,
+            },
+            &models,
+        )
+        .unwrap();
+    let (done, mut completed) = mpsc::channel(16);
+    assert_eq!(
+        scheduled_model(&mut actor, &done, &mut completed)
+            .await
+            .as_deref(),
+        Some("compact")
+    );
+    let _pending = dispatched.recv().await.unwrap();
+    assert_eq!(
+        state(&actor, &receipt.thread).chunk_limit,
+        MAX_ARTIFACT / 32
+    );
 }
 
 #[tokio::test]
@@ -393,7 +444,14 @@ async fn ordinary_provider_overflow_then_larger_profile_recovers_without_stale_c
     assert!(scheduled_model(&mut actor, &done, &mut completed)
         .await
         .is_none());
-    assert!(state(&actor, &receipt.thread).phase == Phase::Blocked);
+    // The failed compaction ends the turn visibly; nothing holds the thread.
+    for _ in 0..2 {
+        actor.schedule(&done).unwrap();
+    }
+    let (status, held): (String, bool) = actor.store.db.query_row("SELECT r.state,t.held FROM runs r JOIN threads t ON t.id=r.thread WHERE r.thread=?1 ORDER BY r.ordinal DESC LIMIT 1", [&receipt.thread], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    assert_eq!((status.as_str(), held), ("failed", false));
+    let shown: bool = actor.store.db.query_row("SELECT EXISTS(SELECT 1 FROM entries WHERE thread=?1 AND kind='recovery' AND text LIKE 'Compaction could not start%')", [&receipt.thread], |r| r.get(0)).unwrap();
+    assert!(shown);
     assert_eq!(
         crate::context::working_ids(&actor.store.db, &receipt.thread).unwrap(),
         original
@@ -403,16 +461,6 @@ async fn ordinary_provider_overflow_then_larger_profile_recovers_without_stale_c
         .unwrap()
         .checkpoint
         .is_none());
-    assert!(actor
-        .store
-        .command(
-            &Command::Resume {
-                id: CommandId::new(),
-                thread: receipt.thread.clone()
-            },
-            &models
-        )
-        .is_err());
     let before = actor.context_snapshot(&receipt.thread).unwrap();
     let mut profile = before.profile;
     profile.model = "larger".into();
@@ -431,9 +479,10 @@ async fn ordinary_provider_overflow_then_larger_profile_recovers_without_stale_c
     actor
         .store
         .command(
-            &Command::Resume {
+            &Command::Submit {
                 id: CommandId::new(),
                 thread: receipt.thread.clone(),
+                text: "continue".into(),
             },
             &models,
         )
@@ -461,8 +510,11 @@ async fn ordinary_provider_overflow_then_larger_profile_recovers_without_stale_c
                     .checkpoint
                     .is_some());
                 assert!(estimate_input_tokens(&spec).unwrap() > old_ceiling);
-                assert!(spec.messages[0].text().contains(&task));
-                assert_eq!(history(&actor, &receipt.thread), transcript);
+                assert!(spec
+                    .messages
+                    .iter()
+                    .any(|message| message.text().contains(&task)));
+                assert!(history(&actor, &receipt.thread).starts_with(&transcript));
                 recovered = true;
             }
             response

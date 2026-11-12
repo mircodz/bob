@@ -205,7 +205,8 @@ pub(crate) fn apply(
                 )? == 1,
                 "context changed; refresh before compacting"
             );
-            let reset = tx.execute("DELETE FROM compactions WHERE thread=?1 AND json_extract(state,'$.phase')='blocked'",[thread])?;
+            // Retry keeps accepted summary progress; clearing the run tag re-arms the budgets.
+            let reset = tx.execute("UPDATE compactions SET state=json_set(state,'$.run','') WHERE thread=?1 AND json_extract(state,'$.phase')='blocked'",[thread])?;
             if reset > 0 {
                 let unresolved: bool = tx.query_row(
                     "SELECT EXISTS(SELECT 1 FROM operations WHERE thread=?1 AND state='unknown')",

@@ -75,7 +75,7 @@ fn seeded(actor: &mut Actor, thread: &ThreadId, complete: bool) -> (RunId, Compa
     let state: CompactionState = serde_json::from_value(json!({
         "epoch":epoch,"revision":revision,"profile_revision":profile_revision,
         "tail_start":i64::MAX,"cursor":0,"offset":0,"summary":"s".repeat(40_000),
-        "newest_request":"preserve exact task","complete":complete,"chunk_limit":24_000,"output_tokens":null,"projection_version":1
+        "newest_request":"preserve exact task","complete":complete,"chunk_limit":24_000,"output_tokens":null,"projection_version":1,"run":run.0
     })).unwrap();
     actor
         .store

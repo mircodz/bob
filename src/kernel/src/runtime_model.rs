@@ -110,37 +110,17 @@ impl Actor {
         Ok(snapshot)
     }
 
-    fn pause_context(&mut self, run: &RunId, thread: &ThreadId, text: &str) -> anyhow::Result<()> {
+    /// Ends the turn with a visible error without holding the thread, so the next message
+    /// (or one already queued) continues normally.
+    fn fail_context(&mut self, run: &RunId, thread: &ThreadId, text: &str) -> anyhow::Result<()> {
         let tx = self
             .store
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        tx.execute("UPDATE runs SET state='interrupted' WHERE id=?1", [run])?;
-        tx.execute("UPDATE threads SET held=1 WHERE id=?1", [thread])?;
-        crate::lifecycle::stop_owned(&tx, run)?;
-        entry(&tx, thread, "recovery", text, EntryData::default())?;
+        fail_turn(&tx, run, thread, text)?;
         change(&tx, Some(thread), "context_paused", &run.0)?;
         tx.commit()?;
         Ok(())
-    }
-
-    fn block_compaction(
-        &mut self,
-        run: &RunId,
-        thread: &ThreadId,
-        reason: &str,
-    ) -> anyhow::Result<()> {
-        let (epoch,revision,profile_revision) = self.store.db.query_row("SELECT c.epoch,c.revision,t.profile_revision FROM contexts c JOIN threads t ON t.id=c.thread WHERE c.thread=?1",[thread],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
-        let mut state = CompactionState {
-            epoch,
-            revision,
-            profile_revision,
-            projection_version: 1,
-            ..Default::default()
-        };
-        state.block(reason);
-        self.store.db.execute("INSERT INTO compactions(thread,state) VALUES(?1,?2) ON CONFLICT(thread) DO UPDATE SET state=excluded.state",params![thread,encode(&state)?])?;
-        self.pause_context(run, thread, &state.blocked)
     }
 
     pub(super) fn request(
@@ -158,15 +138,20 @@ impl Actor {
                 |r| r.get(0),
             )
             .optional()?;
+        let mut carry = None;
         if let Some(pending) = pending {
-            let state: CompactionState = decode(pending)?;
-            let current:(i64,i64,i64)=self.store.db.query_row("SELECT c.epoch,c.revision,t.profile_revision FROM contexts c JOIN threads t ON t.id=c.thread WHERE c.thread=?1",[thread],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
-            if current == (state.epoch, state.revision, state.profile_revision) {
+            let mut state: CompactionState = decode(pending)?;
+            if !state.matches(&self.store.db, thread)? {
+                self.store
+                    .db
+                    .execute("DELETE FROM compactions WHERE thread=?1", [thread])?;
+            } else if state.run == run.0 {
                 return self.compact_step(run, thread, state, done);
+            } else {
+                // An earlier turn's attempt: keep its accepted progress, re-plan the rest.
+                self.migrate(thread, &mut state)?;
+                carry = Some(state);
             }
-            self.store
-                .db
-                .execute("DELETE FROM compactions WHERE thread=?1", [thread])?;
         }
         let ready:bool=self.store.db.query_row("SELECT EXISTS(SELECT 1 FROM model_context m JOIN contexts c ON c.thread=m.thread JOIN threads t ON t.id=m.thread WHERE m.thread=?1 AND m.epoch=c.epoch AND m.profile_revision=t.profile_revision)",[thread],|r|r.get(0))?;
         if !ready {
@@ -188,7 +173,7 @@ impl Actor {
         tx.commit()?;
         let mut spec = match self.model_spec(thread) {
             Ok(spec) => spec,
-            Err(error) => return self.pause_context(run, thread, &error.to_string()),
+            Err(error) => return self.fail_context(run, thread, &error.to_string()),
         };
         let caps = self.model_capabilities(&spec.model.id);
         if let Some(output) = output_override {
@@ -197,7 +182,7 @@ impl Actor {
         let input_limit = crate::context::input_limit(&spec.model, &caps, spec.max_tokens);
         let mut tokens = estimate_input_tokens(&spec)?;
         if tokens >= input_limit {
-            return self.block_compaction(run,thread,"System instructions and tool schemas exceed this model's input budget. Select a larger model or reduce configured context.");
+            return self.fail_context(run,thread,"System instructions and tool schemas exceed this model's input budget. Select a larger model or reduce configured context.");
         }
         let compact_pending: bool = self.store.db.query_row(
             "SELECT compact_pending FROM contexts WHERE thread=?1",
@@ -223,25 +208,28 @@ impl Actor {
         over |= crate::context::measured_input(&self.store.db, thread, tokens)?
             .is_some_and(|measured| measured > (input_limit * 4 / 5) as u64);
         if over || compact_pending {
-            match self.begin_compaction(thread, &spec, input_limit, over) {
+            match self.begin_compaction(run, thread, &spec, input_limit, over, carry) {
                 Ok(Some(state)) => return self.compact_step(run, thread, state, done),
                 Ok(None) => {
                     self.store.db.execute(
                         "UPDATE contexts SET compact_pending=0 WHERE thread=?1",
                         [thread],
                     )?;
+                    self.store
+                        .db
+                        .execute("DELETE FROM compactions WHERE thread=?1", [thread])?;
                     let overflow_recovery: bool = self.store.db.query_row(
                         "SELECT retry_count>0 FROM runs WHERE id=?1",
                         [run],
                         |r| r.get(0),
                     )?;
                     if over || overflow_recovery {
-                        return self.block_compaction(run,thread,"The latest instruction or unresolved tool exchange cannot fit this model. No context was removed; select a larger model.");
+                        return self.fail_context(run,thread,"The latest instruction or unresolved tool exchange cannot fit this model. No context was removed; select a larger model.");
                     }
                 }
                 Err(error) if crate::ownership::busy(&error) => return Err(error),
                 Err(error) => {
-                    return self.block_compaction(
+                    return self.fail_context(
                         run,
                         thread,
                         &format!(
@@ -250,6 +238,11 @@ impl Actor {
                     )
                 }
             }
+        } else if carry.is_some() {
+            // The working context fits again (for example on a larger model).
+            self.store
+                .db
+                .execute("DELETE FROM compactions WHERE thread=?1", [thread])?;
         }
         if compact_only {
             let tx = self
@@ -271,7 +264,7 @@ impl Actor {
     ) -> anyhow::Result<()> {
         let spec = match self.model_spec(thread) {
             Ok(spec) => spec,
-            Err(error) => return self.pause_context(run, thread, &error.to_string()),
+            Err(error) => return self.fail_context(run, thread, &error.to_string()),
         };
         let operation = OperationId::new();
         let tx = self
@@ -302,7 +295,7 @@ impl Actor {
     ) -> anyhow::Result<()> {
         let serialized = encode(&spec)?;
         if serialized.len() > MAX_ARTIFACT {
-            return self.pause_context(run,thread,"Request manifest exceeded its bounded retention budget; no provider call was made.");
+            return self.fail_context(run,thread,"Request manifest exceeded its bounded retention budget; no provider call was made.");
         }
         let op = OperationId::new();
         let tx = self
@@ -339,16 +332,18 @@ impl Actor {
 
     fn begin_compaction(
         &mut self,
+        run: &RunId,
         thread: &ThreadId,
         spec: &RequestSpec,
         input_limit: usize,
         force: bool,
+        carry: Option<CompactionState>,
     ) -> anyhow::Result<Option<CompactionState>> {
         let overhead = estimate_input_tokens(&RequestSpec {
             messages: Vec::new(),
             ..spec.clone()
         })?;
-        let final_input_ceiling: Option<usize> = self.store.db.query_row("SELECT json_extract(o.input,'$.overflow_input_limit') FROM operations o JOIN runs r ON r.id=o.run JOIN contexts c ON c.thread=o.thread JOIN threads t ON t.id=o.thread WHERE o.thread=?1 AND o.name='model' AND r.state='active' AND o.epoch=c.epoch AND o.profile_revision=t.profile_revision AND json_extract(o.input,'$.checkpoint') IS c.checkpoint ORDER BY o.rowid DESC LIMIT 1",[thread],|r|r.get(0)).optional()?.flatten();
+        let final_input_ceiling: Option<usize> = self.store.db.query_row("SELECT json_extract(o.input,'$.overflow_input_limit') FROM operations o JOIN runs r ON r.id=o.run JOIN contexts c ON c.thread=o.thread JOIN threads t ON t.id=o.thread WHERE o.thread=?1 AND o.name='model' AND r.state='active' AND o.epoch=c.epoch AND json_extract(o.input,'$.model') IS json_extract(t.profile,'$.model') AND json_extract(o.input,'$.checkpoint') IS c.checkpoint ORDER BY o.rowid DESC LIMIT 1",[thread],|r|r.get(0)).optional()?.flatten();
         let checkpoint_limit = (input_limit * 4 / 5).min(final_input_ceiling.unwrap_or(usize::MAX));
         let tail_budget = (checkpoint_limit.saturating_sub(overhead) / 3).min(MAX_ARTIFACT / 16);
         let mut recent: Vec<(i64, Message)> = Vec::new();
@@ -396,7 +391,14 @@ impl Actor {
                     .sum();
             }
         }
-        let tail_start = recent.first().map_or(i64::MAX, |(ordinal, _)| *ordinal);
+        let tail_start = match recent.first() {
+            Some((ordinal, _)) => *ordinal,
+            None => self.store.db.query_row(
+                "SELECT COALESCE(MAX(ordinal),0)+1 FROM working WHERE thread=?1",
+                [thread],
+                |r| r.get(0),
+            )?,
+        };
         let prefix: bool = self.store.db.query_row(
             "SELECT EXISTS(SELECT 1 FROM working WHERE thread=?1 AND ordinal<?2)",
             params![thread, tail_start],
@@ -416,23 +418,40 @@ impl Actor {
             estimate_text(&newest_request) + tokens + overhead + 64 < checkpoint_limit,
             "protected task and steering leave insufficient room for a summary; select a larger model"
         );
-        let (epoch,revision,profile_revision)=self.store.db.query_row("SELECT c.epoch,c.revision,t.profile_revision FROM contexts c JOIN threads t ON t.id=c.thread WHERE c.thread=?1",[thread],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
-        let state = CompactionState {
+        let (epoch,revision,profile_revision,checkpoint)=self.store.db.query_row("SELECT c.epoch,c.revision,t.profile_revision,c.checkpoint FROM contexts c JOIN threads t ON t.id=c.thread WHERE c.thread=?1",[thread],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
+        let mut state = CompactionState {
             final_input_ceiling,
             epoch,
             revision,
             profile_revision,
+            checkpoint,
             tail_start,
             cursor: 0,
             offset: 0,
             summary: String::new(),
             newest_request,
             complete: false,
-            chunk_limit: 24_000,
+            // Large windows take large fragments, so fewer sequential summary requests.
+            chunk_limit: (input_limit / 4).clamp(24_000, MAX_ARTIFACT / 32),
             output_tokens: None,
-            projection_version: 1,
+            projection_version: 2,
             ..Default::default()
         };
+        if let Some(previous) = carry {
+            // The summary covers [0, cursor) and cursor <= tail_start, so the tail only moves
+            // forward and summarizing simply continues into newly appended messages.
+            let tail_start = state.tail_start.max(previous.tail_start);
+            state = CompactionState {
+                tail_start,
+                complete: previous.complete && tail_start == previous.tail_start,
+                newest_request: state.newest_request,
+                final_input_ceiling: state.final_input_ceiling,
+                chunk_limit: state.chunk_limit,
+                ..previous
+            };
+            state.rearm();
+        }
+        state.run = run.0.clone();
         let tx = self
             .store
             .db
@@ -456,21 +475,22 @@ impl Actor {
                 .execute("DELETE FROM compactions WHERE thread=?1", [thread])?;
             return Ok(());
         }
-        if state.projection_version == 0 {
-            state.cursor = 0;
-            state.offset = 0;
-            state.summary.clear();
-            state.complete = false;
-            state.phase = Phase::Summarize;
-            state.projection_version = 1;
-            state.newest_request = protected_context(&self.store.db, thread)?;
+        self.migrate(thread, &mut state)?;
+        if state.run != run.0 {
+            // Explicit retries and legacy states start fresh budgets but keep accepted progress.
+            state.rearm();
+            state.run = run.0.clone();
+        } else if state.phase == Phase::Blocked {
+            return self.fail_context(run, thread, &state.blocked);
         }
-        if state.attempts >= MAX_ATTEMPTS && (!state.complete || state.phase == Phase::Reduce) {
+        if state.attempts.saturating_sub(state.attempt_base) >= MAX_ATTEMPTS
+            && (!state.complete || state.phase == Phase::Reduce)
+        {
             state.block("total request budget exhausted");
         }
         if state.phase == Phase::Blocked {
             state.save(&self.store.db, thread)?;
-            return self.pause_context(run, thread, &state.blocked);
+            return self.fail_context(run, thread, &state.blocked);
         }
         if state.complete && state.phase != Phase::Reduce {
             state.phase = Phase::Validate;
@@ -479,7 +499,7 @@ impl Actor {
         }
         let mut spec = match self.model_spec(thread) {
             Ok(spec) => spec,
-            Err(error) => return self.pause_context(run, thread, &error.to_string()),
+            Err(error) => return self.fail_context(run, thread, &error.to_string()),
         };
         spec.system = SUMMARY_SYSTEM.into();
         spec.tools.clear();
@@ -557,12 +577,25 @@ impl Actor {
             }
             state.block("fragment cursor cannot advance");
             state.save(&self.store.db, thread)?;
-            return self.pause_context(run, thread, &state.blocked);
+            return self.fail_context(run, thread, &state.blocked);
         }
         spec.messages = vec![Message::user_text(format!(
             "Previous summary:\n{}\n\nNext transcript fragment:\n{chunk}",
             state.summary
         ))];
+        // Escaping can make text serialize far larger than its token estimate; shrink the
+        // fragment (or the summary) instead of failing on the manifest retention limit.
+        if encode(&spec)?.len() > MAX_ARTIFACT {
+            if chunk.len() > 256 {
+                state.chunk_limit = chunk.len() / 8;
+            } else if state.phase != Phase::Reduce && !state.summary.is_empty() {
+                state.reduce();
+            } else {
+                state.block("summary request exceeds the retention limit");
+            }
+            state.save(&self.store.db, thread)?;
+            return self.compact_step(run, thread, state, done);
+        }
         state.attempts += 1;
         state.attempt = Attempt {
             input_tokens: estimate_input_tokens(&spec)?,
@@ -579,6 +612,35 @@ impl Actor {
         self.start_model(run, thread, spec, "compact", Some(&next), done)
     }
 
+    /// Upgrades states persisted before the summarized prefix was pinned.
+    fn migrate(&self, thread: &ThreadId, state: &mut CompactionState) -> anyhow::Result<()> {
+        if state.projection_version >= 2 {
+            return Ok(());
+        }
+        if state.projection_version == 0 {
+            state.cursor = 0;
+            state.offset = 0;
+            state.summary.clear();
+            state.complete = false;
+            state.phase = Phase::Summarize;
+            state.newest_request = protected_context(&self.store.db, thread)?;
+        }
+        state.checkpoint = self.store.db.query_row(
+            "SELECT checkpoint FROM contexts WHERE thread=?1",
+            [thread],
+            |r| r.get(0),
+        )?;
+        if state.tail_start == i64::MAX {
+            state.tail_start = self.store.db.query_row(
+                "SELECT COALESCE(MAX(ordinal),0)+1 FROM working WHERE thread=?1",
+                [thread],
+                |r| r.get(0),
+            )?;
+        }
+        state.projection_version = 2;
+        Ok(())
+    }
+
     fn commit_compaction(
         &mut self,
         run: &RunId,
@@ -588,6 +650,11 @@ impl Actor {
     ) -> anyhow::Result<()> {
         state.phase = Phase::Validate;
         state.save(&self.store.db, thread)?;
+        let revision: i64 = self.store.db.query_row(
+            "SELECT revision FROM contexts WHERE thread=?1",
+            [thread],
+            |r| r.get(0),
+        )?;
         let summary_message = |summary: &str| {
             Message::user_text(format!(
                 "[conversation summary]\n{}{}",
@@ -661,14 +728,7 @@ impl Actor {
             state.matches(&tx, thread)?,
             "compaction profile or context changed before publication"
         );
-        crate::context::checkpoint(
-            &tx,
-            thread,
-            &operation,
-            state.epoch,
-            state.revision,
-            &messages,
-        )?;
+        crate::context::checkpoint(&tx, thread, &operation, state.epoch, revision, &messages)?;
         tx.execute("DELETE FROM compactions WHERE thread=?1", [thread])?;
         tx.execute(
             "UPDATE runs SET retry_count=0,retry_at=0 WHERE id=?1",
@@ -852,12 +912,12 @@ pub(super) fn finish_compact(
                 ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. }
             )
         });
-    let mut retry = active
-        && completion.stop_reason == StopReason::MaxTokens
-        && retry_model(tx, operation, ModelFailureKind::Fatal, max_output, true)?;
-    if active && !valid && completion.stop_reason != StopReason::MaxTokens {
+    // An exhausted budget leaves the state blocked; the next step fails the turn visibly.
+    if active && completion.stop_reason == StopReason::MaxTokens {
+        retry_model(tx, operation, ModelFailureKind::Fatal, max_output, true)?;
+    } else if active && !valid {
         if let Some(state) = &mut current {
-            retry = state.retry(ModelFailureKind::Transient, false, max_output, usize::MAX);
+            state.retry(ModelFailureKind::Transient, false, max_output, usize::MAX);
             state.save(tx, thread)?;
         }
     }
@@ -878,40 +938,56 @@ pub(super) fn finish_compact(
         next.retries = 0;
         if next.phase == Phase::Reduce && next.reduction_offset == next.reduction_source.len() {
             if next.summary.len() > next.reduction_source.len() * 3 / 4 {
-                next.block("summary reduction did not make meaningful progress");
-            } else {
-                next.reduction_source.clear();
-                next.reduction_offset = 0;
-                next.phase = if next.complete {
-                    Phase::Validate
-                } else {
-                    Phase::Summarize
-                };
+                // The model could not shorten it; cut it so every reduction still makes progress.
+                let end = end_boundary(&next.summary, 0, next.reduction_source.len() / 2);
+                next.summary.truncate(end);
+                next.summary.push_str("\n[summary truncated]");
             }
+            next.reduction_source.clear();
+            next.reduction_offset = 0;
+            next.phase = if next.complete {
+                Phase::Validate
+            } else {
+                Phase::Summarize
+            };
         } else if next.complete && next.phase == Phase::Summarize {
             next.phase = Phase::Validate;
         }
         next.save(tx, thread)?;
         tx.execute("UPDATE runs SET retry_count=0,retry_at=0 WHERE id=(SELECT run FROM operations WHERE id=?1)",[operation])?;
-    } else if active && !retry {
-        tx.execute(
-            "UPDATE runs SET state='interrupted' WHERE id=(SELECT run FROM operations WHERE id=?1)",
-            [operation],
-        )?;
-        tx.execute("UPDATE threads SET held=1 WHERE id=?1", [thread])?;
-        let run = RunId(tx.query_row(
-            "SELECT run FROM operations WHERE id=?1",
-            [operation],
-            |row| row.get(0),
-        )?);
-        crate::lifecycle::stop_owned(tx, &run)?;
-        entry(
-            tx,
-            thread,
-            "recovery",
-            &format!("Compaction answer was invalid or incomplete. {RECOVERY}"),
-            EntryData::default(),
-        )?;
     }
+    Ok(())
+}
+
+pub(super) fn fail_compaction(
+    tx: &rusqlite::Transaction<'_>,
+    run: &RunId,
+    thread: &ThreadId,
+    error: &str,
+) -> anyhow::Result<()> {
+    fail_turn(
+        tx,
+        run,
+        thread,
+        &format!("Compaction failed: {error}. {RECOVERY}"),
+    )
+}
+
+/// Ends a turn with a visible error. Unlike a stop, the thread stays runnable: queued
+/// steering becomes ordinary input and starts the next turn.
+pub(super) fn fail_turn(
+    tx: &rusqlite::Transaction<'_>,
+    run: &RunId,
+    thread: &ThreadId,
+    text: &str,
+) -> anyhow::Result<()> {
+    entry(tx, thread, "recovery", text, EntryData::default())?;
+    // Stopping cancels queued steering; keep the user's words as ordinary queued input.
+    tx.execute(
+        "UPDATE submissions SET source='human' WHERE thread=?1 AND state='queued' AND source='steering'",
+        [thread],
+    )?;
+    crate::lifecycle::fail(tx, run, text)?;
+    tx.execute("UPDATE threads SET held=0 WHERE id=?1", [thread])?;
     Ok(())
 }

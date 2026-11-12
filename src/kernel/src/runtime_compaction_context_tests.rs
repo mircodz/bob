@@ -359,8 +359,22 @@ fn measurement_excludes_summary_and_stale_profile_epoch_checkpoint() {
         ("compact", 999999),
         ("session_title", 999999),
     ] {
-        actor.store.db.execute("INSERT INTO operations(id,run,thread,name,kind,input,state) VALUES(?1,?2,?3,?4,'model',?5,'done')",params![OperationId::new(),run,receipt.thread,name,encode(&json!({"measured_input_tokens":measured,"estimated_input_tokens":4000,"checkpoint":null})).unwrap()]).unwrap();
+        actor.store.db.execute("INSERT INTO operations(id,run,thread,name,kind,input,state) VALUES(?1,?2,?3,?4,'model',?5,'done')",params![OperationId::new(),run,receipt.thread,name,encode(&json!({"model":"test","measured_input_tokens":measured,"estimated_input_tokens":4000,"checkpoint":null})).unwrap()]).unwrap();
     }
+    assert_eq!(
+        crate::context::measured_input(&actor.store.db, &receipt.thread, 4500).unwrap(),
+        Some(14500)
+    );
+    // Profile edits that keep the model (instructions, reasoning, budgets) keep the
+    // measurement; only a different model invalidates it.
+    actor
+        .store
+        .db
+        .execute(
+            "UPDATE threads SET profile_revision=profile_revision+1 WHERE id=?1",
+            [&receipt.thread],
+        )
+        .unwrap();
     assert_eq!(
         crate::context::measured_input(&actor.store.db, &receipt.thread, 4500).unwrap(),
         Some(14500)
@@ -369,7 +383,7 @@ fn measurement_excludes_summary_and_stale_profile_epoch_checkpoint() {
         .store
         .db
         .execute(
-            "UPDATE threads SET profile_revision=profile_revision+1 WHERE id=?1",
+            "UPDATE threads SET profile=json_set(profile,'$.model','other') WHERE id=?1",
             [&receipt.thread],
         )
         .unwrap();
@@ -381,7 +395,7 @@ fn measurement_excludes_summary_and_stale_profile_epoch_checkpoint() {
         .store
         .db
         .execute(
-            "UPDATE threads SET profile_revision=0 WHERE id=?1",
+            "UPDATE threads SET profile=json_set(profile,'$.model','test') WHERE id=?1",
             [&receipt.thread],
         )
         .unwrap();

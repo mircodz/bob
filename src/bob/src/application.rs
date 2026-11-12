@@ -200,6 +200,13 @@ fn resumed_permissions(config: PermissionPolicy, session: &SessionSnapshot) -> P
     }
 }
 
+fn same_json<T: serde::Serialize>(left: &T, right: &T) -> bool {
+    match (serde_json::to_value(left), serde_json::to_value(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
 fn prepare_launch(mut options: LaunchOptions) -> Result<PreparedLaunch> {
     options.workspace = std::fs::canonicalize(&options.workspace).context("resolve workspace")?;
     ensure!(options.workspace.is_dir(), "workspace must be a directory");
@@ -361,30 +368,37 @@ pub async fn open_with_titles(options: LaunchOptions, auto_titles: bool) -> Resu
             let mut policy = session.policy.clone();
             policy.denied_tools = config.permissions.deny.iter().cloned().collect();
             let permissions = resumed_permissions(permission_policy, &session);
+            // Only real changes are written: every profile update fences in-flight model work
+            // and invalidates approvals, so a no-op resume must not bump any revision.
+            let mut bootstrap = Vec::new();
+            let mut policy_revision = session.policy_revision;
+            if !same_json(&permissions, &session.permissions) {
+                bootstrap.push(Command::SetPermissions {
+                    id: CommandId::new(),
+                    session: session.id.clone(),
+                    permissions,
+                    expected_revision: policy_revision,
+                });
+                policy_revision += 1;
+            }
+            if !same_json(&policy, &session.policy) {
+                bootstrap.push(Command::SetPolicy {
+                    id: CommandId::new(),
+                    session: session.id.clone(),
+                    policy,
+                    expected_revision: policy_revision,
+                });
+            }
+            if !same_json(&profile, &session.profile) {
+                bootstrap.push(Command::UpdateProfile {
+                    id: CommandId::new(),
+                    thread: session.thread.clone(),
+                    profile,
+                    expected_revision: session.profile_revision,
+                });
+            }
             handle
-                .activate_session(
-                    session.id.clone(),
-                    vec![
-                        Command::SetPermissions {
-                            id: CommandId::new(),
-                            session: session.id.clone(),
-                            permissions,
-                            expected_revision: session.policy_revision,
-                        },
-                        Command::SetPolicy {
-                            id: CommandId::new(),
-                            session: session.id.clone(),
-                            policy,
-                            expected_revision: session.policy_revision + 1,
-                        },
-                        Command::UpdateProfile {
-                            id: CommandId::new(),
-                            thread: session.thread.clone(),
-                            profile,
-                            expected_revision: session.profile_revision,
-                        },
-                    ],
-                )
+                .activate_session(session.id.clone(), bootstrap)
                 .await?;
             return handle.session(session.id).await;
         }

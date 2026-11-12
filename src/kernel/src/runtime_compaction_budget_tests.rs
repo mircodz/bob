@@ -172,6 +172,7 @@ async fn output_cap_retries_shrink_fragments_and_exhaust_without_checkpoint() {
         );
     }
     assert!(state(&actor, &receipt.thread).phase == Phase::Blocked);
+    // The failure ends only the turn; resuming is always allowed and re-arms the budgets.
     assert!(actor
         .store
         .command(
@@ -181,7 +182,7 @@ async fn output_cap_retries_shrink_fragments_and_exhaust_without_checkpoint() {
             },
             &models
         )
-        .is_err());
+        .is_ok());
     assert!(actor
         .context_snapshot(&receipt.thread)
         .unwrap()
@@ -190,8 +191,8 @@ async fn output_cap_retries_shrink_fragments_and_exhaust_without_checkpoint() {
 }
 
 #[tokio::test]
-async fn unchanged_reduction_blocks_and_changed_profile_allows_recovery() {
-    let (_dir, store, receipt, models) = fixture();
+async fn unchanged_reduction_truncates_instead_of_blocking() {
+    let (_dir, store, receipt, _) = fixture();
     let (requests, mut dispatched) = mpsc::unbounded_channel();
     let mut actor = Actor::new_owned(store, Arc::new(BarrierExecutor { requests })).unwrap();
     let (run, mut pending) = seeded(&mut actor, &receipt.thread, true);
@@ -199,76 +200,31 @@ async fn unchanged_reduction_blocks_and_changed_profile_allows_recovery() {
     pending.reduce();
     pending.chunk_limit = 100_000;
     pending.save(&actor.store.db, &receipt.thread).unwrap();
+    let source = pending.reduction_source.len();
     let (done, mut completed) = mpsc::channel(16);
-    loop {
+    for _ in 0..8 {
         actor.request(&run, &receipt.thread, &done).unwrap();
         let (_, response) = dispatch(&mut dispatched).await;
         let current = state(&actor, &receipt.thread);
-        let reply = if current.reduction_offset + current.attempt.fragment_bytes
-            >= current.reduction_source.len()
-        {
+        let last = current.reduction_offset + current.attempt.fragment_bytes
+            >= current.reduction_source.len();
+        // The model echoes its input instead of shortening it.
+        let reply = if last {
             current.reduction_source.clone()
         } else {
             "interim summary".into()
         };
         response.send(answer(&reply)).unwrap();
         finish(&mut actor, &mut completed).await;
-        if state(&actor, &receipt.thread).phase == Phase::Blocked {
+        if last {
             break;
         }
     }
-    actor.request(&run, &receipt.thread, &done).unwrap();
-    assert!(actor
-        .store
-        .command(
-            &Command::Resume {
-                id: CommandId::new(),
-                thread: receipt.thread.clone()
-            },
-            &models
-        )
-        .is_err());
-    let mut profile = actor.context_snapshot(&receipt.thread).unwrap().profile;
-    profile.instructions.push_str(" changed profile");
-    actor
-        .store
-        .command(
-            &Command::UpdateProfile {
-                id: CommandId::new(),
-                thread: receipt.thread.clone(),
-                profile,
-                expected_revision: 0,
-            },
-            &models,
-        )
-        .unwrap();
-    actor
-        .store
-        .command(
-            &Command::Resume {
-                id: CommandId::new(),
-                thread: receipt.thread.clone(),
-            },
-            &models,
-        )
-        .unwrap();
-    actor.request(&run, &receipt.thread, &done).unwrap();
-    finish(&mut actor, &mut completed).await;
-    let remaining: i64 = actor
-        .store
-        .db
-        .query_row(
-            "SELECT COUNT(*) FROM compactions WHERE thread=?1",
-            [&receipt.thread],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(remaining, 0);
-    assert!(actor
-        .context_snapshot(&receipt.thread)
-        .unwrap()
-        .checkpoint
-        .is_none());
+    let after = state(&actor, &receipt.thread);
+    assert!(after.phase != Phase::Blocked);
+    assert!(after.reduction_source.is_empty());
+    assert!(after.summary.len() <= source / 2 + 32);
+    assert!(after.summary.ends_with("[summary truncated]"));
 }
 
 #[tokio::test]
@@ -323,7 +279,7 @@ async fn legacy_serialized_cursor_restarts_safe_projection_without_changing_hist
     let original = history(&actor, &receipt.thread);
     advance(&mut actor, &run, &receipt.thread).await;
     let migrated = state(&actor, &receipt.thread);
-    assert_eq!(migrated.projection_version, 1);
+    assert_eq!(migrated.projection_version, 2);
     assert_eq!(migrated.attempts, 1);
     let (_, request) = pending_request(&actor, &receipt.thread);
     assert!(request.messages[0]
@@ -333,6 +289,42 @@ async fn legacy_serialized_cursor_restarts_safe_projection_without_changing_hist
         .text()
         .contains("old serialization summary"));
     assert_eq!(history(&actor, &receipt.thread), original);
+}
+
+#[tokio::test]
+async fn next_turn_rearms_blocked_compaction_and_keeps_progress() {
+    let (_dir, store, receipt, _) = fixture();
+    let mut actor = Actor::new_owned(store, Arc::new(CompactExecutor)).unwrap();
+    let (old, mut pending) = seeded(&mut actor, &receipt.thread, false);
+    pending.attempts = MAX_ATTEMPTS;
+    pending.retries = 3;
+    pending.block("attempt/retry budget exhausted");
+    pending.save(&actor.store.db, &receipt.thread).unwrap();
+    actor
+        .store
+        .db
+        .execute("UPDATE runs SET state='failed' WHERE id=?1", [&old])
+        .unwrap();
+    let run = RunId::new();
+    actor
+        .store
+        .db
+        .execute(
+            "INSERT INTO runs(id,thread,state) VALUES(?1,?2,'active')",
+            params![run, receipt.thread],
+        )
+        .unwrap();
+    // The first step prepares the system context, the second resumes the compaction.
+    advance(&mut actor, &run, &receipt.thread).await;
+    advance(&mut actor, &run, &receipt.thread).await;
+    let resumed = state(&actor, &receipt.thread);
+    assert!(resumed.phase != Phase::Blocked);
+    assert_eq!(resumed.run, run.0);
+    assert_eq!(resumed.attempt_base, MAX_ATTEMPTS);
+    assert_eq!(resumed.attempts, MAX_ATTEMPTS + 1);
+    // The accepted summary from the earlier turn is carried into the next request.
+    let (_, request) = pending_request(&actor, &receipt.thread);
+    assert!(request.messages[0].text().contains(&"s".repeat(1000)));
 }
 
 #[tokio::test]
@@ -346,6 +338,18 @@ async fn fixed_protected_overhead_blocks_without_dispatch_and_uncertain_effects_
     actor.request(&run, &receipt.thread, &done).unwrap();
     assert!(state(&actor, &receipt.thread).phase == Phase::Blocked);
     assert!(actor.workers.is_empty());
+    // The failure ends only the turn: the run settles as failed and nothing holds the thread.
+    actor.schedule(&done).unwrap();
+    let (status, held): (String, bool) = actor
+        .store
+        .db
+        .query_row(
+            "SELECT r.state,t.held FROM runs r JOIN threads t ON t.id=r.thread WHERE r.id=?1",
+            [&run],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((status.as_str(), held), ("failed", false));
     assert!(actor
         .store
         .command(
@@ -355,7 +359,7 @@ async fn fixed_protected_overhead_blocks_without_dispatch_and_uncertain_effects_
             },
             &models
         )
-        .is_err());
+        .is_ok());
     actor.store.db.execute("INSERT INTO operations(id,run,thread,name,kind,input,state) VALUES(?1,?2,?3,'write_file','tool','{}','unknown')",params![OperationId::new(),run,receipt.thread]).unwrap();
     let revision = actor.context_snapshot(&receipt.thread).unwrap().revision;
     assert!(actor
