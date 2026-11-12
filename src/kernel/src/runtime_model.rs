@@ -851,21 +851,6 @@ pub(super) fn retry_model(
         "UPDATE runs SET retry_count=retry_count+1,retry_at=?1 WHERE id=?2",
         params![retry_at, run],
     )?;
-    // Output-limit retries are internal; don't surface them in the transcript.
-    if truncated {
-        return Ok(true);
-    }
-    entry(
-        tx,
-        &thread,
-        "notice",
-        if failure == ModelFailureKind::ContextOverflow {
-            "Provider context overflow; recovering the working context before retrying."
-        } else {
-            "Transient provider failure; a cancellable retry is scheduled."
-        },
-        EntryData::default(),
-    )?;
     Ok(true)
 }
 

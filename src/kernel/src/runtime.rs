@@ -1617,6 +1617,10 @@ impl Actor {
             |r| r.get(0),
         )?;
         let max_output = self.model_capabilities(&selected_model).max_output_tokens;
+        let reasoning = match &result {
+            Err(_) if kind == "model" && name == "model" => self.live.reasoning(opid),
+            _ => None,
+        };
         let tx = self
             .store
             .db
@@ -1792,11 +1796,17 @@ impl Actor {
                 let message = if valid {
                     completion.message
                 } else {
+                    let text = completion.message.text();
+                    let mut content: Vec<_> = completion
+                        .message
+                        .content
+                        .into_iter()
+                        .filter(|block| matches!(block, ContentBlock::Thinking { .. }))
+                        .collect();
+                    content.push(ContentBlock::Text { text });
                     Message {
                         role: Role::Assistant,
-                        content: vec![ContentBlock::Text {
-                            text: completion.message.text(),
-                        }],
+                        content,
                     }
                 };
                 let result = artifact(&tx, &encode(&ModelRecord::Message(message.clone()))?)?;
@@ -1886,17 +1896,6 @@ impl Actor {
                             ),
                             true,
                         )?;
-                    } else if name != "compact" || !active {
-                        entry(
-                            &tx,
-                            &thread,
-                            "recovery",
-                            &format!("Model request failed: {text}"),
-                            EntryData {
-                                operation: Some(opid),
-                                ..Default::default()
-                            },
-                        )?;
                     }
                     tx.execute(
                         "UPDATE operations SET state=?1 WHERE id=?2",
@@ -1911,6 +1910,56 @@ impl Actor {
                             max_output,
                             false,
                         )?;
+                    if kind != "tool" && (name != "compact" || !active) {
+                        // One line: what happened and what comes next; the full error follows it.
+                        let summary = if !active {
+                            "Model request cancelled".to_owned()
+                        } else if !retry {
+                            "Model request failed".to_owned()
+                        } else if retry_kind == Some(ModelFailureKind::ContextOverflow) {
+                            "Model request interrupted · compacting the context before retrying"
+                                .to_owned()
+                        } else {
+                            let retry_at: i64 = tx.query_row(
+                                "SELECT retry_at FROM runs WHERE id=?1",
+                                [&run],
+                                |r| r.get(0),
+                            )?;
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis()
+                                .min(i64::MAX as u128) as i64;
+                            format!(
+                                "Model request interrupted · retrying in {}s",
+                                (retry_at - now + 999).max(0) / 1000
+                            )
+                        };
+                        // Reasoning streamed before the failure is kept for display only.
+                        let reasoning = reasoning
+                            .map(|thinking| {
+                                let message = Message {
+                                    role: Role::Assistant,
+                                    content: vec![ContentBlock::Thinking {
+                                        thinking,
+                                        signature: String::new(),
+                                    }],
+                                };
+                                artifact(&tx, &encode(&ModelRecord::Message(message))?)
+                            })
+                            .transpose()?;
+                        entry(
+                            &tx,
+                            &thread,
+                            "recovery",
+                            &format!("{summary}\n{text}"),
+                            EntryData {
+                                operation: Some(opid),
+                                result: reasoning.as_ref(),
+                                ..Default::default()
+                            },
+                        )?;
+                    }
                     if active && kind == "model" && !retry && name == "compact" {
                         model_runtime::fail_compaction(&tx, &run, &thread, &text)?;
                     } else if active && kind == "model" && !retry {

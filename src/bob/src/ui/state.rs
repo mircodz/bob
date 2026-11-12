@@ -3129,7 +3129,7 @@ impl App {
                             .retain(|id, _| pane.expanded.contains(id));
                         pane.content_key = Some(render::content_key(&view));
                         for entry in &view.entries {
-                            if entry.kind == EntryKind::Assistant
+                            if matches!(entry.kind, EntryKind::Assistant | EntryKind::Recovery)
                                 && entry.operation.as_ref().is_some_and(|operation| {
                                     pane.expanded_live_thinking.remove(operation)
                                 })

@@ -657,6 +657,65 @@ async fn cancellation_unblocks_a_saturated_progress_producer() {
     bounded(handle.shutdown()).await.unwrap();
 }
 
+#[tokio::test]
+async fn failed_attempt_keeps_its_streamed_reasoning_on_one_failure_line() {
+    let dir = TempDir::new();
+    let (executor, mut requests) = ExecutorFixture::new();
+    let handle = bounded(Runtime::open(&dir.db(), executor)).await.unwrap();
+    let mut live = handle.subscribe();
+    let root = create(&handle, &dir.0).await;
+    submit(&handle, &root.thread).await;
+    let attempt = next(&mut requests).await;
+    let start = live_until(&mut live, |s| !s.attempts.is_empty()).await;
+    let operation = start.attempts[0].operation.clone();
+    attempt
+        .progress
+        .emit(ModelUpdate::Reasoning {
+            block_id: "thinking".into(),
+            kind: ReasoningKind::Thinking,
+            text: "Checking the parser first".into(),
+        })
+        .await
+        .unwrap();
+    live_until(&mut live, |s| !s.attempts[0].reasoning.is_empty()).await;
+    attempt
+        .finish
+        .send(Err(anyhow::anyhow!(
+            "provider stream failed: openai stream ended: error decoding response body"
+        )))
+        .unwrap();
+    settled(&mut live, &operation).await;
+    let shown = view(&handle, &root.thread).await;
+    let failures: Vec<_> = shown
+        .entries
+        .iter()
+        .filter(|e| e.kind == EntryKind::Recovery)
+        .collect();
+    assert_eq!(failures.len(), 1);
+    assert!(
+        failures[0].text.starts_with("Model request failed\n"),
+        "{}",
+        failures[0].text
+    );
+    assert!(failures[0].text.contains("error decoding response body"));
+    assert_eq!(
+        failures[0].thinking.as_deref(),
+        Some("Checking the parser first")
+    );
+    assert!(shown
+        .entries
+        .iter()
+        .all(|e| !matches!(e.kind, EntryKind::Assistant | EntryKind::Notice)));
+    assert_eq!(
+        scalar(
+            &dir.db(),
+            "SELECT COUNT(*) FROM entries WHERE kind='recovery' AND model IS NOT NULL"
+        ),
+        0
+    );
+    bounded(handle.shutdown()).await.unwrap();
+}
+
 async fn malformed_completion_is_isolated(ids: Vec<String>, expected_error: &str) {
     let dir = TempDir::new();
     let (executor, mut requests) = ExecutorFixture::new();

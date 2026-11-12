@@ -228,11 +228,11 @@ impl ProviderService {
                     }
                     StreamEvent::MessageStop { completion } => return Ok(completion),
                     StreamEvent::Error { message } => {
-                        bail!("provider stream failed: {message}; no retry attempted")
+                        bail!("provider stream failed: {message}")
                     }
                 }
             }
-            bail!("provider stream ended before a final completion; no retry attempted")
+            bail!("provider stream ended before a final completion")
         };
         tokio::select! {
             biased;

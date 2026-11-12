@@ -38,7 +38,7 @@ pub(super) const CANCELLED: &str = "generation cancelled";
 pub(super) fn timeout(phase: &str) -> anyhow::Error {
     AdapterFailure {
         kind: ModelFailureKind::Transient,
-        message: format!("provider {phase} deadline exceeded; no retry attempted"),
+        message: format!("provider {phase} deadline exceeded"),
     }
     .into()
 }

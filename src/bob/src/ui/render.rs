@@ -242,6 +242,66 @@ fn header(name: String, state: OperationState, detail: String) -> Line<'static> 
         Span::styled(status, Style::default().fg(state_color(&state))),
     ])
 }
+/// A failed model request: its summary line and the full error after it.
+/// Older entries put both on one line, separated by the first colon.
+fn model_failure(text: &str) -> Option<(&str, &str)> {
+    if !text.starts_with("Model request ") {
+        return None;
+    }
+    let first = text.split('\n').next().unwrap_or(text);
+    Some(match first.split_once(": ") {
+        Some((summary, _)) => (summary, &text[summary.len() + 2..]),
+        None => text.split_once('\n').unwrap_or((text, "")),
+    })
+}
+
+/// A few words naming why a provider request failed; the full error stays
+/// available in the inspector.
+pub(super) fn failure_cause(detail: &str) -> String {
+    let lower = detail.to_lowercase();
+    let known = [
+        ("connection reset", "connection reset"),
+        ("connection refused", "connection refused"),
+        ("connection closed", "connection closed"),
+        (
+            "error decoding response body",
+            "connection dropped mid-response",
+        ),
+        ("before a final completion", "stream ended early"),
+        ("error sending request", "couldn't reach the provider"),
+        ("deadline exceeded", "timed out"),
+        ("timed out", "timed out"),
+        ("context_length_exceeded", "context too long"),
+        ("maximum context length", "context too long"),
+        ("prompt is too long", "context too long"),
+        (" 400 ", "bad request (400)"),
+        (" 401 ", "not authorized (401)"),
+        (" 403 ", "forbidden (403)"),
+        (" 404 ", "not found (404)"),
+        (" 408 ", "timed out (408)"),
+        (" 413 ", "request too large (413)"),
+        (" 429 ", "rate limited (429)"),
+        (" 500 ", "provider error (500)"),
+        (" 502 ", "provider unavailable (502)"),
+        (" 503 ", "provider unavailable (503)"),
+        (" 504 ", "provider timed out (504)"),
+        (" 529 ", "provider overloaded (529)"),
+        ("cancelled", "cancelled"),
+    ];
+    if let Some((_, cause)) = known.iter().find(|(needle, _)| lower.contains(needle)) {
+        return (*cause).to_owned();
+    }
+    let line = detail.lines().next().unwrap_or_default().trim();
+    let line = line
+        .strip_prefix("provider stream failed: ")
+        .unwrap_or(line);
+    let line = line.strip_suffix("; no retry attempted").unwrap_or(line);
+    match line.char_indices().nth(120) {
+        Some((end, _)) => format!("{}…", &line[..end]),
+        None => line.to_owned(),
+    }
+}
+
 fn agent_failure(entry: &Entry) -> Option<(&str, &str)> {
     if entry.kind != EntryKind::Coordination {
         return None;
@@ -404,7 +464,7 @@ pub(super) fn transcript(pane: &Pane, root: bool, width: u16) -> Vec<Row> {
         } else {
             None
         };
-        if entry.kind == EntryKind::Assistant {
+        if matches!(entry.kind, EntryKind::Assistant | EntryKind::Recovery) {
             if let Some(thinking) = &entry.thinking {
                 thinking_rows(
                     &mut rows,
@@ -578,9 +638,36 @@ pub(super) fn transcript(pane: &Pane, root: bool, width: u16) -> Vec<Row> {
                     .unwrap_or("agent")
                     .to_owned(),
             )],
-            EntryKind::Recovery => {
-                vec![Line::styled(safe(&entry.text), text().fg(Palette::WARN()))]
-            }
+            EntryKind::Recovery => match model_failure(&entry.text) {
+                Some((summary, detail)) => {
+                    let (title, next) = summary.split_once(" · ").unwrap_or((summary, ""));
+                    let state = if title.ends_with("failed") {
+                        OperationState::Failed
+                    } else if title.ends_with("cancelled") {
+                        OperationState::Cancelled
+                    } else {
+                        OperationState::Interrupted
+                    };
+                    let mut spans = vec![
+                        Span::styled("• ", Style::default().fg(state_color(&state))),
+                        Span::styled(safe(title), bold()),
+                    ];
+                    if state != OperationState::Cancelled && !detail.trim().is_empty() {
+                        spans.push(Span::styled(
+                            format!(" · {}", safe(&failure_cause(detail))),
+                            text(),
+                        ));
+                    }
+                    if !next.is_empty() {
+                        spans.push(Span::styled(
+                            format!(" · {}", safe(next)),
+                            Style::default().fg(state_color(&state)),
+                        ));
+                    }
+                    vec![Line::from(spans)]
+                }
+                None => vec![Line::styled(safe(&entry.text), text().fg(Palette::WARN()))],
+            },
             _ => safe(&entry.text)
                 .lines()
                 .map(|line| Line::styled(line.to_owned(), text()))

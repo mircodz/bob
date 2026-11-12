@@ -355,3 +355,30 @@ fn collapsed_thinking_never_previews_long_reasoning() {
     assert!(shown.contains("Thinking"), "{shown}");
     assert!(!shown.contains("word"), "{shown}");
 }
+
+#[test]
+fn model_failures_render_as_one_header_line_with_their_cause() {
+    let mut retry = entry(1, "", OperationState::Done, EntryKind::Recovery);
+    retry.tool = None;
+    retry.text = "Model request interrupted · retrying in 10s\nprovider stream failed: openai: error sending request for url (https://api.example.com/chat/completions): client error (SendRequest): connection error: Connection reset by peer (os error 54)".into();
+    retry.thinking = Some("Checking the parser first".into());
+    let mut legacy = entry(2, "", OperationState::Done, EntryKind::Recovery);
+    legacy.tool = None;
+    legacy.text = "Model request failed: provider stream failed: openai stream ended: error decoding response body; no retry attempted".into();
+    let shown = screen(&pane(vec![retry, legacy]), true);
+    assert!(
+        shown.contains("• Model request interrupted · connection reset · retrying in 10s"),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("• Model request failed · connection dropped mid-response"),
+        "{shown}"
+    );
+    assert!(!shown.contains("os error"), "{shown}");
+    assert!(!shown.contains("no retry attempted"), "{shown}");
+    assert!(!shown.contains("Checking the parser"), "{shown}");
+    assert!(
+        shown.find("Thinking").unwrap() < shown.find("Model request interrupted").unwrap(),
+        "{shown}"
+    );
+}

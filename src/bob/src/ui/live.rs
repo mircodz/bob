@@ -1,5 +1,4 @@
 use super::{
-    clipped,
     render::Row,
     state::{Anchor, AnchorId, App, HitAction, Pane},
     style::*,
@@ -408,7 +407,10 @@ pub(super) fn rows(
                     offset: source.text().len(),
                 },
                 line: Line::styled(
-                    format!("Stream interrupted: {}", safe(&clipped(error, 1024))),
+                    format!(
+                        "Stream interrupted · {}",
+                        safe(&super::render::failure_cause(error))
+                    ),
                     text().fg(Palette::WARN()),
                 ),
                 band: false,

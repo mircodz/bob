@@ -362,6 +362,21 @@ impl LiveProjection {
         }
     }
 
+    /// Reasoning an attempt has streamed so far, so a failed attempt can keep it.
+    pub(crate) fn reasoning(&mut self, operation: &OperationId) -> Option<String> {
+        let attempt = self.active.get_mut(operation)?;
+        self.dirty |= attempt.drain();
+        let text = attempt
+            .draft
+            .reasoning
+            .iter()
+            .map(|block| block.text.trim())
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        (!text.is_empty()).then_some(text)
+    }
+
     pub(crate) fn stop(&mut self, operation: &OperationId) {
         if let Some(attempt) = self.active.get_mut(operation) {
             if !attempt.draft.stopping {

@@ -1024,7 +1024,7 @@ impl Store {
             })?;
             entries = rows.collect::<Result<_, _>>()?;
             for entry in entries.iter_mut() {
-                if entry.kind == EntryKind::Assistant {
+                if matches!(entry.kind, EntryKind::Assistant | EntryKind::Recovery) {
                     if let Some(source) = &entry.artifact {
                         entry.thinking = thinking(&self.db, source)?;
                     }
