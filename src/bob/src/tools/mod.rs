@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::time::Duration;
 use tokio::sync::{watch, Mutex};
-#[cfg(test)]
+#[cfg(all(test, unix))]
 const STREAM_LIMIT: usize = 256 * 1024;
 const COMMAND_LIMIT: usize = 16 * 1024;
 const SHELL_LIMITATION: &str = native_worker::CONTAINMENT;

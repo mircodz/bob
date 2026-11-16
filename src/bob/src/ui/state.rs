@@ -736,6 +736,7 @@ pub(super) struct App {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub enum VoiceState {
     #[default]
     Off,

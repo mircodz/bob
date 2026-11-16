@@ -43,6 +43,7 @@ struct Fixture {
 impl Fixture {
     fn create() -> Result<Self> {
         let root = std::env::temp_dir().join(format!("bob-workflow-{}", uuid::Uuid::new_v4()));
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
         {

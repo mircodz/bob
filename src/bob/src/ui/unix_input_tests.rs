@@ -115,7 +115,13 @@ impl Fixture {
             ws_ypixel: 0,
         };
         syscall(unsafe {
-            libc::openpty(&mut master, &mut slave, null_mut(), null_mut(), &mut size)
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                null_mut(),
+                null_mut(),
+                &raw mut size,
+            )
         })?;
         let (master, slave) = unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) };
         for file in [&master, &slave] {

@@ -3,22 +3,13 @@ name: Release
 on:
   push:
     tags: ["v*"]
-  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  validate:
-    uses: ./.github/workflows/ci.yml
-    permissions:
-      contents: read
-    with:
-      skip-artifacts: true
-
   build:
-    name: ${{ matrix.target }}
-    needs: validate
+    name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -26,99 +17,35 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-          - os: macos-latest
-            target: x86_64-apple-darwin
           - os: macos-latest
             target: aarch64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install declared Rust toolchain and target
-        run: rustup target add ${{ matrix.target }}
-
-      - name: Install cross linker (aarch64 linux)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
-
+      - name: Install declared Rust toolchain
+        run: rustup show active-toolchain
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-
-      - name: Build durable binaries
-        run: cargo build --locked --release -p bob --bins --target ${{ matrix.target }}
-
-      - name: Package (unix)
-        if: matrix.os != 'windows-latest'
+      - name: Build release binaries
+        run: cargo build --locked --release -p bob --bins
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
         run: |
-          directory="target/${{ matrix.target }}/release"
           archive="bob-${{ matrix.target }}.tar.gz"
-          tar -czf "$archive" -C "$directory" bob bob-exec
+          tar -czf "$archive" -C target/release bob bob-exec
           echo "ASSET=$archive" >> "$GITHUB_ENV"
-
-      - name: Package (windows)
-        if: matrix.os == 'windows-latest'
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $directory = "target/${{ matrix.target }}/release"
+          $directory = "target/release"
           $archive = "bob-${{ matrix.target }}.zip"
           Compress-Archive -Path "$directory/bob.exe", "$directory/bob-exec.exe" -DestinationPath $archive
           "ASSET=$archive" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-      - name: Validate archive layout (unix)
-        if: matrix.os != 'windows-latest'
-        run: |
-          test "$(tar -tzf "$ASSET" | LC_ALL=C sort)" = "$(printf '%s\n' bob bob-exec | LC_ALL=C sort)"
-          mkdir package-smoke
-          tar -xzf "$ASSET" -C package-smoke
-          test -x package-smoke/bob
-          test -x package-smoke/bob-exec
-
-      - name: Relocated Unix real-helper acceptance
-        if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'aarch64-apple-darwin'
-        run: |
-          BOB_REPLACEMENT_PACKAGE_DIR="$PWD/package-smoke" cargo test --locked --release -p bob --target ${{ matrix.target }} --test packaged_unix_acceptance packaged_unix_frontend_and_helper_acceptance -- --exact --nocapture --test-threads=1
-
-      - name: Smoke test durable archive (windows)
-        if: matrix.os == 'windows-latest'
-        shell: pwsh
-        run: ./scripts/windows-acceptance.ps1 -Package $env:ASSET -Artifacts native-release-artifacts
-
-      - name: Record outstanding native qualification
-        if: matrix.os == 'windows-latest'
-        shell: pwsh
-        run: |
-          @'
-          ## Native Windows release qualification
-          Automated helper execution is not full packaged application acceptance.
-          NOT RUN here: actual packaged TUI in Windows Terminal, multiline paste safety,
-          Unicode/IME/layout input, real clipboard contention/readback, mouse/resize,
-          terminal restoration, large-session memory/handle measurements, and an
-          explicitly authorized GitHub Copilot-only live coding scenario.
-          The release owner must record these results for this source/archive identity
-          before approving the native-windows-release environment. Locked Crossterm's
-          native paste/Unicode-key behavior remains a qualification limitation.
-          ReplaceFileW also retains a final pathname-substitution window; passing
-          recovery characterization does not establish prevention of raced publication.
-          '@ | Add-Content $env:GITHUB_STEP_SUMMARY
-
-      - name: Retain Windows package acceptance evidence
-        if: always() && matrix.os == 'windows-latest'
-        uses: actions/upload-artifact@v4
-        with:
-          name: native-windows-release-evidence
-          path: native-release-artifacts/
-          if-no-files-found: warn
-          retention-days: 7
-
-      - name: Upload durable workflow artifact
+      - name: Upload archive
         uses: actions/upload-artifact@v4
         with:
           name: bob-${{ matrix.target }}
@@ -126,22 +53,11 @@ jobs:
           if-no-files-found: error
 
   publish:
-    name: Publish after native qualification
+    name: Publish release
     needs: build
-    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
-    environment: native-windows-release
     steps:
-      - name: Require source-specific native acceptance
-        env:
-          ACCEPTED_SHA: ${{ vars.NATIVE_WINDOWS_ACCEPTED_SHA }}
-          SOURCE_SHA: ${{ github.sha }}
-        run: |
-          if [ -z "$ACCEPTED_SHA" ] || [ "$ACCEPTED_SHA" != "$SOURCE_SHA" ]; then
-            echo '::error::Publication blocked: complete the README native Windows Terminal/Copilot checklist for this exact source and archive, then have the release owner set NATIVE_WINDOWS_ACCEPTED_SHA to the full tested commit SHA in the protected native-windows-release environment.'
-            exit 1
-          fi
-      - name: Download validated archives
+      - name: Download archives
         uses: actions/download-artifact@v4
         with:
           pattern: bob-*

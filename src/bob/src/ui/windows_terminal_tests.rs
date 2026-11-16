@@ -101,12 +101,10 @@ fn terminal_lifecycle_fixture() {
         EventType: KEY_EVENT as u16,
         ..Default::default()
     };
-    unsafe {
-        queued.Event.KeyEvent.bKeyDown = 1;
-        queued.Event.KeyEvent.wRepeatCount = 1;
-        queued.Event.KeyEvent.wVirtualKeyCode = b'Q' as u16;
-        queued.Event.KeyEvent.uChar.UnicodeChar = b'q' as u16;
-    }
+    queued.Event.KeyEvent.bKeyDown = 1;
+    queued.Event.KeyEvent.wRepeatCount = 1;
+    queued.Event.KeyEvent.wVirtualKeyCode = b'Q' as u16;
+    queued.Event.KeyEvent.uChar.UnicodeChar = b'q' as u16;
     let mut written = 0;
     assert_ne!(
         unsafe { WriteConsoleInputW(raw.as_raw_handle(), &queued, 1, &mut written) },

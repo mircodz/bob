@@ -54,6 +54,16 @@ pub fn normalize_paste(text: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+pub fn disable_raw_mode() -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    let _readiness = if crossterm::terminal::is_raw_mode_enabled().unwrap_or(false) {
+        macos::restore_readiness().ok()
+    } else {
+        None
+    };
+    crossterm::terminal::disable_raw_mode()
+}
+
 #[cfg(test)]
 mod normalization_tests {
     #[test]
@@ -92,16 +102,6 @@ mod normalization_tests {
             std::borrow::Cow::Borrowed(_)
         ));
     }
-}
-
-pub fn disable_raw_mode() -> std::io::Result<()> {
-    #[cfg(target_os = "macos")]
-    let _readiness = if crossterm::terminal::is_raw_mode_enabled().unwrap_or(false) {
-        macos::restore_readiness().ok()
-    } else {
-        None
-    };
-    crossterm::terminal::disable_raw_mode()
 }
 
 #[cfg(target_os = "macos")]

@@ -50,6 +50,7 @@ impl Executor for NoWork {
     }
 }
 
+#[cfg(unix)]
 async fn create_database(path: &Path) -> Result<()> {
     std::fs::create_dir_all(path.parent().unwrap())?;
     Runtime::open_paused(path, Arc::new(NoWork))

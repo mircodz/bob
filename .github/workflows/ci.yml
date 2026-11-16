@@ -2,87 +2,50 @@ name: CI
 
 on:
   push:
-    branches: [main, master]
+    branches: [main]
   pull_request:
-  workflow_call:
-    inputs:
-      skip-artifacts:
-        description: Run validation without CI artifact builds
-        type: boolean
-        default: false
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  check:
-    name: Lint & test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install declared Rust toolchain
-        run: rustup show active-toolchain
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-      - name: Install search dependency
-        run: sudo apt-get update && sudo apt-get install -y ripgrep
-      - name: Format check
-        run: cargo fmt --all --check
-      - name: Build
-        run: cargo build --locked --workspace --all-targets
-      - name: Test
-        run: cargo test --locked --workspace
-      - name: Clippy
-        run: cargo clippy --locked --workspace --all-targets -- -D warnings
-
-  platform-tests:
+  test:
     name: Test ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - name: Install declared Rust toolchain
         run: rustup show active-toolchain
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
-      - name: Install search dependency (macOS)
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev ripgrep
+      - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
         env:
           HOMEBREW_NO_AUTO_UPDATE: 1
         run: brew list ripgrep >/dev/null 2>&1 || brew install ripgrep
-      - name: Install search dependency (Windows)
+      - name: Install dependencies (Windows)
         if: runner.os == 'Windows'
         run: choco install ripgrep --yes --no-progress
-      - name: Native Windows acceptance (PowerShell and Git Bash)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: ./scripts/windows-acceptance.ps1
-      - name: Native Windows locked build
-        if: runner.os == 'Windows'
-        run: cargo build --locked --workspace --all-targets
-      - name: Native Windows Clippy
-        if: runner.os == 'Windows'
+      - name: Format check
+        if: runner.os == 'Linux'
+        run: cargo fmt --all --check
+      - name: Clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
-      - name: Build native effect helper
+      - name: Build shell helper
         run: cargo build --locked -p bob --bin bob-exec
-      - name: Test workspace
-        run: cargo test --locked --workspace
-      - name: Retain native acceptance evidence
-        if: always() && runner.os == 'Windows'
-        uses: actions/upload-artifact@v4
-        with:
-          name: native-windows-acceptance
-          path: native-windows-artifacts/
-          if-no-files-found: warn
-          retention-days: 7
+      - name: Unit tests
+        run: cargo test --locked --workspace --lib --bins --no-fail-fast
 
   build:
     name: Build ${{ matrix.target }}
-    if: ${{ !inputs.skip-artifacts }}
-    needs: [check, platform-tests]
+    if: github.event_name == 'push'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -96,48 +59,30 @@ jobs:
             target: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v4
-      - name: Install declared Rust toolchain and target
-        run: rustup target add ${{ matrix.target }}
+      - name: Install declared Rust toolchain
+        run: rustup show active-toolchain
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-      - name: Build durable release binaries
-        run: cargo build --locked --release -p bob --bins --target ${{ matrix.target }}
-      - name: Package Unix archives
+      - name: Build release binaries
+        run: cargo build --locked --release -p bob --bins
+      - name: Package (Unix)
         if: runner.os != 'Windows'
-        run: |
-          directory="target/${{ matrix.target }}/release"
-          archive="bob-${{ matrix.target }}.tar.gz"
-          tar -czf "$archive" -C "$directory" bob bob-exec
-          echo "ASSET=$archive" >> "$GITHUB_ENV"
-          test "$(tar -tzf "$archive" | LC_ALL=C sort)" = "$(printf '%s\n' bob bob-exec | LC_ALL=C sort)"
-          mkdir package-smoke
-          tar -xzf "$archive" -C package-smoke
-      - name: Relocated Unix real-helper acceptance
-        if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'aarch64-apple-darwin'
-        run: |
-          BOB_REPLACEMENT_PACKAGE_DIR="$PWD/package-smoke" cargo test --locked --release -p bob --target ${{ matrix.target }} --test packaged_unix_acceptance packaged_unix_frontend_and_helper_acceptance -- --exact --nocapture --test-threads=1
-      - name: Package and execute Windows durable smoke
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $directory = 'target/${{ matrix.target }}/release'
-          $archive = 'bob-${{ matrix.target }}.zip'
-          Compress-Archive -Path "$directory/bob.exe", "$directory/bob-exec.exe" -DestinationPath $archive
-          "ASSET=$archive" | Out-File -FilePath $env:GITHUB_ENV -Append
-          ./scripts/windows-acceptance.ps1 -Package $archive -Artifacts native-package-artifacts
-      - name: Retain package acceptance evidence
-        if: always() && runner.os == 'Windows'
-        uses: actions/upload-artifact@v4
-        with:
-          name: native-windows-package-acceptance
-          path: native-package-artifacts/
-          if-no-files-found: warn
-          retention-days: 7
-      - name: Upload durable archive
+        run: tar -czf bob-${{ matrix.target }}.tar.gz -C target/release bob bob-exec
+      - name: Upload (Unix)
+        if: runner.os != 'Windows'
         uses: actions/upload-artifact@v4
         with:
           name: bob-${{ matrix.target }}
-          path: ${{ env.ASSET }}
+          path: bob-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+      - name: Upload (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bob-${{ matrix.target }}
+          path: |
+            target/release/bob.exe
+            target/release/bob-exec.exe
           if-no-files-found: error

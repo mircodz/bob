@@ -124,7 +124,15 @@ impl Executor for FakeExecutor {
     }
 }
 async fn until(handle: &Handle, thread: &ThreadId, predicate: impl Fn(&View) -> bool) -> View {
-    timeout(Duration::from_secs(10), async {
+    until_within(handle, thread, Duration::from_secs(10), predicate).await
+}
+async fn until_within(
+    handle: &Handle,
+    thread: &ThreadId,
+    limit: Duration,
+    predicate: impl Fn(&View) -> bool,
+) -> View {
+    timeout(limit, async {
         loop {
             let view = handle
                 .transcript(Some(thread.clone()), None, 80)

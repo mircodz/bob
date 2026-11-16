@@ -46,7 +46,10 @@ async fn submit(handle: &Handle, thread: &ThreadId, text: String) -> CommandId {
 }
 
 async fn completed(handle: &Handle, thread: &ThreadId, executor: &QueueExecutor, requests: usize) {
-    until(handle, thread, |view| {
+    // The kernel advances one queued step per 25 ms tick, so draining a long
+    // queue takes time proportional to its length (about 60 ms per turn here).
+    let limit = Duration::from_secs(10).max(Duration::from_millis(500) * requests as u32);
+    until_within(handle, thread, limit, |view| {
         executor.requests.lock().unwrap().len() == requests
             && view
                 .threads
