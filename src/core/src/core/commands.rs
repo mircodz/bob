@@ -116,7 +116,7 @@ fn split_arguments(args: &str) -> Vec<String> {
 
 /// Load global commands followed by bounded project ancestors, nearest last.
 pub fn load_custom_commands(cwd: &Path) -> Vec<CustomCommand> {
-    let global = dirs::home_dir().map(|home| home.join(".bob").join("commands"));
+    let global = std::env::home_dir().map(|home| home.join(".bob").join("commands"));
     load_custom_commands_from(cwd, global.as_deref())
 }
 

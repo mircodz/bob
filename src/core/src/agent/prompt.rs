@@ -244,7 +244,7 @@ fn project_context(cwd: &Path) -> Option<String> {
     use crate::core::project_context::{render_instructions, ProjectContext, ProjectInstruction};
     let context = ProjectContext::discover(cwd).ok()?;
     let mut instructions = Vec::new();
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = std::env::home_dir() {
         let path = home.join(".bob/AGENTS.md");
         if let Some(content) = read_nonempty(&path) {
             instructions.push(ProjectInstruction {

@@ -23,7 +23,7 @@ pub(crate) fn configured_executor(
 ) -> Arc<dyn Executor> {
     Arc::new(AppExecutor {
         provider,
-        tools: ToolService::new(configured_shell, dirs::home_dir()),
+        tools: ToolService::new(configured_shell, std::env::home_dir()),
         services: Some(services),
     })
 }

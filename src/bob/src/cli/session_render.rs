@@ -47,7 +47,7 @@ fn query_tail(text: &str, width: usize) -> String {
 }
 
 fn display_path(path: &str) -> String {
-    let shortened = dirs::home_dir().and_then(|home| {
+    let shortened = std::env::home_dir().and_then(|home| {
         Path::new(path).strip_prefix(home).ok().map(|relative| {
             if relative.as_os_str().is_empty() {
                 "~".into()

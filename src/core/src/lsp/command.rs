@@ -6,7 +6,7 @@ pub(super) fn resolve_command(command: &str) -> PathBuf {
         .unwrap_or_default();
     let install_dirs = install_dirs(
         cfg!(windows),
-        dirs::home_dir().as_deref(),
+        std::env::home_dir().as_deref(),
         std::env::var_os("CARGO_HOME").map(PathBuf::from).as_deref(),
         std::env::var_os("LOCALAPPDATA")
             .map(PathBuf::from)

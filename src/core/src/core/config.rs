@@ -434,7 +434,7 @@ fn merge(mut base: BobConfig, over: PartialConfig) -> BobConfig {
 
 pub fn load_config(cwd: &Path) -> anyhow::Result<BobConfig> {
     let mut cfg = BobConfig::default();
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = std::env::home_dir() {
         if let Some(user) = read_partial(&home.join(".bob").join("config.toml"))? {
             cfg = merge(cfg, user);
         }
@@ -474,12 +474,12 @@ pub fn load_project_config(mut cfg: BobConfig, cwd: &Path) -> anyhow::Result<Bob
 }
 
 pub fn global_config_path() -> anyhow::Result<std::path::PathBuf> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("no home directory"))?;
+    let home = std::env::home_dir().ok_or_else(|| anyhow::anyhow!("no home directory"))?;
     Ok(home.join(".bob").join("config.toml"))
 }
 
 pub fn plans_dir() -> anyhow::Result<std::path::PathBuf> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("no home directory"))?;
+    let home = std::env::home_dir().ok_or_else(|| anyhow::anyhow!("no home directory"))?;
     Ok(home.join(".bob").join("plans"))
 }
 

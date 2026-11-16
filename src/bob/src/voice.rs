@@ -31,7 +31,7 @@ pub const TURBO: Model = Model {
 const MODELS: [&Model; 2] = [&TURBO, &BASE];
 
 pub fn models_dir() -> Result<PathBuf> {
-    Ok(dirs::home_dir()
+    Ok(std::env::home_dir()
         .context("no home directory")?
         .join(".bob")
         .join("models"))

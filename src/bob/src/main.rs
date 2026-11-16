@@ -54,7 +54,7 @@ async fn main() -> Result<()> {
     }
     let database = cli::launch::pin_database(bob::storage::resolve_database(
         args.database.as_deref(),
-        dirs::home_dir,
+        std::env::home_dir,
     )?)?;
     let workspace = cli::launch::validate_workspace(&args.workspace)?;
     let selection = cli::selection(&args, &database, &workspace).await?;
@@ -78,7 +78,7 @@ async fn main() -> Result<()> {
 }
 
 async fn inspect(args: &Args) -> Result<()> {
-    let database = bob::storage::resolve_database(args.database.as_deref(), dirs::home_dir)?;
+    let database = bob::storage::resolve_database(args.database.as_deref(), std::env::home_dir)?;
     let catalog = SessionCatalog::open(&database)?;
     let view = if args.inspect {
         Some(serde_json::to_value(catalog.view(

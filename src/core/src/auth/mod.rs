@@ -75,7 +75,7 @@ pub struct AuthStore {
 }
 
 fn auth_path() -> PathBuf {
-    let base = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let base = std::env::home_dir().unwrap_or_else(|| PathBuf::from("."));
     base.join(".bob").join("auth.json")
 }
 

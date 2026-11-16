@@ -24,7 +24,6 @@ async-trait.workspace = true
 regex.workspace = true
 glob.workspace = true
 globset = "0.4"
-dirs.workspace = true
 sha2.workspace = true
 anyhow.workspace = true
 rusqlite = { version = "0.32", features = ["bundled"] }

@@ -146,7 +146,7 @@ mod tests {
         let pinned = pin_database(relative.clone())?;
         let fixture = Directory::new()?;
         let resumed = fixture.workspace("resumed")?;
-        assert_eq!(pinned, launch.join(&relative));
+        assert_eq!(pinned, std::fs::canonicalize(&launch)?.join(&relative));
         assert_eq!(resumed.join(&pinned), pinned);
         assert_ne!(resumed.join(&relative), pinned);
         assert_eq!(pin_database(pinned.clone())?, pinned);

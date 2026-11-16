@@ -88,10 +88,12 @@ fn windows_replacement_preserves_custom_dacl_for_config_and_auth() {
             "original",
         );
         set_dacl(&path, "D:P(A;;FA;;;OW)(A;;FR;;;SY)");
-        let before = read_dacl(&path);
+        // ReplaceFileW may add the auto-inherited (AI) flag; the ACEs and protection must match.
+        let dacl = |path: &Path| read_dacl(path).replace("D:PAI(", "D:P(");
+        let before = dacl(&path);
         atomic_replace(&path, b"replacement", private).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
-        assert_eq!(read_dacl(&path), before);
+        assert_eq!(dacl(&path), before);
         assert!(!sibling(&path, ".update-recovery").exists());
     }
     assert_eq!(std::fs::read_dir(&*root).unwrap().count(), 2);

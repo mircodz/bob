@@ -53,6 +53,7 @@ fn subprocess_lock_authority_survives_pid_contents_and_releases_on_exit() {
     process.0.kill().unwrap();
     process.0.wait().unwrap();
     assert!(FileLock::try_acquire(&contender).unwrap());
+    drop(contender);
     assert_eq!(
         std::fs::read_to_string(lock).unwrap(),
         "999999999 stale-looking PID is not authority"

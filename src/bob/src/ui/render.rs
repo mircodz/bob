@@ -1463,7 +1463,7 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
             spans.push(separator());
             spans.push(Span::styled(
                 safe(
-                    &dirs::home_dir()
+                    &std::env::home_dir()
                         .and_then(|home| {
                             workspace.strip_prefix(home).ok().map(|rest| {
                                 if rest.as_os_str().is_empty() {
