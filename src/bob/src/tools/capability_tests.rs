@@ -678,24 +678,24 @@ fn windows_pinned_directory_rejects_writers_rename_and_preserves_no_clobber_publ
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+        DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
         FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
     let root = TestDir::new();
     fs::create_dir(root.file("parent")).unwrap();
-    let writer = || {
+    let deleter = || {
         fs::OpenOptions::new()
-            .write(true)
+            .access_mode(DELETE)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
             .open(root.file("parent"))
     };
-    let existing_writer = writer().unwrap();
+    let existing_deleter = deleter().unwrap();
     assert!(filesystem::Directory::open(&root.file("parent")).is_err());
-    drop(existing_writer);
+    drop(existing_deleter);
     let directory = filesystem::Directory::open(&root.file("parent")).unwrap();
     assert_eq!(
-        writer().unwrap_err().raw_os_error(),
+        deleter().unwrap_err().raw_os_error(),
         Some(ERROR_SHARING_VIOLATION as i32)
     );
     directory.verify().unwrap();

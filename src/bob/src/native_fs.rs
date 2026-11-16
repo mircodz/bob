@@ -801,8 +801,10 @@ fn open_directory(path: &Path) -> Result<File> {
     {
         use std::os::windows::fs::OpenOptionsExt;
         use windows_sys::Win32::Storage::FileSystem::*;
+        // Renames into a directory open it for writing, so write sharing must stay
+        // allowed; denying delete sharing is what keeps the pinned directory in place.
         options
-            .share_mode(FILE_SHARE_READ)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
     }
     let file = options
@@ -814,7 +816,6 @@ fn open_directory(path: &Path) -> Result<File> {
 
 fn ensure_directory(file: &File) -> Result<()> {
     let metadata = file.metadata()?;
-    ensure!(metadata.is_dir(), "component is not a directory");
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
@@ -825,6 +826,7 @@ fn ensure_directory(file: &File) -> Result<()> {
             "interior directory reparse points are not supported; select the physical directory as the workspace instead"
         );
     }
+    ensure!(metadata.is_dir(), "component is not a directory");
     Ok(())
 }
 
