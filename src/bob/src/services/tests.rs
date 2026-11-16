@@ -81,7 +81,7 @@ async fn preparation_is_pure_and_mutated_inputs_fail_before_execution() {
     let request = invocation(&services, "memory", json!({"content":"fixture preference"}));
     let prepared = services.prepare(request).await.unwrap();
     assert!(services
-        .memory_entries(&services.project_scope(), 0)
+        .memory_entries(&services.repo_scope(), 0)
         .unwrap()
         .is_empty());
     let mut changed = prepared.clone();
@@ -96,20 +96,17 @@ async fn preparation_is_pure_and_mutated_inputs_fail_before_execution() {
         .await
         .is_err());
     assert!(services
-        .memory_entries(&services.project_scope(), 0)
+        .memory_entries(&services.repo_scope(), 0)
         .unwrap()
         .is_empty());
     let result = services.execute(prepared, cancel).await.unwrap();
     assert!(result.text.contains("fixture preference"));
     assert_eq!(
-        services
-            .memory_entries(&services.project_scope(), 0)
-            .unwrap()[0]
-            .content,
+        services.memory_entries(&services.repo_scope(), 0).unwrap()[0].content,
         "fixture preference"
     );
     assert!(services
-        .memory_entries(&MemoryScope::Project("another project".into()), 0)
+        .memory_entries(&MemoryScope::Repo("another project".into()), 0)
         .is_err());
 }
 

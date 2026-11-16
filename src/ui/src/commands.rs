@@ -17,7 +17,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ),
     ("/theme", "switch color theme (dark/light/terminal)"),
     ("/jobs", "list background jobs"),
-    ("/memory", "show saved memories (project + global)"),
+    ("/memory", "show saved memories (repo + global)"),
     ("/init", "generate an AGENTS.md describing this project"),
     ("/mcp", "list configured MCP servers"),
     ("/lsp", "show language servers & their health"),

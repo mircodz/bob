@@ -1295,7 +1295,7 @@ mod tests {
                 } else {
                     Arc::new(InMemoryMemories::default())
                 };
-                let scope = MemoryScope::project(dir.path()).unwrap();
+                let scope = MemoryScope::repo(dir.path()).unwrap();
                 let mut cfg = config(Arc::new(ScriptProvider::new(vec![])));
                 cfg.cwd = dir.path().to_string_lossy().into_owned();
                 cfg.system = Some(BASE.into());

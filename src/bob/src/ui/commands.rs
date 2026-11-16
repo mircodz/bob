@@ -352,7 +352,7 @@ pub(super) async fn execute_with_defaults(
                 use bob_core::core::memory::MemoryScope;
                 let mut lines = Vec::new();
                 for (label, scope) in [
-                    ("Project", services.project_scope()),
+                    ("Repo", services.repo_scope()),
                     ("Global", MemoryScope::Global),
                 ] {
                     let entries = services.memory_entries(&scope, offset)?;

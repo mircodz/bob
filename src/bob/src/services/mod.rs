@@ -28,7 +28,7 @@ const RESULT_LIMIT: usize = 16 * 1024 * 1024;
 
 pub struct Services {
     workspace: PathBuf,
-    project_scope: MemoryScope,
+    repo_scope: MemoryScope,
     memories: Arc<dyn MemoryRepository>,
     web: WebClient,
     mcp: mcp::McpService,
@@ -65,13 +65,13 @@ impl Services {
         memories: Arc<dyn MemoryRepository>,
     ) -> Result<Self> {
         let workspace = std::fs::canonicalize(workspace).context("resolve services workspace")?;
-        let project_scope = MemoryScope::project(&workspace)?;
+        let repo_scope = MemoryScope::repo(&workspace)?;
         let web = WebClient::new()?;
         let lsp = lsp::LspService::start(&config.lsp_servers, &workspace);
         let mcp = mcp::McpService::start(&config.mcp_servers, &workspace).await;
         Ok(Self {
             workspace,
-            project_scope,
+            repo_scope,
             memories,
             web,
             mcp,
@@ -175,13 +175,13 @@ impl Services {
         .await
     }
 
-    pub fn project_scope(&self) -> MemoryScope {
-        self.project_scope.clone()
+    pub fn repo_scope(&self) -> MemoryScope {
+        self.repo_scope.clone()
     }
 
     pub fn memory_entries(&self, scope: &MemoryScope, offset: usize) -> Result<Vec<MemoryEntry>> {
         ensure!(
-            *scope == MemoryScope::Global || *scope == self.project_scope,
+            *scope == MemoryScope::Global || *scope == self.repo_scope,
             "memory scope is outside this service workspace"
         );
         self.memories.list_page(scope, offset, 50)
@@ -223,10 +223,9 @@ impl Services {
             "web_fetch" | "web_search" => {
                 ServiceAction::Web(WebRequest::prepare(name, &invocation.input)?)
             }
-            "memory" => ServiceAction::Memory(MemoryRequest::prepare(
-                &invocation.input,
-                &self.project_scope,
-            )?),
+            "memory" => {
+                ServiceAction::Memory(MemoryRequest::prepare(&invocation.input, &self.repo_scope)?)
+            }
             "lsp" | "rename_symbol" | "code_action" => ServiceAction::Lsp(
                 self.lsp
                     .prepare_with_cancel(name, &invocation.input, cancel)
@@ -294,7 +293,7 @@ impl Services {
                 ensure!(
                     name == "memory"
                         && request
-                            == MemoryRequest::prepare(&tool.invocation.input, &self.project_scope)?,
+                            == MemoryRequest::prepare(&tool.invocation.input, &self.repo_scope)?,
                     "prepared memory request changed"
                 );
                 memory::execute(self.memories.clone(), request, cancel).await?
