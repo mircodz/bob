@@ -674,16 +674,17 @@ impl ToolService {
                 .context("repository worker failed")??;
                 return Ok(ToolOutcome {
                     text: serde_json::to_string(&report)?,
-                    is_error: report.cancelled || !report.errors.is_empty(),
+                    is_error: report.cancelled
+                        || (report.visited == 0 && !report.errors.is_empty()),
                     interrupted: false,
                     presentation: Some(bob_kernel::ToolResultPresentation {
                         summary: Some(format!(
                             "{} results{}",
                             report.entries.len(),
-                            if report.truncated {
-                                " (incomplete)"
-                            } else {
+                            if report.limits_reached.is_empty() {
                                 ""
+                            } else {
+                                " (incomplete)"
                             }
                         )),
                         body_preview: presentation::repository_result(&report),

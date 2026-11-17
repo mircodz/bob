@@ -700,6 +700,10 @@ pub(super) struct SearchReport<S = &'static str> {
     pub bytes_read: usize,
     pub skipped_nonregular: usize,
     pub skipped_ignored: usize,
+    #[serde(default)]
+    pub skipped_binary: usize,
+    #[serde(default)]
+    pub skipped_large: usize,
     pub offset: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_offset: Option<usize>,
@@ -861,6 +865,17 @@ impl Walker<'_> {
         Ok(())
     }
     fn read(&mut self, directory: &Directory, name: &OsStr, limit: usize) -> Result<String> {
+        let bytes = self
+            .read_bytes(directory, name, limit)?
+            .with_context(|| format!("file exceeds {limit}-byte search read limit"))?;
+        Ok(decode_text(bytes))
+    }
+    fn read_bytes(
+        &mut self,
+        directory: &Directory,
+        name: &OsStr,
+        limit: usize,
+    ) -> Result<Option<Vec<u8>>> {
         ensure!(!self.stop(), "search budget exhausted");
         #[cfg(test)]
         SEARCH_READ_HOOK.with(|slot| {
@@ -871,10 +886,9 @@ impl Walker<'_> {
         let mut file = directory.open_file(name)?;
         let before = file.metadata()?;
         let identity = crate::native_fs::identity(&file)?;
-        ensure!(
-            before.len() <= limit as u64,
-            "file exceeds {limit}-byte search read limit"
-        );
+        if before.len() > limit as u64 {
+            return Ok(None);
+        }
         let remaining = BYTE_LIMIT - self.report.bytes_read;
         if before.len() > remaining as u64 {
             self.limit("bytes_read");
@@ -903,7 +917,30 @@ impl Walker<'_> {
             "file changed during search read"
         );
         directory.verify()?;
-        Ok(String::from_utf8(bytes)?)
+        Ok(Some(bytes))
+    }
+    fn grep_file(&mut self, directory: &Directory, name: &OsStr, path: &str) -> Result<()> {
+        let search = self.search;
+        let Query::Grep {
+            regex,
+            context,
+            multiline,
+            output_mode,
+            ..
+        } = &search.query
+        else {
+            bail!("only grep reads file contents");
+        };
+        let Some(bytes) = self.read_bytes(directory, name, READ_LIMIT)? else {
+            self.report.skipped_large += 1;
+            return Ok(());
+        };
+        let text = decode_text(bytes);
+        if text.contains('\0') {
+            self.report.skipped_binary += 1;
+            return Ok(());
+        }
+        self.grep(path, &text, regex, *context, *multiline, *output_mode)
     }
     fn grep(
         &mut self,
@@ -1204,30 +1241,14 @@ impl Walker<'_> {
         let name = path.file_name().context("missing filename")?;
         self.report.visited += 1;
         let search = self.search;
-        let Query::Grep {
-            regex,
-            glob,
-            context,
-            multiline,
-            output_mode,
-        } = &search.query
-        else {
+        let Query::Grep { glob, .. } = &search.query else {
             bail!("only grep supports a file scope");
         };
         if glob
             .as_ref()
             .is_none_or(|glob| glob.matches(Path::new(name)))
         {
-            let text = self.read(directory, name, READ_LIMIT)?;
-            ensure!(!text.contains('\0'), "binary file skipped");
-            self.grep(
-                &relative_name(self.root, path)?,
-                &text,
-                regex,
-                *context,
-                *multiline,
-                *output_mode,
-            )?;
+            self.grep_file(directory, name, &relative_name(self.root, path)?)?;
         }
         directory.verify()?;
         Ok(())
@@ -1331,19 +1352,11 @@ impl Walker<'_> {
                         Err(error) => self.error(&path, error),
                     }
                 }
-                Query::Grep {
-                    regex,
-                    glob,
-                    context,
-                    multiline,
-                    output_mode,
-                } if !is_dir && glob.as_ref().is_none_or(|glob| glob.matches(matched_path)) => {
-                    match self.read(&directory, &entry.name, READ_LIMIT) {
-                        Ok(text) if text.contains('\0') => self.error(&path, "binary file skipped"),
-                        Ok(text) => {
-                            self.grep(&relative, &text, regex, *context, *multiline, *output_mode)?
-                        }
-                        Err(error) => self.error(&path, error),
+                Query::Grep { glob, .. }
+                    if !is_dir && glob.as_ref().is_none_or(|glob| glob.matches(matched_path)) =>
+                {
+                    if let Err(error) = self.grep_file(&directory, &entry.name, &relative) {
+                        self.error(&path, error);
                     }
                 }
                 _ => {}
@@ -1368,7 +1381,7 @@ impl Walker<'_> {
     }
 }
 
-pub(super) fn render<S: AsRef<str>>(report: &SearchReport<S>) -> String {
+pub(super) fn render_entries<S: AsRef<str>>(report: &SearchReport<S>) -> Vec<String> {
     let mut lines = Vec::new();
     let has_context = report
         .entries
@@ -1406,7 +1419,7 @@ pub(super) fn render<S: AsRef<str>>(report: &SearchReport<S>) -> String {
     }
     if lines.is_empty() {
         lines.push(
-            if report.truncated {
+            if !report.limits_reached.is_empty() {
                 "(no results returned; search incomplete)"
             } else if report.offset > 1 {
                 "(no results at this offset)"
@@ -1418,6 +1431,11 @@ pub(super) fn render<S: AsRef<str>>(report: &SearchReport<S>) -> String {
             .to_owned(),
         );
     }
+    lines
+}
+
+pub(super) fn render<S: AsRef<str>>(report: &SearchReport<S>) -> String {
+    let mut lines = render_entries(report);
     for error in &report.errors {
         lines.push(format!("[!] {error}"));
     }
@@ -1446,6 +1464,28 @@ pub(super) fn render<S: AsRef<str>>(report: &SearchReport<S>) -> String {
         }
     }
     lines.join("\n")
+}
+
+/// Decodes file content the way ripgrep searches it: UTF-16 with a byte-order
+/// mark is transcoded and invalid UTF-8 is replaced instead of failing the read.
+fn decode_text(bytes: Vec<u8>) -> String {
+    let utf16 = |data: &[u8], unit: fn([u8; 2]) -> u16| {
+        let units = data
+            .as_chunks()
+            .0
+            .iter()
+            .map(|pair| unit(*pair))
+            .collect::<Vec<_>>();
+        String::from_utf16_lossy(&units)
+    };
+    if let Some(data) = bytes.strip_prefix(&[0xff, 0xfe]) {
+        utf16(data, u16::from_le_bytes)
+    } else if let Some(data) = bytes.strip_prefix(&[0xfe, 0xff]) {
+        utf16(data, u16::from_be_bytes)
+    } else {
+        String::from_utf8(bytes)
+            .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned())
+    }
 }
 
 fn clip(text: &str, limit: usize) -> &str {
@@ -1817,7 +1857,7 @@ mod tests {
     }
 
     #[test]
-    fn search_charges_actual_bytes_even_for_failed_utf8_reads() {
+    fn search_charges_actual_bytes_for_non_utf8_files() {
         let fixture = Fixture::new();
         fixture.write(".gitignore", "*.skip\n");
         fixture.write("a", "hit\n");
@@ -1830,7 +1870,7 @@ mod tests {
         let report = fixture.search("grep", json!({"pattern":"hit", "glob":"[ab]"}));
         assert_eq!(report.bytes_read, 13);
         assert_eq!(report.entries.len(), 1);
-        assert_eq!(report.errors.len(), 1);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert_eq!(report.next_offset, None);
     }
 
@@ -1876,6 +1916,28 @@ mod tests {
             .read(&directory, OsStr::new("file"), READ_LIMIT)
             .is_err());
         assert_eq!(walker.report.bytes_read, BYTE_LIMIT);
+    }
+
+    #[test]
+    fn grep_quietly_skips_binary_and_oversized_files_and_decodes_legacy_text() {
+        let fixture = Fixture::new();
+        fixture.write("latin1.txt", b"caf\xe9 hit\n");
+        fixture.write("binary.bin", b"hit\0\x01\x02");
+        fixture.write("large.txt", "hit\n".repeat(READ_LIMIT / 4 + 1));
+        let utf16 = "\u{feff}wide hit\r\n"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        fixture.write("wide.txt", utf16);
+        let report = fixture.search("grep", json!({"pattern":"hit"}));
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(!report.truncated, "{}", render(&report));
+        assert_eq!(report.skipped_binary, 1);
+        assert_eq!(report.skipped_large, 1);
+        assert_eq!(
+            render(&report),
+            "latin1.txt:1:caf\u{fffd} hit\nwide.txt:1:wide hit"
+        );
     }
 
     #[test]

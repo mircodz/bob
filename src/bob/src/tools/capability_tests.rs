@@ -435,15 +435,16 @@ async fn search_reports_result_and_line_limits_errors_and_cancellation() {
     let report: Value = serde_json::from_str(&result.text).unwrap();
     assert_eq!(report["truncated"], true);
     assert!(report["entries"][0]["text"].as_str().unwrap().len() <= 16 * 1024);
-    fs::write(root.file("one.txt"), vec![0xff, 0xfe]).unwrap();
+    fs::write(root.file("one.txt"), b"\xffx\n").unwrap();
     let result = run(
         &tools,
         prepare(&root, &tools, &thread, "grep", json!({"pattern":"x"})).await,
     )
     .await;
-    assert!(result.is_error);
+    assert!(!result.is_error, "{}", result.text);
     let report: Value = serde_json::from_str(&result.text).unwrap();
-    assert!(!report["errors"].as_array().unwrap().is_empty());
+    assert!(report["errors"].as_array().unwrap().is_empty());
+    assert_eq!(report["entries"][0]["text"], "\u{fffd}x");
     let Action::Repository {
         path, ancestors, ..
     } = repository::prepare(&root.0, "glob", json!({"pattern":"**"})).unwrap()
@@ -781,12 +782,12 @@ fn repository_previews_are_human_bounded_and_keep_incomplete_diagnostics_visible
         "source/\nsource/main.rs\n[Preview; inspect for full result]"
     );
     report.errors.push("file changed during search read".into());
-    assert!(presentation::repository_result(&report)
+    assert!(!presentation::repository_result(&report)
         .unwrap()
         .contains("file changed during search read"));
     report.errors.clear();
     report.truncated = true;
-    assert!(presentation::repository_result(&report)
+    assert!(!presentation::repository_result(&report)
         .unwrap()
         .contains("Search incomplete"));
     report.truncated = false;

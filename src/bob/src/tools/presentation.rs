@@ -18,14 +18,7 @@ pub(super) fn repository_result(report: &repository::SearchReport) -> Option<Str
     if report.cancelled {
         preview.push_str("[!] Search cancelled.\n");
     }
-    if report.truncated {
-        preview
-            .push_str("[!] Search incomplete; narrow the query or inspect continuation details.\n");
-    }
-    if let Some(error) = report.errors.first() {
-        preview.push_str(&format!("[!] {error}\n"));
-    }
-    preview.push_str(&repository::render(report));
+    preview.push_str(&repository::render_entries(report).join("\n"));
     if preview.len() > LIMIT {
         let mut end = LIMIT;
         while !preview.is_char_boundary(end) {
