@@ -719,3 +719,61 @@ fn final_boundary_checks_accepted_messages_and_late_reports_do_not_reopen() {
     );
     tx.commit().unwrap();
 }
+
+#[tokio::test]
+async fn explores_from_one_reply_run_concurrently_and_report_in_order() {
+    let (dir, store, root, models) = fixture();
+    drop(store);
+    let path = dir.0.join("lab.db");
+    let (handle, mut requests) = gated(models, &path).await;
+    begin(&handle, &root).await;
+    let explore = |id: &str, query: &str| ContentBlock::ToolUse {
+        id: id.into(),
+        name: "explore".into(),
+        input: json!({"query":query,"description":query}),
+    };
+    requests
+        .next("root-owned-fixture")
+        .await
+        .finish(Completion {
+            message: Message {
+                role: Role::Assistant,
+                content: vec![
+                    explore("call-first", "first-explore-fixture"),
+                    explore("call-second", "second-explore-fixture"),
+                ],
+            },
+            stop_reason: StopReason::ToolUse,
+            usage: Default::default(),
+        });
+    // Both explorers ask for a model turn before either one has finished.
+    let first = requests.next("first-explore-fixture").await;
+    let second = requests.next("second-explore-fixture").await;
+    second.finish(answer("second explorer report"));
+    first.finish(answer("first explorer report"));
+    let collected = requests.next("root-owned-fixture").await;
+    let reports: Vec<_> = collected
+        .spec
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } => Some((tool_use_id.clone(), content.model_text())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        reports
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect::<Vec<_>>(),
+        ["call-first", "call-second"]
+    );
+    assert!(reports[0].1.contains("first explorer report"));
+    assert!(reports[1].1.contains("second explorer report"));
+    collected.finish(answer("done"));
+}

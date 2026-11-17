@@ -33,6 +33,19 @@ impl Actor {
                     break;
                 }
             }
+        } else if first.2 == "tool" && first.1 == "explore" && first.3 == "waiting" {
+            // Explorers are read-only and calls from one reply cannot depend on each
+            // other, so later explores launch while earlier ones are still collecting.
+            // A collecting explore is revisited only after no later explore needs a launch.
+            for row in rows.iter().skip(1) {
+                if row.2 != "tool" || row.1 != "explore" || row.3 == "approval" {
+                    break;
+                }
+                if matches!(row.3.as_str(), "pending" | "ready") {
+                    selected = &row.0;
+                    break;
+                }
+            }
         }
         let (thread,name,kind,input,state,prepared,revision)=self.store.db.query_row("SELECT thread,name,kind,input,state,prepared,policy_revision FROM operations WHERE id=?1",[selected],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,Option<String>>(5)?,r.get::<_,i64>(6)?)))?;
         Ok(Some(Op {
@@ -137,6 +150,59 @@ mod tests {
         ) -> anyhow::Result<ToolOutcome> {
             unreachable!()
         }
+    }
+    #[test]
+    fn waiting_explores_let_later_explores_launch_but_nothing_else() {
+        let (_dir, store, root, _) = crate::store::tests::fixture();
+        let run = RunId::new();
+        store
+            .db
+            .execute(
+                "INSERT INTO runs(id,thread,state) VALUES(?1,?2,'active')",
+                params![run, root.thread],
+            )
+            .unwrap();
+        let actor = Actor::new(store, Arc::new(Fixture)).unwrap();
+        let ids: Vec<_> = (0..5).map(|_| OperationId::new()).collect();
+        for (i, (name, state)) in [
+            ("explore", "waiting"),
+            ("explore", "waiting"),
+            ("explore", "pending"),
+            ("edit_file", "pending"),
+            ("explore", "pending"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            actor.store.db.execute("INSERT INTO operations(id,run,thread,name,kind,call_id,input,state,effect_write) VALUES(?1,?2,?3,?4,'tool',?1,'{}',?5,?6)",params![ids[i],run,root.thread,name,state,name=="edit_file"]).unwrap();
+        }
+        assert_eq!(actor.scheduled_operation(&run).unwrap().unwrap().id, ids[2]);
+        actor
+            .store
+            .db
+            .execute(
+                "UPDATE operations SET state='waiting' WHERE id=?1",
+                [&ids[2]],
+            )
+            .unwrap();
+        assert_eq!(actor.scheduled_operation(&run).unwrap().unwrap().id, ids[0]);
+        actor
+            .store
+            .db
+            .execute(
+                "UPDATE operations SET state='approval' WHERE id=?1",
+                [&ids[1]],
+            )
+            .unwrap();
+        actor
+            .store
+            .db
+            .execute(
+                "UPDATE operations SET state='pending' WHERE id=?1",
+                [&ids[2]],
+            )
+            .unwrap();
+        assert_eq!(actor.scheduled_operation(&run).unwrap().unwrap().id, ids[0]);
     }
     #[test]
     fn independent_reads_pass_each_other_but_never_cross_a_mutation() {
