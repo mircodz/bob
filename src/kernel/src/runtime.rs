@@ -699,8 +699,11 @@ impl Actor {
                 }
             }
             if Instant::now() >= next_retry {
-                next_retry = Instant::now() + Duration::from_millis(25);
-                if let Some((input, since)) = pending_commands.pop_front() {
+                let mut busy = false;
+                while !busy {
+                    let Some((input, since)) = pending_commands.pop_front() else {
+                        break;
+                    };
                     match input {
                         Input::Command(command, reply) => {
                             let result = if let Some(error) = &self.error {
@@ -715,6 +718,7 @@ impl Actor {
                             {
                                 pending_commands
                                     .push_front((Input::Command(command, reply), since));
+                                busy = true;
                             } else {
                                 let _ = reply.send(result);
                             }
@@ -728,6 +732,7 @@ impl Actor {
                                     Input::Activate(session, bootstrap, reply),
                                     since,
                                 ));
+                                busy = true;
                             } else {
                                 let _ = reply.send(result);
                             }
@@ -735,7 +740,7 @@ impl Actor {
                         _ => unreachable!(),
                     }
                 }
-                if let Some(finished) = pending_results.front() {
+                while let Some(finished) = pending_results.front() {
                     match self.finish_ref(finished) {
                         Ok(()) => {
                             let finished = pending_results.pop_front().unwrap();
@@ -743,9 +748,13 @@ impl Actor {
                                 let _ = worker.task.await;
                             }
                         }
-                        Err(error) if crate::ownership::busy(&error) => {}
+                        Err(error) if crate::ownership::busy(&error) => {
+                            busy = true;
+                            break;
+                        }
                         Err(error) => {
                             self.error = Some(format!("{error:#}"));
+                            break;
                         }
                     }
                 }
@@ -754,24 +763,29 @@ impl Actor {
                         Ok(()) => {
                             pending_title = None;
                         }
-                        Err(error) if crate::ownership::busy(&error) => {}
+                        Err(error) if crate::ownership::busy(&error) => busy = true,
                         Err(error) => {
                             self.error = Some(format!("{error:#}"));
                         }
                     }
                 }
-                if let Some(progress) = pending_progress.front() {
+                while let Some(progress) = pending_progress.front() {
                     let result = self
                         .store
                         .ensure_owner()
                         .and_then(|()| crate::jobs::append_data(&mut self.store.db, progress));
-                    if !result.as_ref().err().is_some_and(crate::ownership::busy) {
-                        if let Err(error) = &result {
-                            self.error = Some(format!("{error:#}"));
-                        }
-                        let progress = pending_progress.pop_front().unwrap();
-                        let _ = progress.reply.send(result);
+                    if result.as_ref().err().is_some_and(crate::ownership::busy) {
+                        busy = true;
+                        break;
                     }
+                    if let Err(error) = &result {
+                        self.error = Some(format!("{error:#}"));
+                    }
+                    let progress = pending_progress.pop_front().unwrap();
+                    let _ = progress.reply.send(result);
+                }
+                if busy {
+                    next_retry = Instant::now() + Duration::from_millis(25);
                 }
             }
             let mut cancellations_settled = true;

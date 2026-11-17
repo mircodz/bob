@@ -374,7 +374,10 @@ impl Store {
                 "unsupported bob session database version {version}"
             );
         }
-        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=25;")?;
+        // WAL with synchronous=NORMAL survives process crashes; only an OS crash or
+        // power loss can drop the latest commits. FULL flushes the disk on every
+        // commit, which made each streamed progress chunk slow on Windows.
+        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=25;")?;
         if tables == 0 {
             db.execute_batch(&format!("BEGIN IMMEDIATE;
                 PRAGMA application_id={APPLICATION}; PRAGMA user_version=9;
