@@ -91,7 +91,7 @@ pub(super) async fn branch(cwd: &Path) -> Option<String> {
     let mut command = tokio::process::Command::new("git");
     command
         .arg("-C")
-        .arg(cwd)
+        .arg(dunce::simplified(cwd))
         .args(["branch", "--show-current"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -116,7 +116,7 @@ pub(super) async fn gather_files(cwd: &Path) -> Vec<String> {
     let mut command = tokio::process::Command::new("git");
     command
         .arg("-C")
-        .arg(cwd)
+        .arg(dunce::simplified(cwd))
         .args([
             "ls-files",
             "-z",

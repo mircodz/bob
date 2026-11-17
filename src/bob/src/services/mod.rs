@@ -250,7 +250,10 @@ impl Services {
             body: ToolBody::Text {
                 text: preview.clone(),
             },
-            details: vec![format!("Workspace: {}", self.workspace.display())],
+            details: vec![format!(
+                "Workspace: {}",
+                dunce::simplified(&self.workspace).display()
+            )],
         });
         let bound = BoundService {
             version: 1,

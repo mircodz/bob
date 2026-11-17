@@ -155,10 +155,10 @@ async fn approval_binds_exact_roots_fixed_files_and_read_only_capabilities() {
     for requirement in &manifests[0].requirements {
         assert!(prepared
             .preview
-            .contains(&requirement.root.display().to_string()));
+            .contains(&dunce::simplified(&requirement.root).display().to_string()));
         assert!(prepared
             .preview
-            .contains(&requirement.source.display().to_string()));
+            .contains(&dunce::simplified(&requirement.source).display().to_string()));
     }
     assert!(presentation.contains("Only pinned pointer files and info/exclude"));
     assert_no_private_text(&prepared.preview);

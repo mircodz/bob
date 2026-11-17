@@ -247,24 +247,29 @@ fn load_inner(
 }
 
 pub(crate) fn render(report: &InstructionReport) -> String {
+    let shown = |path: &str| {
+        dunce::simplified(Path::new(path))
+            .to_string_lossy()
+            .into_owned()
+    };
     let mut output = CONTRACT.to_owned();
     if !report.root.is_empty() {
         output.push_str(&format!(
             "\nFilesystem effect root (relative source/scope paths use this root; absolute paths are explicit discovery imports): {}",
-            serde_json::to_string(&report.root).unwrap()
+            serde_json::to_string(&shown(&report.root)).unwrap()
         ));
     }
     if let Some(root) = &report.discovery_root {
         output.push_str(&format!(
             "\nTrusted convention discovery root: {}",
-            serde_json::to_string(root).unwrap()
+            serde_json::to_string(&shown(root)).unwrap()
         ));
     }
     for source in &report.sources {
         output.push_str(&format!(
             "\n\nSource: {}\nScope: {}\nsha256: {}\n",
-            serde_json::to_string(&source.source).unwrap(),
-            serde_json::to_string(&source.scope).unwrap(),
+            serde_json::to_string(&shown(&source.source)).unwrap(),
+            serde_json::to_string(&shown(&source.scope)).unwrap(),
             source.sha256
         ));
         for line in source.text.lines() {

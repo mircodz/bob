@@ -373,7 +373,7 @@ async fn pending_create(handle: &Handle, thread: &ThreadId, dir: &TestDir) -> De
     let presentation = decision.presentation.as_ref().unwrap();
     assert_eq!(
         presentation.target,
-        Some(dir.target().display().to_string())
+        Some(dunce::simplified(&dir.target()).display().to_string())
     );
     assert_eq!(
         presentation.body,
@@ -492,7 +492,7 @@ async fn external_read_requires_exact_approval_and_denial_grants_no_evidence() {
         assert_eq!(decision.name, "read_file");
         assert_eq!(
             decision.presentation.as_ref().unwrap().target,
-            Some(outside.display().to_string())
+            Some(dunce::simplified(&outside).display().to_string())
         );
         executor.assert_calls(1, 0);
         assert!(executor.tools.files.lock().await.reads.is_empty());

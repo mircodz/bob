@@ -26,6 +26,7 @@ glob.workspace = true
 globset = "0.4"
 sha2.workspace = true
 anyhow.workspace = true
+dunce.workspace = true
 rusqlite = { version = "0.32", features = ["bundled"] }
 toml = "0.8"
 toml_edit = "0.22"

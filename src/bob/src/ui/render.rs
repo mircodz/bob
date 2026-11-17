@@ -1460,6 +1460,7 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
             spans.push(Span::styled("loading", text().fg(Palette::DIM())));
         }
         if let Some(workspace) = &app.workspace {
+            let workspace = dunce::simplified(workspace);
             spans.push(separator());
             spans.push(Span::styled(
                 safe(

@@ -145,8 +145,9 @@ pub fn render_instructions(instructions: &[ProjectInstruction]) -> String {
         out.push_str("\n\n<project-instruction>\n");
         out.push_str(&format!(
             "source: {}\nscope: {}\ncontent: {}\n</project-instruction>",
-            serde_json::to_string(&instruction.path.to_string_lossy()).unwrap(),
-            serde_json::to_string(&instruction.scope.to_string_lossy()).unwrap(),
+            serde_json::to_string(&dunce::simplified(&instruction.path).to_string_lossy()).unwrap(),
+            serde_json::to_string(&dunce::simplified(&instruction.scope).to_string_lossy())
+                .unwrap(),
             serde_json::to_string(&instruction.content).unwrap()
         ));
     }

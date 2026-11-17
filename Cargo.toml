@@ -21,6 +21,7 @@ anyhow = "1"
 uuid = { version = "1", features = ["v4"] }
 clap = { version = "4", features = ["derive"] }
 sha2 = "0.10"
+dunce = "1"
 
 [profile.release]
 lto = true

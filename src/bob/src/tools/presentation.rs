@@ -97,28 +97,31 @@ pub(super) fn diff_preview(before: &str, after: &str, limit: usize) -> String {
 }
 
 pub(super) fn prepared(invocation: &Invocation, bound: &Bound) -> Result<ToolPresentation> {
-    let mut details = vec![format!("Workspace: {}", bound.workspace_root.display())];
+    let mut details = vec![format!(
+        "Workspace: {}",
+        dunce::simplified(&bound.workspace_root).display()
+    )];
     if bound.root != bound.workspace_root {
         details.push(format!(
             "External path capability: {} (explicit approval required in Normal mode)",
-            bound.root.display()
+            dunce::simplified(&bound.root).display()
         ));
     }
     if let Action::Repository { metadata, .. } = &bound.action {
         for requirement in metadata.iter().flat_map(|metadata| &metadata.requirements) {
             details.push(format!(
                 "External Git metadata root: {} (read-only; {:?} pointer: {}; explicit approval required in Normal mode)",
-                requirement.root.display(), requirement.kind, requirement.source.display()
+                dunce::simplified(&requirement.root).display(), requirement.kind, dunce::simplified(&requirement.source).display()
             ));
         }
         if !metadata.is_empty() {
-            details.push(format!("Exact Git metadata manifest sha256: {}. Only pinned pointer files and info/exclude; file traversal stays within {}.", digest(&serde_json::to_vec(metadata)?), bound.root.display()));
+            details.push(format!("Exact Git metadata manifest sha256: {}. Only pinned pointer files and info/exclude; file traversal stays within {}.", digest(&serde_json::to_vec(metadata)?), dunce::simplified(&bound.root).display()));
         }
     }
     let (title, target, body) = match &bound.action {
         Action::Read { path, snapshot } => (
             "Read file".into(),
-            Some(path.display().to_string()),
+            Some(dunce::simplified(path).display().to_string()),
             ToolBody::Text {
                 text: format!("UTF-8 file ({} bytes); numbered output is paged and clipped with continuation cursors", snapshot.len),
             },
@@ -135,12 +138,12 @@ pub(super) fn prepared(invocation: &Invocation, bound: &Bound) -> Result<ToolPre
                 format!("After sha256: {result_sha256}"),
                 format!(
                     "Displaced original retained at: {}",
-                    if cfg!(unix) { staged } else { backup }.display()
+                    dunce::simplified(if cfg!(unix) { staged } else { backup }).display()
                 ),
             ]);
             (
                 match invocation.name.as_str() { "write_file" => "Write file", "multi_edit" => "Edit file", _ => "Edit file" }.into(),
-                Some(path.display().to_string()),
+                Some(dunce::simplified(path).display().to_string()),
                 match invocation.name.as_str() {
                     "edit_file" => {
                         let input: EditInput = serde_json::from_value(invocation.input.clone())?;
@@ -161,14 +164,14 @@ pub(super) fn prepared(invocation: &Invocation, bound: &Bound) -> Result<ToolPre
             ..
         } => {
             let input: create::CreateInput = serde_json::from_value(invocation.input.clone())?;
-            details.push(format!("Pinned existing parent: {}. Missing descendants to create: {}", ancestor_parent.display(), path.parent().context("missing creation parent")?.strip_prefix(ancestor_parent)?.display()));
+            details.push(format!("Pinned existing parent: {}. Missing descendants to create: {}", dunce::simplified(ancestor_parent).display(), path.parent().context("missing creation parent")?.strip_prefix(ancestor_parent)?.display()));
             details.push(format!(
                 "Create only; never overwrite. {} bytes, sha256 {content_sha256}",
                 input.content.len()
             ));
             (
                 "Create file".into(),
-                Some(path.display().to_string()),
+                Some(dunce::simplified(path).display().to_string()),
                 ToolBody::Create {
                     content: input.content,
                 },
@@ -185,7 +188,7 @@ pub(super) fn prepared(invocation: &Invocation, bound: &Bound) -> Result<ToolPre
                 format!("Dialect: {dialect}"),
                 format!(
                     "Executable: {} (sha256 {})",
-                    executable.display(),
+                    dunce::simplified(executable).display(),
                     snapshot.sha256
                 ),
                 format!("Timeout: {}", timeout_description(&input)),
@@ -197,13 +200,13 @@ pub(super) fn prepared(invocation: &Invocation, bound: &Bound) -> Result<ToolPre
             if let Some(helper) = helper {
                 details.push(format!(
                     "Worker: {} (sha256 {})",
-                    helper.path.display(),
+                    dunce::simplified(&helper.path).display(),
                     helper.snapshot.sha256
                 ));
             }
             (
                 "Run shell command".into(),
-                Some(bound.root.display().to_string()),
+                Some(dunce::simplified(&bound.root).display().to_string()),
                 ToolBody::Command {
                     command: input.command,
                 },
@@ -216,14 +219,14 @@ pub(super) fn prepared(invocation: &Invocation, bound: &Bound) -> Result<ToolPre
                 _ => "Search contents",
             }
             .into(),
-            Some(path.display().to_string()),
+            Some(dunce::simplified(path).display().to_string()),
             ToolBody::Text {
                 text: invocation.input.get("pattern").and_then(Value::as_str).map(|pattern| format!("Pattern: {pattern}")).unwrap_or_else(|| "Immediate directory entries".into()),
             },
         ),
         Action::Instructions { path, .. } => (
             "Read project conventions".into(),
-            Some(path.display().to_string()),
+            Some(dunce::simplified(path).display().to_string()),
             ToolBody::Text {
                 text: crate::project_instructions::CONTRACT.into(),
             },

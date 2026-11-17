@@ -212,7 +212,7 @@ pub(super) fn execute(
         Ok(())
     })();
     match verified {
-        Ok(()) => Ok(ToolOutcome { text: format!("Created {} ({} bytes, sha256 {})", path.display(), input.content.len(), content_sha256), is_error: false, interrupted: false, presentation: Some(bob_kernel::ToolResultPresentation { summary: Some("Created file".into()), body_preview: Some(String::new()), exit_code: None }) }),
+        Ok(()) => Ok(ToolOutcome { text: format!("Created {} ({} bytes, sha256 {})", dunce::simplified(path).display(), input.content.len(), content_sha256), is_error: false, interrupted: false, presentation: Some(bob_kernel::ToolResultPresentation { summary: Some("Created file".into()), body_preview: Some(String::new()), exit_code: None }) }),
         Err(error) => Ok(unknown_effect(format!("Creation was published but its final outcome could not be verified: {error:#}; inspect {} relative to original parent identity {}. No rollback or retry attempted.", path.display(), ancestors))),
     }
 }

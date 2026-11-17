@@ -47,8 +47,9 @@ fn query_tail(text: &str, width: usize) -> String {
 }
 
 fn display_path(path: &str) -> String {
+    let path = dunce::simplified(Path::new(path));
     let shortened = std::env::home_dir().and_then(|home| {
-        Path::new(path).strip_prefix(home).ok().map(|relative| {
+        path.strip_prefix(home).ok().map(|relative| {
             if relative.as_os_str().is_empty() {
                 "~".into()
             } else {
@@ -56,7 +57,7 @@ fn display_path(path: &str) -> String {
             }
         })
     });
-    single_line(shortened.as_deref().unwrap_or(path))
+    single_line(&shortened.unwrap_or_else(|| path.display().to_string()))
 }
 
 fn path_label(path: &str, width: usize) -> String {

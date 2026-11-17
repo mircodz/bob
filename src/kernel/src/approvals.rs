@@ -56,7 +56,11 @@ pub(crate) fn choices_with_target(
             let label = if let Some(command) = &grant.command {
                 format!("Allow this exact command for this session: {command}")
             } else if let Some(path) = &grant.path_prefix {
-                format!("Allow {} at {path} for this session", grant.tool)
+                format!(
+                    "Allow {} at {} for this session",
+                    grant.tool,
+                    dunce::simplified(std::path::Path::new(path)).display()
+                )
             } else {
                 format!("Allow {} for this session", grant.tool)
             };

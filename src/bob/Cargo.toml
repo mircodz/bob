@@ -28,6 +28,7 @@ clap.workspace = true
 uuid.workspace = true
 sha2.workspace = true
 regex.workspace = true
+dunce.workspace = true
 globset = "0.4"
 ignore = "0.4"
 futures.workspace = true

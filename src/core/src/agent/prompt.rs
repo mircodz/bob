@@ -122,7 +122,7 @@ pub fn build_system_prompt(
 fn environment_block(cwd: &Path, shell: &CommandShell) -> String {
     let mut s = format!(
         "# Environment\n- Working directory: {}\n- OS: {}",
-        cwd.display(),
+        dunce::simplified(cwd).display(),
         std::env::consts::OS,
     );
     match shell.executable() {
@@ -136,7 +136,7 @@ fn environment_block(cwd: &Path, shell: &CommandShell) -> String {
             s.push_str(&format!(
                 "\n- Command tool: `bash` runs {} (`{}`). {syntax}",
                 shell.kind().name(),
-                path.display()
+                dunce::simplified(path).display()
             ));
         }
         Err(error) => s.push_str(&format!(
@@ -308,7 +308,7 @@ mod tests {
                     .find(|line| line.starts_with("- Command tool:"))
                     .unwrap();
                 assert!(guidance.contains(&format!("`bash` runs {}", kind.name())));
-                assert!(guidance.contains(&executable.display().to_string()));
+                assert!(guidance.contains(&dunce::simplified(&executable).display().to_string()));
                 assert!(guidance.contains(syntax));
                 assert!(!prompt.contains(other_syntax));
                 if kind == ShellKind::Pwsh {

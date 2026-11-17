@@ -203,7 +203,7 @@ impl PreparedWrites {
         for file in &self.files {
             output.push_str(&format!(
                 "{}\nBefore sha256: {}\nAfter sha256: {}\n",
-                file.path.display(),
+                dunce::simplified(&file.path).display(),
                 file.snapshot.sha256,
                 digest(file.after.as_bytes())
             ));

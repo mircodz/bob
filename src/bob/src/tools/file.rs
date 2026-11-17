@@ -327,7 +327,7 @@ pub(super) fn guarded_replace(
     })();
     match checked {
         Ok(()) => Ok(ToolOutcome {
-            text: format!("Edited {} (sha256 {}); displaced original retained at {}\n{}", target.display(), digest(after.as_bytes()), recovery.display(), presentation::diff_preview(before, after, 256 * 1024)),
+            text: format!("Edited {} (sha256 {}); displaced original retained at {}\n{}", dunce::simplified(target).display(), digest(after.as_bytes()), dunce::simplified(&recovery).display(), presentation::diff_preview(before, after, 256 * 1024)),
             is_error: false,
             interrupted: false,
             presentation: Some(bob_kernel::ToolResultPresentation { summary: Some("File edited; displaced original retained".into()), body_preview: Some(presentation::diff_preview(before, after, 2048)), exit_code: None }),

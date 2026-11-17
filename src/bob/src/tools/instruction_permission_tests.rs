@@ -160,7 +160,7 @@ async fn external_project_instructions_still_require_approval_before_reading() {
     assert_eq!(decision.name, "project_instructions");
     assert_eq!(
         decision.presentation.as_ref().unwrap().target,
-        Some(outside.display().to_string())
+        Some(dunce::simplified(&outside).display().to_string())
     );
     executor.assert_calls(1, 0);
     decide(&handle, decision, false).await;

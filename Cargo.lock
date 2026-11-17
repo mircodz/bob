@@ -248,6 +248,7 @@ dependencies = [
  "bob-voice",
  "clap",
  "crossterm",
+ "dunce",
  "futures",
  "globset",
  "ignore",
@@ -277,6 +278,7 @@ dependencies = [
  "async-trait",
  "bob-types",
  "brush-parser",
+ "dunce",
  "futures",
  "getrandom 0.2.17",
  "glob",
@@ -302,6 +304,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bob-types",
+ "dunce",
  "futures",
  "jsonschema",
  "rusqlite",
@@ -881,6 +884,12 @@ dependencies = [
  "quote",
  "syn 2.0.119",
 ]
+
+[[package]]
+name = "dunce"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "either"

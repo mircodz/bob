@@ -263,13 +263,17 @@ fn preview(invocation: &Invocation, bound: &Bound) -> Result<String> {
             let input: create::CreateInput = serde_json::from_value(invocation.input.clone())?;
             format!(
                 "Create {}\nExact content:\n{}\nsha256 {}",
-                path.display(),
+                dunce::simplified(path).display(),
                 input.content,
                 content_sha256
             )
         }
         Action::Repository { path, metadata, .. } => {
-            let mut text = format!("{} in {}", invocation.name, path.display());
+            let mut text = format!(
+                "{} in {}",
+                invocation.name,
+                dunce::simplified(path).display()
+            );
             if !metadata.is_empty() {
                 text.push_str(&format!(
                     "\nExact Git metadata manifest sha256: {}",
@@ -278,19 +282,22 @@ fn preview(invocation: &Invocation, bound: &Bound) -> Result<String> {
                 for requirement in metadata.iter().flat_map(|metadata| &metadata.requirements) {
                     text.push_str(&format!(
                         "\nRead-only Git metadata root: {} (pointer source: {})",
-                        requirement.root.display(),
-                        requirement.source.display()
+                        dunce::simplified(&requirement.root).display(),
+                        dunce::simplified(&requirement.source).display()
                     ));
                 }
             }
             text
         }
         Action::Instructions { path, .. } => {
-            format!("Project conventions for directory {}", path.display())
+            format!(
+                "Project conventions for directory {}",
+                dunce::simplified(path).display()
+            )
         }
         Action::Read { path, snapshot } => format!(
             "Read {} ({} bytes, sha256 {})",
-            path.display(),
+            dunce::simplified(path).display(),
             snapshot.len,
             snapshot.sha256
         ),
@@ -302,7 +309,7 @@ fn preview(invocation: &Invocation, bound: &Bound) -> Result<String> {
             backup,
         } => {
             let recovery = if cfg!(unix) { staged } else { backup };
-            format!("{} {}\nBefore sha256: {}\nAfter sha256: {}\nDisplaced original retained at: {}\n{}", invocation.name, path.display(), snapshot.sha256, result_sha256, recovery.display(), mutation_preview(invocation)?)
+            format!("{} {}\nBefore sha256: {}\nAfter sha256: {}\nDisplaced original retained at: {}\n{}", invocation.name, dunce::simplified(path).display(), snapshot.sha256, result_sha256, dunce::simplified(recovery).display(), mutation_preview(invocation)?)
         }
         Action::Shell {
             executable,
@@ -316,7 +323,7 @@ fn preview(invocation: &Invocation, bound: &Bound) -> Result<String> {
                 .map(|helper| {
                     format!(
                         "\nWorker: {} (sha256 {})",
-                        helper.path.display(),
+                        dunce::simplified(&helper.path).display(),
                         helper.snapshot.sha256
                     )
                 })
@@ -326,7 +333,7 @@ fn preview(invocation: &Invocation, bound: &Bound) -> Result<String> {
             } else {
                 ""
             };
-            format!("Shell: {}\nExecutable: {}{}{}\nArguments: {:?}\nWorkspace: {}\nTimeout: {}\nExact command:\n{}\n\n{}", dialect, executable.display(), worker, probe, shell_kind(dialect)?.command_args(), bound.root.display(), timeout_description(&input), input.command, SHELL_LIMITATION)
+            format!("Shell: {}\nExecutable: {}{}{}\nArguments: {:?}\nWorkspace: {}\nTimeout: {}\nExact command:\n{}\n\n{}", dialect, dunce::simplified(executable).display(), worker, probe, shell_kind(dialect)?.command_args(), dunce::simplified(&bound.root).display(), timeout_description(&input), input.command, SHELL_LIMITATION)
         }
     })
 }

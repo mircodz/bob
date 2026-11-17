@@ -582,7 +582,9 @@ impl LspService {
     }
 
     fn display_path(&self, path: &Path) -> String {
-        path.strip_prefix(&self.workspace)
+        // Language servers report plain drive paths; the workspace is canonical (verbatim on Windows).
+        let path = dunce::simplified(path);
+        path.strip_prefix(dunce::simplified(&self.workspace))
             .unwrap_or(path)
             .display()
             .to_string()
