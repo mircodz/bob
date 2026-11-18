@@ -243,9 +243,9 @@ mod tests {
         let mut draft = Draft::default();
         draft.insert("/");
         completion.refresh(&draft, &[], &[]);
-        assert_eq!(completion.items.len(), 17);
+        assert_eq!(completion.items.len(), 18);
         assert_eq!(completion.items[0].label, "/new");
-        assert_eq!(completion.items[16].label, "/exit");
+        assert_eq!(completion.items[17].label, "/exit");
         draft.insert("co");
         completion.refresh(&draft, &[], &[]);
         assert_eq!(
