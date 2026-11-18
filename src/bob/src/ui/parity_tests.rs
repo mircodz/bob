@@ -510,11 +510,11 @@ fn bash_header_hanging_command_neutral_output_exit_status_and_hits() {
 }
 
 #[test]
-fn shell_output_caps_visual_rows_at_six_and_five_hundred_without_losing_source() {
+fn shell_output_caps_visual_rows_at_six_and_forty_without_losing_source() {
     for width in [24, 40, 80, 100, 120] {
         for body in ["q".repeat(80_000), vec!["q"; 501].join("\n")] {
             let mut app = app(vec![shell("check", &body, OperationState::Done)]);
-            for (expanded, expected) in [(false, 6), (true, 500)] {
+            for (expanded, expected) in [(false, 6), (true, 40)] {
                 if expanded {
                     app.pane_mut()
                         .unwrap()
@@ -531,7 +531,7 @@ fn shell_output_caps_visual_rows_at_six_and_five_hundred_without_losing_source()
                     .iter()
                     .all(|row| row.line.to_string().starts_with("  │ q")));
                 let footer = if expanded {
-                    "display truncated"
+                    "more in the full output"
                 } else if body.contains('\n') {
                     "... 495 more lines (click to expand)"
                 } else {

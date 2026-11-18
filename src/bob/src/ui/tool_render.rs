@@ -11,6 +11,8 @@ use serde_json::Value;
 
 const PREVIEW: usize = 6;
 const EXPANDED_MAX: usize = 500;
+/// Expanding a tool shows a longer excerpt; the full window holds the rest.
+const EXPANDED_OUTPUT: usize = 40;
 
 #[path = "archive_recall.rs"]
 mod archive_recall;
@@ -953,7 +955,7 @@ pub(super) fn tool_with_input_state(
                 output
             };
             let source = safe(source);
-            let limit = if expanded { EXPANDED_MAX } else { PREVIEW };
+            let limit = if expanded { EXPANDED_OUTPUT } else { PREVIEW };
             let lead = if shell { "  │ " } else { "    " };
             if !source.trim_end().is_empty() {
                 let lines = if !shell {
@@ -1023,7 +1025,7 @@ pub(super) fn tool_with_input_state(
                 "{}{}",
                 if shell { "  │ " } else { "    " },
                 if expanded {
-                    "… display truncated · click to read full output".to_owned()
+                    "… more in the full output (click to open)".to_owned()
                 } else if let Some(cut) = hidden_lines {
                     format!(
                         "... {} more line{} (click to expand)",

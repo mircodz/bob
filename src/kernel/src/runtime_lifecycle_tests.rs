@@ -5,7 +5,7 @@ mod owned;
 #[path = "lifecycle_regression_tests.rs"]
 mod regressions;
 use crate::jobs::{JobKind, JobState};
-use crate::presentation::{OperationState, ThreadState};
+use crate::presentation::{EntryKind, OperationState, ThreadState};
 use crate::store::tests::fixture;
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -714,12 +714,27 @@ async fn assert_failed_children_settle_collectors(failure: Failure) {
             assert!(page.next_offset.is_none());
             serde_json::from_str(&page.text).unwrap()
         } else {
-            wait_view(&handle, &root.thread, |v| {
+            let view = wait_view(&handle, &root.thread, |v| {
                 operation_state(v, &task) == Some(OperationState::Failed)
             })
             .await;
-            serde_json::from_str(&handle.tool_output(task, 0, 64 * 1024).await.unwrap().text)
+            let readable = handle
+                .tool_output(task.clone(), 0, 64 * 1024)
+                .await
+                .unwrap();
+            assert!(readable.text.contains("## successful sibling · completed"));
+            assert!(!readable.text.contains("\"agents\""));
+            let sequence = view
+                .entries
+                .iter()
+                .find(|e| e.kind == EntryKind::ToolError && e.operation.as_ref() == Some(&task))
                 .unwrap()
+                .sequence;
+            let model = handle
+                .entry_text(root.thread.clone(), sequence, 0, 64 * 1024)
+                .await
+                .unwrap();
+            serde_json::from_str(&model.text).unwrap()
         };
         assert_eq!(report["status"], "failed");
         let agents = report["agents"].as_array().unwrap();

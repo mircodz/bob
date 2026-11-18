@@ -512,18 +512,27 @@ pub(crate) fn finish_shell(
         return Ok(());
     }
     let (state, text) = match result {
-        Ok((result, display)) => (
-            if result.interrupted {
-                "unknown"
-            } else if state == "stopping" {
-                "cancelled"
-            } else if result.is_error {
-                "failed"
-            } else {
-                "completed"
-            },
-            display.unwrap_or(result.text),
-        ),
+        Ok((result, display)) => {
+            if let Some(display) = &display {
+                let readable = artifact(tx, &bounded(display.clone()))?;
+                tx.execute(
+                    "UPDATE operations SET display_result=?1 WHERE id=?2",
+                    params![readable, operation],
+                )?;
+            }
+            (
+                if result.interrupted {
+                    "unknown"
+                } else if state == "stopping" {
+                    "cancelled"
+                } else if result.is_error {
+                    "failed"
+                } else {
+                    "completed"
+                },
+                display.unwrap_or(result.text),
+            )
+        }
         Err(error) => {
             let promoted: bool = tx.query_row("SELECT COALESCE(json_extract(input,'$.run_in_background'),0)!=1 FROM operations WHERE id=?1", [operation], |r| r.get(0))?;
             let partial = if promoted {

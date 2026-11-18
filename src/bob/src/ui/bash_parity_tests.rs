@@ -332,12 +332,12 @@ fn transcript(app: &App) -> String {
 }
 
 async fn collect(app: &mut App, jobs: &mut JoinSet<Reply>) {
-    let reply = timeout(Duration::from_secs(10), jobs.join_next())
+    while let Some(reply) = timeout(Duration::from_secs(10), jobs.join_next())
         .await
         .unwrap()
-        .unwrap()
-        .unwrap();
-    app.reply(reply);
+    {
+        app.reply(reply.unwrap());
+    }
 }
 
 #[tokio::test]

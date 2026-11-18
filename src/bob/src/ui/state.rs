@@ -1819,20 +1819,22 @@ impl App {
         };
         if shell {
             pane.pending_inputs.insert(id.clone());
+            let input_handle = handle.clone();
+            let input_id = id.clone();
+            let input_thread = thread.clone();
             spawn_reply(jobs, self.runtime_epoch, async move {
-                let result = handle
-                    .tool_input(id.clone())
+                let result = input_handle
+                    .tool_input(input_id.clone())
                     .await
                     .map_err(|error| format!("{error:#}"));
                 Reply::ToolInput {
-                    thread,
-                    operation: id,
+                    thread: input_thread,
+                    operation: input_id,
                     result,
                 }
             });
-        } else {
-            self.refresh_expanded_outputs(jobs);
         }
+        self.refresh_expanded_outputs(jobs);
     }
     fn refresh_expanded_outputs(&mut self, jobs: &mut JoinSet<Reply>) {
         let (Some(handle), Some(thread)) = (self.handle.clone(), self.selected.clone()) else {
@@ -1851,7 +1853,7 @@ impl App {
                 || pane.expanded_outputs.contains_key(id)
                 || pane.pending_outputs.contains_key(id)
                 || pane.output_errors.contains_key(id)
-                || !matches!(tool.name.as_str(), "grep" | "glob" | "list_dir")
+                || !matches!(tool.name.as_str(), "grep" | "glob" | "list_dir" | "bash")
                 || tool.result.is_none()
                 || !matches!(
                     tool.state,

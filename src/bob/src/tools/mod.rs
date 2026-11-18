@@ -349,6 +349,10 @@ impl ToolService {
             "grep" | "glob" | "list_dir" => {
                 presentation::repository_display(&outcome.text).map(Some)
             }
+            "read_file" => Ok(outcome
+                .text
+                .find(&format!("\n\n{}", crate::project_instructions::CONTRACT))
+                .map(|end| outcome.text[..end].to_owned())),
             _ => Ok(None),
         }
     }

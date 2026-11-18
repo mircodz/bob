@@ -57,6 +57,7 @@ mod markdown;
 mod notify;
 #[cfg(test)]
 mod output_parity_tests;
+mod output_style;
 #[cfg(test)]
 mod parity_tests;
 #[cfg(test)]

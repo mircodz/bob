@@ -367,7 +367,7 @@ fn incomplete_preview_and_display_limits_keep_full_output_access() {
     assert!(screen(&collapsed).contains("more output (click to expand)"));
     let expanded = rows(&entry, true, 100);
     assert!(expanded.len() <= EXPANDED_MAX + 3);
-    assert!(screen(&expanded).contains("display truncated"));
+    assert!(screen(&expanded).contains("more in the full output"));
     assert_inspectable(&expanded, "task");
 }
 

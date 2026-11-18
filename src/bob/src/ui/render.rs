@@ -985,11 +985,34 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
                             ),
                             Line::default(),
                         ];
-                        lines.extend(
-                            safe(&inspector.text)
-                                .lines()
-                                .map(|line| Line::styled(line.to_owned(), text())),
-                        );
+                        let style = match &inspector.target {
+                            InspectionTarget::ToolOutput(id) => pane
+                                .view
+                                .as_ref()
+                                .and_then(|view| {
+                                    view.entries.iter().find_map(|entry| {
+                                        entry.tool.as_ref().filter(|tool| &tool.id == id)
+                                    })
+                                })
+                                .map(|tool| {
+                                    output_style::kind(
+                                        &tool.name,
+                                        &tool.input_preview,
+                                        &inspector.text,
+                                    )
+                                }),
+                            _ => None,
+                        };
+                        match style.filter(|_| !inspector.pending) {
+                            Some(style) => {
+                                lines.extend(output_style::lines(&style, &safe(&inspector.text)))
+                            }
+                            None => lines.extend(
+                                safe(&inspector.text)
+                                    .lines()
+                                    .map(|line| Line::styled(line.to_owned(), text())),
+                            ),
+                        }
                         let lines: Vec<_> = lines
                             .iter()
                             .flat_map(|line| {

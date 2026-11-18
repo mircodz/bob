@@ -277,6 +277,31 @@ async fn background_shell_publication_progress_final_and_late_fences() {
 }
 
 #[test]
+fn background_shell_full_output_shows_readable_text_not_model_json() {
+    let (_dir, mut store, root, _models) = store::tests::fixture();
+    let (_run, op, tool) = operation(
+        &store,
+        &root,
+        "bash",
+        json!({"command":"cargo test","run_in_background":true}),
+    );
+    let tx = store.db.transaction().unwrap();
+    jobs::start_shell(&tx, &tool).unwrap();
+    tx.commit().unwrap();
+    let model_json = r#"{"containment_limitation":"...","stdout":{"text":"ok\n"}}"#;
+    let tx = store.db.transaction().unwrap();
+    jobs::finish_shell(
+        &tx,
+        &op,
+        Ok((result(model_json), Some("test result: ok\n".into()))),
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    let page = store.tool_output(&op, 0, 4096).unwrap();
+    assert_eq!(page.text, "test result: ok\n");
+}
+
+#[test]
 fn turn_tracking_keeps_queue_and_does_not_promote_shell() {
     let (_dir, mut store, root, models) = store::tests::fixture();
     let (run, _op, _tool) = operation(&store, &root, "bash", json!({"command":"work"}));
@@ -484,6 +509,11 @@ fn task_aggregation_retains_successful_siblings_and_restricts_roles() {
     assert_eq!(reports["status"], "failed");
     assert_eq!(reports["agents"][0]["output"], "kept success");
     assert_eq!(reports["agents"][1]["output"], "kept failure");
+    let readable = delegation::readable_reports(&reports.to_string()).unwrap();
+    assert_eq!(
+        readable,
+        "## one · completed\n\nkept success\n\n## two · failed\n\nkept failure"
+    );
     for name in ["task", "explore", "spawn_agent", "launch_agent", "workflow"] {
         assert!(!delegation::allowed("task", name));
         assert!(!delegation::allowed("explore", name));

@@ -202,6 +202,30 @@ pub(crate) fn settle(
     )?;
     Ok(())
 }
+/// Renders an aggregate task or explore result as Markdown for people: each
+/// agent's report under its own heading, without the model-facing JSON envelope.
+pub(crate) fn readable_reports(text: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(text).ok()?;
+    let agents = value["agents"].as_array()?;
+    let mut out = String::new();
+    for agent in agents {
+        let name = agent["name"].as_str().unwrap_or("Agent");
+        let status = agent["status"].as_str().unwrap_or("unknown");
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(&format!("## {name} · {status}\n\n"));
+        match agent["output"].as_str() {
+            Some(report) => out.push_str(report.trim_end()),
+            None => out.push_str(
+                agent["note"]
+                    .as_str()
+                    .unwrap_or("No report retained for this agent."),
+            ),
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
 pub(crate) fn reports(db: &Connection, operation: &OperationId) -> anyhow::Result<(bool, Value)> {
     let mut stmt=db.prepare("SELECT a.thread,t.name,a.state,a.outcome FROM agents a JOIN threads t ON t.id=a.thread WHERE a.operation=?1 ORDER BY t.rowid")?;
     let rows = stmt

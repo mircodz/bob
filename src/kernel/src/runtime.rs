@@ -2129,6 +2129,16 @@ impl Actor {
                         .ok()
                         .is_some_and(|value| value["status"] == "failed");
                 finish_tool_entry(&tx, &op.id, &text, failed)?;
+                if let Some(readable) = matches!(op.name.as_str(), "task" | "explore")
+                    .then(|| crate::delegation::readable_reports(&text))
+                    .flatten()
+                {
+                    let readable = artifact(&tx, &readable)?;
+                    tx.execute(
+                        "UPDATE operations SET display_result=?1 WHERE id=?2",
+                        params![readable, op.id],
+                    )?;
+                }
                 tx.execute(
                     "UPDATE operations SET state=?2 WHERE id=?1",
                     params![op.id, if failed { "failed" } else { "done" }],
