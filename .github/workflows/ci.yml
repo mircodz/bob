@@ -80,6 +80,8 @@ jobs:
         with:
           key: ${{ matrix.target }}
       - name: Build release binaries
+        env:
+          BOB_BUILD_COMMIT: ${{ github.sha }}
         run: cargo build --locked --release -p bob --bins
       - name: Package (Unix)
         if: runner.os != 'Windows'
@@ -100,3 +102,52 @@ jobs:
             target/release/bob.exe
             target/release/bob-exec.exe
           if-no-files-found: error
+
+  # Replaces the `edge` pre-release with this push's binaries once every test
+  # and build passes. `bob update` installs from it.
+  publish:
+    name: Publish edge release
+    needs: [test, build]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: publish-edge
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bob-*
+          path: artifacts
+      - name: Collect release files
+        run: |
+          set -euo pipefail
+          mkdir dist
+          for target in aarch64-apple-darwin x86_64-unknown-linux-gnu; do
+            tar -xzf "artifacts/bob-$target/bob-$target.tar.gz" -C dist
+            mv dist/bob "dist/bob-$target"
+            mv dist/bob-exec "dist/bob-exec-$target"
+          done
+          target=x86_64-pc-windows-msvc
+          cp "artifacts/bob-$target/bob.exe" "dist/bob-$target.exe"
+          cp "artifacts/bob-$target/bob-exec.exe" "dist/bob-exec-$target.exe"
+          cd dist
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+      - name: Replace the edge release
+        run: |
+          set -euo pipefail
+          head=$(gh api "repos/$GH_REPO/commits/main" --jq .sha)
+          if [ "$head" != "$GITHUB_SHA" ]; then
+            echo "main has moved on to $head, whose run publishes instead."
+            exit 0
+          fi
+          gh release delete edge --yes --cleanup-tag || true
+          gh api -X DELETE "repos/$GH_REPO/git/refs/tags/edge" >/dev/null 2>&1 || true
+          gh release create edge dist/* --prerelease --target "$GITHUB_SHA" \
+            --title "main @ ${GITHUB_SHA::7}" \
+            --notes "The newest build of main ($GITHUB_SHA), replaced after every push that passes CI. Run \`bob update\` to install it, or download bob and bob-exec for your platform into the same directory."

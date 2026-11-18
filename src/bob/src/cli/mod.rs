@@ -3,6 +3,7 @@ pub mod launch;
 mod sessions;
 #[cfg(test)]
 mod tests;
+mod update;
 
 use bob_types::ReasoningEffort;
 use clap::Parser;
@@ -16,7 +17,7 @@ fn parse_reasoning(value: &str) -> Result<ReasoningEffort, String> {
 #[command(
     name = "bob",
     about = "A provider-agnostic, multi-agent coding assistant on the durable kernel.",
-    version,
+    version = env!("BOB_VERSION"),
     args_conflicts_with_subcommands = true,
     subcommand_negates_reqs = true
 )]

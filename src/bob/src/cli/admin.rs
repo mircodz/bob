@@ -38,6 +38,8 @@ pub enum Command {
         #[command(subcommand)]
         action: VoiceAction,
     },
+    /// Replace bob and bob-exec with the newest build of main that passed CI.
+    Update,
 }
 
 #[cfg(target_os = "macos")]
@@ -142,6 +144,7 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
             VoiceAction::Status => crate::voice::status(),
             VoiceAction::Remove => crate::voice::remove(),
         },
+        Command::Update => super::update::run().await,
     }
 }
 
