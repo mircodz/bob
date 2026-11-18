@@ -16,6 +16,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "set reasoning effort (off/low/medium/high/max)",
     ),
     ("/theme", "switch color theme (dark/light/terminal)"),
+    ("/voice", "switch the voice dictation model"),
     ("/jobs", "list background jobs"),
     ("/memory", "show saved memories (repo + global)"),
     ("/init", "generate an AGENTS.md describing this project"),

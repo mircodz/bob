@@ -3226,6 +3226,14 @@ impl App {
                             Outcome::Theme(name) => {
                                 pane.notify_current(format!("Theme: {name}"));
                             }
+                            Outcome::Voice(name) => {
+                                pane.notify_current(format!("Voice model: {name}"));
+                                #[cfg(any(target_os = "macos", windows))]
+                                {
+                                    self.voice = None;
+                                    self.voice_state = VoiceState::Off;
+                                }
+                            }
                             Outcome::Picker(picker) => {
                                 if pane.inspection_epoch == inspection_epoch
                                     && self.selected.as_ref() == Some(&thread)
@@ -3478,6 +3486,8 @@ pub(super) enum Outcome {
     Notice(String),
     Copy(String),
     Theme(String),
+    #[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
+    Voice(String),
     Picker(commands::Picker),
     Session(Receipt),
     Receipt(Receipt),

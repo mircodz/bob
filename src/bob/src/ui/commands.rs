@@ -20,6 +20,7 @@ pub(super) enum Request {
     Models,
     Reasoning(Option<ReasoningEffort>),
     Theme(Option<String>),
+    Voice(Option<String>),
     Jobs,
     JobOutput(bob_kernel::JobId),
     StopJob(bob_kernel::JobId),
@@ -94,6 +95,7 @@ pub(super) fn route(
             Some(ReasoningEffort::parse(arg).context("Reasoning must be off/low/medium/high/max")?)
         }),
         "/theme" => Request::Theme((!arg.is_empty()).then(|| arg.to_owned())),
+        "/voice" => Request::Voice((!arg.is_empty()).then(|| arg.to_owned())),
         "/jobs" => match arg.split_whitespace().collect::<Vec<_>>().as_slice() {
             [] => Request::Jobs,
             ["stop", id] => Request::StopJob(bob_kernel::JobId((*id).into())),
@@ -313,6 +315,7 @@ pub(super) async fn execute_with_defaults(
             .await??;
             return Ok(Outcome::Theme(name));
         }
+        Request::Voice(name) => return voice_model(name, workspace).await,
         Request::Copy => {
             let mut before = None;
             loop {
@@ -499,6 +502,61 @@ pub(super) async fn execute_with_defaults(
         }
     };
     handle.command(command).await.map(Outcome::Receipt)
+}
+
+#[cfg(any(target_os = "macos", windows))]
+async fn voice_model(name: Option<String>, workspace: Option<PathBuf>) -> Result<Outcome> {
+    let workspace = workspace.context("Workspace metadata unavailable")?;
+    let lookup = workspace.clone();
+    let (installed, active) =
+        tokio::task::spawn_blocking(move || crate::voice::choices(&lookup)).await??;
+    let Some(name) = name else {
+        anyhow::ensure!(
+            !installed.is_empty(),
+            "No voice model installed; run `bob voice install` or `bob voice install --turbo` in a shell"
+        );
+        let selected = installed
+            .iter()
+            .position(|model| Some(model.name) == active)
+            .unwrap_or(0);
+        return Ok(Outcome::Picker(Picker {
+            title: format!("Voice model (current: {})", active.unwrap_or("none")),
+            items: installed
+                .iter()
+                .map(|model| Item {
+                    label: model.name.into(),
+                    description: model.summary.into(),
+                })
+                .collect(),
+            selected,
+            command: "/voice",
+        }));
+    };
+    anyhow::ensure!(
+        installed.iter().any(|model| model.name == name),
+        "Voice model {name} is not installed; installed: {}",
+        installed
+            .iter()
+            .map(|model| model.name)
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let saved = name.clone();
+    let active = tokio::task::spawn_blocking(move || {
+        bob_core::core::config::set_voice_model(&saved)?;
+        crate::voice::choices(&workspace).map(|(_, active)| active)
+    })
+    .await??;
+    anyhow::ensure!(
+        active == Some(name.as_str()),
+        "Saved {name} to ~/.bob/config.toml, but [voice] model in this project's .bob.config.toml overrides it"
+    );
+    Ok(Outcome::Voice(name))
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+async fn voice_model(_: Option<String>, _: Option<PathBuf>) -> Result<Outcome> {
+    bail!("Voice dictation is only available on macOS and Windows.")
 }
 
 #[derive(Clone, Default)]

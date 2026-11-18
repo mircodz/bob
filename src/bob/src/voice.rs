@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug)]
 pub struct Model {
     pub name: &'static str,
+    pub summary: &'static str,
     pub file: &'static str,
     pub bytes: u64,
     pub sha256: &'static str,
@@ -16,6 +17,7 @@ pub struct Model {
 
 pub const BASE: Model = Model {
     name: "base.en",
+    summary: "148 MB · fast, English only",
     file: "ggml-base.en.bin",
     bytes: 147_964_211,
     sha256: "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002",
@@ -23,6 +25,7 @@ pub const BASE: Model = Model {
 
 pub const TURBO: Model = Model {
     name: "large-v3-turbo",
+    summary: "1.6 GB · most accurate",
     file: "ggml-large-v3-turbo.bin",
     bytes: 1_624_555_275,
     sha256: "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69",
@@ -84,6 +87,20 @@ fn choose(
 pub fn selected(workspace: &Path) -> Result<(&'static Model, PathBuf)> {
     let config = bob_core::core::config::load_config(workspace)?;
     choose(config.voice.model.as_deref(), installed_in(&models_dir()?))
+}
+
+/// Installed models for `/voice`, and the one dictation would use now (none
+/// when the configured model is missing).
+pub fn choices(workspace: &Path) -> Result<(Vec<&'static Model>, Option<&'static str>)> {
+    let config = bob_core::core::config::load_config(workspace)?;
+    let installed = installed_in(&models_dir()?);
+    let active = choose(config.voice.model.as_deref(), installed.clone())
+        .ok()
+        .map(|(model, _)| model.name);
+    Ok((
+        installed.into_iter().map(|(model, _)| model).collect(),
+        active,
+    ))
 }
 
 fn sha256_file(path: &Path) -> Result<String> {

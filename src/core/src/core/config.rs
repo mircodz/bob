@@ -768,6 +768,27 @@ pub fn set_default_reasoning_at(path: &Path, label: &str) -> anyhow::Result<()> 
     })
 }
 
+/// Sets `[voice] model` in the global config; comments and other settings survive.
+pub fn set_voice_model(model: &str) -> anyhow::Result<()> {
+    set_voice_model_at(&global_config_path()?, model)
+}
+
+pub fn set_voice_model_at(path: &Path, model: &str) -> anyhow::Result<()> {
+    update_config_doc_at(path, |doc| {
+        let voice = doc
+            .entry("voice")
+            .or_insert_with(toml_edit::table)
+            .as_table_mut()
+            .ok_or_else(|| anyhow::anyhow!("voice must be a table"))?;
+        let mut value = toml_edit::Value::from(model);
+        if let Some(existing) = voice.get("model").and_then(toml_edit::Item::as_value) {
+            value.decor_mut().clone_from(existing.decor());
+        }
+        voice["model"] = toml_edit::Item::Value(value);
+        Ok(())
+    })
+}
+
 /// Remove an MCP server by name. Returns true if one was removed.
 pub fn remove_mcp_server(name: &str) -> anyhow::Result<bool> {
     update_config_doc_at(&global_config_path()?, |doc| {
@@ -1241,6 +1262,32 @@ mod tests {
         assert!(permissions.deny.as_ref().unwrap().is_empty());
         let cfg = merge(BobConfig::default(), p);
         assert_eq!(cfg.reasoning, "");
+    }
+
+    #[test]
+    fn set_voice_model_keeps_comments_and_other_settings() {
+        let dir = TestDir::new();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "# keep me\nprovider = \"anthropic\"\n\n[voice]\nmodel = \"base.en\" # chosen with /voice\n",
+        )
+        .unwrap();
+        set_voice_model_at(&path, "large-v3-turbo").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.starts_with("# keep me\nprovider = \"anthropic\"\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("model = \"large-v3-turbo\" # chosen with /voice"),
+            "{text}"
+        );
+        let missing = dir.path().join("fresh.toml");
+        set_voice_model_at(&missing, "base.en").unwrap();
+        let fresh: PartialConfig =
+            toml::from_str(&std::fs::read_to_string(&missing).unwrap()).unwrap();
+        assert_eq!(fresh.voice.unwrap().model.as_deref(), Some("base.en"));
     }
 
     #[test]
