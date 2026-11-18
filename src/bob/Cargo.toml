@@ -49,7 +49,9 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 libc = "0.2"
 crossterm = { version = "0.28", features = ["use-dev-tty", "libc"] }
 
-[target.'cfg(target_os = "macos")'.dependencies]
+# Not on Linux: audio capture links ALSA's shared library, so bob would fail to
+# start on machines without it.
+[target.'cfg(any(target_os = "macos", windows))'.dependencies]
 bob-voice = { path = "../voice", features = ["whisper"] }
 
 [target.'cfg(windows)'.dependencies]

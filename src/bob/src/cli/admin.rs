@@ -33,7 +33,7 @@ pub enum Command {
         action: LspAction,
     },
     /// Manage local voice dictation (Ctrl+R in the input box).
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     Voice {
         #[command(subcommand)]
         action: VoiceAction,
@@ -42,7 +42,7 @@ pub enum Command {
     Update,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 #[derive(Debug, Subcommand)]
 pub enum VoiceAction {
     /// Download a Whisper model to ~/.bob/models (base English, 148 MB, by default).
@@ -138,7 +138,7 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
         Command::Config { action } => run_config(action),
         Command::Mcp { action } => run_mcp(action).await,
         Command::Lsp { action } => run_lsp(action),
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         Command::Voice { action } => match action {
             VoiceAction::Install { turbo, from } => crate::voice::install(turbo, from).await,
             VoiceAction::Status => crate::voice::status(),

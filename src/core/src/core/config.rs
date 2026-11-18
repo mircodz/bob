@@ -548,7 +548,7 @@ deny = [{deny}]
 # Language servers live in the PROJECT config (./.bob.config.toml), added with
 # `bob lsp add rust --ext rs -- rust-analyzer`.
 
-# Voice dictation (macOS, Ctrl+R in the input box). Install models with
+# Voice dictation (macOS and Windows, Ctrl+R in the input box). Install models with
 # `bob voice install` (base.en) or `bob voice install --turbo` (large-v3-turbo).
 # [voice]
 # model = "large-v3-turbo" # "base.en" | "large-v3-turbo"; unset = best installed

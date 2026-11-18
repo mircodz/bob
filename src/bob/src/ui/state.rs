@@ -730,13 +730,13 @@ pub(super) struct App {
     pub size: Rect,
     clock: u64,
     output_epoch: u64,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     pub voice: Option<crate::voice::Recorder>,
     pub voice_state: VoiceState,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
 pub enum VoiceState {
     #[default]
     Off,
@@ -747,7 +747,7 @@ pub enum VoiceState {
 }
 
 impl App {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     fn toggle_voice(&mut self) {
         if self.voice.is_none() {
             let workspace = self
@@ -774,13 +774,13 @@ impl App {
         }
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     fn toggle_voice(&mut self) {
-        self.notify_voice("Voice dictation is only available on macOS.".into());
+        self.notify_voice("Voice dictation is only available on macOS and Windows.".into());
     }
 
     fn cancel_voice(&mut self) {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         if let Some(recorder) = &self.voice {
             recorder.cancel();
             self.voice_state = VoiceState::Ready;
@@ -797,7 +797,7 @@ impl App {
     }
 
     /// Applies finished transcriptions and recorder state; true when the UI changed.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     pub fn poll_voice(&mut self) -> bool {
         let Some(recorder) = &self.voice else {
             return false;
@@ -838,7 +838,7 @@ impl App {
         changed
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     pub fn poll_voice(&mut self) -> bool {
         false
     }
@@ -893,7 +893,7 @@ impl App {
             size: Rect::default(),
             clock: 0,
             output_epoch: 0,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", windows))]
             voice: None,
             voice_state: VoiceState::Off,
         }

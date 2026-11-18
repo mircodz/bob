@@ -1,13 +1,11 @@
 //! Microphone capture via cpal.
 //!
-//! Opens the default input device and streams mono f32 samples over a channel.
-//! Input is resampled naively to ~16 kHz (decimation) since STT models expect
-//! 16 kHz mono. For production, swap the decimation for a real resampler
-//! (e.g. `rubato`).
+//! Opens the default input device and streams mono f32 samples at 16 kHz, the
+//! rate the STT models expect, resampling by linear interpolation.
 
 use anyhow::{anyhow, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{SampleFormat, Stream};
+use cpal::{FromSample, Sample, SampleFormat, SizedSample, Stream};
 use crossbeam_channel::{Receiver, Sender};
 
 /// Target sample rate expected by the STT models.
@@ -27,32 +25,18 @@ impl AudioCapture {
             .default_input_device()
             .ok_or_else(|| anyhow!("no default input device"))?;
         let config = device.default_input_config()?;
-        let src_sr = config.sample_rate().0;
+        let source_rate = config.sample_rate().0;
         let channels = config.channels() as usize;
-        let decim = (src_sr / TARGET_SR).max(1) as usize;
-
         let (tx, rx) = crossbeam_channel::bounded::<Vec<f32>>(32);
-        // Stream errors must not print: the host may own the terminal (e.g. a TUI).
-        let err_fn = |_e| {};
-
         let stream = match config.sample_format() {
-            SampleFormat::F32 => device.build_input_stream(
-                &config.into(),
-                move |data: &[f32], _| downmix_decimate(data, channels, decim, &tx),
-                err_fn,
-                None,
-            )?,
-            SampleFormat::I16 => device.build_input_stream(
-                &config.into(),
-                move |data: &[i16], _| {
-                    let f: Vec<f32> = data.iter().map(|s| *s as f32 / i16::MAX as f32).collect();
-                    downmix_decimate(&f, channels, decim, &tx);
-                },
-                err_fn,
-                None,
-            )?,
+            SampleFormat::F32 => input::<f32>(&device, &config, channels, source_rate, tx),
+            SampleFormat::I16 => input::<i16>(&device, &config, channels, source_rate, tx),
+            SampleFormat::I32 => input::<i32>(&device, &config, channels, source_rate, tx),
+            SampleFormat::U16 => input::<u16>(&device, &config, channels, source_rate, tx),
+            SampleFormat::U8 => input::<u8>(&device, &config, channels, source_rate, tx),
+            SampleFormat::F64 => input::<f64>(&device, &config, channels, source_rate, tx),
             other => return Err(anyhow!("unsupported sample format: {other:?}")),
-        };
+        }?;
 
         stream.play()?;
         Ok(Self {
@@ -62,23 +46,78 @@ impl AudioCapture {
     }
 }
 
-/// Downmix interleaved channels to mono and decimate to ~16 kHz.
-fn downmix_decimate(data: &[f32], channels: usize, decim: usize, tx: &Sender<Vec<f32>>) {
-    let mut out = Vec::with_capacity(data.len() / (channels * decim) + 1);
-    let mut i = 0;
-    while i + channels <= data.len() {
-        let mut acc = 0.0;
-        for c in 0..channels {
-            acc += data[i + c];
-        }
-        out.push(acc / channels as f32);
-        i += channels * decim;
-    }
-    // Non-blocking: drop a chunk rather than stall the audio callback.
-    let _ = tx.try_send(out);
+fn input<T>(
+    device: &cpal::Device,
+    config: &cpal::SupportedStreamConfig,
+    channels: usize,
+    source_rate: u32,
+    tx: Sender<Vec<f32>>,
+) -> Result<Stream>
+where
+    T: SizedSample,
+    f32: FromSample<T>,
+{
+    let mut resampler = Resampler::new(source_rate);
+    let mut mono = Vec::new();
+    Ok(device.build_input_stream(
+        &config.config(),
+        move |data: &[T], _| {
+            mono.clear();
+            mono.extend(data.chunks_exact(channels).map(|frame| {
+                frame
+                    .iter()
+                    .map(|sample| sample.to_sample::<f32>())
+                    .sum::<f32>()
+                    / channels as f32
+            }));
+            // Non-blocking: drop a chunk rather than stall the audio callback.
+            let _ = tx.try_send(resampler.push(&mono));
+        },
+        // Stream errors must not print: the host may own the terminal (e.g. a TUI).
+        |_| {},
+        None,
+    )?)
 }
 
-/// Minimal WAV reader (16-bit PCM): downmix to mono, decimate to ~16 kHz.
+/// Converts mono audio at any rate to 16 kHz by linear interpolation, one
+/// chunk at a time, carrying its position across chunks.
+struct Resampler {
+    step: f64,
+    position: f64,
+    previous: Option<f32>,
+}
+
+impl Resampler {
+    fn new(source_rate: u32) -> Self {
+        Self {
+            step: f64::from(source_rate.max(1)) / f64::from(TARGET_SR),
+            position: 0.0,
+            previous: None,
+        }
+    }
+
+    /// `position` counts from the carried-over last sample of the previous
+    /// chunk (index 0) when there is one, otherwise from this chunk's start.
+    fn push(&mut self, input: &[f32]) -> Vec<f32> {
+        let mut frames = Vec::with_capacity(input.len() + 1);
+        frames.extend(self.previous);
+        frames.extend_from_slice(input);
+        let mut out = Vec::with_capacity((input.len() as f64 / self.step) as usize + 1);
+        while self.position + 1.0 < frames.len() as f64 {
+            let index = self.position as usize;
+            let fraction = (self.position - index as f64) as f32;
+            out.push(frames[index] + (frames[index + 1] - frames[index]) * fraction);
+            self.position += self.step;
+        }
+        if let Some(&last) = frames.last() {
+            self.position -= (frames.len() - 1) as f64;
+            self.previous = Some(last);
+        }
+        out
+    }
+}
+
+/// Minimal WAV reader (16-bit PCM): downmix to mono, resample to 16 kHz.
 /// Enough for the offline path and tests; not a general audio decoder.
 pub fn read_wav_16k_mono(path: &std::path::Path) -> Result<Vec<f32>> {
     let bytes = std::fs::read(path)?;
@@ -120,18 +159,54 @@ pub fn read_wav_16k_mono(path: &std::path::Path) -> Result<Vec<f32>> {
         anyhow::bail!("only 16-bit PCM WAV supported (got {bits}-bit)");
     }
     let ch = channels.max(1) as usize;
-    let decim = (sample_rate / TARGET_SR).max(1) as usize;
-    let mut out = Vec::new();
-    let frame_bytes = 2 * ch;
-    let mut i = 0;
-    while i + frame_bytes <= data.len() {
-        let mut acc = 0.0f32;
-        for c in 0..ch {
-            let s = i16::from_le_bytes([data[i + 2 * c], data[i + 2 * c + 1]]);
-            acc += s as f32 / i16::MAX as f32;
-        }
-        out.push(acc / ch as f32);
-        i += frame_bytes * decim;
+    let mono: Vec<f32> = data
+        .chunks_exact(2 * ch)
+        .map(|frame| {
+            frame
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|sample| f32::from_sample(i16::from_le_bytes(*sample)))
+                .sum::<f32>()
+                / ch as f32
+        })
+        .collect();
+    Ok(Resampler::new(sample_rate).push(&mono))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tone(rate: u32, seconds: f64) -> Vec<f32> {
+        (0..(f64::from(rate) * seconds) as usize)
+            .map(|n| (2.0 * std::f64::consts::PI * 440.0 * n as f64 / f64::from(rate)).sin() as f32)
+            .collect()
     }
-    Ok(out)
+
+    #[test]
+    fn every_common_rate_becomes_16_khz_without_changing_speed() {
+        for rate in [8_000, 16_000, 22_050, 24_000, 44_100, 48_000, 96_000] {
+            let input = tone(rate, 2.0);
+            let mut resampler = Resampler::new(rate);
+            let output: Vec<f32> = input
+                .chunks(rate as usize / 100 + 7)
+                .flat_map(|chunk| resampler.push(chunk))
+                .collect();
+            let expected = 2 * TARGET_SR as usize;
+            assert!(
+                output.len().abs_diff(expected) <= 2,
+                "{rate} Hz: {} samples, expected {expected}",
+                output.len()
+            );
+            for (n, sample) in output.iter().enumerate() {
+                let ideal =
+                    (2.0 * std::f64::consts::PI * 440.0 * n as f64 / f64::from(TARGET_SR)).sin();
+                assert!(
+                    (f64::from(*sample) - ideal).abs() < 0.05,
+                    "{rate} Hz: sample {n} is {sample}, expected {ideal}"
+                );
+            }
+        }
+    }
 }

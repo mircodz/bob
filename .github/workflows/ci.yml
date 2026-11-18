@@ -82,12 +82,14 @@ jobs:
         with:
           key: ${{ matrix.target }}
       # The version's last number counts the commits on main, so each published
-      # build gets a higher number than the one before it.
-      - name: Number the build
+      # build gets a higher number than the one before it. The CMake include
+      # keeps whisper.cpp from targeting the runner's own CPU.
+      - name: Set build variables
         shell: bash
         run: |
           echo "BOB_BUILD_NUMBER=$(git rev-list --count HEAD)" >> "$GITHUB_ENV"
           echo "BOB_BUILD_COMMIT=$GITHUB_SHA" >> "$GITHUB_ENV"
+          echo "CMAKE_PROJECT_INCLUDE_BEFORE=$(pwd -W 2>/dev/null || pwd)/.github/portable-whisper.cmake" >> "$GITHUB_ENV"
       - name: Build release binaries
         run: cargo build --locked --release -p bob --bins
       - name: Package (Unix)

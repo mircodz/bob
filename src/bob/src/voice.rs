@@ -1,5 +1,5 @@
 //! Local voice dictation: model management for `bob voice` and a push-to-talk
-//! recorder for the composer. Compiled in on macOS only.
+//! recorder for the composer. Compiled in on macOS and Windows.
 
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
