@@ -38,7 +38,7 @@ pub enum Command {
         #[command(subcommand)]
         action: VoiceAction,
     },
-    /// Replace bob and bob-exec with the newest build of main that passed CI.
+    /// Replace bob and bob-exec with the latest release.
     Update,
 }
 

@@ -73,15 +73,22 @@ jobs:
             target: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Install declared Rust toolchain
         run: rustup show active-toolchain
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+      # The version's last number counts the commits on main, so each published
+      # build gets a higher number than the one before it.
+      - name: Number the build
+        shell: bash
+        run: |
+          echo "BOB_BUILD_NUMBER=$(git rev-list --count HEAD)" >> "$GITHUB_ENV"
+          echo "BOB_BUILD_COMMIT=$GITHUB_SHA" >> "$GITHUB_ENV"
       - name: Build release binaries
-        env:
-          BOB_BUILD_COMMIT: ${{ github.sha }}
         run: cargo build --locked --release -p bob --bins
       - name: Package (Unix)
         if: runner.os != 'Windows'
@@ -103,17 +110,18 @@ jobs:
             target/release/bob-exec.exe
           if-no-files-found: error
 
-  # Replaces the `edge` pre-release with this push's binaries once every test
-  # and build passes. `bob update` installs from it.
+  # Publishes each push to main that passes every test and build as release
+  # v<version>, numbered by its commit count, and marks it Latest. `bob update`
+  # installs the Latest release.
   publish:
-    name: Publish edge release
+    name: Publish release
     needs: [test, build]
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: write
     concurrency:
-      group: publish-edge
+      group: publish-release
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
@@ -135,10 +143,12 @@ jobs:
           target=x86_64-pc-windows-msvc
           cp "artifacts/bob-$target/bob.exe" "dist/bob-$target.exe"
           cp "artifacts/bob-$target/bob-exec.exe" "dist/bob-exec-$target.exe"
+          version=$(dist/bob-x86_64-unknown-linux-gnu --version | cut -d' ' -f2)
+          echo "TAG=v$version" >> "$GITHUB_ENV"
           cd dist
           sha256sum -- * > SHA256SUMS
           cat SHA256SUMS
-      - name: Replace the edge release
+      - name: Create the release
         run: |
           set -euo pipefail
           head=$(gh api "repos/$GH_REPO/commits/main" --jq .sha)
@@ -146,8 +156,17 @@ jobs:
             echo "main has moved on to $head, whose run publishes instead."
             exit 0
           fi
-          gh release delete edge --yes --cleanup-tag || true
-          gh api -X DELETE "repos/$GH_REPO/git/refs/tags/edge" >/dev/null 2>&1 || true
-          gh release create edge dist/* --prerelease --target "$GITHUB_SHA" \
-            --title "main @ ${GITHUB_SHA::7}" \
-            --notes "The newest build of main ($GITHUB_SHA), replaced after every push that passes CI. Run \`bob update\` to install it, or download bob and bob-exec for your platform into the same directory."
+          if [ "$(gh release view "$TAG" --json targetCommitish --jq .targetCommitish 2>/dev/null)" = "$GITHUB_SHA" ]; then
+            echo "$TAG is already published."
+            exit 0
+          fi
+          notes="Built from $GITHUB_SHA after CI passed on main. Run \`bob update\` to install it."
+          if previous=$(gh release view --json tagName --jq .tagName 2>/dev/null); then
+            notes+=$'\n\n'"Changes since $previous: https://github.com/$GH_REPO/compare/$previous...$TAG"
+          fi
+          gh release create "$TAG" dist/* --target "$GITHUB_SHA" --latest \
+            --title "bob ${TAG#v}" --notes "$notes"
+      - name: Keep the newest 30 releases
+        run: |
+          gh release list --limit 200 --json tagName --jq '.[30:][].tagName' |
+            while read -r tag; do gh release delete "$tag" --yes --cleanup-tag < /dev/null; done

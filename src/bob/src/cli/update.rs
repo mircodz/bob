@@ -4,7 +4,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const RELEASE: &str = "https://api.github.com/repos/mircodz/bob/releases/tags/edge";
+const RELEASE: &str = "https://api.github.com/repos/mircodz/bob/releases/latest";
 /// Installed in this order, so a busy helper stops the update before bob changes.
 const EXECUTABLES: [&str; 2] = ["bob-exec", "bob"];
 const TARGET: Option<&str> = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
@@ -60,13 +60,14 @@ pub async fn run() -> Result<()> {
         .get(RELEASE)
         .send()
         .await
-        .context("fetch the edge release from GitHub")?;
+        .context("fetch the latest release from GitHub")?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
-        bail!("no build of main has been published yet; try again once CI on main has finished");
+        bail!("no release has been published yet; try again once CI on main has finished");
     }
     let release: serde_json::Value = response.error_for_status()?.json().await?;
-    let commit = release["target_commitish"].as_str().unwrap_or("unknown");
-    let build = format!("main @ {}", commit.get(..7).unwrap_or(commit));
+    let tag = release["tag_name"]
+        .as_str()
+        .context("the latest release has no tag")?;
     let url = |name: &str| {
         release["assets"]
             .as_array()
@@ -75,11 +76,7 @@ pub async fn run() -> Result<()> {
             .find(|asset| asset["name"] == name)
             .and_then(|asset| asset["browser_download_url"].as_str())
             .map(str::to_owned)
-            .with_context(|| {
-                format!(
-                    "the edge release has no {name}; CI may still be publishing it, so try again in a minute"
-                )
-            })
+            .with_context(|| format!("release {tag} has no {name}"))
     };
     let sums = client
         .get(url("SHA256SUMS")?)
@@ -103,10 +100,10 @@ pub async fn run() -> Result<()> {
     if downloads.iter().all(|download| {
         std::fs::read(&download.swap.target).is_ok_and(|bytes| sha256(&bytes) == download.sha256)
     }) {
-        println!("bob is already up to date ({build}).");
+        println!("bob is already up to date ({tag}).");
         return Ok(());
     }
-    println!("Downloading {build} for {target} …");
+    println!("Downloading bob {tag} for {target} …");
     let result = download_and_install(&client, &downloads).await;
     for download in &downloads {
         let _ = std::fs::remove_file(&download.swap.staged);
@@ -115,7 +112,12 @@ pub async fn run() -> Result<()> {
         }
     }
     let version = result?;
-    println!("Installed {version} in {}.", directory.display());
+    println!(
+        "Updated bob {} → {} in {}.",
+        env!("BOB_VERSION"),
+        version.strip_prefix("bob ").unwrap_or(&version),
+        directory.display()
+    );
     println!("Restart any open bob sessions to use it.");
     Ok(())
 }
