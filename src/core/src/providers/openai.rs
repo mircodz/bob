@@ -83,8 +83,17 @@ pub struct OpenAiProvider {
     timeouts: StreamTimeouts,
     /// Backend-advertised `reasoning_effort` levels; empty uses name heuristics.
     reasoning_efforts: Vec<String>,
-    /// DeepSeek wire rules: replay reasoning as `reasoning_content`, disable thinking for Off.
-    deepseek: bool,
+    dialect: Dialect,
+}
+
+/// How earlier reasoning goes back to the backend on assistant messages.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Dialect {
+    OpenAi,
+    /// Replays reasoning as `reasoning_content` and disables thinking for Off.
+    DeepSeek,
+    /// Replays signed reasoning as `reasoning_text` plus `reasoning_opaque`.
+    Copilot,
 }
 
 impl OpenAiProvider {
@@ -104,7 +113,7 @@ impl OpenAiProvider {
             context_window: None,
             timeouts: StreamTimeouts::default(),
             reasoning_efforts: Vec::new(),
-            deepseek: false,
+            dialect: Dialect::OpenAi,
         }
     }
 
@@ -117,7 +126,7 @@ impl OpenAiProvider {
             context_window: None,
             timeouts: StreamTimeouts::default(),
             reasoning_efforts: Vec::new(),
-            deepseek: false,
+            dialect: Dialect::OpenAi,
         }
     }
 
@@ -129,12 +138,19 @@ impl OpenAiProvider {
     /// DeepSeek rejects tool requests (400) unless earlier reasoning comes back as
     /// `reasoning_content`, and it thinks unless thinking is explicitly disabled.
     pub fn with_deepseek_dialect(mut self) -> Self {
-        self.deepseek = true;
+        self.dialect = Dialect::DeepSeek;
+        self
+    }
+
+    /// Copilot streams Claude's reasoning with a `reasoning_opaque` signature; without both
+    /// back on later requests the model no longer sees what it thought before a tool call.
+    pub fn with_copilot_dialect(mut self) -> Self {
+        self.dialect = Dialect::Copilot;
         self
     }
 
     fn label(&self) -> &'static str {
-        if self.deepseek {
+        if self.dialect == Dialect::DeepSeek {
             "deepseek"
         } else {
             "openai"
@@ -174,7 +190,7 @@ impl OpenAiProvider {
             messages.push(json!({ "role": "system", "content": sys }));
         }
         for m in &opts.messages {
-            messages.extend(to_api_messages(m, self.deepseek));
+            messages.extend(to_api_messages(m, self.dialect));
         }
         let mut body = json!({
             "model": self.model,
@@ -196,7 +212,7 @@ impl OpenAiProvider {
             body["reasoning_effort"] = json!(effort);
             // Reasoning models reject an explicit temperature.
             body.as_object_mut().map(|o| o.remove("temperature"));
-        } else if self.deepseek && opts.reasoning == ReasoningEffort::Off {
+        } else if self.dialect == Dialect::DeepSeek && opts.reasoning == ReasoningEffort::Off {
             body["thinking"] = json!({ "type": "disabled" });
         }
         if !opts.tools.is_empty() {
@@ -304,6 +320,7 @@ impl Provider for OpenAiProvider {
             ).await else { return; };
             let mut text = String::new();
             let mut thinking = String::new();
+            let mut signature = None;
             let mut finish = None;
             let mut protocol_error = None;
             let mut usage = Usage::default();
@@ -360,6 +377,11 @@ impl Provider for OpenAiProvider {
                                 kind: ReasoningKind::Thinking,
                                 text: r.to_string(),
                             });
+                        }
+                    }
+                    if let Some(opaque) = delta["reasoning_opaque"].as_str() {
+                        if !opaque.is_empty() {
+                            signature = Some(crate::providers::codec::copilot_signature(opaque));
                         }
                     }
                     if let Some(c) = delta["content"].as_str() {
@@ -454,11 +476,11 @@ impl Provider for OpenAiProvider {
                 return;
             }
             let mut content: Vec<ContentBlock> = Vec::new();
-            // Unsigned, so Anthropic never replays it; only DeepSeek gets it back as input.
-            if !thinking.is_empty() {
+            // Copilot signs Claude's reasoning with `reasoning_opaque`; DeepSeek's stays unsigned.
+            if !thinking.is_empty() || signature.is_some() {
                 content.push(ContentBlock::Thinking {
                     thinking,
-                    signature: String::new(),
+                    signature: signature.unwrap_or_default(),
                 });
             }
             if !text.is_empty() {
@@ -582,9 +604,10 @@ fn map_finish(reason: &str) -> StopReason {
     crate::providers::codec::map_stop_reason(reason)
 }
 
-/// Tool results split into separate Chat Completions messages. With `reasoning_content`,
-/// every assistant message carries it, empty when there was no thinking, as DeepSeek requires.
-fn to_api_messages(m: &Message, reasoning_content: bool) -> Vec<Value> {
+/// Tool results split into separate Chat Completions messages. DeepSeek needs
+/// `reasoning_content` on every assistant message, empty when there was no thinking;
+/// Copilot takes signed reasoning back as `reasoning_text` plus `reasoning_opaque`.
+fn to_api_messages(m: &Message, dialect: Dialect) -> Vec<Value> {
     if m.role == Role::Tool {
         return m
             .content
@@ -605,11 +628,17 @@ fn to_api_messages(m: &Message, reasoning_content: bool) -> Vec<Value> {
 
     let mut text = String::new();
     let mut reasoning = String::new();
+    let mut signature = None;
     let mut tool_calls: Vec<Value> = Vec::new();
     for b in &m.content {
         match classify_block(b) {
             OpenAiBlock::Text(t) => text.push_str(&t),
-            OpenAiBlock::Reasoning(t) => reasoning.push_str(&t),
+            OpenAiBlock::Reasoning(t, s) => {
+                reasoning.push_str(&t);
+                if let Some(opaque) = crate::providers::codec::copilot_opaque(&s) {
+                    signature = Some(opaque.to_owned());
+                }
+            }
             OpenAiBlock::ToolCall(v) => tool_calls.push(v),
             // Tool results require Role::Tool; opaque reasoning has no chat representation.
             OpenAiBlock::ToolResult { .. } | OpenAiBlock::SkipUnsupported => {}
@@ -629,15 +658,23 @@ fn to_api_messages(m: &Message, reasoning_content: bool) -> Vec<Value> {
     if !tool_calls.is_empty() {
         msg["tool_calls"] = json!(tool_calls);
     }
-    if reasoning_content && m.role == Role::Assistant {
-        msg["reasoning_content"] = json!(reasoning);
+    match (dialect, signature) {
+        (Dialect::DeepSeek, _) if m.role == Role::Assistant => {
+            msg["reasoning_content"] = json!(reasoning);
+        }
+        (Dialect::Copilot, Some(signature)) if m.role == Role::Assistant => {
+            msg["reasoning_text"] = json!(reasoning);
+            msg["reasoning_opaque"] = json!(signature);
+        }
+        _ => {}
     }
     vec![msg]
 }
 
 enum OpenAiBlock {
     Text(String),
-    Reasoning(String),
+    /// Reasoning text and its signature, empty when unsigned.
+    Reasoning(String, String),
     ToolCall(Value),
     ToolResult {
         tool_use_id: String,
@@ -662,7 +699,10 @@ fn classify_block(b: &ContentBlock) -> OpenAiBlock {
             tool_use_id: tool_use_id.clone(),
             content: content.model_text().into_owned(),
         },
-        ContentBlock::Thinking { thinking, .. } => OpenAiBlock::Reasoning(thinking.clone()),
+        ContentBlock::Thinking {
+            thinking,
+            signature,
+        } => OpenAiBlock::Reasoning(thinking.clone(), signature.clone()),
         ContentBlock::RedactedThinking { .. } | ContentBlock::ReasoningItem { .. } => {
             OpenAiBlock::SkipUnsupported
         }
@@ -671,10 +711,18 @@ fn classify_block(b: &ContentBlock) -> OpenAiBlock {
 
 fn from_api_message(msg: &Value) -> Message {
     let mut content: Vec<ContentBlock> = Vec::new();
-    if let Some(r) = msg["reasoning_content"].as_str().filter(|r| !r.is_empty()) {
+    let reasoning = msg["reasoning_text"]
+        .as_str()
+        .or_else(|| msg["reasoning_content"].as_str())
+        .unwrap_or("");
+    let signature = msg["reasoning_opaque"]
+        .as_str()
+        .filter(|opaque| !opaque.is_empty())
+        .map(crate::providers::codec::copilot_signature);
+    if !reasoning.is_empty() || signature.is_some() {
         content.push(ContentBlock::Thinking {
-            thinking: r.to_string(),
-            signature: String::new(),
+            thinking: reasoning.to_string(),
+            signature: signature.unwrap_or_default(),
         });
     }
     if let Some(c) = msg["content"].as_str() {
@@ -792,7 +840,7 @@ mod tests {
                     content: vec![block],
                 };
                 assert_eq!(
-                    to_api_messages(&message, false),
+                    to_api_messages(&message, Dialect::OpenAi),
                     vec![expected],
                     "{message:?}"
                 );
@@ -916,6 +964,48 @@ mod tests {
                 .all(|message| message.get("reasoning_content").is_none()));
         }
         #[test]
+        fn copilot_dialect_replays_signed_reasoning_with_its_signature() {
+            let openai = OpenAiProvider::with_auth(
+                "claude-opus-5.5".into(),
+                "https://example.invalid".into(),
+                Arc::new(crate::auth::StaticKey("test".into())),
+            );
+            let copilot = openai.clone().with_copilot_dialect();
+            let assistant = |provider: &OpenAiProvider, signature: &str| {
+                let message = Message {
+                    role: Role::Assistant,
+                    content: vec![
+                        ContentBlock::Thinking {
+                            thinking: "Check the parser".into(),
+                            signature: signature.into(),
+                        },
+                        ContentBlock::ToolUse {
+                            id: "call-1".into(),
+                            name: "list_agents".into(),
+                            input: json!({}),
+                        },
+                    ],
+                };
+                let options = GenerateOptions {
+                    messages: vec![message],
+                    ..Default::default()
+                };
+                provider.build_body(&options, true)["messages"][0].clone()
+            };
+            let signed = assistant(&copilot, "copilot:opaque+/=");
+            assert_eq!(signed["reasoning_text"], "Check the parser");
+            assert_eq!(signed["reasoning_opaque"], "opaque+/=");
+            assert_eq!(signed["tool_calls"][0]["id"], "call-1");
+            for unsent in [
+                assistant(&copilot, ""),
+                assistant(&copilot, "anthropic-signature"),
+                assistant(&openai, "copilot:opaque+/="),
+            ] {
+                assert!(unsent.get("reasoning_text").is_none(), "{unsent}");
+                assert!(unsent.get("reasoning_opaque").is_none(), "{unsent}");
+            }
+        }
+        #[test]
         fn request_options_gate_reasoning_temperature_and_stream_usage() {
             for (model, effort, expected_effort, expected_temperature) in [
                 ("gpt-4o", ReasoningEffort::High, None, Some(0.5)),
@@ -1027,7 +1117,7 @@ mod tests {
                 ],
             };
             assert_eq!(
-                to_api_messages(&message, false),
+                to_api_messages(&message, Dialect::OpenAi),
                 vec![json!({
                     "role":"assistant","content":"日本語 😀","tool_calls":[
                         {"id":"call-b","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a\\nb.rs\"}"}},
@@ -1051,7 +1141,7 @@ mod tests {
                 ],
             };
             assert_eq!(
-                to_api_messages(&results, false),
+                to_api_messages(&results, Dialect::OpenAi),
                 vec![
                     json!({"role":"tool","tool_call_id":"call-b","content":"not found"}),
                     json!({"role":"tool","tool_call_id":"call-a","content":"[]"}),
@@ -1099,6 +1189,13 @@ mod tests {
             );
             let message = from_api_message(&json!({"reasoning_content":"","content":"Answer"}));
             assert!(matches!(&message.content[..], [ContentBlock::Text { .. }]));
+            let message = from_api_message(
+                &json!({"reasoning_text":"Think","reasoning_opaque":"blob","content":"Answer"}),
+            );
+            assert_eq!(
+                serde_json::to_value(&message.content[0]).unwrap(),
+                json!({"type":"thinking","thinking":"Think","signature":"copilot:blob"})
+            );
         }
     }
 
@@ -1273,13 +1370,20 @@ mod tests {
 
         #[tokio::test]
         async fn chat_streams_copilot_and_deepseek_reasoning_as_thinking() {
-            // Copilot sends `reasoning_text`; DeepSeek sends `reasoning_content`.
-            for field in ["reasoning_text", "reasoning_content"] {
-                let frames = [
+            // Copilot sends `reasoning_text` signed by `reasoning_opaque`; DeepSeek sends
+            // unsigned `reasoning_content`.
+            for (field, opaque, signature) in [
+                ("reasoning_text", Some("opaque+/="), "copilot:opaque+/="),
+                ("reasoning_content", None, ""),
+            ] {
+                let mut frames = vec![
                     json!({"id":"msg_1","choices":[{"delta":{"content":null,"role":"assistant",field:"Checking "}}]}),
                     json!({"id":"msg_1","choices":[{"delta":{"content":null,field:"divisors"}}]}),
-                    json!({"id":"msg_1","choices":[{"delta":{"content":"Prime"},"finish_reason":"stop"}]}),
                 ];
+                if let Some(opaque) = opaque {
+                    frames.push(json!({"id":"msg_1","choices":[{"delta":{"content":null,"reasoning_opaque":opaque}}]}));
+                }
+                frames.push(json!({"id":"msg_1","choices":[{"delta":{"content":"Prime"},"finish_reason":"stop"}]}));
                 let body = frames
                     .iter()
                     .map(|f| format!("data: {f}\n\n"))
@@ -1309,7 +1413,7 @@ mod tests {
                 assert_eq!(
                     serde_json::to_value(&completion.message).unwrap(),
                     json!({"role":"assistant","content":[
-                        {"type":"thinking","thinking":"Checking divisors","signature":""},
+                        {"type":"thinking","thinking":"Checking divisors","signature":signature},
                         {"type":"text","text":"Prime"}
                     ]}),
                     "{field}"

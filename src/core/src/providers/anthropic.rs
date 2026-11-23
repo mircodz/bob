@@ -573,8 +573,13 @@ fn block_to_wire(b: &ContentBlock) -> BlockWire {
             "content": content.model_text(),
             "is_error": is_error,
         })),
-        // Unsigned thinking was captured from another provider for display; Anthropic rejects it.
-        ContentBlock::Thinking { signature, .. } if signature.is_empty() => BlockWire::Skip,
+        // Unsigned or Copilot-signed thinking came from another provider; Anthropic rejects it.
+        ContentBlock::Thinking { signature, .. }
+            if signature.is_empty()
+                || crate::providers::codec::copilot_opaque(signature).is_some() =>
+        {
+            BlockWire::Skip
+        }
         ContentBlock::Thinking {
             thinking,
             signature,
@@ -698,6 +703,26 @@ mod tests {
             assert_eq!(blocks[0]["thinking"], "let me reason");
             assert_eq!(blocks[0]["signature"], "sig-abc");
             assert_eq!(blocks[1]["type"], "tool_use");
+        }
+
+        #[test]
+        fn copilot_signed_thinking_is_dropped_for_anthropic() {
+            let msg = Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Thinking {
+                        thinking: "Check the parser".to_string(),
+                        signature: crate::providers::codec::copilot_signature("opaque"),
+                    },
+                    ContentBlock::Text {
+                        text: "hi".to_string(),
+                    },
+                ],
+            };
+            let v = to_api_message(&msg);
+            let blocks = v["content"].as_array().unwrap();
+            assert_eq!(blocks.len(), 1);
+            assert_eq!(blocks[0]["type"], "text");
         }
 
         #[test]

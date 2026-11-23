@@ -129,6 +129,7 @@ pub(crate) async fn create_with_options(
     } else {
         Ok(Arc::new(
             OpenAiProvider::with_auth(model, api_base, source)
+                .with_copilot_dialect()
                 .with_stream_timeouts(timeouts)
                 .with_context_window(window)
                 .with_reasoning_efforts(reasoning_efforts),

@@ -29,6 +29,18 @@ impl BlockWire {
     }
 }
 
+/// Copilot chat signs reasoning with `reasoning_opaque`, which only Copilot accepts
+/// back; the prefix keeps it from being replayed to Anthropic as a signature.
+const COPILOT_SIGNATURE: &str = "copilot:";
+
+pub(crate) fn copilot_signature(opaque: &str) -> String {
+    format!("{COPILOT_SIGNATURE}{opaque}")
+}
+
+pub(crate) fn copilot_opaque(signature: &str) -> Option<&str> {
+    signature.strip_prefix(COPILOT_SIGNATURE)
+}
+
 /// Parse-error sentinel recognized by the agent loop before tool execution.
 pub const TOOL_ARGS_PARSE_ERROR_KEY: &str = "__bob_tool_args_parse_error__";
 
