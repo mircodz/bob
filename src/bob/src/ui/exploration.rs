@@ -37,7 +37,10 @@ pub(super) fn groups(entries: &[Entry]) -> Vec<Group<'_>> {
                 "read_file" | "grep" | "glob" | "list_dir" => run.push(entry),
                 _ => finish(&mut run, &mut groups),
             }
-        } else if !(entry.kind == EntryKind::Assistant && entry.text.trim().is_empty()) {
+        } else if !(entry.kind == EntryKind::Assistant
+            && entry.text.trim().is_empty()
+            && entry.thinking.is_none())
+        {
             finish(&mut run, &mut groups);
         }
     }

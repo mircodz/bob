@@ -197,6 +197,7 @@ impl Pane {
                 || super::super::visibility::hidden_tool(entry)
                 || (entry.kind == bob_kernel::EntryKind::Assistant
                     && entry.text.trim().is_empty()
+                    && entry.thinking.is_none()
                     && !entry.is_preview);
             Some(entry.sequence) == first || Some(entry.sequence) == last || !hidden
         });
@@ -698,6 +699,43 @@ mod tests {
         accept(&mut pane, tools(90, 100), Query::Older(100), 10);
         assert_eq!(pane.viewport.anchor, Some(anchor(90)));
         assert!(pane.expanded.contains(&OperationId("tool-90".into())));
+    }
+
+    #[test]
+    fn thinking_before_a_tool_call_stays_between_the_calls() {
+        let mut view = tools(10, 18);
+        for entry in &mut view.entries[3..5] {
+            entry.kind = EntryKind::Assistant;
+            entry.tool = None;
+            entry.text = String::new();
+        }
+        view.entries[3].thinking = Some("Checking the parser first".into());
+        let mut pane = Pane::default();
+        accept(&mut pane, view, Query::Replace(None), 100);
+        let entries = &pane.view.as_ref().unwrap().entries;
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.sequence)
+                .collect::<Vec<_>>(),
+            [10, 11, 12, 13, 15, 16, 17]
+        );
+        let groups = exploration::groups(entries);
+        assert_eq!(
+            groups
+                .iter()
+                .map(|group| group.entries.len())
+                .collect::<Vec<_>>(),
+            [3, 3]
+        );
+        let screen = crate::ui::render::transcript(&pane, false, 120)
+            .iter()
+            .map(|row| row.line.to_string())
+            .collect::<Vec<_>>();
+        assert!(screen.iter().any(|line| line.trim() == "Thinking"));
+        assert!(!screen
+            .iter()
+            .any(|line| line.contains("Checking the parser")));
     }
 
     #[test]
