@@ -372,9 +372,12 @@ pub(crate) fn yield_group(tx: &Transaction<'_>, operation: &OperationId) -> anyh
     Ok(job)
 }
 
+/// Runs on every scheduler tick; see `runtime::RUNNABLE_SQL` for the join order.
+pub(crate) const RUNNING_GROUPS_SQL: &str = "SELECT g.operation,g.job FROM task_groups g CROSS JOIN operations o ON o.id=g.operation CROSS JOIN threads t ON t.id=o.thread WHERE g.state='running' AND t.session=?1 LIMIT 128";
+
 pub(crate) fn advance_groups(tx: &Transaction<'_>, session: &SessionId) -> anyhow::Result<()> {
     let groups: Vec<(String, Option<String>)> = {
-        let mut stmt = tx.prepare("SELECT g.operation,g.job FROM task_groups g JOIN operations o ON o.id=g.operation JOIN threads t ON t.id=o.thread WHERE g.state='running' AND t.session=?1 LIMIT 128")?;
+        let mut stmt = tx.prepare(RUNNING_GROUPS_SQL)?;
         let rows = stmt.query_map([session], |r| Ok((r.get(0)?, r.get(1)?)))?;
         rows.collect::<Result<_, _>>()?
     };

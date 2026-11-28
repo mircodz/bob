@@ -265,13 +265,16 @@ fn authorize_progress(
     Ok(())
 }
 
+/// Runs on every scheduler tick; see `runtime::RUNNABLE_SQL` for the join order.
+pub(crate) const CLEANUP_SQL: &str = "SELECT o.id,o.run,o.thread,o.input,t.profile,w.state='running' AND j.state='running' FROM workflows w CROSS JOIN jobs j ON j.id=w.job CROSS JOIN operations o ON o.id=w.operation CROSS JOIN threads t ON t.id=o.thread WHERE w.result IS NULL AND (w.state='failing' OR j.state IN ('stopping','unknown') OR (j.background=1 AND j.state='running' AND EXISTS(SELECT 1 FROM runs r JOIN contexts c ON c.thread=r.thread WHERE r.id=o.run AND r.state='active' AND r.epoch=c.epoch) AND t.held=0)) AND t.session=?1 LIMIT 128";
+
 pub(crate) fn cleanup(
     tx: &Transaction<'_>,
     session: &SessionId,
     models: &[ModelInfo],
 ) -> anyhow::Result<()> {
     let rows = {
-        let mut stmt = tx.prepare("SELECT o.id,o.run,o.thread,o.input,t.profile,w.state='running' AND j.state='running' FROM workflows w JOIN jobs j ON j.id=w.job JOIN operations o ON o.id=w.operation JOIN threads t ON t.id=o.thread WHERE w.result IS NULL AND (w.state='failing' OR j.state IN ('stopping','unknown') OR (j.background=1 AND j.state='running' AND EXISTS(SELECT 1 FROM runs r JOIN contexts c ON c.thread=r.thread WHERE r.id=o.run AND r.state='active' AND r.epoch=c.epoch) AND t.held=0)) AND t.session=?1 LIMIT 128")?;
+        let mut stmt = tx.prepare(CLEANUP_SQL)?;
         let rows = stmt.query_map([session], |r| {
             Ok((
                 r.get::<_, String>(0)?,

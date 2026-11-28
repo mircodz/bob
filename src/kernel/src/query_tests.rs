@@ -343,6 +343,38 @@ fn forward_transcript_returns_nearest_entries_and_empty_exhaustion() {
 }
 
 #[test]
+fn scheduler_tick_queries_start_from_live_work_not_session_history() {
+    let (_dir, store, receipt, _) = fixture();
+    let session: String = store
+        .db
+        .query_row(
+            "SELECT session FROM threads WHERE id=?1",
+            [&receipt.thread],
+            |r| r.get(0),
+        )
+        .unwrap();
+    for query in [
+        crate::runtime::RUNNABLE_SQL,
+        crate::delegation::RUNNING_GROUPS_SQL,
+        crate::workflow::CLEANUP_SQL,
+    ] {
+        let mut stmt = store
+            .db
+            .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
+            .unwrap();
+        let plan: Vec<String> = stmt
+            .query_map([&session], |r| r.get(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            !plan.iter().any(|line| line.contains("thread_operations")),
+            "{query}\n{plan:#?}"
+        );
+    }
+}
+
+#[test]
 fn tool_output_pages_human_artifact_and_falls_back_without_mutation() {
     let (_dir, store, receipt, _) = fixture();
     let run = seed_run(&store, &receipt.thread, "active");

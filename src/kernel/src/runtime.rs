@@ -45,6 +45,11 @@ pub struct RuntimeOptions {
 
 const WAIT_NOTICE_AFTER: Duration = Duration::from_secs(5);
 
+/// Checked on every scheduler tick. The CROSS JOINs make SQLite start from the
+/// small partial indexes of running groups and unsettled workflows; joining
+/// from `threads` instead walks every operation the session ever ran.
+pub(crate) const RUNNABLE_SQL: &str = "SELECT EXISTS(SELECT 1 FROM runs r JOIN threads t ON t.id=r.thread WHERE t.session=?1 AND r.state IN ('active','stopping')) OR EXISTS(SELECT 1 FROM submissions s JOIN threads t ON t.id=s.thread WHERE t.session=?1 AND t.held=0 AND s.state='queued') OR EXISTS(SELECT 1 FROM task_groups g CROSS JOIN operations o ON o.id=g.operation CROSS JOIN threads t ON t.id=o.thread WHERE t.session=?1 AND g.state='running') OR EXISTS(SELECT 1 FROM workflows w CROSS JOIN operations o ON o.id=w.operation CROSS JOIN threads t ON t.id=o.thread WHERE t.session=?1 AND w.result IS NULL)";
+
 pub struct Runtime;
 #[derive(Clone)]
 pub struct Handle {
@@ -935,10 +940,10 @@ impl Actor {
         let Some(session) = self.selected_session.as_ref() else {
             return Ok(());
         };
-        let runnable: bool = self.store.db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM runs r JOIN threads t ON t.id=r.thread WHERE t.session=?1 AND r.state IN ('active','stopping')) OR EXISTS(SELECT 1 FROM submissions s JOIN threads t ON t.id=s.thread WHERE t.session=?1 AND t.held=0 AND s.state='queued') OR EXISTS(SELECT 1 FROM task_groups g JOIN operations o ON o.id=g.operation JOIN threads t ON t.id=o.thread WHERE t.session=?1 AND g.state='running') OR EXISTS(SELECT 1 FROM workflows w JOIN operations o ON o.id=w.operation JOIN threads t ON t.id=o.thread WHERE t.session=?1 AND w.result IS NULL)",
-            [session], |r| r.get(0),
-        )?;
+        let runnable: bool = self
+            .store
+            .db
+            .query_row(RUNNABLE_SQL, [session], |r| r.get(0))?;
         if !runnable {
             return Ok(());
         }

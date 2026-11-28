@@ -11,6 +11,8 @@ mod primitive_tests;
 mod runtime_tests;
 
 use crate::{EffectClass, ToolDescriptor};
+#[cfg(test)]
+pub(crate) use runtime::CLEANUP_SQL;
 pub(crate) use runtime::{cleanup, execute, fail, SCHEMA};
 
 pub(crate) fn tools() -> Vec<ToolDescriptor> {
