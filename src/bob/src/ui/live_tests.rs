@@ -738,6 +738,45 @@ fn cached_composer_live_frame_measurement() {
     );
 }
 
+#[test]
+#[ignore = "manual sidebar toggle measurement; set BOB_BENCH_VIEW to a `bob --inspect` view"]
+fn sidebar_toggle_measurement() {
+    let path = std::env::var("BOB_BENCH_VIEW").unwrap();
+    let view: View = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let thread = view.entries[0].thread.clone();
+    let mut app = App::new(80);
+    app.threads = view.threads.clone();
+    app.select(thread);
+    app.pane_mut().unwrap().view = Some(view);
+    let mut terminal = Terminal::new(TestBackend::new(160, 50)).unwrap();
+    let cold = Instant::now();
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let cold = cold.elapsed();
+    let start = Instant::now();
+    for _ in 0..20 {
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    }
+    let cached = start.elapsed() / 20;
+    let start = Instant::now();
+    for _ in 0..20 {
+        app.sidebar = !app.sidebar;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    }
+    let toggle = start.elapsed() / 20;
+    let start = Instant::now();
+    for _ in 0..20 {
+        let pane = app.pane_mut().unwrap();
+        pane.content_key = None;
+        pane.rendered = None;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    }
+    let rebuild = start.elapsed() / 20;
+    eprintln!(
+        "rows={}; cold={cold:?}; cached={cached:?}/frame; toggle={toggle:?}/frame; rebuild={rebuild:?}/frame",
+        app.pane().unwrap().rendered.as_ref().unwrap().rows.len()
+    );
+}
+
 #[tokio::test]
 async fn ready_timer_does_not_starve_input_commands_or_watch() {
     let mut events = futures::stream::repeat_with(|| {

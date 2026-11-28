@@ -2,6 +2,8 @@ use super::sanitize::safe_display_text;
 use once_cell::sync::Lazy;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
+use std::collections::HashMap;
+use std::sync::Mutex;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{FontStyle, ThemeSet};
 use syntect::parsing::SyntaxSet;
@@ -19,7 +21,76 @@ static HIGHLIGHTER: Lazy<Highlighter> = Lazy::new(|| Highlighter {
 const HIGHLIGHT_LINE_BYTES: usize = 2048;
 const HIGHLIGHT_BLOCK_BYTES: usize = 256 * 1024;
 
+/// Source bytes kept per memo generation; the highlighted spans take several
+/// times that. Transcript rebuilds (new entries, resizes, toggling the
+/// sidebar) highlight the same code again, and syntect is far slower than the
+/// rest of a rebuild.
+const MEMO_BYTES: usize = 1 << 20;
+
+struct Memo<V> {
+    theme: u64,
+    bytes: usize,
+    current: HashMap<(String, String), V>,
+    previous: HashMap<(String, String), V>,
+}
+impl<V: Clone> Memo<V> {
+    fn new() -> Mutex<Self> {
+        Mutex::new(Self {
+            theme: 0,
+            bytes: 0,
+            current: HashMap::new(),
+            previous: HashMap::new(),
+        })
+    }
+}
+
+static LINES: Lazy<Mutex<Memo<Vec<Span<'static>>>>> = Lazy::new(Memo::new);
+static BLOCKS: Lazy<Mutex<Memo<Vec<Line<'static>>>>> = Lazy::new(Memo::new);
+
+fn memoized<V: Clone>(
+    memo: &Mutex<Memo<V>>,
+    code: &str,
+    lang: &str,
+    compute: fn(&str, &str) -> V,
+) -> V {
+    let theme = super::theme::generation();
+    let key = (lang.to_owned(), code.to_owned());
+    {
+        let mut memo = memo.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if memo.theme != theme {
+            memo.theme = theme;
+            memo.bytes = 0;
+            memo.current.clear();
+            memo.previous.clear();
+        }
+        if let Some(value) = memo.current.get(&key) {
+            return value.clone();
+        }
+        if let Some(value) = memo.previous.remove(&key) {
+            memo.bytes += key.0.len() + key.1.len();
+            memo.current.insert(key, value.clone());
+            return value;
+        }
+    }
+    let value = compute(code, lang);
+    let mut memo = memo.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if memo.theme == theme {
+        if memo.bytes > MEMO_BYTES {
+            memo.previous = std::mem::take(&mut memo.current);
+            memo.bytes = 0;
+        }
+        memo.bytes += key.0.len() + key.1.len();
+        memo.previous.remove(&key);
+        memo.current.insert(key, value.clone());
+    }
+    value
+}
+
 pub fn highlight(code: &str, lang: &str) -> Vec<Line<'static>> {
+    memoized(&BLOCKS, code, lang, highlight_block)
+}
+
+fn highlight_block(code: &str, lang: &str) -> Vec<Line<'static>> {
     let code = safe_display_text(code);
     if code.len() > HIGHLIGHT_BLOCK_BYTES
         || code
@@ -86,6 +157,10 @@ fn lang_syntax<'a>(
 }
 
 pub fn highlight_line(code: &str, lang: &str) -> Vec<Span<'static>> {
+    memoized(&LINES, code, lang, highlight_single)
+}
+
+fn highlight_single(code: &str, lang: &str) -> Vec<Span<'static>> {
     let code = safe_display_text(code);
     if code.len() > HIGHLIGHT_LINE_BYTES {
         return vec![Span::styled(
