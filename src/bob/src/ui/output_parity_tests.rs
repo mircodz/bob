@@ -113,7 +113,7 @@ impl Executor for RepositoryFixture {
     ) -> Result<ToolOutcome> {
         self.gate.acquire().await.unwrap().forget();
         Ok(ToolOutcome {
-            text: json!({"model_only_json": ["not human output"]}).to_string(),
+            text: json!({"model_only_json": vec!["not human output"; 200]}).to_string(),
             is_error: false,
             interrupted: false,
             presentation: Some(ToolResultPresentation {
@@ -260,6 +260,13 @@ async fn repository_expansion_and_inspector_use_bounded_readable_pages_not_model
 
         app.toggle_tool(id.clone(), &mut jobs);
         assert!(app.pane().unwrap().pending_outputs.contains_key(&id));
+        let loading = render::transcript(app.pane().unwrap(), true, 120)
+            .iter()
+            .map(|row| row.line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!loading.contains("model_only_json"), "{loading}");
+        assert!(loading.contains("Loading full output"), "{loading}");
         assert_eq!(drain(&mut app, &mut jobs).await, 1);
         let page = &app.pane().unwrap().expanded_outputs[&id];
         assert!(page.text.len() <= 16384);

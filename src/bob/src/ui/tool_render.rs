@@ -948,7 +948,9 @@ pub(super) fn tool_with_input_state(
         if let Some(output) = output {
             let body_preview = presentation.and_then(|p| p.body_preview.as_deref());
             let structured = serde_json::from_str::<Value>(output)
-                .is_ok_and(|value| value.is_object() || value.is_array());
+                .is_ok_and(|value| value.is_object() || value.is_array())
+                || (result.is_some_and(|result| result.is_preview)
+                    && output.trim_start().starts_with(['{', '[']));
             let source = if !expanded || structured {
                 body_preview.unwrap_or(output)
             } else {
