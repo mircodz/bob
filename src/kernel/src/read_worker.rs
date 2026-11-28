@@ -1,6 +1,7 @@
-use crate::{ArtifactId, TextPage, ThreadId};
+use crate::{ArtifactId, OperationId, TextPage, ThreadId};
 use anyhow::Context;
 use rusqlite::{params, Connection, OpenFlags};
+use serde_json::Value;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
@@ -13,6 +14,13 @@ enum Input {
         usize,
         oneshot::Sender<anyhow::Result<TextPage>>,
     ),
+    ToolOutput(
+        OperationId,
+        usize,
+        usize,
+        oneshot::Sender<anyhow::Result<TextPage>>,
+    ),
+    ToolArguments(OperationId, oneshot::Sender<anyhow::Result<Value>>),
     Close(oneshot::Sender<()>),
 }
 
@@ -51,6 +59,14 @@ impl Reader {
                         })();
                         let _ = reply.send(result);
                     }
+                    Input::ToolOutput(operation, offset, limit, reply) => {
+                        if reply.is_closed() { continue; }
+                        let _ = reply.send(store.tool_output(&operation, offset, limit));
+                    }
+                    Input::ToolArguments(operation, reply) => {
+                        if reply.is_closed() { continue; }
+                        let _ = reply.send(crate::jobs::tool_input(&store.db, &operation));
+                    }
                     Input::Close(reply) => { let _ = reply.send(()); break; }
                 }
             }
@@ -81,6 +97,25 @@ impl Reader {
                 tx,
             ))
             .await?;
+        rx.await?
+    }
+
+    pub(crate) async fn tool_output(
+        &self,
+        operation: OperationId,
+        offset: usize,
+        limit: usize,
+    ) -> anyhow::Result<TextPage> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(Input::ToolOutput(operation, offset, limit, tx))
+            .await?;
+        rx.await?
+    }
+
+    pub(crate) async fn tool_input(&self, operation: OperationId) -> anyhow::Result<Value> {
+        let (tx, rx) = oneshot::channel();
+        self.tx.send(Input::ToolArguments(operation, tx)).await?;
         rx.await?
     }
 

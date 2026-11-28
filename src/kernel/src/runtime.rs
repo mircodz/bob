@@ -77,7 +77,6 @@ enum Input {
         Vec<CommandId>,
         oneshot::Sender<anyhow::Result<QueueSnapshot>>,
     ),
-    ToolArguments(OperationId, oneshot::Sender<anyhow::Result<Value>>),
     JobOutput(
         JobId,
         usize,
@@ -113,12 +112,6 @@ enum Input {
         usize,
         usize,
         oneshot::Sender<anyhow::Result<String>>,
-    ),
-    ToolOutput(
-        OperationId,
-        usize,
-        usize,
-        oneshot::Sender<anyhow::Result<TextPage>>,
     ),
     Catalog(oneshot::Sender<anyhow::Result<Vec<ModelCatalogEntry>>>),
     RefreshModels(oneshot::Sender<anyhow::Result<Vec<ModelCatalogEntry>>>),
@@ -281,9 +274,7 @@ impl Handle {
         rx.await?
     }
     pub async fn tool_input(&self, operation: OperationId) -> anyhow::Result<Value> {
-        let (tx, rx) = oneshot::channel();
-        self.tx.send(Input::ToolArguments(operation, tx)).await?;
-        rx.await?
+        self.reader.tool_input(operation).await
     }
     pub async fn job_output(
         &self,
@@ -378,11 +369,7 @@ impl Handle {
         offset: usize,
         limit: usize,
     ) -> anyhow::Result<TextPage> {
-        let (tx, rx) = oneshot::channel();
-        self.tx
-            .send(Input::ToolOutput(operation, offset, limit, tx))
-            .await?;
-        rx.await?
+        self.reader.tool_output(operation, offset, limit).await
     }
     pub async fn refresh_models(&self) -> anyhow::Result<Vec<ModelCatalogEntry>> {
         let (tx, rx) = oneshot::channel();
@@ -634,7 +621,6 @@ impl Actor {
                     Some(Input::Jobs(session,reply))=>{let _=reply.send(crate::jobs::list(&self.store.db,&session));}
                     Some(Input::Queue(thread,reply))=>{let _=reply.send(crate::jobs::queue(&self.store.db,&thread));}
                     Some(Input::QueueSnapshot(thread,tracked,reply))=>{let _=reply.send(crate::jobs::queue_snapshot(&self.store.db,&thread,&tracked));}
-                    Some(Input::ToolArguments(operation,reply))=>{let _=reply.send(crate::jobs::tool_input(&self.store.db,&operation));}
                     Some(Input::JobOutput(job,offset,limit,reply))=>{let _=reply.send(crate::jobs::page(&self.store.db,&job,offset,limit));}
                     Some(input @ Input::Activate(..)) | Some(input @ Input::Command(..)) => {
                         if closing.is_some() {
@@ -658,7 +644,6 @@ impl Actor {
                     Some(Input::ApprovalOptions(operation,revision,reply))=>{let _=reply.send(crate::approvals::options(&self.store.db,&operation,revision));}
                     Some(Input::TranscriptAfter(thread,after,limit,reply))=>{let _=reply.send(self.store.transcript_after(thread,after,limit,self.error.clone()));}
                     Some(Input::Artifact(id,offset,limit,reply))=>{let _=reply.send(self.store.artifact_page(&id,offset,limit));}
-                    Some(Input::ToolOutput(operation,offset,limit,reply))=>{let _=reply.send(self.store.tool_output(&operation,offset,limit));}
                     Some(Input::RefreshModels(reply))=>{let _=reply.send(self.refresh_models());}
                     Some(Input::Catalog(reply))=>{let _=reply.send(Ok(self.model_catalog.clone()));}
                     Some(Input::Sessions(query,reply))=>{let _=reply.send(crate::sessions::sessions(&self.store.db,query));}
